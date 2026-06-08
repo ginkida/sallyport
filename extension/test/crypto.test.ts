@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createHmac } from 'node:crypto';
 import { Signer, decodeSecret } from '../src/crypto.js';
-import { canonicalJson, MAX_CLOCK_SKEW_S } from '../src/protocol.js';
+import { canonicalJson, MAX_CLOCK_SKEW_S, NONCE_CACHE_SIZE } from '../src/protocol.js';
 
 const SECRET_BYTES = new Uint8Array(32);
 for (let i = 0; i < 32; i++) SECRET_BYTES[i] = 0;
@@ -191,6 +191,21 @@ describe('Signer.verify replay protection', () => {
     await v.verify(signed);
     await expect(v.verify(signed)).rejects.toThrow(/replay/);
   });
+
+  it('evicts the oldest nonce once the cache overflows (replay allowed after eviction)', async () => {
+    const v = await makeSigner(SECRET_BYTES);
+    const ping = (nonce: string) =>
+      reSign({ v: 1, ts: Math.floor(Date.now() / 1000), nonce, type: 'ping', body: {} });
+    await v.verify(await ping('n-0')); // recorded
+    // Still in the cache → replay rejected.
+    await expect(v.verify(await ping('n-0'))).rejects.toThrow(/replay/);
+    // Push NONCE_CACHE_SIZE more distinct nonces; the overflow insert evicts 'n-0'.
+    for (let i = 1; i <= NONCE_CACHE_SIZE; i++) {
+      await v.verify(await ping(`n-${i}`));
+    }
+    // 'n-0' has fallen out of the rolling cache — replaying it now succeeds.
+    await expect(v.verify(await ping('n-0'))).resolves.toBeTruthy();
+  }, 20000);
 });
 
 describe('cross-language compatibility', () => {

@@ -141,6 +141,15 @@ describe('validatePattern', () => {
   });
 });
 
+describe('matchAllowlist — malformed stored pattern', () => {
+  it('returns no match when a stored http(s) pattern is not a valid URL (catch path)', () => {
+    // matchOne builds `new URL(pattern)`; a malformed pattern that slipped
+    // into storage must fail closed (no match), not throw.
+    expect(matchAllowlist('https://example.com/', [entry('https://')]).matched).toBe(false);
+    expect(matchAllowlist('https://example.com/', [entry('http://[')]).matched).toBe(false);
+  });
+});
+
 describe('matchAllowlist — port handling', () => {
   it('host-only pattern matches any port (localhost dev case)', () => {
     expect(matchAllowlist('http://localhost:3000/', [entry('localhost')]).matched).toBe(true);

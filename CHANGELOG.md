@@ -22,6 +22,14 @@ uses [Semantic Versioning](https://semver.org/).
 - **Repo settings**: secret scanning + push protection on, private
   vulnerability reporting enabled, `main` protected against force-push and
   deletion, unused wiki/projects disabled.
+- **Dev-dependency advisories cleared** (build/test tooling only — none ship
+  in the daemon or extension artifact, and none is reachable in how the
+  project uses the tools): `vitest` 2 → 4.1 (UI-server arbitrary-file-read,
+  critical), `esbuild` → 0.27 (dev-server request advisory), `vite` → 8 via
+  vitest (path traversal). Two new unit tests (nonce-cache eviction in
+  `crypto.ts`, malformed-pattern path in `allowlist.ts`) restore the per-file
+  coverage gates under vitest 4's stricter v8 remapping — thresholds were
+  raised back, not lowered.
 
 ## [0.2.0] — 2026-06-08
 
