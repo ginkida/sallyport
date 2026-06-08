@@ -23,7 +23,10 @@ updates:
         patterns: ['*']
 
   # Keeps the SHA-pinned actions in .github/workflows/ current (Dependabot
-  # bumps both the pinned SHA and the # vX.Y.Z comment).
+  # bumps both the pinned SHA and the # vX.Y.Z comment). Major bumps are
+  # ignored to keep CI on the tested action majors — security advisories
+  # still come through regardless of this ignore, and patch/minor SHA
+  # updates within the major are still applied.
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -32,3 +35,6 @@ updates:
     groups:
       actions:
         patterns: ['*']
+    ignore:
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']
