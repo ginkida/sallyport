@@ -16,7 +16,10 @@ const common = {
   target: 'es2022',
   platform: 'browser',
   logLevel: 'info',
-  sourcemap: 'linked',
+  // Maps only in watch/dev mode. Production builds (the CI artifact + the
+  // released zip) ship map-free so there's no dangling sourceMappingURL and
+  // no full-source duplication — the source is in the repo for debugging.
+  sourcemap: watch ? 'linked' : false,
 };
 
 const targets = [
