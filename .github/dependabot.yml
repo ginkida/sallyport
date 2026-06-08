@@ -21,6 +21,13 @@ updates:
     groups:
       extension-deps:
         patterns: ['*']
+    # Patch/minor (and any advisory-driven security update, which ignore
+    # never blocks) flow automatically; major bumps of the dev toolchain
+    # (eslint, typescript, vitest, …) are adopted deliberately, not as
+    # weekly auto-PRs that break lint/typecheck.
+    ignore:
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']
 
   # Keeps the SHA-pinned actions in .github/workflows/ current (Dependabot
   # bumps both the pinned SHA and the # vX.Y.Z comment). Major bumps are
