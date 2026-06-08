@@ -6,6 +6,23 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security / CI
+
+- **Repository supply-chain hardening.** GitHub Actions in `ci.yml` are now
+  pinned to full commit SHAs (with `# vX.Y.Z` comments Dependabot keeps
+  current) instead of mutable tags, `actions/checkout` runs with
+  `persist-credentials: false`, the workflow has least-privilege
+  `permissions: contents: read`, and a `concurrency` group cancels superseded
+  runs.
+- **Dependabot** (`.github/dependabot.yml`): weekly update PRs for the daemon
+  (pip), extension (npm), and the workflow actions, plus GitHub's automatic
+  security-update PRs (vulnerability alerts enabled).
+- **CodeQL** (`.github/workflows/codeql.yml`): `security-extended` static
+  analysis for Python and JavaScript/TypeScript on push, PR, and weekly.
+- **Repo settings**: secret scanning + push protection on, private
+  vulnerability reporting enabled, `main` protected against force-push and
+  deletion, unused wiki/projects disabled.
+
 ## [0.2.0] — 2026-06-08
 
 ### Added
