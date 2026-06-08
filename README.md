@@ -100,11 +100,12 @@ Sallyport needs **Python ≥ 3.10** (it uses match statements and `X | Y` type
 syntax). Check with `python --version` first.
 
 ```sh
-cd daemon
-pip install --user -e .
+pip install --user sallyport
 ```
 
-This installs `sallyport-daemon` on your `PATH`. Verify it landed there:
+Or from source (for development): `cd daemon && pip install --user -e .`
+
+This installs the `sallyport-daemon` command on your `PATH`. Verify it landed there:
 
 ```sh
 which sallyport-daemon   # should print a path; if not, add your Python

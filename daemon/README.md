@@ -1,4 +1,4 @@
-# sallyport-daemon
+# sallyport
 
 The Python MCP-server half of **[Sallyport](https://github.com/ginkida/sallyport)** —
 a security-first bridge between Claude Code (or any MCP client) and your Chrome,
@@ -16,8 +16,10 @@ per-domain allowlist and a per-domain opt-in for arbitrary JS.
 ## Install
 
 ```sh
-pip install sallyport-daemon
+pip install sallyport
 ```
+
+The package installs the `sallyport-daemon` console command.
 
 ## Quickstart
 

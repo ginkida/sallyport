@@ -3,7 +3,7 @@ name: publish
 # Publishes the daemon to PyPI via Trusted Publishing (OIDC) — no API token
 # is stored in the repo. Fires when a GitHub Release is published, or manually.
 # One-time setup on PyPI: add a Trusted Publisher (or a pending publisher) for
-# project "sallyport-daemon" → owner "ginkida", repo "sallyport",
+# project "sallyport" → owner "ginkida", repo "sallyport",
 # workflow "publish.yml", environment "pypi".
 on:
   release:
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/sallyport-daemon
+      url: https://pypi.org/p/sallyport
     permissions:
       id-token: write # OIDC token for PyPI Trusted Publishing
     steps:

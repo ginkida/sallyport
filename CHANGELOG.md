@@ -6,10 +6,13 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-08
+
 ### Packaging
 
-- **Daemon is now PyPI-ready** (`pip install sallyport-daemon`). `pyproject.toml`
-  carries full metadata (SPDX `license = "MIT"` + `LICENSE`, readme, authors,
+- **Daemon published to PyPI as `sallyport`** (`pip install sallyport`; the
+  package installs the `sallyport-daemon` command). `pyproject.toml` carries
+  full metadata (SPDX `license = "MIT"` + `LICENSE`, readme, authors,
   keywords, classifiers, `[project.urls]`); a daemon-focused `daemon/README.md`
   is the PyPI long-description. Build (hatchling) + `twine check` pass for both
   sdist and wheel.
@@ -536,6 +539,7 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ginkida/sallyport/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ginkida/sallyport/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ginkida/sallyport/releases/tag/v0.1.0
