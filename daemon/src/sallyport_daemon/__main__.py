@@ -312,6 +312,15 @@ async def _run_exec(args: argparse.Namespace, bridge: Bridge, shutdown: asyncio.
 
 
 async def amain(args: argparse.Namespace) -> int:
+    # `list-tools` is fully offline — print the catalogue WITHOUT touching the
+    # secret file. Generating an HMAC secret as a side effect of a command
+    # documented as "no daemon start" would be a surprising credential write.
+    if args.command == "list-tools":
+        for tool_def in TOOLS:
+            first_line = (tool_def.description or "").splitlines()[0]
+            print(f"{tool_def.name:<14} {first_line}")
+        return 0
+
     secret_path = Path(args.secret_file)
     try:
         secret, created = load_or_create(secret_path)
@@ -331,12 +340,6 @@ async def amain(args: argparse.Namespace) -> int:
 
     if args.show_secret:
         print(encode_b64(secret))
-        return 0
-
-    if args.command == "list-tools":
-        for tool_def in TOOLS:
-            first_line = (tool_def.description or "").splitlines()[0]
-            print(f"{tool_def.name:<14} {first_line}")
         return 0
 
     if args.command == "doctor":

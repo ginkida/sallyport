@@ -6,6 +6,25 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-06-08
+
+### Fixed
+
+- **`list-tools` no longer creates the secret as a side effect.** The command
+  is documented as an offline catalogue print, but `amain()` loaded/created
+  `~/.config/sallyport/secret` before dispatching it — so a first-time
+  `sallyport-daemon list-tools` silently generated an HMAC secret (chmod 600,
+  never printed, no network — but an undocumented credential write). It now
+  returns before touching the secret file. Regression test added.
+
+### Packaging
+
+- **sdist no longer ships the test suite.** `tests/` resolves the shared
+  cross-language fixture at repo root (`fixtures/canonical-vectors.json`),
+  which is outside the package, so the tests could never run from an sdist
+  (`pip download` + `pytest` errored with `FileNotFoundError`). The sdist now
+  ships `src` + metadata + docs only.
+
 ## [0.3.0] — 2026-06-08
 
 ### Packaging
@@ -539,7 +558,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/ginkida/sallyport/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ginkida/sallyport/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ginkida/sallyport/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ginkida/sallyport/releases/tag/v0.1.0

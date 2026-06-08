@@ -1,6 +1,6 @@
 [project]
 name = "sallyport"
-version = "0.3.0"
+version = "0.3.1"
 description = "MCP server bridging Claude Code to a browser extension over WS+HMAC"
 readme = "README.md"
 license = "MIT"
@@ -116,3 +116,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sallyport_daemon"]
+
+# The test suite resolves the shared cross-language fixture at repo-root
+# (fixtures/canonical-vectors.json), which lives outside this package — so the
+# tests can't run from an sdist. Ship a clean sdist (src + metadata + docs)
+# rather than tests that would error on a fresh extract.
+[tool.hatch.build.targets.sdist]
+exclude = ["/tests"]

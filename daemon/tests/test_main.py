@@ -139,7 +139,8 @@ def test_parse_args_default_no_subcommand() -> None:
 async def test_list_tools_prints_each_tool(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    ns = parse_args(["--secret-file", str(tmp_path / "s"), "list-tools"])
+    secret_file = tmp_path / "s"
+    ns = parse_args(["--secret-file", str(secret_file), "list-tools"])
     rc = await amain(ns)
     assert rc == 0
     out = capsys.readouterr().out
@@ -161,6 +162,10 @@ async def test_list_tools_prints_each_tool(
         "save_to_file",
     ):
         assert name in out
+    # list-tools is fully offline — it must NOT create the HMAC secret as a
+    # side effect (regression: it used to generate ~/.config/sallyport/secret
+    # silently before printing the catalogue).
+    assert not secret_file.exists()
 
 
 async def test_doctor_reports_ok_and_prints_secret(
@@ -211,11 +216,12 @@ async def test_doctor_diagnoses_corrupt_secret(
 async def test_bad_secret_exits_cleanly_for_non_doctor(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    """For non-doctor commands a corrupt secret exits 1 with a clean stderr
-    message instead of a traceback."""
+    """For non-doctor commands that need the secret, a corrupt secret exits 1
+    with a clean stderr message instead of a traceback. (``list-tools`` is
+    intentionally exempt — it never loads the secret.)"""
     bad = tmp_path / "secret"
     bad.write_bytes(b"not valid base64 @@@")
-    ns = parse_args(["--secret-file", str(bad), "list-tools"])
+    ns = parse_args(["--secret-file", str(bad), "serve"])
     rc = await amain(ns)
     assert rc == 1
     err = capsys.readouterr().err
