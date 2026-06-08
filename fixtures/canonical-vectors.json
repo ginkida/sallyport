@@ -1,0 +1,428 @@
+[
+  {
+    "name": "null",
+    "input": null,
+    "canonical": "null",
+    "mac_b64": "yrjqA4qD4DoLUyH8aQZ1hVv75sJlCvULL7vI43PP8K4="
+  },
+  {
+    "name": "bool_true",
+    "input": true,
+    "canonical": "true",
+    "mac_b64": "sUxji4/YDLhllEdeJXOq/cx8puqYlMXeRmjNk2sKBUU="
+  },
+  {
+    "name": "bool_false",
+    "input": false,
+    "canonical": "false",
+    "mac_b64": "1kuF8IIOrQDMY2Z8q/y06sDi/0x8yYt4XbkU2DPGq3A="
+  },
+  {
+    "name": "int_zero",
+    "input": 0,
+    "canonical": "0",
+    "mac_b64": "mXnkw+4Zll+ezG3KazlUsQwYwb+hBcUSzDrli+hdtxw="
+  },
+  {
+    "name": "int_positive",
+    "input": 42,
+    "canonical": "42",
+    "mac_b64": "ls4KWoIINwq0q9Y1RgxMmvyUxujyo9cXFHpDSl4/TJs="
+  },
+  {
+    "name": "int_negative",
+    "input": -7,
+    "canonical": "-7",
+    "mac_b64": "7B+CUqBVsJvaJCRjb97OK/+GuEOdmowphGaU4PdXZqA="
+  },
+  {
+    "name": "string_empty",
+    "input": "",
+    "canonical": "\"\"",
+    "mac_b64": "FAtHQR8QUhzEiFH0PJq+cwFuHUVifIUj0ly/f+ZPiwM="
+  },
+  {
+    "name": "string_simple",
+    "input": "hello",
+    "canonical": "\"hello\"",
+    "mac_b64": "oaXumYqAIWZHlX6hJxG+tb+fvTe2pPOFy4Q3YhsIUGU="
+  },
+  {
+    "name": "object_empty",
+    "input": {},
+    "canonical": "{}",
+    "mac_b64": "IvjuqQlACvmK3zaBqfMZI+9rf8ukq7VT2Sgjo+nVwl4="
+  },
+  {
+    "name": "array_empty",
+    "input": [],
+    "canonical": "[]",
+    "mac_b64": "g84TvaZSMzTaoU8z0fwq3Jj/i1fE31vl0vWLHCx4+h4="
+  },
+  {
+    "name": "object_reverse_keys",
+    "input": {
+      "z": 1,
+      "a": 2,
+      "m": 3
+    },
+    "canonical": "{\"a\":2,\"m\":3,\"z\":1}",
+    "mac_b64": "qZa+UWikLHgngmvTtq3xOQEE78IgWIOG4N5sehIIbRE="
+  },
+  {
+    "name": "object_numeric_string_keys",
+    "input": {
+      "2": "two",
+      "10": "ten",
+      "1": "one"
+    },
+    "canonical": "{\"1\":\"one\",\"10\":\"ten\",\"2\":\"two\"}",
+    "mac_b64": "xVZXr6CYEieiE7w3Vr9Ay0M/uC9Jsb4oOYAOHkPWgVs="
+  },
+  {
+    "name": "object_unicode_keys",
+    "input": {
+      "тест": 1,
+      "abc": 2,
+      "🔑": 3
+    },
+    "canonical": "{\"abc\":2,\"тест\":1,\"🔑\":3}",
+    "mac_b64": "BEeLqitPRTg8V0kPUurX9XS+m5reUpLOS7JiwN2UInQ="
+  },
+  {
+    "name": "nested_three_deep",
+    "input": {
+      "outer": {
+        "middle": {
+          "inner": [
+            1,
+            2,
+            3
+          ]
+        }
+      }
+    },
+    "canonical": "{\"outer\":{\"middle\":{\"inner\":[1,2,3]}}}",
+    "mac_b64": "u/EAoudGl5a1Bie7GPAYaK12yHpfy8JzXrt2Vc2KYXQ="
+  },
+  {
+    "name": "array_of_mixed",
+    "input": [
+      1,
+      "two",
+      null,
+      true,
+      {
+        "k": "v"
+      }
+    ],
+    "canonical": "[1,\"two\",null,true,{\"k\":\"v\"}]",
+    "mac_b64": "aNoNSkEWHdF7Rgj2qPOF7eN/QUf4uB35h8BMZUX4Rbk="
+  },
+  {
+    "name": "string_cyrillic",
+    "input": {
+      "k": "тест"
+    },
+    "canonical": "{\"k\":\"тест\"}",
+    "mac_b64": "BwlIx6E+DPAiD7uhkhxLHAFFj+4qJtG6RS2Ky07jN9U="
+  },
+  {
+    "name": "string_emoji",
+    "input": {
+      "k": "💀🔐🚀"
+    },
+    "canonical": "{\"k\":\"💀🔐🚀\"}",
+    "mac_b64": "DTZpFm3p21xcn0oB4HeDgmpV8nlLLGMPvBK1LHLcGF8="
+  },
+  {
+    "name": "string_with_quote",
+    "input": {
+      "k": "has \"quote\" inside"
+    },
+    "canonical": "{\"k\":\"has \\\"quote\\\" inside\"}",
+    "mac_b64": "GblXhyqGwH/dgkOCYOQqDiC9+5WxcrUFUnvYQbDh9+Q="
+  },
+  {
+    "name": "string_with_backslash",
+    "input": {
+      "k": "back\\slash"
+    },
+    "canonical": "{\"k\":\"back\\\\slash\"}",
+    "mac_b64": "cx2B/1RBq7Qz6HoMcLtWEhp86XYyftICl1jeek2sVj0="
+  },
+  {
+    "name": "string_with_newline",
+    "input": {
+      "k": "line\nbreak"
+    },
+    "canonical": "{\"k\":\"line\\nbreak\"}",
+    "mac_b64": "Pla9783a4bI/HvF5fKUv6u1LT9zFM+JcIdCROA6hjm4="
+  },
+  {
+    "name": "negative_zero",
+    "input": {
+      "k": 0
+    },
+    "canonical": "{\"k\":0}",
+    "mac_b64": "IePwncuSrutfbPbLcicH+ZqUptTFWY/sxYR3m/7EMms="
+  },
+  {
+    "name": "large_int",
+    "input": {
+      "k": 9007199254740991
+    },
+    "canonical": "{\"k\":9007199254740991}",
+    "mac_b64": "pJKirXitMrC7rfoYS6sTQzlcxUe01VTDsAPQN1vpYuM="
+  },
+  {
+    "name": "large_int_negative",
+    "input": {
+      "k": -9007199254740991
+    },
+    "canonical": "{\"k\":-9007199254740991}",
+    "mac_b64": "dSZ9gTveMGn90Whtiv+64LBvzm25FFOWyxTpuP3raP4="
+  },
+  {
+    "name": "float_half",
+    "input": {
+      "k": 0.5
+    },
+    "canonical": "{\"k\":0.5}",
+    "mac_b64": "8CXcjcqFIx1xfTFGtaQsoZKOIh9t8ajglmWP+0tXjz4="
+  },
+  {
+    "name": "float_pi",
+    "input": {
+      "k": 3.141592653589793
+    },
+    "canonical": "{\"k\":3.141592653589793}",
+    "mac_b64": "cMvsdp8vLIOytejKefnz8sCtP/93kGv7S86krI8WSzk="
+  },
+  {
+    "name": "float_tenths_array",
+    "input": [
+      0.1,
+      0.2,
+      0.3
+    ],
+    "canonical": "[0.1,0.2,0.3]",
+    "mac_b64": "zb9xIhTlFUlZwJ4WvIeMLTtugxr589WQ+9vknNjH+mw="
+  },
+  {
+    "name": "float_fixed_low_boundary",
+    "input": {
+      "k": 0.0001
+    },
+    "canonical": "{\"k\":0.0001}",
+    "mac_b64": "rRoZCc2PqMXmB+sqTrnbdbTpHL+N/t6j5roq7NXVBC8="
+  },
+  {
+    "name": "float_sci_1e-5",
+    "input": {
+      "k": 1e-05
+    },
+    "canonical": "{\"k\":1e-05}",
+    "mac_b64": "MLXpIJS9vS3ZV226gFDOhO3SwJWZvzzo7Dsrv7zC5hk="
+  },
+  {
+    "name": "float_sci_1e-6",
+    "input": {
+      "k": 1e-06
+    },
+    "canonical": "{\"k\":1e-06}",
+    "mac_b64": "P6MNM7ul28Z+4afym0he0TPB5mq96Yw9A0OR+tU2BH8="
+  },
+  {
+    "name": "float_sci_1e-7",
+    "input": {
+      "k": 1e-07
+    },
+    "canonical": "{\"k\":1e-07}",
+    "mac_b64": "2s5BQcUn5TRqM468iQnCzmByGXFyGGpKLU1onubJSdI="
+  },
+  {
+    "name": "float_sci_negative_mantissa",
+    "input": {
+      "k": -1.5e-07
+    },
+    "canonical": "{\"k\":-1.5e-07}",
+    "mac_b64": "qIfUM9D6RT3RlFx5AdTYE2LrC6yCGU2wxweBRA9NTDQ="
+  },
+  {
+    "name": "float_sci_1e21",
+    "input": {
+      "k": 1e+21
+    },
+    "canonical": "{\"k\":1e+21}",
+    "mac_b64": "b/KCjTnjDxnC82JeEemvcQw2EpvNEGPPIBo4IErk7GA="
+  },
+  {
+    "name": "float_subnormal_min",
+    "input": {
+      "k": 5e-324
+    },
+    "canonical": "{\"k\":5e-324}",
+    "mac_b64": "ByKUIda7VmZTtCoP1LvtUR0hlA6+nHI8fGXPvxEUdSU="
+  },
+  {
+    "name": "float_fixed_long_fraction",
+    "input": {
+      "k": 1000000000000000.5
+    },
+    "canonical": "{\"k\":1000000000000000.5}",
+    "mac_b64": "s/TYF6N+saJBW3u7e1GiAMxNexurcPXfEa8CbQ40j1Y="
+  },
+  {
+    "name": "float_integral_normalises",
+    "input": {
+      "k": 2.0
+    },
+    "canonical": "{\"k\":2}",
+    "mac_b64": "aTDxn9H+ovXTUHbOEtr2MP35GfEcoEBsdLV2hfiCvXI="
+  },
+  {
+    "name": "float_negative_zero_normalises",
+    "input": {
+      "k": -0.0
+    },
+    "canonical": "{\"k\":0}",
+    "mac_b64": "IePwncuSrutfbPbLcicH+ZqUptTFWY/sxYR3m/7EMms="
+  },
+  {
+    "name": "float_integral_2pow53",
+    "input": {
+      "k": 9007199254740992.0
+    },
+    "canonical": "{\"k\":9007199254740992}",
+    "mac_b64": "ZPJSBchWK7mNySNNFpa3vw3gKXQ1r75eGFydwgIwERg="
+  },
+  {
+    "name": "float_integral_1e16",
+    "input": {
+      "k": 1e+16
+    },
+    "canonical": "{\"k\":10000000000000000}",
+    "mac_b64": "Vjq95lU+NsEd13kNy+3SzlR55uWn9eZDIPM0UNBndhY="
+  },
+  {
+    "name": "float_integral_1p2e16",
+    "input": {
+      "k": 1.2e+16
+    },
+    "canonical": "{\"k\":12000000000000000}",
+    "mac_b64": "TNuq28d/gp4P4VkXnMdiF4QNwuPqfb5zh8tspB0L5o4="
+  },
+  {
+    "name": "float_integral_snowflake",
+    "input": {
+      "k": 1.7e+18
+    },
+    "canonical": "{\"k\":1700000000000000000}",
+    "mac_b64": "TAMa1Zs1S7EqpQWQ/igNAg/z/QfgRexTh1+3QoCJbWg="
+  },
+  {
+    "name": "float_integral_just_below_1e21",
+    "input": {
+      "k": 9.999999999999999e+20
+    },
+    "canonical": "{\"k\":999999999999999900000}",
+    "mac_b64": "qhsh6q0S6GJVOJ67HKK9O043FGplZxXcwJVtEDWcoeI="
+  },
+  {
+    "name": "int_exact_2pow60",
+    "input": {
+      "k": 1152921504606846976
+    },
+    "canonical": "{\"k\":1152921504606847000}",
+    "mac_b64": "YTN/uinES4eemcMR7xNcau8803/dlivP5ndNzbHmtj0="
+  },
+  {
+    "name": "int_shortest_2pow60",
+    "input": {
+      "k": 1152921504606847000
+    },
+    "canonical": "{\"k\":1152921504606847000}",
+    "mac_b64": "YTN/uinES4eemcMR7xNcau8803/dlivP5ndNzbHmtj0="
+  },
+  {
+    "name": "int_exact_1e21",
+    "input": {
+      "k": 1000000000000000000000
+    },
+    "canonical": "{\"k\":1e+21}",
+    "mac_b64": "b/KCjTnjDxnC82JeEemvcQw2EpvNEGPPIBo4IErk7GA="
+  },
+  {
+    "name": "object_keys_astral_vs_bmp",
+    "input": {
+      "😀": 2,
+      "�": 1
+    },
+    "canonical": "{\"�\":1,\"😀\":2}",
+    "mac_b64": "BuRRg121BY1QEbMSQHbYwDRMgcg+0ti4PAboi7zcfOQ="
+  },
+  {
+    "name": "object_keys_private_use_vs_astral",
+    "input": {
+      "𐀀": 2,
+      "": 1
+    },
+    "canonical": "{\"\":1,\"𐀀\":2}",
+    "mac_b64": "FD5LPYQSb3aIhorHYbx9D5LGQP1iWDrXojVuzjXx7e0="
+  },
+  {
+    "name": "envelope_tool_call",
+    "input": {
+      "v": 1,
+      "ts": 1700000000,
+      "nonce": "AAAAAAAAAAAAAAAAAAAAAA==",
+      "type": "tool_call",
+      "id": "req1",
+      "body": {
+        "name": "navigate",
+        "args": {
+          "url": "https://example.com/"
+        }
+      }
+    },
+    "canonical": "{\"body\":{\"args\":{\"url\":\"https://example.com/\"},\"name\":\"navigate\"},\"id\":\"req1\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAA==\",\"ts\":1700000000,\"type\":\"tool_call\",\"v\":1}",
+    "mac_b64": "/OcAjJGftRL4Aq+yomTyrqJCPIZWNINfGFYVbLUerM0="
+  },
+  {
+    "name": "envelope_tool_result_ok",
+    "input": {
+      "v": 1,
+      "ts": 1700000001,
+      "nonce": "BBBBBBBBBBBBBBBBBBBBBB==",
+      "type": "tool_result",
+      "id": "req1",
+      "body": {
+        "ok": true,
+        "data": {
+          "tabId": 7,
+          "url": "https://example.com/"
+        }
+      }
+    },
+    "canonical": "{\"body\":{\"data\":{\"tabId\":7,\"url\":\"https://example.com/\"},\"ok\":true},\"id\":\"req1\",\"nonce\":\"BBBBBBBBBBBBBBBBBBBBBB==\",\"ts\":1700000001,\"type\":\"tool_result\",\"v\":1}",
+    "mac_b64": "z8AmbuQxxdvXp2Wpe3XWkW7zWXiZJfK7qBnLdXomaT4="
+  },
+  {
+    "name": "envelope_tool_result_error",
+    "input": {
+      "v": 1,
+      "ts": 1700000002,
+      "nonce": "CCCCCCCCCCCCCCCCCCCCCC==",
+      "type": "tool_result",
+      "id": "req2",
+      "body": {
+        "ok": false,
+        "error": "evil.com is not in the allowlist",
+        "code": "domain_not_allowed"
+      }
+    },
+    "canonical": "{\"body\":{\"code\":\"domain_not_allowed\",\"error\":\"evil.com is not in the allowlist\",\"ok\":false},\"id\":\"req2\",\"nonce\":\"CCCCCCCCCCCCCCCCCCCCCC==\",\"ts\":1700000002,\"type\":\"tool_result\",\"v\":1}",
+    "mac_b64": "iunRckHPHuTGmdVKFwNvb/C3PWKPJuMB9fTMgMFUnSI="
+  }
+]

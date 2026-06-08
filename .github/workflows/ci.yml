@@ -1,0 +1,123 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: CI only checks out, tests, and uploads run artifacts.
+permissions:
+  contents: read
+
+# Same checks run by pre-commit, plus the full test suites.
+jobs:
+  daemon:
+    name: daemon (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12']
+    defaults:
+      run:
+        working-directory: daemon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: daemon/pyproject.toml
+      - run: pip install -e '.[dev]'
+      - run: ruff check .
+      - run: mypy
+      - run: pytest -q  # also enforces --cov-fail-under=80 via pyproject.toml
+      # Guard invariant #1: the canonical-JSON / HMAC fixtures must stay in
+      # sync with protocol.py. Regenerate and fail if the committed file
+      # drifts — a protocol change that forgot to re-pin the vectors (or
+      # diverged from protocol.ts) is caught here instead of on the wire.
+      - name: canonical-vector fixtures are in sync
+        run: |
+          python3 ../fixtures/generate.py
+          git diff --exit-code ../fixtures/canonical-vectors.json
+
+  extension:
+    name: extension (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test:cov  # vitest run with per-file coverage thresholds
+      - run: npm run build
+
+  # Dependency vulnerability visibility. Deliberately NON-blocking: every
+  # npm advisory here is in dev-only build/test tooling (esbuild/vite/vitest)
+  # and the daemon's only runtime deps (mcp, websockets) pull transitive
+  # packages we don't pin directly. Gating merges on those would train people
+  # to ignore red, so this job surfaces advisories as annotations without
+  # failing the run. Review the log when it flags something new.
+  audit:
+    name: dependency audit (informational)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - run: npm ci
+        working-directory: extension
+      - name: npm audit (extension dev/build deps)
+        working-directory: extension
+        continue-on-error: true
+        run: npm audit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: pip-audit (daemon deps)
+        working-directory: daemon
+        continue-on-error: true
+        run: |
+          pip install -e . pip-audit
+          pip-audit
+
+  # Bundle the built extension so a release can drop the artefact straight
+  # into chrome://extensions.
+  extension-artifact:
+    name: extension build artifact
+    needs: extension
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sallyport-extension-unpacked
+          path: extension/dist
+          if-no-files-found: error

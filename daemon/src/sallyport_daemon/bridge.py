@@ -1,0 +1,281 @@
+"""WebSocket server that the extension connects into.
+
+There is at most one extension client at a time. The MCP side calls
+:meth:`Bridge.call_tool` and we route it to whatever extension is currently
+attached, awaiting the signed response.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import secrets as _secrets
+from typing import Any
+
+import websockets
+from websockets.asyncio.server import ServerConnection, serve
+
+from .protocol import Envelope, ProtocolError, Signer
+
+log = logging.getLogger("sallyport.ws")
+
+
+class ExtensionNotConnected(Exception):
+    pass
+
+
+class ToolError(Exception):
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class Bridge:
+    """Owns the single extension connection + a queue of pending tool calls."""
+
+    def __init__(
+        self,
+        secret: bytes,
+        host: str,
+        port: int,
+        request_timeout: float = 60.0,
+        hello_timeout: float = 10.0,
+    ) -> None:
+        self._signer = Signer(secret)
+        self._host = host
+        self._port = port
+        self._request_timeout = request_timeout
+        self._hello_timeout = hello_timeout
+        self._client: ServerConnection | None = None
+        self._client_lock = asyncio.Lock()
+        self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._send_lock = asyncio.Lock()
+        # Serialise MCP-side tool calls. The extension's tools share per-tab
+        # state (CDP attachments, accessibility refs), so two concurrent
+        # tool_calls can race. We make it impossible from this side.
+        self._call_lock = asyncio.Lock()
+
+    @property
+    def connected(self) -> bool:
+        return self._client is not None
+
+    # 16 MiB: enough for a full-page PNG screenshot at common viewport sizes,
+    # plus headroom. Larger frames are rejected by `websockets` automatically
+    # with a 1009 close, which is exactly what we want — the offending client
+    # gets disconnected and we don't run out of memory holding a hostile blob.
+    MAX_FRAME_BYTES = 16 * 1024 * 1024
+
+    async def serve_forever(self, *, shutdown: asyncio.Event | None = None) -> None:
+        """Run the WS server until cancelled or until ``shutdown`` is set.
+
+        Bound to a loopback address only: anyone with the secret on this
+        machine can connect; nobody on the network can even try.
+        """
+        log.info("ws: listening on %s:%d", self._host, self._port)
+        async with serve(
+            self._handle_client,
+            self._host,
+            self._port,
+            max_size=self.MAX_FRAME_BYTES,
+            # ping_interval keeps NAT/proxies awake AND lets us notice a
+            # half-open TCP socket within ~40 s instead of waiting for the
+            # next user-initiated send.
+            ping_interval=20,
+            ping_timeout=20,
+        ):
+            if shutdown is None:
+                await asyncio.Future()
+            else:
+                await shutdown.wait()
+                # Tell the connected client we're going away (gracefully) so
+                # they don't pile up reconnect attempts on a dead socket.
+                if self._client is not None:
+                    try:
+                        await self._client.close(code=1001, reason="daemon shutting down")
+                    except Exception:  # noqa: BLE001,S110 - best effort on shutdown
+                        log.debug("ws: error closing client during shutdown", exc_info=True)
+
+    async def _handle_client(self, ws: ServerConnection) -> None:
+        # A web page can open a cross-origin WebSocket to 127.0.0.1 without
+        # any special permission. The real extension's service worker sends a
+        # chrome-extension:// Origin; non-browser clients send none (and must
+        # still pass the signed-hello gate below). Anything else is a browser
+        # page and is refused outright.
+        origin = ws.request.headers.get("Origin") if ws.request is not None else None
+        if origin is not None and not origin.startswith("chrome-extension://"):
+            log.warning("ws: rejecting connection with browser-page origin %r", origin)
+            await ws.close(code=1008, reason="forbidden origin")
+            return
+
+        # Authenticate BEFORE claiming the single-client slot: the first
+        # frame must be a valid signed hello, within _hello_timeout. An
+        # unauthenticated peer therefore can neither occupy the slot
+        # (denying service to the real extension) nor learn whether an
+        # extension is currently attached.
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=self._hello_timeout)
+        except (asyncio.TimeoutError, websockets.ConnectionClosed):
+            log.warning("ws: closing client that sent no hello within %.0fs", self._hello_timeout)
+            await ws.close(code=1008, reason="hello required")
+            return
+        try:
+            if isinstance(raw, bytes):
+                raise ProtocolError("binary frame before hello")
+            env = self._signer.verify(self._parse_json(raw))
+            if env.type != "hello":
+                raise ProtocolError(f"expected hello, got {env.type!r}")
+        except (ProtocolError, RecursionError) as exc:
+            # RecursionError: a deeply-nested frame can blow the parser /
+            # canonicaliser stack — same treatment as any malformed frame.
+            # Don't echo the reason to a possibly-attacker peer.
+            log.warning("ws: rejecting unauthenticated client: %s", exc)
+            await ws.close(code=1008, reason="authentication failed")
+            return
+
+        # Only one client at a time. If another is already attached, drop the
+        # new one — it authenticated, so a 1008 with a reason is fine.
+        async with self._client_lock:
+            if self._client is not None:
+                log.warning("ws: rejecting second client")
+                await ws.close(code=1008, reason="another client is already connected")
+                return
+            self._client = ws
+
+        log.info("ws: client attached from %s", ws.remote_address)
+        try:
+            ack = self._signer.sign(Envelope(type="hello_ack", body={}))
+            await self._send_raw(ws, ack)
+            await self._read_loop(ws)
+        except websockets.ConnectionClosed:
+            log.info("ws: client closed")
+        except Exception:
+            log.exception("ws: client loop crashed")
+        finally:
+            async with self._client_lock:
+                if self._client is ws:
+                    self._client = None
+            # Cancel pending requests so the caller doesn't hang forever.
+            for fut in list(self._pending.values()):
+                if not fut.done():
+                    fut.set_exception(ExtensionNotConnected("extension disconnected mid-request"))
+            self._pending.clear()
+
+    async def _read_loop(self, ws: ServerConnection) -> None:
+        async for raw in ws:
+            if isinstance(raw, bytes):
+                # We only do JSON text.
+                log.warning("ws: ignoring binary frame")
+                continue
+            try:
+                env = self._signer.verify(self._parse_json(raw))
+            except (ProtocolError, RecursionError) as exc:
+                # RecursionError: json.loads (and the canonical encoder)
+                # recurse per nesting level, so a few-KiB deeply-nested
+                # frame — far under the 16 MiB cap — blows the stack.
+                # Skip it like any other bad frame; never tear down the
+                # connection. Don't echo the reason to a possibly-attacker
+                # peer.
+                log.warning("ws: rejected frame: %s", exc)
+                continue
+
+            if env.type == "hello":
+                # The attach-time hello is consumed by _handle_client; this
+                # re-acks a (harmless) mid-session hello.
+                ack = self._signer.sign(Envelope(type="hello_ack", body={}))
+                await self._send_raw(ws, ack)
+            elif env.type == "pong":
+                pass  # keepalive (we don't currently send pings; reserved)
+            elif env.type == "tool_result":
+                if env.id is None:
+                    continue
+                fut = self._pending.pop(env.id, None)
+                # The `not fut.done()` guard is load-bearing: if the call
+                # already timed out, `asyncio.wait_for` marked the future
+                # done (with a TimeoutError) before `_call_tool_locked`
+                # popped it. A late tool_result must NOT call set_result on
+                # an already-resolved future — that raises InvalidStateError
+                # and crashes the read loop.
+                if fut and not fut.done():
+                    fut.set_result(env.body or {})
+            else:
+                log.debug("ws: unhandled type %r", env.type)
+
+    @staticmethod
+    def _parse_json(raw: str) -> dict[str, Any]:
+        import json
+
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, RecursionError) as exc:
+            # json.JSONDecodeError is a ValueError; deeply-nested JSON
+            # raises RecursionError (NOT a ValueError). Surface both as a
+            # ProtocolError so the read loop skips the frame instead of
+            # tearing down the connection with a traceback.
+            raise ProtocolError(f"malformed JSON frame: {type(exc).__name__}") from exc
+        if not isinstance(parsed, dict):
+            raise ProtocolError("frame is not a JSON object")
+        return parsed
+
+    async def _send_raw(self, ws: ServerConnection, env: dict[str, Any]) -> None:
+        import json
+
+        async with self._send_lock:
+            await ws.send(json.dumps(env, separators=(",", ":")))
+
+    async def call_tool(self, name: str, args: dict[str, Any]) -> Any:
+        # Local-only tools run in this process and don't need the extension.
+        # Imported lazily to avoid a circular reference (local_tools imports
+        # ToolError from this module).
+        from .local_tools import LOCAL_TOOLS, PRE_CALL_VALIDATORS
+
+        async with self._call_lock:
+            if name in LOCAL_TOOLS:
+                return await LOCAL_TOOLS[name](args)
+            # Daemon-side pre-call validation (sandbox membership for
+            # `upload`, etc.) runs BEFORE the WS round-trip so both MCP
+            # and `sallyport-daemon exec` get the same authoritative gate.
+            validator = PRE_CALL_VALIDATORS.get(name)
+            if validator is not None:
+                validator(args)
+            return await self._call_tool_locked(name, args)
+
+    async def _call_tool_locked(self, name: str, args: dict[str, Any]) -> Any:
+        if self._client is None:
+            raise ExtensionNotConnected(
+                "extension is not connected — open Chrome and check the Sallyport popup",
+            )
+        req_id = _secrets.token_hex(8)
+        try:
+            env = self._signer.sign(
+                Envelope(type="tool_call", id=req_id, body={"name": name, "args": args})
+            )
+        except (ProtocolError, RecursionError) as exc:
+            # Arguments the canonical encoding rejects (non-finite floats,
+            # precision-losing ints, lone surrogates, absurd nesting) fail
+            # fast and legibly instead of surfacing as a baffling timeout.
+            raise ToolError(
+                f"tool arguments are not wire-serialisable: {exc}", code="bad_args"
+            ) from exc
+        fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending[req_id] = fut
+        try:
+            await self._send_raw(self._client, env)
+            try:
+                result = await asyncio.wait_for(fut, timeout=self._request_timeout)
+            except asyncio.TimeoutError as exc:
+                raise ToolError(
+                    f"timeout: extension did not reply within {self._request_timeout}s"
+                ) from exc
+        finally:
+            self._pending.pop(req_id, None)
+
+        if not isinstance(result, dict):
+            # A verified-but-malformed tool_result body (truthy non-dict —
+            # the extension is expected to send {ok, data|error, code?}).
+            # Surface a clean ToolError instead of an AttributeError on
+            # result.get(...), which would reach the MCP caller as an
+            # opaque crash rather than a tool failure.
+            raise ToolError("extension returned a non-object tool_result body", code="bad_args")
+        if result.get("ok") is True:
+            return result.get("data")
+        raise ToolError(result.get("error", "unknown error"), code=result.get("code"))

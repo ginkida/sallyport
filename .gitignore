@@ -1,0 +1,42 @@
+# OS / editors
+.DS_Store
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Node / extension
+node_modules/
+dist/
+*.log
+coverage/
+.coverage
+.coverage.*
+htmlcov/
+*.tsbuildinfo
+*.zip
+*.crx
+*.pem
+
+# Secrets (just in case anyone runs from-repo)
+secret
+.config/
+.env
+.env.*
+
+# Local editor / tooling files
+CLAUDE.md
+.claude/
+.mcp.json
+.vscode/
+.idea/
+
+# Local-only reference material (not for redistribution)
+kimi-reference/
+ANALYSIS.md

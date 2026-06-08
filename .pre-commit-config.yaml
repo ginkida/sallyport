@@ -1,0 +1,57 @@
+# Run with: pre-commit install (once) then pre-commit on every commit.
+# Heavy stuff (full pytest, vitest) lives in CI, not here — pre-commit
+# should be fast or it will be bypassed.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]
+
+  # Python (daemon/)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^daemon/
+      - id: ruff-format
+        files: ^daemon/
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        files: ^daemon/src/
+        args: [--config-file=daemon/pyproject.toml]
+        additional_dependencies: [mcp>=1.0.0, websockets>=13.0]
+
+  # TypeScript (extension/) — Prettier + ESLint via local scripts.
+  # We use 'language: system' so the hook runs through the project's own
+  # npm scripts (and thus the project's pinned eslint/prettier versions)
+  # instead of pre-commit installing its own copies.
+  - repo: local
+    hooks:
+      - id: extension-prettier
+        name: extension prettier (check)
+        language: system
+        entry: bash -c 'cd extension && npm run format:check'
+        files: ^extension/(src|test)/.*\.(ts|js|json|css|html)$
+        pass_filenames: false
+      - id: extension-eslint
+        name: extension eslint
+        language: system
+        entry: bash -c 'cd extension && npm run lint'
+        files: ^extension/(src|test)/.*\.(ts|js)$
+        pass_filenames: false
+      - id: extension-typecheck
+        name: extension typecheck
+        language: system
+        entry: bash -c 'cd extension && npm run typecheck'
+        files: ^extension/(src|test)/.*\.ts$
+        pass_filenames: false

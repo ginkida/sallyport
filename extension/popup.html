@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=400, initial-scale=1">
+  <title>Sallyport</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>Sallyport</h1>
+    <div id="state-badge" class="badge">loading…</div>
+  </header>
+
+  <!-- ──────────────── Onboarding (shown only before pairing) ──────────────── -->
+  <section id="onboarding" class="onboarding hidden">
+    <p class="lede">Connect this extension to your local Sallyport daemon to give an MCP agent a controlled view of your browser.</p>
+
+    <ol class="steps">
+      <li>Start the daemon — Claude Code does this when you run <code>claude mcp add sallyport sallyport-daemon</code>, or run <code>sallyport-daemon serve</code> in a shell.</li>
+      <li>On first start it prints a one-line secret inside a <code>===</code> banner. Copy the whole banner.</li>
+      <li>Paste below — we'll find the secret for you.</li>
+    </ol>
+
+    <textarea id="pair-secret" rows="4" placeholder="paste the daemon banner here — or just the base64 secret line"></textarea>
+    <div id="pair-detect" class="detect"></div>
+
+    <details class="advanced">
+      <summary>Advanced</summary>
+      <label class="muted small" for="pair-url">Daemon URL</label>
+      <input type="text" id="pair-url" placeholder="ws://127.0.0.1:10086/ws">
+    </details>
+
+    <button id="pair-submit" class="primary large" disabled>Pair</button>
+    <div id="onboard-error" class="error"></div>
+  </section>
+
+  <!-- ──────────────── Main UI (shown after pairing) ──────────────── -->
+  <div id="main" class="hidden">
+    <nav id="tabs">
+      <button data-tab="status" class="tab active">Status</button>
+      <button data-tab="allowlist" class="tab">Allowlist</button>
+      <button data-tab="audit" class="tab">Audit</button>
+    </nav>
+
+    <section id="tab-status" class="tab-panel active">
+      <div id="status-card" class="status-card">
+        <div class="status-dot"></div>
+        <div class="status-text">
+          <div id="status-title" class="status-title">—</div>
+          <div id="status-sub" class="status-sub muted small">—</div>
+        </div>
+      </div>
+
+      <div id="status-error" class="error"></div>
+
+      <div id="status-stats" class="stats hidden">
+        <div class="stat">
+          <div class="stat-num" id="stat-allow">0</div>
+          <div class="stat-lbl">allowed sites</div>
+        </div>
+        <div class="stat">
+          <div class="stat-num" id="stat-recent">0</div>
+          <div class="stat-lbl">calls (1h)</div>
+        </div>
+      </div>
+
+      <!-- Current-tab quick add — only shown when on a real http(s) tab -->
+      <div id="current-tab" class="current-tab hidden">
+        <div class="ct-row">
+          <span class="muted small">Current tab:</span>
+          <span id="ct-host" class="ct-host"></span>
+          <span id="ct-state" class="ct-state"></span>
+        </div>
+        <button id="ct-add" class="hidden">Add this site to the allowlist</button>
+      </div>
+
+      <div id="quick-allow" class="quick-allow hidden">
+        <label class="muted small" for="quick-allow-input">Add any other domain</label>
+        <div class="row">
+          <input type="text" id="quick-allow-input" placeholder="example.com">
+          <button id="quick-allow-add">Add</button>
+        </div>
+        <div id="quick-allow-error" class="error"></div>
+      </div>
+
+      <div id="paused-block" class="block hidden">
+        <p>Sallyport is paused — no commands will run.</p>
+        <button id="resume-btn" class="primary">Resume</button>
+      </div>
+
+      <details id="status-advanced" class="advanced hidden">
+        <summary>Advanced</summary>
+        <label class="muted small" for="settings-url">Daemon URL</label>
+        <div class="row">
+          <input type="text" id="settings-url" placeholder="ws://127.0.0.1:10086/ws">
+          <button id="settings-save">Save</button>
+        </div>
+        <div class="muted small adv-section-label">Available tools (<span id="tool-count">0</span>)</div>
+        <ul id="tool-list" class="muted small tool-list"></ul>
+      </details>
+
+      <div id="actions-block" class="actions hidden">
+        <button id="pause-btn">Pause</button>
+        <button id="reconnect-btn">Reconnect</button>
+        <button id="unpair-btn" class="danger">Unpair</button>
+      </div>
+
+      <div id="status-flash" class="flash"></div>
+    </section>
+
+    <section id="tab-allowlist" class="tab-panel">
+      <p class="muted small">Tools only run on domains in this list. Add sites you want the agent to touch.</p>
+      <div class="row">
+        <input type="text" id="allow-input" placeholder="example.com or *.example.com">
+        <label class="checkbox">
+          <input type="checkbox" id="allow-eval"> allow evaluate()
+        </label>
+        <button id="allow-add" class="primary">Add</button>
+      </div>
+      <div id="allow-error" class="error"></div>
+      <div id="allow-flash" class="flash"></div>
+      <ul id="allow-list"></ul>
+    </section>
+
+    <section id="tab-audit" class="tab-panel">
+      <div id="audit-summary" class="audit-summary muted small"></div>
+      <input type="text" id="audit-filter" placeholder="filter — tool name, url, error text">
+      <div class="row audit-toolbar">
+        <button id="audit-refresh">Refresh</button>
+        <button id="audit-export">Export JSON</button>
+        <button id="audit-clear" class="danger">Clear</button>
+      </div>
+      <ul id="audit-list"></ul>
+    </section>
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

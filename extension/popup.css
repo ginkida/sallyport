@@ -1,0 +1,199 @@
+:root {
+  --bg: #1c1c1f;
+  --fg: #e8e8ea;
+  --muted: #9a9aa1;
+  --accent: #5b8bff;
+  --danger: #e85a5a;
+  --ok: #4ec272;
+  --warn: #e8b34e;
+  --border: #2d2d33;
+  --panel: #232328;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 0;
+  width: 400px;
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px; border-bottom: 1px solid var(--border);
+}
+h1 { margin: 0; font-size: 15px; font-weight: 600; }
+h2 { font-size: 12px; text-transform: uppercase; color: var(--muted); margin: 16px 0 6px; letter-spacing: 0.05em; }
+
+.badge {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--panel); color: var(--muted);
+}
+.badge.connected { color: var(--ok); }
+.badge.connecting { color: var(--warn); }
+.badge.disconnected, .badge.no_secret { color: var(--danger); }
+
+nav#tabs { display: flex; border-bottom: 1px solid var(--border); }
+.tab {
+  flex: 1; background: none; border: none; color: var(--muted); padding: 8px 0;
+  cursor: pointer; font: inherit; border-bottom: 2px solid transparent;
+}
+.tab.active { color: var(--fg); border-bottom-color: var(--accent); }
+
+.tab-panel { display: none; padding: 12px 14px; }
+.tab-panel.active { display: block; }
+
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.error { color: var(--danger); font-size: 12px; min-height: 0; margin: 4px 0; }
+.error:empty { display: none; }
+
+.row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+.row > input[type=text] { flex: 1; min-width: 0; }
+.checkbox { display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 12px; }
+
+input[type=text], textarea {
+  background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; font: inherit; width: 100%;
+}
+textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+button {
+  background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+button.primary:hover { filter: brightness(1.1); }
+button.danger { color: var(--danger); border-color: rgba(232, 90, 90, 0.3); }
+button.large { width: 100%; padding: 10px; font-weight: 600; margin-top: 8px; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button:disabled:hover { border-color: var(--border); }
+.danger-heading { color: var(--danger); }
+
+.block { margin: 10px 0; }
+.hidden { display: none; }
+
+/* ──────────────── Onboarding ──────────────── */
+.onboarding { padding: 14px; }
+.onboarding .lede { margin: 0 0 12px; color: var(--fg); }
+.onboarding .steps {
+  list-style: decimal inside;
+  padding: 0; margin: 0 0 12px;
+  color: var(--muted); font-size: 12px;
+}
+.onboarding .steps li { padding: 3px 0; }
+.onboarding .steps code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; background: var(--panel); padding: 1px 4px;
+  border-radius: 3px; color: var(--fg);
+}
+.onboarding .advanced {
+  margin: 10px 0; font-size: 12px; color: var(--muted);
+}
+.onboarding .advanced summary { cursor: pointer; padding: 4px 0; user-select: none; }
+.onboarding .advanced summary:hover { color: var(--fg); }
+.onboarding .advanced label { display: block; margin: 6px 0 2px; }
+
+.detect { font-size: 12px; margin: 6px 0 0; min-height: 1.2em; }
+.detect.ok { color: var(--ok); }
+.detect.warn { color: var(--warn); }
+
+/* ──────────────── Connected status card ──────────────── */
+.status-card {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px;
+  margin-bottom: 10px;
+}
+.status-dot {
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--muted); flex-shrink: 0;
+}
+.status-card.connected .status-dot {
+  background: var(--ok);
+  box-shadow: 0 0 0 0 rgba(78, 194, 114, 0.6);
+  animation: pulse 2.4s ease-out infinite;
+}
+.status-card.connecting .status-dot { background: var(--warn); }
+.status-card.disconnected .status-dot,
+.status-card.paused .status-dot { background: var(--danger); }
+@keyframes pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(78, 194, 114, 0.5); }
+  70%  { box-shadow: 0 0 0 8px rgba(78, 194, 114, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(78, 194, 114, 0); }
+}
+.status-text { flex: 1; min-width: 0; }
+.status-title { font-weight: 600; font-size: 14px; }
+.status-sub { margin-top: 2px; word-break: break-all; }
+
+.stats { display: flex; gap: 8px; margin-bottom: 10px; }
+.stat {
+  flex: 1; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 6px; padding: 10px; text-align: center;
+}
+.stat-num { font-size: 20px; font-weight: 600; color: var(--fg); }
+.stat-lbl { color: var(--muted); font-size: 11px; margin-top: 2px; }
+
+.quick-allow { margin: 10px 0; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.actions button { flex: 1; }
+
+/* ──────────────── Current-tab widget ──────────────── */
+.current-tab {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 6px; padding: 10px; margin: 10px 0;
+}
+.ct-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ct-host { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg); flex: 1; min-width: 0; word-break: break-all; }
+.ct-state.ok { color: var(--ok); font-size: 11px; }
+.ct-state.miss { color: var(--warn); font-size: 11px; }
+#ct-add { width: 100%; margin-top: 8px; }
+
+/* ──────────────── Advanced disclosure (status tab) ──────────────── */
+#status-advanced { margin: 14px 0 0; font-size: 12px; color: var(--muted); }
+#status-advanced summary { cursor: pointer; padding: 4px 0; user-select: none; }
+#status-advanced summary:hover { color: var(--fg); }
+#status-advanced .adv-section-label { margin: 12px 0 4px; }
+.tool-list { max-height: 140px; overflow-y: auto; padding: 4px 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; }
+.tool-list li { padding: 2px 0; font-family: ui-monospace, monospace; font-size: 11px; }
+
+/* ──────────────── Inline flash / toast ──────────────── */
+.flash {
+  font-size: 12px; min-height: 0; margin: 6px 0;
+  padding: 0; border-radius: 4px; transition: opacity 0.3s;
+}
+.flash:empty { display: none; }
+.flash.ok { color: var(--ok); padding: 4px 8px; background: rgba(78, 194, 114, 0.1); }
+.flash.err { color: var(--danger); padding: 4px 8px; background: rgba(232, 90, 90, 0.1); }
+.flash.fade { opacity: 0; }
+
+/* ──────────────── Audit polish ──────────────── */
+.audit-toolbar { margin-bottom: 8px; }
+.audit-summary { margin: 0 0 6px; }
+.audit-summary .err { color: var(--danger); }
+#audit-filter { margin-bottom: 8px; }
+
+ul { list-style: none; padding: 0; margin: 6px 0; }
+#allow-list li, #audit-list li {
+  padding: 6px 8px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 8px;
+}
+#allow-list li:last-child, #audit-list li:last-child { border-bottom: none; }
+#allow-list .pattern { flex: 1; font-family: ui-monospace, monospace; }
+#allow-list .eval-tag { color: var(--warn); font-size: 11px; }
+#allow-list .remove { background: none; border: none; color: var(--muted); cursor: pointer; padding: 2px 6px; }
+#allow-list .remove:hover { color: var(--danger); }
+
+#audit-list li { flex-direction: column; align-items: stretch; gap: 2px; }
+#audit-list .audit-head { display: flex; gap: 8px; align-items: baseline; }
+#audit-list .audit-tool { font-family: ui-monospace, monospace; color: var(--accent); }
+#audit-list .audit-time { color: var(--muted); font-size: 11px; }
+#audit-list .audit-url { font-size: 11px; color: var(--muted); word-break: break-all; }
+#audit-list .audit-err { color: var(--danger); font-size: 11px; }
+#audit-list .ok { color: var(--ok); }
+#audit-list .fail { color: var(--danger); }
+
+#tool-list li { padding: 2px 0; font-family: ui-monospace, monospace; font-size: 11px; }

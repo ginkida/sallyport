@@ -1,0 +1,209 @@
+# Sallyport security
+
+This document describes what Sallyport is designed to defend against, what
+it deliberately doesn't try to defend against, and the known limitations
+of the current implementation. The README's `## Security model` section
+is the user-facing summary; this file is the deeper reference for anyone
+auditing the code or considering Sallyport for their setup.
+
+## Threat model
+
+Sallyport assumes:
+
+- **one trusted local user** running Claude Code (or another MCP client)
+  on their own machine;
+- the user wants the client to drive Chrome on a **small, explicit set of
+  domains** rather than the open web;
+- the user wants a **visible audit trail** of every action and a **kill
+  switch** they can hit from the popup.
+
+Concretely we try to defend against:
+
+1. **Other local processes** on the same machine that could otherwise
+   speak the bridge protocol to the daemon — HMAC pairing + loopback-only
+   bind close this. The single-client slot is claimed only **after** a
+   verified signed `hello` (first frame, 10 s deadline), and browser-page
+   `Origin` headers are refused at connect time — so an unauthenticated
+   peer (including a malicious web page opening a cross-origin WebSocket
+   to `127.0.0.1`) can neither hold the slot to deny service to the real
+   extension nor probe whether an extension is attached.
+2. **An agent over-reaching its scope** — the per-domain allowlist gates
+   every DOM tool, the per-domain `evaluate` flag gates arbitrary JS, the
+   per-tool `password_field` / `unsafe_path` / `wrong_element` checks
+   gate the most damaging actions, and `close_tab` won't even close
+   non-allowlisted tabs.
+3. **Filesystem exfiltration via `upload`** — the daemon-side sandbox
+   (`~/Downloads/sallyport/` by default, override `SALLYPORT_DOWNLOAD_DIR`)
+   rejects paths outside the sandbox; `Path.resolve()` defeats symlink
+   escapes.
+4. **Replay** — every WS frame carries an HMAC, a timestamp (±30 s
+   tolerance), and a one-time nonce (4096-entry rolling cache).
+
+We do **not** try to defend against:
+
+- a local user with read access to `~/.config/sallyport/secret` (they pair
+  to the bridge and become the agent);
+- a compromised Chrome process or extension (debugger access is full
+  page access by definition — Sallyport limits *which* pages it drives,
+  not what driving can do);
+- prompt injection against the upstream model;
+- adversaries on the local network (everything is loopback);
+- side-channel attacks via the audit log timing or popup rendering.
+
+## What's gated and how
+
+See the README "Security model" section for the user-facing bullets and
+the "Tools" table for per-tool notes. Quick reference:
+
+| Concern | Mechanism | Where |
+|---|---|---|
+| Daemon ↔ extension authenticity | HMAC-SHA256, ts±30 s, 4096-nonce cache | `daemon/.../protocol.py`, `extension/src/crypto.ts` |
+| Network exposure | Loopback-only bind (`refuse_non_loopback`) | `daemon/.../__main__.py` |
+| Domain scope | Allowlist enforced before every DOM tool | `extension/src/allowlist.ts`, `extension/src/tools/gates.ts` |
+| Arbitrary JS | Per-domain `allowEvaluate` opt-in | `extension/src/tools/gates.ts:ensureEvaluateAllowed` |
+| Password input | Probe `activeElement.type` in `fill`/`key_type`/`send_keys` | `extension/src/tools/dom.ts`, `keyboard.ts` |
+| Closing tabs | Allowlist-gated like other DOM tools | `extension/src/tools/tabs.ts:closeTab` |
+| Filesystem (write) | `save_to_file` sandbox to `~/Downloads/sallyport/` | `daemon/.../local_tools.py:save_to_file` |
+| Filesystem (read via Chrome) | `upload` paths must resolve under the same sandbox; symlink-safe | `daemon/.../local_tools.py:validate_upload_paths` + `PRE_CALL_VALIDATORS` |
+| Frame size | 16 MiB cap, 1009 close on overflow | `daemon/.../bridge.py:MAX_FRAME_BYTES` |
+| Secret file | `chmod 600`, perms warned on relax | `daemon/.../secret.py` |
+| Concurrent calls | Daemon `_call_lock` serialises MCP tool calls | `daemon/.../bridge.py` |
+| Multiple WS clients | Slot claimed only after verified signed hello; second authenticated client rejected with 1008 | `daemon/.../bridge.py:_handle_client` |
+| Unauthenticated slot-squatting / probing | Hello-before-slot + 10 s hello deadline + browser-page Origins refused | `daemon/.../bridge.py:_handle_client` |
+
+## Known limitations
+
+### Nonce cache lives only as long as the extension's service worker
+
+MV3 service workers are killed after ~30 s of inactivity. The
+`Signer`'s in-memory nonce cache (`extension/src/crypto.ts`) goes with
+it. A captured WS frame could in principle be replayed inside the
+±30 s `MAX_CLOCK_SKEW_S` window in a freshly-spawned SW.
+
+**Exploitability:** very low. Everything is loopback, so capture requires
+local root or a kernel-level shim, and timing requires the SW to be down
+exactly when the replay arrives. The daemon side's nonce cache is
+process-lifetime, so a replay against the daemon (which is the actual
+target) is always caught.
+
+**Possible fix:** persist `seenNonces` in `chrome.storage.session` —
+not done because the storage write per frame is a real overhead and the
+practical exposure is near-zero.
+
+### Password probe: closed shadow roots and cross-origin iframes
+
+The keystroke gate (`key_type` / `send_keys`) finds the focused element
+by walking `document.activeElement` down through **open** shadow roots
+(`fill` checks the resolved node directly and is unaffected). Two cases
+it cannot reach:
+
+- **Closed shadow roots.** `element.shadowRoot` is `null` to page
+  script for `attachShadow({mode:'closed'})`, so a focused
+  `<input type=password>` inside a closed root is invisible to the
+  probe. Open roots (the default and overwhelmingly common case) are
+  covered.
+- **Iframes (any origin).** The probe runs in the top frame and descends
+  only `.shadowRoot`, never `.contentDocument`, so `document.activeElement`
+  returns the `<iframe>` element, not the focused element inside it.
+  Typing into a password field inside *any* iframe — same-origin or
+  cross-origin — isn't caught.
+- **Hostile in-page getters.** The probe reads the focused element's
+  `type` / `shadowRoot` via `Runtime.evaluate`. A page that defines a
+  throwing getter for one of those makes the probe throw; the result then
+  reads as `undefined` and the gate passes. (`fill`, which probes the
+  resolved node, is unaffected.)
+
+**Exploitability:** the agent must (a) drive focus into the closed root
+/ iframe and (b) the page (or iframe) must be on an allowlisted domain —
+a site the user already trusted. Real but narrow blind spots; `fill`
+into the same field is still caught because it probes the node directly.
+
+**Possible fix:** resolve the focused node at the CDP `DOM` level (which
+can pierce closed roots) and walk frames via `Target.getTargets`. Not
+done yet — adds CDP round-trips on every keystroke tool call for a
+narrow, already-trusted-origin case.
+
+### Audit log persistence depends on `chrome.storage.local` quota
+
+Even with per-entry truncation (`MAX_AUDIT_STRING = 1024`), 500 entries
+× ~5 KB headroom = ~2.5 MB, well inside the 10 MiB quota. A pathological
+agent that spams huge structured arg objects could in principle still
+push it. The truncation walks objects/arrays recursively, so unusual
+shapes don't slip through unbounded.
+
+**Typed credentials are redacted.** When `fill` / `key_type` /
+`send_keys` run with `allowPassword=true` (the only way text reaches a
+password field), the typed value is replaced with a length placeholder
+before it is written to the audit log, so passwords are not retained at
+rest or surfaced by the popup's Export. Values typed into non-password
+fields are kept verbatim — that is the point of a visible audit trail —
+so treat the exported log as containing whatever the agent typed into
+ordinary inputs.
+
+### Allowlist matches any port unless a port is pinned
+
+A host-only entry (`example.com`, `*.example.com`) authorizes the host
+on **any port** — intentional, so allowlisting `localhost` reaches a dev
+server on `localhost:3000`. To scope to one port, use the URL form with
+an explicit port: `https://example.com:8443/*` matches only `:8443`; a
+URL pattern with no port (`https://example.com/p/*`) matches only the
+scheme's default port. The matcher honors the port a URL pattern
+specifies (earlier builds silently ignored it). If you run a second
+sensitive service on a different port of an allowlisted host, pin the
+port rather than relying on a host-only entry.
+
+### Extension `host_permissions: <all_urls>`
+
+Necessary for `chrome.debugger.attach` to be allowed on arbitrary URLs.
+Chrome's install warning surfaces this as "Read and change all your
+data on the websites you visit." Sallyport limits what we actually do with
+it via the per-tab allowlist gate, but the initial permission grant is
+broad. This is intrinsic to debugger-based bridges and not separately
+fixable inside Sallyport.
+
+### Secret file at `~/.config/sallyport/secret` is plaintext
+
+By design. Any process running under the same UID can read it and pair
+to the bridge. The threat model assumes one trusted local user. If you
+need stronger isolation, run Sallyport inside a per-user container or VM.
+
+### Tool-name shadowing between local and extension tools
+
+`Sallyport.call_tool` checks `LOCAL_TOOLS` before forwarding. If someone
+adds a tool to `extension/src/tools.ts` with the same name as a local
+tool, the local one silently wins. Currently no collision; the catalogue
+test (`test_tools_catalogue_covers_extension`) pins the expected set so
+adding an extension tool with an existing local name would still appear
+in the catalogue and need an `expected` update — but the test wouldn't
+flag the shadow specifically. Worth a follow-up assertion.
+
+## Adding a new tool safely
+
+The "Adding a new tool" section in the README has the mechanical steps.
+For *security-relevant* additions, also check:
+
+1. **Does the tool touch the page?** Add `await ensureAllowed(tab.url)`
+   before any CDP call. `list_tabs` is the only exception (listing is
+   metadata, not action — already documented).
+2. **Does it run arbitrary user-supplied JS?** Use
+   `ensureEvaluateAllowed` instead of `ensureAllowed`. If the JS body
+   is fixed and only args are JSON-interpolated (like `fetch_in_page`),
+   `ensureAllowed` is enough.
+3. **Does it touch the filesystem from the daemon?** Use
+   `_resolve_dir()` and validate against it — the same sandbox shape as
+   `save_to_file` and `upload`'s validator.
+4. **Does it touch the filesystem via Chrome?** Register a validator in
+   `PRE_CALL_VALIDATORS` (`local_tools.py`) that checks paths against
+   `_resolve_dir()` with `Path.resolve()` to defeat symlinks.
+5. **Does it accept focus-routed input** (keyboard/clipboard)? Mirror
+   the `password_field` probe pattern from `keyboard.ts`.
+6. **Does it produce binary blobs as output?** Truncated in audit
+   automatically via `truncateAuditValue`; safe.
+
+## Reporting
+
+There is no formal vulnerability-reporting channel set up for this
+project yet. For non-sensitive issues, open a GitHub issue. For anything
+you'd rather not disclose publicly, reach the project maintainer
+directly via whatever channel you normally use — there is no advisory
+email address.
