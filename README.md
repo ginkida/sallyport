@@ -1,5 +1,10 @@
 # Sallyport
 
+[![CI](https://github.com/ginkida/sallyport/actions/workflows/ci.yml/badge.svg)](https://github.com/ginkida/sallyport/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/ginkida/sallyport/actions/workflows/codeql.yml/badge.svg)](https://github.com/ginkida/sallyport/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/ginkida/sallyport)](https://github.com/ginkida/sallyport/releases/latest)
+
 A secure browser-automation bridge between Claude Code (or any MCP client) and
 your Chrome. An alternative to Kimi WebBridge with explicit security
 boundaries instead of implicit ones.
