@@ -2,7 +2,36 @@
 name = "sallyport-daemon"
 version = "0.2.0"
 description = "MCP server bridging Claude Code to a browser extension over WS+HMAC"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [{ name = "ginkida" }]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "anthropic",
+    "browser-automation",
+    "chrome",
+    "security",
+    "hmac",
+    "ai-agents",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Security",
+]
 dependencies = [
     # Upper-bounded at the next major: the MCP SDK churns its API across the
     # 1.x line, so an unbounded floor would let a fresh install pull a future
@@ -22,6 +51,12 @@ dev = [
 
 [project.scripts]
 sallyport-daemon = "sallyport_daemon.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/ginkida/sallyport"
+Repository = "https://github.com/ginkida/sallyport"
+Issues = "https://github.com/ginkida/sallyport/issues"
+Changelog = "https://github.com/ginkida/sallyport/blob/main/CHANGELOG.md"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

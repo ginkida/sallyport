@@ -6,6 +6,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Packaging
+
+- **Daemon is now PyPI-ready** (`pip install sallyport-daemon`). `pyproject.toml`
+  carries full metadata (SPDX `license = "MIT"` + `LICENSE`, readme, authors,
+  keywords, classifiers, `[project.urls]`); a daemon-focused `daemon/README.md`
+  is the PyPI long-description. Build (hatchling) + `twine check` pass for both
+  sdist and wheel.
+- **Publish via PyPI Trusted Publishing (OIDC)** — `.github/workflows/publish.yml`
+  builds and uploads on a published GitHub Release (or manual dispatch) with
+  no API token stored in the repo; the publish job is scoped to `id-token:
+  write` and runs in a `pypi` environment. Actions are SHA-pinned.
+
 ### Security / CI
 
 - **Repository supply-chain hardening.** GitHub Actions in `ci.yml` are now
