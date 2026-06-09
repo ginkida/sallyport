@@ -6,6 +6,29 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-06-09
+
+### Fixed
+
+- **Reconnect race in the extension's WS `open` handler.** The orphan guard
+  (`if (this.ws !== ws) return`) ran before the `await signer.sign('hello')`,
+  but a user-triggered `reconnectNow()` during that await could swap in a
+  fresh socket — and the stale handler would then flip state to `connected`
+  on the dead socket and clear the *new* socket's reconnect timer. The handler
+  now re-checks ownership after signing. Internal-only (not reachable by a
+  remote peer); regression test added.
+
+### Security
+
+- **Nonce cache survives reconnects to the same daemon.** `Signer.setSecret`
+  is now a no-op when the secret is unchanged, so a reconnect (daemon restart,
+  network blip, popup Reconnect) no longer wipes the replay cache. Previously
+  every `connect()` cleared it, briefly reopening the ±30 s replay window on
+  the extension side. The window is now bounded by service-worker lifetime
+  only. Exploitability was already "very low" (loopback capture needs local
+  root; the daemon's process-lifetime cache catches the real replays) — see
+  `SECURITY.md`. Regression test added.
+
 ## [0.3.1] — 2026-06-08
 
 ### Fixed

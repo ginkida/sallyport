@@ -64,17 +64,30 @@ function constantTimeEq(a: Uint8Array, b: Uint8Array): boolean {
 
 export class Signer {
   private key: CryptoKey | null = null;
+  private secretBytes: Uint8Array | null = null;
   private seenNonces: string[] = [];
   private seenSet = new Set<string>();
 
   async setSecret(secret: Uint8Array): Promise<void> {
+    // Re-setting the *same* secret — the common reconnect case (daemon
+    // restart, network blip, popup-triggered Reconnect) — must NOT wipe the
+    // nonce cache. Clearing it reopens a replay window for any frame
+    // captured within the ±MAX_CLOCK_SKEW_S tolerance. Only a genuine secret
+    // change (re-pairing) resets replay state. The cache is still lost when
+    // the MV3 service worker is torn down; that residual gap is documented
+    // in SECURITY.md.
+    if (this.key && this.secretBytes && constantTimeEq(this.secretBytes, secret)) {
+      return;
+    }
     this.key = await importKey(secret);
+    this.secretBytes = new Uint8Array(secret); // own copy; caller may reuse its buffer
     this.seenNonces = [];
     this.seenSet.clear();
   }
 
   clear(): void {
     this.key = null;
+    this.secretBytes = null;
     this.seenNonces = [];
     this.seenSet.clear();
   }

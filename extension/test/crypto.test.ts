@@ -208,6 +208,33 @@ describe('Signer.verify replay protection', () => {
   }, 20000);
 });
 
+describe('Signer.setSecret nonce-cache lifecycle', () => {
+  it('preserves the nonce cache when re-set with the same secret (reconnect)', async () => {
+    // Regression: connect() calls setSecret() on every (re)connect. Setting
+    // the SAME secret must keep the replay cache, otherwise a frame captured
+    // within the skew window could be replayed across a reconnect.
+    const s = await makeSigner(SECRET_BYTES);
+    const peer = await makeSigner(SECRET_BYTES);
+    const frame = await peer.sign('ping', {});
+    await s.verify(frame); // nonce now recorded
+
+    await s.setSecret(SECRET_BYTES); // same secret → cache must survive
+    await expect(s.verify(frame)).rejects.toThrow(/replay/);
+  });
+
+  it('clears the nonce cache and swaps the key when the secret changes', async () => {
+    const s = await makeSigner(SECRET_BYTES);
+    const peer = await makeSigner(SECRET_BYTES);
+    const frame = await peer.sign('ping', {});
+    await s.verify(frame);
+
+    await s.setSecret(SECRET_OTHER_BYTES); // genuine re-pair → reset replay state
+    // The old frame is no longer a replay (cache cleared); it now fails the
+    // MAC check under the new key — proving both the clear and the key swap.
+    await expect(s.verify(frame)).rejects.toThrow(/mac mismatch/);
+  });
+});
+
 describe('cross-language compatibility', () => {
   // PINNED VECTOR: HMAC-SHA256 of a known canonical envelope with a known
   // 32-zero-byte secret. The daemon's pytest suite pins the SAME bytes

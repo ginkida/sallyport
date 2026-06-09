@@ -228,6 +228,13 @@ export class BridgeConnection {
         const env = await this.signer.sign('hello', {
           extensionVersion: this.deps.extensionVersion,
         });
+        // The orphan guard above goes stale across the `await`: a
+        // user-triggered reconnectNow() can tear down `ws` and install a
+        // fresh socket while we were signing. Re-check ownership before
+        // mutating shared state — otherwise we'd flip to 'connected' on a
+        // dead socket and clearReconnectTimer() would kill the *new*
+        // socket's pending retry.
+        if (this.ws !== ws) return;
         if (ws.readyState === this.deps.WebSocket.OPEN) {
           ws.send(JSON.stringify(env));
         }

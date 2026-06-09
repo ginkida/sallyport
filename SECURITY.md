@@ -80,6 +80,12 @@ MV3 service workers are killed after ~30 s of inactivity. The
 it. A captured WS frame could in principle be replayed inside the
 ±30 s `MAX_CLOCK_SKEW_S` window in a freshly-spawned SW.
 
+Reconnecting to the same daemon no longer clears the cache: `setSecret`
+is a no-op when the secret is unchanged, so a network blip or a daemon
+restart keeps the replay window closed on the extension side. The only
+remaining reset is genuine SW termination — the gap is bounded by the SW
+lifetime, not by every reconnect.
+
 **Exploitability:** very low. Everything is loopback, so capture requires
 local root or a kernel-level shim, and timing requires the SW to be down
 exactly when the replay arrives. The daemon side's nonce cache is

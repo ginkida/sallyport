@@ -19,6 +19,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createHmac } from 'node:crypto';
 import { BridgeConnection, type Deps, type StatusSnapshot } from '../src/bridge-connection.js';
+import { Signer } from '../src/crypto.js';
 import { canonicalJson } from '../src/protocol.js';
 
 const SECRET_BYTES = new Uint8Array(32);
@@ -447,6 +448,67 @@ describe('BridgeConnection — Reconnect-button regressions', () => {
 
     expect(ws1.sent).toHaveLength(0);
     // ws2 still owns the state.
+    ws2.simulateOpen();
+    await until(() => bridge.status().state === 'connected');
+  });
+
+  it('open handler re-checks ownership AFTER signing (reconnectNow racing the hello sign)', async () => {
+    // Harder variant of the orphan guard: the guard at the top of the open
+    // handler passes, but reconnectNow() fires *during* the await on
+    // signer.sign(). The stale handler must re-check ownership after the
+    // await and bail — not flip us to 'connected' on the dead socket and
+    // clear the new socket's reconnect timer.
+    const { deps } = makeDeps({ reconnectBaseMs: 10 });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws1 = FakeWebSocket.instances[0];
+
+    // Gate the FIRST hello-sign so a reconnect can interleave mid-await.
+    let releaseSign!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseSign = r;
+    });
+    const realSign = Signer.prototype.sign;
+    let signCalls = 0;
+    let firstSignReturned = false;
+    const spy = vi.spyOn(Signer.prototype, 'sign').mockImplementation(async function (
+      this: Signer,
+      type: string,
+      body: unknown,
+      id?: string,
+    ) {
+      signCalls += 1;
+      if (signCalls === 1) {
+        await gate;
+        const out = await realSign.call(this, type, body, id);
+        firstSignReturned = true;
+        return out;
+      }
+      return realSign.call(this, type, body, id);
+    });
+
+    // ws1 opens → handler enters and parks on the gated sign.
+    ws1.simulateOpen();
+    await until(() => signCalls === 1);
+
+    // User hits Reconnect mid-sign: ws1 is torn down, ws2 installed.
+    await bridge.reconnectNow();
+    expect(ws1.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    // Release ws1's now-orphaned hello sign. With the post-await re-check the
+    // stale handler bails; without it, it would set state='connected'.
+    releaseSign();
+    await until(() => firstSignReturned);
+    await flush();
+
+    expect(ws1.sent).toHaveLength(0);
+    expect(bridge.status().state).toBe('connecting'); // ws2 still owns the slot
+
+    spy.mockRestore();
+
+    // ws2 completes the handshake normally.
+    const ws2 = FakeWebSocket.instances[1];
     ws2.simulateOpen();
     await until(() => bridge.status().state === 'connected');
   });
