@@ -175,13 +175,13 @@ need stronger isolation, run Sallyport inside a per-user container or VM.
 
 ### Tool-name shadowing between local and extension tools
 
-`Sallyport.call_tool` checks `LOCAL_TOOLS` before forwarding. If someone
+`Bridge.call_tool` checks `LOCAL_TOOLS` before forwarding. If someone
 adds a tool to `extension/src/tools.ts` with the same name as a local
-tool, the local one silently wins. Currently no collision; the catalogue
-test (`test_tools_catalogue_covers_extension`) pins the expected set so
-adding an extension tool with an existing local name would still appear
-in the catalogue and need an `expected` update — but the test wouldn't
-flag the shadow specifically. Worth a follow-up assertion.
+tool, the local one silently wins. Currently no collision, and two tests
+guard it: `test_no_local_tool_shadowing` parses the extension's
+`tools.ts` registry and asserts it is disjoint from `LOCAL_TOOLS`, and
+`test_tools_catalogue_covers_extension` pins the expected catalogue so
+any new name needs an explicit `expected` update.
 
 ## Adding a new tool safely
 
