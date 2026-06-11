@@ -65,6 +65,18 @@ export class BridgeConnection {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private lastError: string | null = null;
+  /** Session-local mirror of settings.paused. Set synchronously (before any
+   * await) in pause()/resume() so an in-flight connect() observes a pause
+   * that lands during one of its awaits. Storage stays authoritative across
+   * service-worker restarts — start() and _attemptReconnect() read it before
+   * connecting; this flag only closes the in-flight race window. */
+  private paused = false;
+  /** Connection-lifecycle generation. Bumped by disconnect() (and so by
+   * pair/unpair/pause) and by a proceeding _attemptReconnect(). start() and
+   * connect() capture it before their awaits and bail if it moved — the
+   * stale-guard race class fixed for the 'open' handler in 0.3.2, applied
+   * to every state check that spans an await. */
+  private epoch = 0;
 
   constructor(private deps: Deps) {}
 
@@ -77,9 +89,16 @@ export class BridgeConnection {
   }
 
   async start(): Promise<void> {
+    const epoch = ++this.epoch;
     const settings = await this.deps.storage.getSettings();
     const secret = await this.deps.storage.getSecret();
+    // pair()/unpair()/pause()/disconnect() may have run while we read
+    // storage — whoever bumped the epoch owns the state now. Proceeding with
+    // the stale `secret` local would, after an unpair, resurrect the cleared
+    // secret into the signer and reconnect.
+    if (epoch !== this.epoch) return;
     if (settings.paused) {
+      this.paused = true;
       this.state = 'disconnected';
       this.lastError = 'paused';
       return;
@@ -89,8 +108,9 @@ export class BridgeConnection {
       this.lastError = 'no pairing secret — paste from daemon in the popup';
       return;
     }
+    if (this.paused) return; // pause() raced us; it sets state/lastError itself
     this.shouldReconnect = true;
-    await this.connect(settings.serverUrl || DEFAULT_SERVER_URL, secret);
+    await this.connect(settings.serverUrl || DEFAULT_SERVER_URL, secret, epoch);
   }
 
   async pair(secretB64: string, serverUrl?: string): Promise<void> {
@@ -111,6 +131,7 @@ export class BridgeConnection {
   }
 
   async pause(): Promise<void> {
+    this.paused = true; // before the first await — closes the connect() race
     await this.deps.storage.setSettings({ paused: true });
     await this.disconnect();
     this.state = 'disconnected';
@@ -119,6 +140,7 @@ export class BridgeConnection {
   }
 
   async resume(): Promise<void> {
+    this.paused = false;
     await this.deps.storage.setSettings({ paused: false });
     await this.start();
     this.pushStatus();
@@ -157,6 +179,23 @@ export class BridgeConnection {
       this.pushStatus();
       return;
     }
+    // The entry guards went stale across the storage awaits (same race class
+    // as the 'open'-handler ownership re-check): a connect may have started
+    // or completed, or pause() may have landed, while we were reading
+    // storage. Without this, a scheduled retry resumed after a successful
+    // connect stomps state to 'disconnected' and opens a rival socket — the
+    // daemon rejects it (1008) while the live socket is orphaned out of
+    // `this.ws`, stranding every subsequent tool result.
+    if (this.paused) return;
+    // Re-read through a widening cast: TS keeps the entry guards' narrowing
+    // of `this.state` across the awaits, but the awaits are exactly where it
+    // can change.
+    const state = this.state as ConnectionState;
+    if (state === 'connected') return;
+    if (!opts.tearDownInFlight && state === 'connecting') return;
+    // Claim ownership: a connect() still parked on an await must not
+    // resurrect the socket we are about to tear down.
+    const epoch = ++this.epoch;
     this.clearReconnectTimer();
     if (opts.tearDownInFlight && this.ws) {
       try {
@@ -168,10 +207,11 @@ export class BridgeConnection {
     }
     this.state = 'disconnected';
     this.shouldReconnect = true;
-    await this.connect(settings.serverUrl || DEFAULT_SERVER_URL, secret);
+    await this.connect(settings.serverUrl || DEFAULT_SERVER_URL, secret, epoch);
   }
 
   async disconnect(): Promise<void> {
+    this.epoch++; // invalidate any start()/connect() parked on an await
     this.shouldReconnect = false;
     this.clearReconnectTimer();
     this.reconnectAttempt = 0;
@@ -191,7 +231,7 @@ export class BridgeConnection {
     await this.reconnectNow();
   }
 
-  private async connect(url: string, secretB64: string): Promise<void> {
+  private async connect(url: string, secretB64: string, epoch: number): Promise<void> {
     if (this.state === 'connecting' || this.state === 'connected') return;
     this.state = 'connecting';
     this.currentUrl = url;
@@ -206,6 +246,15 @@ export class BridgeConnection {
       this.pushStatus();
       return;
     }
+
+    // pause()/unpair()/disconnect()/reconnectNow() may have run while we
+    // awaited setSecret — whoever bumped the epoch owns the state now and
+    // has already put state/lastError where they want them. Creating the
+    // socket anyway would reconnect a bridge the user just stopped (pause
+    // case: ends 'connected' while settings.paused is true). The paused
+    // check covers a pause() that has set its flag but not yet reached its
+    // disconnect(); that disconnect() will settle state moments later.
+    if (epoch !== this.epoch || this.paused) return;
 
     let ws: WebSocket;
     try {
@@ -290,6 +339,9 @@ export class BridgeConnection {
     });
 
     ws.addEventListener('error', () => {
+      // An orphaned socket's late error must not stomp the lastError of the
+      // attempt that replaced it.
+      if (this.ws !== ws) return;
       // Chrome's WebSocket fires `error` both for genuine failures and as a
       // sibling of `close` on graceful daemon exits. Only treat it as a
       // diagnostic if we never got to `connected`.

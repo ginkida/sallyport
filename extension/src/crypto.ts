@@ -122,7 +122,12 @@ export class Signer {
     const env = raw as SignedEnvelope;
 
     if (env.v !== PROTOCOL_VERSION) throw new Error(`bad version: ${env.v}`);
-    if (typeof env.ts !== 'number') throw new Error('bad ts');
+    // Integer seconds only — the daemon rejects a non-int `ts` (`isinstance(ts,
+    // int)` in protocol.py), so accepting a fractional one here would let the
+    // two halves disagree on which frames are well-formed. Both signers always
+    // emit integers (`Math.floor` / `int(time.time())`), so this never rejects
+    // a legitimate frame; it only closes the conformance gap.
+    if (typeof env.ts !== 'number' || !Number.isInteger(env.ts)) throw new Error('bad ts');
     if (typeof env.nonce !== 'string' || !env.nonce) throw new Error('bad nonce');
     if (typeof env.type !== 'string' || !env.type) throw new Error('bad type');
     if (typeof env.mac !== 'string' || !env.mac) throw new Error('bad mac');

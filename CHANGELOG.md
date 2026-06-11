@@ -6,6 +6,60 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-06-11
+
+### Security
+
+- **`navigate` now refuses to replace a non-allowlisted tab.** Reusing an
+  existing tab destroys whatever it holds, but `navigate` only checked the
+  *target* URL — so an agent that found a banking/email tab or an in-progress
+  form via `list_tabs` could discard it behind the allowlist's back by
+  navigating it to an allowlisted URL, the exact loss `close_tab` is gated
+  against (invariant #12). It now refuses with `domain_not_allowed` when the
+  tab being replaced is real content that isn't itself allowlisted. Blank
+  tabs (`about:blank` / new-tab) and `chrome://` / `edge://` pages are
+  unaffected (the latter still open the target in a fresh tab), and
+  `newTab=true` remains the escape hatch. Regression tests added.
+- **`fill`'s password gate now reads the `type` attribute from the browser
+  DOM, not page JS.** The gate probed `this.type` via an in-page function; a
+  hostile *allowlisted* page could shadow `type` with a throwing getter so the
+  probe returned `undefined` and the gate passed — text was typed into the
+  password field and (because `allowPassword` stayed false) written to the
+  audit log in cleartext. `fill` now resolves the node and reads its `type`
+  attribute via CDP `DOM.getAttributes`, which page JS cannot shadow with a
+  throwing or lying accessor, and fails closed if the node can't be read.
+  `SECURITY.md`'s incorrect claim that `fill` was already immune is corrected;
+  `key_type` / `send_keys` retain the documented in-page-getter blind spot.
+  Regression tests added.
+
+### Fixed
+
+- **The extension now rejects a fractional `ts` on the wire.** `crypto.ts`
+  accepted any numeric `ts` while the daemon requires an integer
+  (`isinstance(ts, int)` in `protocol.py`), so the two halves disagreed on
+  which frames are well-formed. Both signers only ever emit integer seconds
+  (`Math.floor` / `int(time.time())`), so this rejects no legitimate frame; it
+  closes a latent cross-language conformance gap. Regression test added.
+- **Remaining stale-guard races in the extension's connection state machine.**
+  Same class as the `open`-handler race fixed in 0.3.2 (state checked before
+  an `await`, mutated during it), now closed for every such window in
+  `bridge-connection.ts` via a connection-lifecycle epoch counter plus a
+  synchronous session-local `paused` flag:
+  - `pause()` landing during `start()`'s storage reads no longer loses to the
+    stale settings snapshot — the bridge can no longer end up `connected`
+    while `settings.paused` is true;
+  - `unpair()` landing during `start()` no longer lets the stale secret local
+    be re-imported into the signer and reconnect as if still paired;
+  - a scheduled backoff retry that resumes after a successful reconnect no
+    longer stomps state to `disconnected` and opens a rival socket (which the
+    daemon would reject with 1008 while the live one sat orphaned, stranding
+    subsequent tool results);
+  - an orphaned socket's late `error` event no longer overwrites the
+    `lastError` of the attempt that replaced it.
+
+  All internal-only (not reachable by a remote peer); four regression tests
+  added.
+
 ## [0.3.2] — 2026-06-09
 
 ### Fixed
@@ -581,7 +635,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/ginkida/sallyport/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ginkida/sallyport/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ginkida/sallyport/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ginkida/sallyport/compare/v0.2.0...v0.3.0

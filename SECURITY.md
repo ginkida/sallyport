@@ -61,7 +61,7 @@ the "Tools" table for per-tool notes. Quick reference:
 | Network exposure | Loopback-only bind (`refuse_non_loopback`) | `daemon/.../__main__.py` |
 | Domain scope | Allowlist enforced before every DOM tool | `extension/src/allowlist.ts`, `extension/src/tools/gates.ts` |
 | Arbitrary JS | Per-domain `allowEvaluate` opt-in | `extension/src/tools/gates.ts:ensureEvaluateAllowed` |
-| Password input | Probe `activeElement.type` in `fill`/`key_type`/`send_keys` | `extension/src/tools/dom.ts`, `keyboard.ts` |
+| Password input | `fill` reads the `type` attribute via CDP `DOM.getAttributes` (browser DOM, not page JS); `key_type`/`send_keys` probe `activeElement.type` | `extension/src/tools/dom.ts`, `keyboard.ts` |
 | Closing tabs | Allowlist-gated like other DOM tools | `extension/src/tools/tabs.ts:closeTab` |
 | Filesystem (write) | `save_to_file` sandbox to `~/Downloads/sallyport/` | `daemon/.../local_tools.py:save_to_file` |
 | Filesystem (read via Chrome) | `upload` paths must resolve under the same sandbox; symlink-safe | `daemon/.../local_tools.py:validate_upload_paths` + `PRE_CALL_VALIDATORS` |
@@ -100,8 +100,9 @@ practical exposure is near-zero.
 
 The keystroke gate (`key_type` / `send_keys`) finds the focused element
 by walking `document.activeElement` down through **open** shadow roots
-(`fill` checks the resolved node directly and is unaffected). Two cases
-it cannot reach:
+(`fill` resolves a specific node by selector/ref and reads its `type`
+attribute via CDP `DOM.getAttributes`, so it is immune to the in-page
+getter trick below). Two cases the keystroke gate cannot reach:
 
 - **Closed shadow roots.** `element.shadowRoot` is `null` to page
   script for `attachShadow({mode:'closed'})`, so a focused
@@ -113,21 +114,26 @@ it cannot reach:
   returns the `<iframe>` element, not the focused element inside it.
   Typing into a password field inside *any* iframe — same-origin or
   cross-origin — isn't caught.
-- **Hostile in-page getters.** The probe reads the focused element's
-  `type` / `shadowRoot` via `Runtime.evaluate`. A page that defines a
-  throwing getter for one of those makes the probe throw; the result then
-  reads as `undefined` and the gate passes. (`fill`, which probes the
-  resolved node, is unaffected.)
+- **Hostile in-page getters (keystroke gate only).** The keystroke probe
+  reads the focused element's `type` / `shadowRoot` via `Runtime.evaluate`.
+  A page that defines a throwing getter for one of those makes the probe
+  throw; the result then reads as `undefined` and the keystroke gate
+  passes. `fill` is **not** affected: it reads the `type` attribute from
+  the browser's DOM via CDP `DOM.getAttributes`, which a page cannot
+  shadow with a throwing or lying JS accessor, and fails closed if the
+  node can't be read.
 
 **Exploitability:** the agent must (a) drive focus into the closed root
 / iframe and (b) the page (or iframe) must be on an allowlisted domain —
-a site the user already trusted. Real but narrow blind spots; `fill`
-into the same field is still caught because it probes the node directly.
+a site the user already trusted. Real but narrow blind spots, and only
+for `key_type` / `send_keys`; `fill` into the same field reads the DOM
+attribute directly and is caught regardless of in-page getters.
 
 **Possible fix:** resolve the focused node at the CDP `DOM` level (which
-can pierce closed roots) and walk frames via `Target.getTargets`. Not
-done yet — adds CDP round-trips on every keystroke tool call for a
-narrow, already-trusted-origin case.
+can pierce closed roots) and walk frames via `Target.getTargets` — the
+same approach `fill` already uses for its node. Not done for the
+keystroke gate yet — it adds CDP round-trips on every keystroke tool call
+for a narrow, already-trusted-origin case.
 
 ### Audit log persistence depends on `chrome.storage.local` quota
 

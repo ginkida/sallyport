@@ -634,3 +634,93 @@ describe('BridgeConnection — pair / unpair / pause / resume', () => {
     expect(bridge.status().state).toBe('connecting');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Stale-guard races: state checked before an await, mutated during it.
+// Same class as the 'open'-handler ownership re-check fixed in 0.3.2.
+// ---------------------------------------------------------------------------
+
+describe('BridgeConnection — stale-guard races across awaits', () => {
+  it('pause() landing during start() wins — bridge must not end up connected while paused', async () => {
+    const { deps } = makeDeps();
+    const bridge = new BridgeConnection(deps);
+    // start() parks on its storage awaits; pause() interleaves. Before the
+    // fix, start() resumed with a stale settings snapshot, connected anyway,
+    // and the bridge ran tools while settings.paused was true.
+    const startP = bridge.start();
+    const pauseP = bridge.pause();
+    await Promise.all([startP, pauseP]);
+    for (const ws of FakeWebSocket.instances) ws.simulateOpen();
+    await flush();
+    expect(bridge.status().state).toBe('disconnected');
+    expect(bridge.status().lastError).toBe('paused');
+    expect(FakeWebSocket.instances.every((ws) => ws.sent.length === 0)).toBe(true);
+  });
+
+  it('unpair() landing during start() does not resurrect the cleared secret', async () => {
+    const { deps } = makeDeps();
+    const bridge = new BridgeConnection(deps);
+    // start() read the secret into a local before unpair() cleared storage
+    // and the signer. Before the fix, start() resumed, re-imported that
+    // stale local into the signer and reconnected as if still paired.
+    const startP = bridge.start();
+    const unpairP = bridge.unpair();
+    await Promise.all([startP, unpairP]);
+    for (const ws of FakeWebSocket.instances) ws.simulateOpen();
+    await flush();
+    expect(bridge.status().state).toBe('no_secret');
+    expect(FakeWebSocket.instances.every((ws) => ws.sent.length === 0)).toBe(true);
+  });
+
+  it('a scheduled retry resumed after a successful connect does not stomp the live socket', async () => {
+    const base = makeStorage({ secret: SECRET_B64 });
+    let defer = false;
+    const parked: Array<() => void> = [];
+    const storage: Deps['storage'] = {
+      ...base,
+      async getSettings() {
+        if (defer) await new Promise<void>((r) => parked.push(r));
+        return base.getSettings();
+      },
+    };
+    const { deps } = makeDeps({ storage });
+    deps.reconnectBaseMs = 5;
+    deps.reconnectMaxMs = 10;
+    const bridge = new BridgeConnection(deps);
+
+    await bridge.start();
+    FakeWebSocket.instances[0].simulateOpen();
+    await until(() => bridge.status().state === 'connected');
+
+    // Daemon restarts: close schedules a retry; park that retry on its
+    // storage read so a user reconnect can complete underneath it.
+    defer = true;
+    FakeWebSocket.instances[0].simulateClose();
+    await until(() => parked.length === 1);
+
+    defer = false;
+    await bridge.reconnectNow();
+    FakeWebSocket.instances[1].simulateOpen();
+    await until(() => bridge.status().state === 'connected');
+
+    // Un-park the stale retry. Before the fix it stomped state to
+    // 'disconnected' and opened a rival socket the daemon would 1008,
+    // while the live socket was orphaned out of `this.ws`.
+    parked.shift()!();
+    await flush();
+    expect(bridge.status().state).toBe('connected');
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
+  it("an orphaned socket's late error does not stomp lastError of the new attempt", async () => {
+    const { deps } = makeDeps();
+    const bridge = new BridgeConnection(deps);
+    await bridge.start(); // instance 0 left mid-connect
+    await bridge.reconnectNow(); // tears it down, instance 1 takes over
+    const [orphan, fresh] = FakeWebSocket.instances;
+    orphan.simulateError();
+    expect(bridge.status().lastError).toBeNull();
+    fresh.simulateOpen();
+    await until(() => bridge.status().state === 'connected');
+  });
+});

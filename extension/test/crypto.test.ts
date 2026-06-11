@@ -132,6 +132,17 @@ describe('Signer.verify field validation', () => {
     await expect(s.verify(signed)).rejects.toThrow(/ts/);
   });
 
+  it('rejects a fractional ts (daemon accepts integer seconds only)', async () => {
+    // The daemon's protocol.py requires `isinstance(ts, int)`; accepting a
+    // fractional ts here would let the two halves disagree on which frames
+    // are well-formed. The check runs before the MAC compare, so no valid
+    // signature is needed to exercise it.
+    const s = await makeSigner(SECRET_BYTES);
+    const signed = await s.sign('ping', {});
+    (signed as Record<string, unknown>).ts = (signed.ts as number) + 0.5;
+    await expect(s.verify(signed)).rejects.toThrow(/bad ts/);
+  });
+
   it('rejects non-object input', async () => {
     const s = await makeSigner(SECRET_BYTES);
     await expect(s.verify('not-an-object')).rejects.toThrow(/object/);

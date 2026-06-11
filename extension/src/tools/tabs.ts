@@ -63,6 +63,15 @@ export const listTabs: Tool = async () => {
   };
 };
 
+/** A tab that holds no user content, so navigating over it discards nothing
+ * and needs no allowlist check on the page being replaced. Browser-internal
+ * pages (chrome://, edge://) are handled separately — opened in a fresh tab —
+ * so they are intentionally not listed here. */
+export function isBlankTarget(url: string | undefined): boolean {
+  if (!url) return true;
+  return url === 'about:blank' || url === 'about:newtab';
+}
+
 export const navigate: Tool = async (args) => {
   const url = String(args.url || '');
   if (!url) throw new BridgeError('bad_args', 'navigate: url required');
@@ -81,9 +90,25 @@ export const navigate: Tool = async (args) => {
     tab = await chrome.tabs.create({ url, active: true });
   } else {
     tab = await resolveTab(args);
-    if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('edge://')) {
+    const current = tab.url ?? '';
+    if (current.startsWith('chrome://') || current.startsWith('edge://')) {
+      // Browser-internal page: can't navigate it in place, and there is no
+      // user content to lose — open the target in a fresh tab instead.
       tab = await chrome.tabs.create({ url, active: true });
     } else {
+      // Reusing an existing tab DESTROYS whatever it currently holds. If that
+      // page is real content that isn't itself allowlisted, refuse — otherwise
+      // an agent could enumerate tabs via `list_tabs` and clobber a banking /
+      // email tab or an in-progress form by navigating it to an allowlisted
+      // URL, the exact loss `close_tab` is gated against (invariant #12).
+      // Blank tabs (about:blank / new-tab) hold nothing, so they pass.
+      if (!isBlankTarget(current) && !matchAllowlist(current, list).matched) {
+        throw new BridgeError(
+          'domain_not_allowed',
+          `navigate: refusing to replace non-allowlisted tab ${hostnameOf(current)} — ` +
+            `pass newTab=true to open ${hostnameOf(url)} in a new tab instead`,
+        );
+      }
       await chrome.tabs.update(tab.id!, { url });
     }
   }

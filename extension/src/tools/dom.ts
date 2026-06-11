@@ -43,6 +43,44 @@ export async function resolveSelectorOrRef(
   return resolved.object.objectId;
 }
 
+/**
+ * Decide whether a fill target is an `<input type=password>` from the flat
+ * `[name, value, name, value, …]` attribute list CDP's `DOM.getAttributes`
+ * returns. The list comes from the browser's own DOM, NOT from a page-readable
+ * JS getter, so a hostile page cannot mask a password field from the gate by
+ * shadowing `this.type` with a throwing or lying accessor.
+ *
+ * Fail-closed: a nullish list means the node's attributes could not be read,
+ * so we treat it as a password field rather than letting text through. A
+ * present-but-empty list (an element with no attributes) is an ordinary field.
+ * Attribute names are compared case-insensitively and the value is trimmed and
+ * lower-cased to match the HTML content-attribute semantics (`type=PASSWORD`).
+ */
+export function attributesIndicatePassword(attrs: readonly string[] | null | undefined): boolean {
+  if (!attrs) return true;
+  for (let i = 0; i + 1 < attrs.length; i += 2) {
+    if (attrs[i].toLowerCase() === 'type') {
+      return attrs[i + 1].trim().toLowerCase() === 'password';
+    }
+  }
+  return false;
+}
+
+/**
+ * Resolve the fill target to a DOM node and read its `type` attribute through
+ * CDP, so the password gate reads the browser's ground truth instead of a
+ * page-controllable `this.type`. Any failure to read the node fails closed
+ * (treated as a password field).
+ */
+async function targetIsPasswordField(tabId: number, objectId: string): Promise<boolean> {
+  const node = await cdp<{ nodeId?: number }>(tabId, 'DOM.requestNode', { objectId });
+  if (!node.nodeId) return true;
+  const res = await cdp<{ attributes?: string[] }>(tabId, 'DOM.getAttributes', {
+    nodeId: node.nodeId,
+  });
+  return attributesIndicatePassword(res.attributes);
+}
+
 export const click: Tool = async (args) => {
   const selector = String(args.selector || '');
   if (!selector) throw new BridgeError('bad_args', 'click: selector required');
@@ -77,17 +115,7 @@ export const fill: Tool = async (args) => {
 
   const objectId = await resolveSelectorOrRef(tab.id!, selector, 'fill');
 
-  const probe = await cdp<{ result: { value?: { isPassword: boolean; tag: string } } }>(
-    tab.id!,
-    'Runtime.callFunctionOn',
-    {
-      objectId,
-      functionDeclaration:
-        "function() { return { tag: this.tagName, isPassword: this.type === 'password' }; }",
-      returnByValue: true,
-    },
-  );
-  if (probe.result.value?.isPassword && args.allowPassword !== true) {
+  if (args.allowPassword !== true && (await targetIsPasswordField(tab.id!, objectId))) {
     throw new BridgeError(
       'password_field',
       'fill: refusing to type into <input type=password>; pass allowPassword=true to override',
