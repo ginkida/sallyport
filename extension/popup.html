@@ -96,6 +96,10 @@
           <input type="text" id="settings-url" placeholder="ws://127.0.0.1:10086/ws">
           <button id="settings-save">Save</button>
         </div>
+        <label class="checkbox">
+          <input type="checkbox" id="keep-awake"> keep automated tabs awake
+        </label>
+        <div class="muted small">Unfreezes background tabs while the bridge drives them; the page believes it is focused (e.g. Telegram sends read receipts).</div>
         <div class="muted small adv-section-label">Available tools (<span id="tool-count">0</span>)</div>
         <ul id="tool-list" class="muted small tool-list"></ul>
       </details>

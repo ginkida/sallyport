@@ -341,6 +341,7 @@ $('#status-advanced').addEventListener('toggle', async () => {
     send<{ ok: boolean; tools: string[] }>({ type: 'LIST_TOOLS' }),
   ]);
   ($('#settings-url') as HTMLInputElement).value = s.serverUrl;
+  ($('#keep-awake') as HTMLInputElement).checked = s.keepAwake;
   const ul = $('#tool-list') as HTMLUListElement;
   ul.innerHTML = '';
   if (tools?.tools) {
@@ -351,6 +352,11 @@ $('#status-advanced').addEventListener('toggle', async () => {
       ul.appendChild(li);
     }
   }
+});
+
+$('#keep-awake').addEventListener('change', async () => {
+  // Takes effect on the next tool call — keepAwake is re-read per attach.
+  await setSettings({ keepAwake: ($('#keep-awake') as HTMLInputElement).checked });
 });
 
 $('#settings-save').addEventListener('click', async () => {

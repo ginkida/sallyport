@@ -112,6 +112,7 @@ describe('settings', () => {
     const s = await getSettings();
     expect(s.serverUrl).toBe(DEFAULT_SERVER_URL);
     expect(s.paused).toBe(false);
+    expect(s.keepAwake).toBe(true); // default on
   });
 
   it('merges a partial patch into existing settings', async () => {
@@ -124,6 +125,16 @@ describe('settings', () => {
     s = await getSettings();
     expect(s.serverUrl).toBe('ws://x/ws'); // preserved
     expect(s.paused).toBe(true);
+  });
+
+  it('keepAwake survives an explicit off and stays off across patches', async () => {
+    await setSettings({ keepAwake: false });
+    let s = await getSettings();
+    expect(s.keepAwake).toBe(false);
+
+    await setSettings({ paused: true });
+    s = await getSettings();
+    expect(s.keepAwake).toBe(false); // preserved, not reset to the default
   });
 });
 

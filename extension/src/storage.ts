@@ -21,6 +21,10 @@ export type AuditEntry = {
 export type Settings = {
   serverUrl: string;
   paused: boolean;
+  /** Keep driven tabs unfrozen + focus-emulated while the debugger is
+   * attached (cdp.ts:keepAwake). Default on; the page then behaves as if
+   * active (e.g. Telegram sends read receipts during automation). */
+  keepAwake: boolean;
 };
 
 export const DEFAULT_SERVER_URL = 'ws://127.0.0.1:10086/ws';
@@ -69,6 +73,7 @@ export async function getSettings(): Promise<Settings> {
   return {
     serverUrl: v?.serverUrl || DEFAULT_SERVER_URL,
     paused: !!v?.paused,
+    keepAwake: v?.keepAwake !== false, // default on
   };
 }
 

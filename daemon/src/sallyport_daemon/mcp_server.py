@@ -149,24 +149,41 @@ TOOLS: list[Tool] = [
     Tool(
         name="mouse_click",
         description=(
-            "Click via real Input.dispatchMouseEvent at the element's geometric "
-            "center, as a full pointer sequence — hover move, then press and "
-            "release with human-ish delays — so pointer-event routers (React "
-            "SPAs) that ignore a bare press+release accept it. Use this when "
-            "the regular `click` (DOM .click()) doesn't trip pointer-event "
-            "listeners — common on canvas-heavy UIs, drag-and-drop libraries "
-            "(react-dnd), and games. button is 'left' (default), 'middle', or "
-            "'right'. clickCount is 1..3 (double/triple click). "
-            "Allowlist-gated. Refuses zero-size elements with `not_visible`. "
-            "The result reports `covered: true` + `hitTarget` when a "
-            "different element sits at the click point (overlay, wrapper) — "
-            "the events were dispatched there, which is usually why a click "
-            "'did nothing'; try clicking the hitTarget element instead."
+            "Click via real Input.dispatchMouseEvent as a full pointer "
+            "sequence — hover move, then press and release with human-ish "
+            "delays — so pointer-event routers (React SPAs) that ignore a "
+            "bare press+release accept it. Use this when the regular `click` "
+            "(DOM .click()) doesn't trip pointer-event listeners — common on "
+            "canvas-heavy UIs, drag-and-drop libraries (react-dnd), and "
+            "games. Target is EITHER selector (CSS or @eN ref) OR explicit "
+            "viewport coordinates x+y (CSS px — manual aim from a screenshot "
+            "or hit diagnostics; rejected if outside the viewport). With a "
+            "selector, the click point is auto-aimed: center first, then "
+            "four points toward the corners, picking one where the target "
+            "is actually the topmost element. If every probe point is "
+            "covered by another node (overlay), the click still fires at "
+            "the center and the result reports `covered: true`, a "
+            "`hitTarget` descriptor, and `hitTargetRef` — an @eN ref for "
+            "the covering node, so the agent can click IT directly (the "
+            "covering layer often owns the event handler). button is 'left' "
+            "(default), 'middle', or 'right'. clickCount is 1..3 "
+            "(double/triple click). Allowlist-gated. Refuses zero-size "
+            "elements with `not_visible`."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "selector": {"type": "string"},
+                "selector": {"type": "string", "description": "CSS selector or @eN ref"},
+                "x": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Viewport X in CSS px (use with y, instead of selector)",
+                },
+                "y": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Viewport Y in CSS px (use with x, instead of selector)",
+                },
                 "button": {
                     "type": "string",
                     "enum": ["left", "middle", "right"],
@@ -180,7 +197,6 @@ TOOLS: list[Tool] = [
                 },
                 "tabId": {"type": "integer"},
             },
-            "required": ["selector"],
             "additionalProperties": False,
         },
     ),

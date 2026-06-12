@@ -6,6 +6,44 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-06-12
+
+### Added
+
+- **Keep-awake: driven tabs no longer freeze in the background.** Chrome
+  freezes background tabs and (on macOS) fully-occluded windows — JS stalls,
+  pages stop loading, dispatched clicks sit in a dead queue the moment the
+  user looks at another window. On every tool call the extension now
+  re-asserts `Page.setWebLifecycleState('active')` +
+  `Emulation.setFocusEmulationEnabled(true)` on the attached tab:
+  the tab stays unfrozen and believes it is focused, so SPA
+  "I'm in background" logic stays off. Best-effort (older Chrome degrades
+  to the previous behaviour); the effect ends at debugger detach. Paint is
+  deliberately not covered — `visibilityState` stays `hidden`, so
+  `screenshot` still wants a visible tab (`tab_not_visible` /
+  `bringToFront`). Side effect worth knowing: a page that believes it is
+  active behaves like one (Telegram sends read receipts / presence during
+  automation) — new popup toggle **Advanced → keep automated tabs awake**
+  (default on) turns it off.
+- **`mouse_click` auto-aims around partial overlays.** Instead of always
+  clicking the geometric center, the probe (pure `aim.ts`, unit-tested,
+  still a fixed literal) hit-tests the center plus four points pulled
+  toward the corners and clicks the first one where the target is actually
+  the topmost element — badges/ripples/avatars covering the center no
+  longer eat the click silently.
+- **`mouse_click` mints a ref for the covering node.** When every probe
+  point is covered, the result now carries `hitTargetRef` — a real per-tab
+  `@eN` for the overlay (alongside the textual `hitTarget`), so "click the
+  thing that ate it" is a single follow-up call instead of a dead end.
+- **`mouse_click` accepts explicit coordinates** — `x`/`y` (viewport CSS
+  px, mutually exclusive with `selector`) as the manual escape hatch: aim
+  from a `screenshot` region or the hit diagnostics. Points outside the
+  viewport are rejected with `bad_args` (CDP would silently drop them);
+  the result reports what sat under the point.
+- **README: Troubleshooting rows for frozen/occluded tabs** — the keep-awake
+  toggle, Chrome's "Always keep these sites active" exception, occlusion
+  flags, and why a sliver of visible window is enough for screenshots.
+
 ## [0.5.1] — 2026-06-12
 
 ### Fixed
@@ -756,7 +794,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ginkida/sallyport/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/ginkida/sallyport/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ginkida/sallyport/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ginkida/sallyport/compare/v0.3.3...v0.4.0
