@@ -152,7 +152,7 @@ describe('findClickPoint', () => {
   it('serialises to a self-contained literal (no imports/closures)', () => {
     const src = findClickPoint.toString();
     expect(src).not.toMatch(/\brequire\b|\bimport\b/);
-     
+
     const revived = (0, eval)('(' + src + ')') as typeof findClickPoint;
     const el = fakeEl(RECT);
     expect(
@@ -182,7 +182,7 @@ describe('describePoint', () => {
 
   it('serialises to a self-contained literal', () => {
     const src = describePoint.toString();
-     
+
     const revived = (0, eval)('(' + src + ')') as typeof describePoint;
     expect(revived(doc(null), 1, 1).vw).toBe(1280);
   });
