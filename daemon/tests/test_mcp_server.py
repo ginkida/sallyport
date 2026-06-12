@@ -63,6 +63,7 @@ def test_tools_catalogue_covers_extension() -> None:
         "fetch_in_page",
         "upload",
         "save_to_file",
+        "status",
     }
     assert daemon_names == expected
 
@@ -104,6 +105,41 @@ def test_no_local_tool_shadowing() -> None:
     # Assert that no local tool name is in the extension tools
     shadowed = set(LOCAL_TOOLS.keys()) & extension_tool_names
     assert not shadowed, f"Local tools shadow extension tools: {shadowed}"
+
+    # Daemon built-ins (answered before any routing — see Bridge.call_tool)
+    # would shadow extension tools even harder than LOCAL_TOOLS.
+    from sallyport_daemon.bridge import BUILTIN_TOOLS
+
+    shadowed_builtin = set(BUILTIN_TOOLS) & extension_tool_names
+    assert not shadowed_builtin, f"Builtin tools shadow extension tools: {shadowed_builtin}"
+
+
+async def test_status_answers_without_extension() -> None:
+    """`status` is the loop-preflight tool: it must answer instantly with
+    connected=false when no extension is attached, instead of raising
+    ExtensionNotConnected like extension-bound tools do."""
+    from sallyport_daemon.bridge import Bridge
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+    out = await bridge.call_tool("status", {})
+    assert out["connected"] is False
+    assert out["port"] == 10086
+    assert out["pendingCalls"] == 0
+    assert isinstance(out["version"], str)
+    assert out["uptimeS"] >= 0
+
+
+async def test_status_does_not_queue_behind_call_lock() -> None:
+    """status must answer while another tool call holds the call lock —
+    that's the whole point of answering before lock acquisition."""
+    import asyncio
+
+    from sallyport_daemon.bridge import Bridge
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+    async with bridge._call_lock:  # noqa: SLF001 - simulating a slow in-flight call
+        out = await asyncio.wait_for(bridge.call_tool("status", {}), timeout=1.0)
+    assert out["connected"] is False
 
 
 def test_tool_schemas_are_well_formed() -> None:

@@ -183,26 +183,34 @@ arbitrary JS on that host.
 | Name | Notes |
 |---|---|
 | `list_tabs` | No allowlist check — listing is free. |
-| `navigate` | Checks the *destination* URL against allowlist. |
+| `navigate` | Checks the *destination* URL against allowlist. `waitFor={selector?,text?,absent?,timeoutMs?}` polls after the load until the page is actually usable (SPAs render long after "loaded"). |
 | `reload` | Hard reload via `bypassCache=true`. Allowlist-gated; refs invalidate. |
 | `close_tab` | `tabId` required — no implicit fallback (closing the wrong tab loses work). |
-| `snapshot` | Accessibility tree with stable `@eN` refs (per-tab). Falls back to a DOM walk (same refs) when the a11y tree exposes no interactive elements — Telegram Web K and similar SPAs. `mode=auto\|a11y\|dom`. |
-| `read_text` | Whole-page or by ref. No raw JS. |
-| `click` | DOM `.click()`. CSS selector or `@eN` ref. |
-| `mouse_click` | Real `Input.dispatchMouseEvent` at element center. Use when `click` doesn't trip pointer listeners (canvas, drag-and-drop). `button` left/middle/right, `clickCount` 1–3. |
-| `fill` | Blocks password fields without `allowPassword=true`. `method=insertText` clears the field and types via CDP with real input events (for SPA editors that ignore programmatic values). |
+| `snapshot` | Accessibility tree with stable `@eN` refs (per-tab), pruned of layout noise. Cross-checks against a DOM walk (same refs) when the a11y tree looks suspiciously sparse — Telegram Web K and similar SPAs. `mode=auto\|a11y\|dom`; `compact=true` → flat list of actionable elements only; `selector` scopes to one subtree. |
+| `read_text` | Whole-page or by ref. No raw JS. Capped at 20 000 chars by default (`maxChars` overrides; cut results carry `truncated`/`totalChars`). |
+| `click` | DOM `.click()`. CSS selector or `@eN` ref. Optional `waitFor` polls for the click's effect in the same call. |
+| `mouse_click` | Real `Input.dispatchMouseEvent` as a full hover→press→release sequence. Auto-aims around partial overlays; a fully covered target reports `covered`/`hitTarget`/`hitTargetRef`. Explicit `x`/`y` (viewport CSS px) as manual aim. `button` left/middle/right, `clickCount` 1–3, optional `waitFor`. |
+| `fill` | Blocks password fields without `allowPassword=true`. `method=insertText` clears the field and types via CDP with real input events (for SPA editors that ignore programmatic values). Optional `waitFor`. |
 | `key_type` | Raw text input via CDP. Blocks when focus is on a password field without `allowPassword=true`. |
 | `send_keys` | `Mod+A`, `Shift+Tab`, etc. `Mod` = `Cmd` on macOS, `Ctrl` elsewhere. Same password-field gate as `key_type`. |
-| `screenshot` | PNG/JPEG as a native MCP image block. `maxWidth` downscales, `region={x,y,width,height}` crops (viewport-relative CSS px). |
-| `wait_for` | Poll (250 ms) until a selector/`@eN` ref is visible and/or page text contains a substring. `timeoutMs` ≤ 30 s; timeout returns `{found:false}`, not an error. Replaces blind sleeps. |
+| `screenshot` | PNG/JPEG as a native MCP image block. `maxWidth` downscales, `region={x,y,width,height}` crops (viewport-relative CSS px). Hidden tabs fail fast with `tab_not_visible`; `bringToFront=true` activates the tab first (steals focus). |
+| `wait_for` | Poll (250 ms) until a selector/`@eN` ref is visible and/or page text contains a substring; `absent=true` waits until it is GONE. `timeoutMs` ≤ 30 s; timeout returns `{found:false}`, not an error. Replaces blind sleeps. Prefer the embedded `waitFor` on the preceding action when there is one. |
 | `evaluate` | Per-domain opt-in. Returns `{type, value}`. |
 | `fetch_in_page` | `fetch()` with page cookies/auth. Returns `{status, contentType, headers, mode, data}`. Allowlist-gated. |
 | `upload` | Attach local files to `<input type=file>` via `DOM.setFileInputFiles`. Paths must be absolute, `..`-free, **and resolve under `~/Downloads/sallyport/`** (override via `SALLYPORT_DOWNLOAD_DIR`) — same sandbox as `save_to_file`, with symlink escapes blocked by `Path.resolve()`. Target must really be a file input. Allowlist-gated. |
 | `save_to_file` | **Daemon-local** — writes base64 to `~/Downloads/sallyport/<filename>` (override via `SALLYPORT_DOWNLOAD_DIR`). Sandboxed: no path separators or `..`. |
+| `status` | **Daemon-answered** health check: `{connected, version, port, pendingCalls, uptimeS}`. No browser round-trip and never queues behind a running call — use it as preflight before browser work. |
 
 All tools accept `tabId` to target a specific tab; otherwise they use the
 active tab in the current window. There is no implicit "last touched tab"
 memo — explicit IDs win, the active tab is the only fallback.
+
+For agents running on a schedule, the cheap iteration shape is: `status`
+(skip everything if the extension is detached) → scoped reads
+(`snapshot selector=… compact=true`, `read_text ref=…`) → actions with
+embedded `waitFor` instead of separate `wait_for` calls. Driven tabs are
+kept awake automatically, so the loop keeps working while the browser
+window sits in the background (see Troubleshooting for the trade-offs).
 
 ## Compared to Kimi WebBridge
 

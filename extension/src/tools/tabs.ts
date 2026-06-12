@@ -1,7 +1,9 @@
 import { BridgeError } from './errors.js';
 import { matchAllowlist } from '../allowlist.js';
 import { getAllowlist } from '../storage.js';
+import { attach } from './cdp.js';
 import { ensureAllowed, hostnameOf } from './gates.js';
+import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { clearRefsForTab } from './refs.js';
 import type { Tool } from './types.js';
 
@@ -80,6 +82,7 @@ export const navigate: Tool = async (args) => {
   } catch {
     throw new BridgeError('bad_args', 'navigate: url is not a valid URL');
   }
+  const waitSpec = parseWaitFor(args.waitFor, 'navigate');
   const list = await getAllowlist();
   if (!matchAllowlist(url, list).matched) {
     throw new BridgeError('domain_not_allowed', `${hostnameOf(url)} is not in the allowlist`);
@@ -115,7 +118,16 @@ export const navigate: Tool = async (args) => {
   await waitForLoad(tab.id!);
   // Navigation invalidates any refs we held for this tab.
   clearRefsForTab(tab.id!);
-  return { tabId: tab.id, url, data: { tabId: tab.id, url } };
+  let wait = null;
+  if (waitSpec) {
+    // "Loaded" (tab status complete) rarely means "rendered" on SPAs — the
+    // embedded wait covers the gap to the element/text actually appearing,
+    // saving the follow-up wait_for round-trip. Needs CDP, so attach here
+    // (navigate alone doesn't).
+    await attach(tab.id!);
+    wait = await runEmbeddedWait(tab.id!, waitSpec);
+  }
+  return { tabId: tab.id, url, data: { tabId: tab.id, url, ...(wait ? { wait } : {}) } };
 };
 
 export const closeTab: Tool = async (args) => {

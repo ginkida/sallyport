@@ -448,11 +448,13 @@ def _run_doctor_secret_error(secret_path: Path, error: str) -> int:
 
 
 async def _run_exec(args: argparse.Namespace, bridge: Bridge, shutdown: asyncio.Event) -> int:
-    # Local-only tools (e.g. save_to_file) don't need an extension at all,
-    # so we skip both the WS server startup and the connect-wait for them.
+    # Local-only tools (e.g. save_to_file) and daemon built-ins (status)
+    # don't need an extension at all, so we skip both the WS server startup
+    # and the connect-wait for them.
+    from .bridge import BUILTIN_TOOLS
     from .local_tools import LOCAL_TOOLS
 
-    is_local = args.tool in LOCAL_TOOLS
+    is_local = args.tool in LOCAL_TOOLS or args.tool in BUILTIN_TOOLS
 
     ws_task: asyncio.Task[None] | None = None
     if not is_local:

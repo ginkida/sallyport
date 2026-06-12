@@ -6,17 +6,25 @@ import { clearRefsForTab } from './refs.js';
  * set stays accurate without polling. */
 const attached = new Set<number>();
 
-chrome.tabs.onRemoved.addListener((tabId) => {
-  attached.delete(tabId);
-  clearRefsForTab(tabId);
-});
+// The MV3 service worker always has the full chrome.*; vitest imports this
+// module transitively (tabs.ts/poll.ts pull pure helpers) where it doesn't
+// exist at load time — guard the top-level registrations so importing never
+// demands the API surface, only calling does.
+if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    attached.delete(tabId);
+    clearRefsForTab(tabId);
+  });
+}
 
-chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId !== undefined) {
-    attached.delete(source.tabId);
-    clearRefsForTab(source.tabId);
-  }
-});
+if (typeof chrome !== 'undefined' && chrome.debugger?.onDetach) {
+  chrome.debugger.onDetach.addListener((source) => {
+    if (source.tabId !== undefined) {
+      attached.delete(source.tabId);
+      clearRefsForTab(source.tabId);
+    }
+  });
+}
 
 export async function attach(tabId: number): Promise<void> {
   if (!attached.has(tabId)) {

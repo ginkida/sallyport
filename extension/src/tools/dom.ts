@@ -1,9 +1,12 @@
 import { attach, cdp } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
+import { parseWaitFor, runEmbeddedWait, READ_TEXT_FN } from './poll.js';
 import { getRef, isRef } from './refs.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
+
+export { READ_TEXT_FN } from './poll.js';
 
 export async function resolveSelectorOrRef(
   tabId: number,
@@ -84,6 +87,7 @@ async function targetIsPasswordField(tabId: number, objectId: string): Promise<b
 export const click: Tool = async (args) => {
   const selector = String(args.selector || '');
   if (!selector) throw new BridgeError('bad_args', 'click: selector required');
+  const waitSpec = parseWaitFor(args.waitFor, 'click');
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
@@ -99,7 +103,12 @@ export const click: Tool = async (args) => {
       returnByValue: true,
     },
   );
-  return { tabId: tab.id, url: tab.url, data: { ok: true, ...(out.result.value ?? {}) } };
+  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+  return {
+    tabId: tab.id,
+    url: tab.url,
+    data: { ok: true, ...(out.result.value ?? {}), ...(wait ? { wait } : {}) },
+  };
 };
 
 // Focus the target, select its whole content and delete it with real input
@@ -144,6 +153,7 @@ export const fill: Tool = async (args) => {
   }
   const method = args.method === 'insertText' ? 'insertText' : 'value';
   const value = String(args.value);
+  const waitSpec = parseWaitFor(args.waitFor, 'fill');
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
@@ -170,10 +180,16 @@ export const fill: Tool = async (args) => {
     if (value !== '') {
       await cdp(tab.id!, 'Input.insertText', { text: value });
     }
+    const insertWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
     return {
       tabId: tab.id,
       url: tab.url,
-      data: { ok: true, tag: prep.result.value?.tag ?? '', mode: 'insertText' },
+      data: {
+        ok: true,
+        tag: prep.result.value?.tag ?? '',
+        mode: 'insertText',
+        ...(insertWait ? { wait: insertWait } : {}),
+      },
     };
   }
 
@@ -212,16 +228,39 @@ export const fill: Tool = async (args) => {
       returnByValue: true,
     },
   );
-  return { tabId: tab.id, url: tab.url, data: { ok: true, ...(out.result.value ?? {}) } };
+  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+  return {
+    tabId: tab.id,
+    url: tab.url,
+    data: { ok: true, ...(out.result.value ?? {}), ...(wait ? { wait } : {}) },
+  };
 };
 
-// Trimmed innerText preferred; fall back to textContent (hidden-but-present nodes).
-// Pinned as a const so the ref-branch and body-branch (and wait_for's text
-// probe) can't drift apart.
-export const READ_TEXT_FN =
-  'function() { return (this.innerText || this.textContent || "").trim(); }';
+// A whole-page innerText on a chat SPA easily runs to tens of KB — past the
+// MCP tool-result budget, which shunts the payload into a file the agent
+// then has to re-read. Cap by default; `maxChars` overrides either way, and
+// the `truncated`/`totalChars` markers keep the cut visible.
+const DEFAULT_READ_MAX_CHARS = 20_000;
+
+function parseMaxChars(raw: unknown): number {
+  if (raw === undefined || raw === null) return DEFAULT_READ_MAX_CHARS;
+  const v = Number(raw);
+  if (!Number.isInteger(v) || v < 1) {
+    throw new BridgeError('bad_args', 'read_text: maxChars must be an integer >= 1');
+  }
+  return v;
+}
+
+function capText(
+  text: string,
+  maxChars: number,
+): { text: string; truncated?: true; totalChars?: number } {
+  if (text.length <= maxChars) return { text };
+  return { text: text.slice(0, maxChars), truncated: true, totalChars: text.length };
+}
 
 export const readText: Tool = async (args) => {
+  const maxChars = parseMaxChars(args.maxChars);
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
@@ -245,7 +284,7 @@ export const readText: Tool = async (args) => {
       functionDeclaration: READ_TEXT_FN,
       returnByValue: true,
     });
-    return { tabId: tab.id, url: tab.url, data: { text: out.result.value ?? '' } };
+    return { tabId: tab.id, url: tab.url, data: capText(out.result.value ?? '', maxChars) };
   }
 
   const doc = await cdp<{ root: { nodeId: number } }>(tab.id!, 'DOM.getDocument', { depth: 0 });
@@ -265,5 +304,5 @@ export const readText: Tool = async (args) => {
     functionDeclaration: READ_TEXT_FN,
     returnByValue: true,
   });
-  return { tabId: tab.id, url: tab.url, data: { text: out.result.value ?? '' } };
+  return { tabId: tab.id, url: tab.url, data: capText(out.result.value ?? '', maxChars) };
 };

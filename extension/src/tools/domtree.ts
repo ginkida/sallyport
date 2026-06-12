@@ -53,7 +53,11 @@ export type DomTreeNode = {
 
 export type DomTreeResult = { tree: DomTreeNode[]; els: unknown[]; truncated: boolean };
 
-export function collectDomTree(doc: DomDocumentLike): DomTreeResult {
+/** Walk `root` (a single element) instead of the whole body when given —
+ * `snapshot selector=…` uses this to scope the result to one subtree.
+ * Optional second parameter so the original whole-page probe literal
+ * `(collectDomTree)(document)` keeps working unchanged. */
+export function collectDomTree(doc: DomDocumentLike, root?: DomNodeLike | null): DomTreeResult {
   // Bounds keep the probe's output well under the 16 MiB frame cap even on
   // pathological pages, and keep the snapshot readable for the model.
   const MAX_ELS = 400; // interactive elements that get refs
@@ -261,7 +265,7 @@ export function collectDomTree(doc: DomDocumentLike): DomTreeResult {
     return out;
   }
 
-  const body = doc.body;
-  const tree = body ? walkElement(body) : [];
+  const start = root || doc.body;
+  const tree = start ? walkElement(start) : [];
   return { tree, els, truncated };
 }

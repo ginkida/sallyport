@@ -6,6 +6,42 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-06-12
+
+Loop-efficiency release: an agent iterating on a schedule pays per
+round-trip (a whole model turn each) and per result byte — this release
+attacks both.
+
+### Added
+
+- **Embedded `waitFor` on `navigate`, `click`, `mouse_click`, `fill`** —
+  action + wait-for-its-effect in ONE call: after the action succeeds, the
+  extension polls (same engine as `wait_for`, shared `poll.ts`) until a
+  selector/text is present — or gone, with `absent: true` — and the result
+  gains `wait: {found, elapsedMs}`. A wait timeout or a wait error (stale
+  ref, bad CSS) never fails the action itself; it is folded into the `wait`
+  field. This halves the calls of the dominant act→wait→act loop pattern.
+- **`wait_for` gains `absent: true`** — wait until the selector/text is
+  GONE (spinner finished, modal closed, message left the outbox).
+- **`snapshot` gains `selector`** — scope the snapshot to one subtree (CSS
+  or `@eN`; always a DOM walk, `source: 'dom'`). On chat-style SPAs,
+  snapshot just the panel being worked (dialog list, composer) instead of
+  the whole page; combines with `compact` for the smallest possible result.
+- **`status` tool** — instant daemon/extension health check answered by the
+  daemon itself: no browser round-trip, and it deliberately does NOT queue
+  behind the per-call lock, so it answers even while a slow tool call is in
+  flight. Returns `{connected, version, port, pendingCalls, uptimeS}`. Loop
+  preflight: `connected: false` → skip the browser work instead of burning
+  a 60 s timeout. Works with `sallyport-daemon exec status` (no extension
+  wait).
+
+### Changed
+
+- **`read_text` caps output at 20 000 chars by default** (override with
+  `maxChars`); a cut result carries `truncated: true` + `totalChars`.
+  Whole-page reads on chat SPAs ran to 60 KB+, blowing the MCP tool-result
+  budget into a file detour.
+
 ## [0.6.0] — 2026-06-12
 
 ### Added
@@ -794,7 +830,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ginkida/sallyport/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ginkida/sallyport/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/ginkida/sallyport/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ginkida/sallyport/compare/v0.4.0...v0.5.0

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets as _secrets
+import time
 from typing import Any
 
 import websockets
@@ -22,6 +23,11 @@ log = logging.getLogger("sallyport.ws")
 
 class ExtensionNotConnected(Exception):
     pass
+
+
+# Tools answered by the daemon itself, before locks and routing. Unlike
+# LOCAL_TOOLS (local_tools.py) these need Bridge state, so they live here.
+BUILTIN_TOOLS = frozenset({"status"})
 
 
 class ToolError(Exception):
@@ -54,6 +60,7 @@ class Bridge:
         # state (CDP attachments, accessibility refs), so two concurrent
         # tool_calls can race. We make it impossible from this side.
         self._call_lock = asyncio.Lock()
+        self._started_monotonic = time.monotonic()
 
     @property
     def connected(self) -> bool:
@@ -222,7 +229,26 @@ class Bridge:
         async with self._send_lock:
             await ws.send(json.dumps(env, separators=(",", ":")))
 
+    def _status(self) -> dict[str, Any]:
+        """Cheap health snapshot for loop preflight. Exposes no secret
+        material — connection state, version, port, queue depth, uptime."""
+        from .pidfile import daemon_version
+
+        return {
+            "connected": self.connected,
+            "version": daemon_version(),
+            "port": self._port,
+            "pendingCalls": len(self._pending),
+            "uptimeS": round(time.monotonic() - self._started_monotonic, 1),
+        }
+
     async def call_tool(self, name: str, args: dict[str, Any]) -> Any:
+        # Built-ins answer BEFORE the call lock on purpose: `status` exists
+        # so a loop iteration can fail fast / report progress even while a
+        # slow tool call (e.g. a 30 s embedded wait) holds the lock.
+        if name == "status":
+            return self._status()
+
         # Local-only tools run in this process and don't need the extension.
         # Imported lazily to avoid a circular reference (local_tools imports
         # ToolError from this module).

@@ -19,6 +19,30 @@ from .bridge import Bridge, ExtensionNotConnected, ToolError
 log = logging.getLogger("sallyport.mcp")
 
 
+# Embedded post-action wait, shared by navigate/click/mouse_click/fill.
+_WAIT_FOR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "selector": {"type": "string", "description": "CSS selector or @eN ref"},
+        "text": {"type": "string", "description": "Substring of the page's visible text"},
+        "timeoutMs": {"type": "integer", "minimum": 0, "maximum": 30000, "default": 10000},
+        "absent": {
+            "type": "boolean",
+            "default": False,
+            "description": "Wait until GONE instead of present",
+        },
+    },
+    "additionalProperties": False,
+    "description": (
+        "Optional post-action wait (same engine as wait_for): after the action "
+        "succeeds, poll until selector/text is present-and-visible (or gone, "
+        "with absent=true). Saves the follow-up wait_for round-trip — prefer "
+        "this over a separate wait_for call. The result gains "
+        "wait:{found, elapsedMs}; a wait timeout or error never fails the "
+        "action itself."
+    ),
+}
+
 # Mirrors the tool registry in extension/src/tools.ts. Kept short and explicit
 # so Claude knows the shape of every call without guessing.
 TOOLS: list[Tool] = [
@@ -33,7 +57,10 @@ TOOLS: list[Tool] = [
             "Open a URL. The destination domain must be in the extension's allowlist "
             "or the call fails with domain_not_allowed. Set newTab=true to open a "
             "new tab; otherwise updates the tab passed in tabId, or the active tab "
-            "in the current window if tabId is omitted. Returns {tabId, url}."
+            "in the current window if tabId is omitted. waitFor polls after the "
+            "load until a selector/text shows up — on SPAs 'loaded' rarely means "
+            "'rendered', so prefer navigate+waitFor over navigate then wait_for. "
+            "Returns {tabId, url, wait?}."
         ),
         inputSchema={
             "type": "object",
@@ -41,6 +68,7 @@ TOOLS: list[Tool] = [
                 "url": {"type": "string"},
                 "newTab": {"type": "boolean", "default": False},
                 "tabId": {"type": "integer"},
+                "waitFor": _WAIT_FOR_SCHEMA,
             },
             "required": ["url"],
             "additionalProperties": False,
@@ -95,7 +123,10 @@ TOOLS: list[Tool] = [
             "compact=true returns a flat `elements` list of just the actionable "
             "elements ({ref, role, name, value?}) instead of the full tree — much "
             "smaller; use it when you need something to click, not the page text. "
-            "Domain must be in allowlist."
+            "selector (CSS or @eN) scopes the snapshot to one subtree (always a "
+            "DOM walk, source='dom') — on big SPAs snapshot just the panel you "
+            "work with (chat list, composer) instead of the whole page; combine "
+            "with compact for the smallest result. Domain must be in allowlist."
         ),
         inputSchema={
             "type": "object",
@@ -111,6 +142,10 @@ TOOLS: list[Tool] = [
                     "default": False,
                     "description": "Flat list of interactive elements only, no tree",
                 },
+                "selector": {
+                    "type": "string",
+                    "description": "Scope to this subtree (CSS selector or @eN ref)",
+                },
             },
             "additionalProperties": False,
         },
@@ -119,12 +154,21 @@ TOOLS: list[Tool] = [
         name="read_text",
         description=(
             "Read the text content of the page, or of a specific element if ref is given. "
-            "No arbitrary JS — uses CDP's Runtime.callFunctionOn with a fixed function."
+            "No arbitrary JS — uses CDP's Runtime.callFunctionOn with a fixed function. "
+            "Output is capped at 20000 chars by default (override with maxChars); a cut "
+            "result carries truncated=true + totalChars. Prefer ref / a scoped target "
+            "over whole-page reads on chat-style SPAs."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "ref": {"type": "string", "description": "Optional @eN ref from snapshot"},
+                "maxChars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 20000,
+                    "description": "Cap on returned characters",
+                },
                 "tabId": {"type": "integer"},
             },
             "additionalProperties": False,
@@ -134,13 +178,16 @@ TOOLS: list[Tool] = [
         name="click",
         description=(
             "Click an element via DOM .click(). selector can be a CSS selector or a "
-            "@eN ref from snapshot. Refs are more reliable on SPAs."
+            "@eN ref from snapshot. Refs are more reliable on SPAs. waitFor "
+            "polls for the click's effect (panel opened, item selected) in the "
+            "same call."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "selector": {"type": "string"},
                 "tabId": {"type": "integer"},
+                "waitFor": _WAIT_FOR_SCHEMA,
             },
             "required": ["selector"],
             "additionalProperties": False,
@@ -196,6 +243,7 @@ TOOLS: list[Tool] = [
                     "default": 1,
                 },
                 "tabId": {"type": "integer"},
+                "waitFor": _WAIT_FOR_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -222,6 +270,7 @@ TOOLS: list[Tool] = [
                 },
                 "allowPassword": {"type": "boolean", "default": False},
                 "tabId": {"type": "integer"},
+                "waitFor": _WAIT_FOR_SCHEMA,
             },
             "required": ["selector", "value"],
             "additionalProperties": False,
@@ -318,11 +367,15 @@ TOOLS: list[Tool] = [
         description=(
             "Wait until a CSS selector (or @eN ref) is present AND visible, "
             "and/or until the page's visible text contains a substring — the "
-            "replacement for blind sleeps between actions. Polls every 250 ms "
-            "up to timeoutMs (default 10000, capped at 30000). At least one of "
-            "selector/text is required; if both are given, both must hold. "
-            "Returns {found, elapsedMs}; a timeout returns found=false rather "
-            "than an error. Domain must be in allowlist."
+            "replacement for blind sleeps between actions. absent=true inverts "
+            "both: wait until the selector/text is GONE (spinner finished, "
+            "modal closed). Polls every 250 ms up to timeoutMs (default 10000, "
+            "capped at 30000). At least one of selector/text is required; if "
+            "both are given, both must hold. Returns {found, elapsedMs}; a "
+            "timeout returns found=false rather than an error. NOTE: when the "
+            "wait directly follows a navigate/click/mouse_click/fill, pass "
+            "waitFor on that call instead — one round-trip less. Domain must "
+            "be in allowlist."
         ),
         inputSchema={
             "type": "object",
@@ -334,6 +387,11 @@ TOOLS: list[Tool] = [
                     "minimum": 0,
                     "maximum": 30000,
                     "default": 10000,
+                },
+                "absent": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Wait until GONE instead of present",
                 },
                 "tabId": {"type": "integer"},
             },
@@ -434,6 +492,18 @@ TOOLS: list[Tool] = [
             "required": ["data", "filename"],
             "additionalProperties": False,
         },
+    ),
+    Tool(
+        name="status",
+        description=(
+            "Instant daemon/extension health check — answered by the daemon "
+            "itself, no browser round-trip, and it never queues behind a "
+            "running tool call. Returns {connected, version, port, "
+            "pendingCalls, uptimeS}. Use it as loop-iteration preflight: if "
+            "connected=false, skip the browser work instead of burning a "
+            "60 s timeout."
+        ),
+        inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
     ),
 ]
 

@@ -240,6 +240,20 @@ describe('collectDomTree — snapshot DOM fallback', () => {
     expect(collectDomTree({ body: null })).toEqual({ tree: [], els: [], truncated: false });
   });
 
+  it('walks only the given root subtree when one is passed (scoped snapshot)', () => {
+    const wanted = el('UL', {}, [el('BUTTON', {}, [text('In scope')])]);
+    const noise = el('DIV', {}, [el('BUTTON', {}, [text('Out of scope')]), text('page noise')]);
+    const body = el('BODY', {}, [noise, wanted]);
+    const { tree, els } = collectDomTree(doc(body), wanted);
+    expect(tree).toEqual([{ role: 'button', name: 'In scope', idx: 0 }]);
+    expect(els).toHaveLength(1);
+  });
+
+  it('a null root falls back to the whole body', () => {
+    const body = el('BODY', {}, [el('BUTTON', {}, [text('Go')])]);
+    expect(collectDomTree(doc(body), null).tree).toEqual(collectDomTree(doc(body)).tree);
+  });
+
   it('is self-contained: toString() yields a standalone expression', () => {
     // snapshot.ts serialises the function into the page; any closure
     // reference (import, module const) would throw a ReferenceError there.

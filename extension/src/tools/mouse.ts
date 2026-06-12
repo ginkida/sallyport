@@ -3,6 +3,7 @@ import { attach, cdp } from './cdp.js';
 import { resolveSelectorOrRef } from './dom.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
+import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { newRef } from './refs.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
@@ -193,6 +194,7 @@ export const mouseClick: Tool = async (args) => {
   if (!Number.isInteger(clickCount) || clickCount < 1 || clickCount > 3) {
     throw new BridgeError('bad_args', 'mouse_click: clickCount must be an integer between 1 and 3');
   }
+  const waitSpec = parseWaitFor(args.waitFor, 'mouse_click');
 
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
@@ -228,6 +230,7 @@ export const mouseClick: Tool = async (args) => {
       );
     }
     await dispatchClick(tab.id!, x, y, button, clickCount);
+    const coordWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
     return {
       tabId: tab.id,
       url: tab.url,
@@ -238,6 +241,7 @@ export const mouseClick: Tool = async (args) => {
         button,
         clickCount,
         ...(info?.hitTarget ? { hitTarget: info.hitTarget } : {}),
+        ...(coordWait ? { wait: coordWait } : {}),
       },
     };
   }
@@ -249,6 +253,7 @@ export const mouseClick: Tool = async (args) => {
   }
 
   await dispatchClick(tab.id!, point.x, point.y, button, clickCount);
+  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
 
   return {
     tabId: tab.id,
@@ -260,6 +265,7 @@ export const mouseClick: Tool = async (args) => {
       y: point.y,
       button,
       clickCount,
+      ...(wait ? { wait } : {}),
       // Diagnostic, not a gate: the click is dispatched either way (the
       // covering node may be a legitimate event-handling layer), but the
       // agent learns where the events actually landed — and gets a ref to
