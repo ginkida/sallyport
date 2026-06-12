@@ -35,12 +35,54 @@ function parseMaxWidth(raw: unknown): number | null {
   return v;
 }
 
+// Fixed probe (no agent input — same trust shape as the other fixed
+// literals, no per-domain evaluate flag needed). Chrome freezes the
+// renderer of hidden tabs (background tab, or fully occluded window on
+// macOS), so Page.captureScreenshot waits for a frame that never comes and
+// the daemon times the call out at 60 s. Probe first and fail fast.
+const VISIBILITY_PROBE = 'document.visibilityState';
+
+async function readVisibility(tabId: number): Promise<string | null> {
+  try {
+    const r = await cdp<{ result: { value?: unknown } }>(tabId, 'Runtime.evaluate', {
+      expression: VISIBILITY_PROBE,
+      returnByValue: true,
+      timeout: 2000,
+    });
+    return typeof r.result.value === 'string' ? r.result.value : null;
+  } catch {
+    return null; // can't probe — let the capture itself decide
+  }
+}
+
+/** Fail fast with `tab_not_visible` instead of hanging when the tab cannot
+ * produce a frame. `bringToFront` activates the tab first (explicit opt-in —
+ * it visibly steals the user's tab/window focus) and waits briefly for the
+ * renderer to learn it is visible. */
+async function ensureVisible(tabId: number, bringToFront: boolean): Promise<void> {
+  if (bringToFront) {
+    await cdp(tabId, 'Page.bringToFront');
+    // Activation reaches the renderer asynchronously — poll up to ~2 s.
+    for (let i = 0; i < 20 && (await readVisibility(tabId)) === 'hidden'; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+  if ((await readVisibility(tabId)) === 'hidden') {
+    throw new BridgeError(
+      'tab_not_visible',
+      'screenshot: tab is hidden (background tab or occluded window) — Chrome will not render ' +
+        'a frame for it. Activate the tab manually or pass bringToFront=true.',
+    );
+  }
+}
+
 export const screenshot: Tool = async (args) => {
   const region = parseRegion(args.region);
   const maxWidth = parseMaxWidth(args.maxWidth);
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
+  await ensureVisible(tab.id!, args.bringToFront === true);
   const format = args.format === 'jpeg' ? 'jpeg' : 'png';
   const params: Record<string, unknown> = { format };
   if (format === 'jpeg') params.quality = typeof args.quality === 'number' ? args.quality : 80;

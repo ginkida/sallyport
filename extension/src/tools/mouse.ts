@@ -13,11 +13,20 @@ const BUTTON_BITS: Record<string, number> = {
   right: 2,
 };
 
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 /** Synthetic .click() (the existing `click` tool) doesn't trip pointer-event
  * listeners that some apps rely on (canvas, drag-and-drop, react-dnd, some
- * game UIs). `mouse_click` dispatches real `Input.dispatchMouseEvent` press
- * + release at the element's geometric center, escalating `clickCount` for
- * double/triple clicks. */
+ * game UIs). `mouse_click` dispatches the full real-input sequence —
+ * `mouseMoved` (hover) → press → release via `Input.dispatchMouseEvent` at
+ * the element's geometric center, with human-ish delays between events,
+ * escalating `clickCount` for double/triple clicks. SPAs that gate
+ * navigation on a complete pointer sequence (pointerdown → pointerup with
+ * a plausible gap, hover state set beforehand) reject a bare instantaneous
+ * press+release; the timings below are what makes them accept the click. */
+const HOVER_SETTLE_MS = 30;
+const PRESS_HOLD_MS = 60;
+const BETWEEN_CLICKS_MS = 80;
 export const mouseClick: Tool = async (args) => {
   const selector = String(args.selector || '');
   if (!selector) throw new BridgeError('bad_args', 'mouse_click: selector required');
@@ -67,6 +76,17 @@ export const mouseClick: Tool = async (args) => {
   }
 
   const bit = BUTTON_BITS[button];
+  // Hover first: pointermove/mouseover set the hover state many UIs require
+  // before they honour a click on the same coordinates.
+  await cdp(tab.id!, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved',
+    x: v.x,
+    y: v.y,
+    button: 'none',
+    buttons: 0,
+    pointerType: 'mouse',
+  });
+  await sleep(HOVER_SETTLE_MS);
   for (let i = 1; i <= clickCount; i++) {
     await cdp(tab.id!, 'Input.dispatchMouseEvent', {
       type: 'mousePressed',
@@ -75,7 +95,9 @@ export const mouseClick: Tool = async (args) => {
       button,
       clickCount: i,
       buttons: bit,
+      pointerType: 'mouse',
     });
+    await sleep(PRESS_HOLD_MS);
     await cdp(tab.id!, 'Input.dispatchMouseEvent', {
       type: 'mouseReleased',
       x: v.x,
@@ -83,7 +105,9 @@ export const mouseClick: Tool = async (args) => {
       button,
       clickCount: i,
       buttons: 0,
+      pointerType: 'mouse',
     });
+    if (i < clickCount) await sleep(BETWEEN_CLICKS_MS);
   }
 
   return {

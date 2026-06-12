@@ -6,6 +6,54 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-12
+
+### Added
+
+- **`screenshot` fails fast on hidden tabs instead of hanging 60 s.** Chrome
+  freezes the renderer of background tabs and occluded windows, so
+  `Page.captureScreenshot` waits for a frame that never comes and the call
+  dies at the daemon's 60 s timeout. The extension now probes
+  `document.visibilityState` first (a fixed literal, no agent input — same
+  trust shape as the other fixed probes) and returns a structured
+  `tab_not_visible` error immediately. New opt-in `bringToFront: true`
+  activates the tab via `Page.bringToFront` before capturing — explicit
+  because it visibly steals the user's tab/window focus.
+- **`snapshot` gains `compact: true`** — returns a flat `elements` list of
+  just the actionable elements (`{ref, role, name, value?}`) instead of the
+  full tree. On text-heavy SPAs this shrinks the result by an order of
+  magnitude when the agent only needs something to click.
+- **`doctor` names the process holding the port** — PID, uptime, command
+  (via `lsof`/`ps`, best-effort), and the daemon version + start time from
+  the new diagnostic pidfile (`daemon-<port>.pid` next to the secret,
+  written by long-lived daemons, removed on clean shutdown). Orphaned
+  holders are flagged as such.
+- **`doctor --kill-stale`** — SIGTERMs orphaned `sallyport-daemon` processes
+  (parent is PID 1, i.e. the session that spawned them is dead). Daemons
+  whose parent is alive are listed but deliberately left running; survivors
+  of SIGTERM are reported, never SIGKILLed automatically.
+
+### Changed
+
+- **`snapshot`'s a11y tree is drastically smaller.** `InlineTextBox` nodes
+  (per-line layout fragments duplicating their parent's text), empty leaves,
+  and text children that merely repeat the parent's accessible name are now
+  always pruned — they carry nothing the agent can act on, and on real SPAs
+  they were most of the payload (Telegram Web K: 63 KB → a few KB). The
+  builder moved to `extension/src/tools/axtree.ts` (pure, unit-tested).
+- **`mouse_click` dispatches the full pointer sequence** — `mouseMoved`
+  (hover) → press → release with human-ish delays (30/60/80 ms) and
+  `pointerType: 'mouse'`, instead of a bare instantaneous press+release.
+  SPAs that gate navigation on a complete pointer sequence (React routers)
+  rejected the old shape.
+- **The daemon shuts itself down when its parent process dies.** Stdin EOF
+  remains the primary lifecycle signal, but if the MCP client crashes while
+  another process still holds the write end of the stdin pipe, EOF never
+  arrives — the daemon used to linger as a zombie holding the port and
+  running stale code. A watchdog now detects re-parenting to PID 1 (poll
+  every 5 s) and triggers the normal clean shutdown. Daemons deliberately
+  started under init/launchd are exempt.
+
 ## [0.4.0] — 2026-06-12
 
 ### Added
@@ -683,7 +731,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ginkida/sallyport/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ginkida/sallyport/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/ginkida/sallyport/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ginkida/sallyport/compare/v0.3.1...v0.3.2

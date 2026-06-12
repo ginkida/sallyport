@@ -18,7 +18,13 @@ from typing import Any
 import pytest
 import websockets
 
-from sallyport_daemon.__main__ import _parse_kv, amain, parse_args
+from sallyport_daemon.__main__ import (
+    _parse_kv,
+    amain,
+    find_sallyport_processes,
+    parse_args,
+    parse_ps_line,
+)
 from sallyport_daemon.protocol import Envelope, Signer
 
 # asyncio_mode = "auto" in pyproject already auto-marks async tests — no
@@ -228,9 +234,7 @@ async def test_bad_secret_exits_cleanly_for_non_doctor(
     assert "cannot use secret file" in err
 
 
-async def test_doctor_flags_port_in_use(
-    capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
+async def test_doctor_flags_port_in_use(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
     """If the port is already held, `doctor` fails the bind check and
     returns 1 with an actionable message."""
     # Hold the port for the duration of the check.
@@ -571,3 +575,212 @@ async def test_exec_rejects_bad_arg_format(
     assert rc == 2
     err = capsys.readouterr().err
     assert "key=value" in err
+
+
+# ---------------------------------------------------------------------------
+# zombie-daemon diagnostics: ps parsing, port-holder report, kill-stale,
+# parent watchdog
+# ---------------------------------------------------------------------------
+
+
+def test_parse_args_doctor_kill_stale() -> None:
+    assert parse_args(["doctor"]).kill_stale is False
+    assert parse_args(["doctor", "--kill-stale"]).kill_stale is True
+
+
+def test_parse_ps_line_valid() -> None:
+    info = parse_ps_line("  123   456  02-03:04:05 /usr/bin/sallyport-daemon --port 10086")
+    assert info is not None
+    assert info.pid == 123
+    assert info.ppid == 456
+    assert info.etime == "02-03:04:05"
+    assert info.command == "/usr/bin/sallyport-daemon --port 10086"
+    assert info.orphaned is False
+
+
+def test_parse_ps_line_orphan() -> None:
+    info = parse_ps_line("99 1 01:02 sallyport-daemon")
+    assert info is not None
+    assert info.orphaned is True
+
+
+def test_parse_ps_line_garbage() -> None:
+    assert parse_ps_line("") is None
+    assert parse_ps_line("too few") is None
+    assert parse_ps_line("notanint 1 01:02 cmd") is None
+    assert parse_ps_line("1 notanint 01:02 cmd") is None
+
+
+PS_OUTPUT = """\
+  100     1  03:00:00 /opt/venv/bin/sallyport-daemon
+  200   150  00:05:00 /opt/venv/bin/python -m sallyport_daemon serve
+  300     1  10:00:00 /usr/bin/some-other-tool
+  400   399  00:00:01 grep sallyport-daemon-lookalike-but-own-pid
+"""
+
+
+def test_find_sallyport_processes_filters() -> None:
+    procs = find_sallyport_processes(PS_OUTPUT, own_pid=400)
+    assert [p.pid for p in procs] == [100, 200]
+    assert [p.orphaned for p in procs] == [True, False]
+
+
+def test_find_sallyport_processes_excludes_self() -> None:
+    procs = find_sallyport_processes(PS_OUTPUT, own_pid=100)
+    assert [p.pid for p in procs] == [200, 400]
+
+
+def test_describe_port_holder_names_pid_version_and_age(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When lsof/ps/pidfile all cooperate, the report carries PID, version,
+    start age, uptime, and the ORPHANED marker with the kill-stale hint."""
+    import time as _time
+
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [100])
+    monkeypatch.setattr(
+        m,
+        "_ps_snapshot",
+        lambda: "100 1 03:00:00 /opt/venv/bin/sallyport-daemon\n",
+    )
+    pidfile = tmp_path / "daemon-10086.pid"
+    pidfile.write_text(
+        json.dumps(
+            {
+                "pid": 100,
+                "port": 10086,
+                "version": "0.3.2",
+                "started_at": _time.time() - 7200,
+            }
+        )
+    )
+    lines = m._describe_port_holder(10086, tmp_path)
+    text = "\n".join(lines)
+    assert "PID 100" in text
+    assert "sallyport 0.3.2" in text
+    assert "started 2.0h ago" in text
+    assert "up 03:00:00" in text
+    assert "ORPHANED" in text
+    assert "--kill-stale" in text
+
+
+def test_describe_port_holder_degrades_without_ps_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A holder that isn't a sallyport process (or ps failed) still gets a
+    PID line; no orphan hint is invented."""
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [555])
+    monkeypatch.setattr(m, "_ps_snapshot", lambda: "")
+    lines = m._describe_port_holder(10086, tmp_path)
+    assert any("PID 555" in line for line in lines)
+    assert not any("--kill-stale" in line for line in lines)
+
+
+def test_describe_port_holder_empty_without_lsof(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [])
+    assert m._describe_port_holder(10086, Path("/nonexistent")) == []
+
+
+def test_kill_stale_terminates_only_orphans(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SIGTERM goes to orphaned daemons only; live-session daemons are listed
+    and left alone."""
+    import signal as _signal
+
+    import sallyport_daemon.__main__ as m
+
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(m, "_ps_snapshot", lambda: PS_OUTPUT)
+    monkeypatch.setattr(m.os, "getpid", lambda: 400)
+    monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: False)
+    m._run_kill_stale()
+    out = capsys.readouterr().out
+    assert killed == [(100, _signal.SIGTERM)]
+    assert "KILL  PID 100" in out
+    assert "LEFT  PID 200" in out
+    assert "WARN" not in out
+
+
+def test_kill_stale_reports_survivors(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m, "_ps_snapshot", lambda: "100 1 03:00:00 sallyport-daemon\n")
+    monkeypatch.setattr(m.os, "getpid", lambda: 400)
+    monkeypatch.setattr(m.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(m.time, "monotonic", _FakeMonotonic())
+    m._run_kill_stale()
+    out = capsys.readouterr().out
+    assert "WARN  PID 100 ignored SIGTERM" in out
+
+
+class _FakeMonotonic:
+    """Advances one second per call so the SIGTERM-wait loop exits at once."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        self.t += 1.0
+        return self.t
+
+
+def test_kill_stale_without_ps(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m, "_ps_snapshot", lambda: "")
+    m._run_kill_stale()
+    assert "nothing scanned" in capsys.readouterr().out
+
+
+async def test_watch_parent_triggers_on_reparent() -> None:
+    """When the parent dies (getppid flips to 1), the watchdog sets the
+    shutdown event and exits."""
+    from sallyport_daemon.__main__ import _watch_parent
+
+    shutdown = asyncio.Event()
+    calls = {"n": 0}
+
+    def fake_getppid() -> int:
+        calls["n"] += 1
+        return 1 if calls["n"] >= 3 else 4242
+
+    await asyncio.wait_for(
+        _watch_parent(shutdown, interval=0.01, getppid=fake_getppid), timeout=5.0
+    )
+    assert shutdown.is_set()
+
+
+async def test_watch_parent_exempt_when_started_under_init() -> None:
+    """A daemon deliberately started under init/launchd (initial ppid == 1)
+    must not immediately shut itself down."""
+    from sallyport_daemon.__main__ import _watch_parent
+
+    shutdown = asyncio.Event()
+    await asyncio.wait_for(_watch_parent(shutdown, interval=0.01, getppid=lambda: 1), timeout=5.0)
+    assert not shutdown.is_set()
+
+
+async def test_watch_parent_exits_on_shutdown() -> None:
+    """The watchdog ends promptly when shutdown is set by someone else —
+    it must not keep the drain phase waiting."""
+    from sallyport_daemon.__main__ import _watch_parent
+
+    shutdown = asyncio.Event()
+    task = asyncio.create_task(_watch_parent(shutdown, interval=30.0, getppid=lambda: 4242))
+    await asyncio.sleep(0.05)
+    shutdown.set()
+    await asyncio.wait_for(task, timeout=5.0)
+    assert not task.cancelled()

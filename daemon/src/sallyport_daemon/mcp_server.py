@@ -89,8 +89,11 @@ TOOLS: list[Tool] = [
             "(canvas-style SPAs like Telegram Web), automatically falls back to a "
             "DOM walk returning visible text + interactive elements with the same "
             "@eN refs; the result's `source` field says which path ran ('a11y' or "
-            "'dom'). mode forces a path: 'auto' (default), 'a11y', 'dom'. Domain "
-            "must be in allowlist."
+            "'dom'). mode forces a path: 'auto' (default), 'a11y', 'dom'. "
+            "compact=true returns a flat `elements` list of just the actionable "
+            "elements ({ref, role, name, value?}) instead of the full tree — much "
+            "smaller; use it when you need something to click, not the page text. "
+            "Domain must be in allowlist."
         ),
         inputSchema={
             "type": "object",
@@ -100,6 +103,11 @@ TOOLS: list[Tool] = [
                     "type": "string",
                     "enum": ["auto", "a11y", "dom"],
                     "default": "auto",
+                },
+                "compact": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Flat list of interactive elements only, no tree",
                 },
             },
             "additionalProperties": False,
@@ -140,12 +148,14 @@ TOOLS: list[Tool] = [
         name="mouse_click",
         description=(
             "Click via real Input.dispatchMouseEvent at the element's geometric "
-            "center. Use this when the regular `click` (DOM .click()) doesn't "
-            "trip pointer-event listeners — common on canvas-heavy UIs, "
-            "drag-and-drop libraries (react-dnd), and games. button is "
-            "'left' (default), 'middle', or 'right'. clickCount is 1..3 "
-            "(double/triple click). Allowlist-gated. Refuses zero-size "
-            "elements with `not_visible`."
+            "center, as a full pointer sequence — hover move, then press and "
+            "release with human-ish delays — so pointer-event routers (React "
+            "SPAs) that ignore a bare press+release accept it. Use this when "
+            "the regular `click` (DOM .click()) doesn't trip pointer-event "
+            "listeners — common on canvas-heavy UIs, drag-and-drop libraries "
+            "(react-dnd), and games. button is 'left' (default), 'middle', or "
+            "'right'. clickCount is 1..3 (double/triple click). "
+            "Allowlist-gated. Refuses zero-size elements with `not_visible`."
         ),
         inputSchema={
             "type": "object",
@@ -242,7 +252,11 @@ TOOLS: list[Tool] = [
             "maxWidth downscales the capture to at most that many CSS px wide "
             "(e.g. 800) to cut size. region={x,y,width,height} crops to a "
             "viewport-relative CSS-px rectangle (getBoundingClientRect "
-            "coordinates); it is intersected with the viewport. Prefer "
+            "coordinates); it is intersected with the viewport. Hidden tabs "
+            "(background tab, occluded window) cannot render a frame — the "
+            "call fails fast with `tab_not_visible` instead of hanging; pass "
+            "bringToFront=true to activate the tab first (it visibly steals "
+            "the user's tab/window focus, so only when intended). Prefer "
             "snapshot/read_text for understanding page structure."
         ),
         inputSchema={
@@ -250,6 +264,11 @@ TOOLS: list[Tool] = [
             "properties": {
                 "format": {"type": "string", "enum": ["png", "jpeg"], "default": "png"},
                 "quality": {"type": "integer", "minimum": 1, "maximum": 100},
+                "bringToFront": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Activate the tab before capturing (steals focus)",
+                },
                 "maxWidth": {
                     "type": "integer",
                     "minimum": 16,
