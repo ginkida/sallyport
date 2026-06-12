@@ -52,19 +52,59 @@ export const mouseClick: Tool = async (args) => {
 
   // Scroll into view first so the bounding rect is in the visible viewport;
   // otherwise center coords can land outside (0,0)–(viewport) and CDP drops
-  // the event silently.
+  // the event silently. The hit-test reports which element actually sits at
+  // the click point: real mouse events go to the topmost element there, so
+  // when an overlay/wrapper covers the target's center, the click lands on
+  // that node instead — `covered` + `hitTarget` in the result make this
+  // visible to the agent instead of looking like a click that did nothing.
+  // The probe is a fixed literal (no agent input interpolated).
   const probe = await cdp<{
-    result: { value?: { tag: string; x: number; y: number; visible: boolean } };
+    result: {
+      value?: {
+        tag: string;
+        x: number;
+        y: number;
+        visible: boolean;
+        covered: boolean;
+        hitTarget: string | null;
+      };
+    };
   }>(tab.id!, 'Runtime.callFunctionOn', {
     objectId,
     functionDeclaration: `function() {
       this.scrollIntoView({ block: 'center', inline: 'center' });
       const r = this.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      // Hit-test from the element's own root so targets inside open shadow
+      // trees resolve to the inner node, not the shadow host.
+      const root = this.getRootNode ? this.getRootNode() : document;
+      const from = root && root.elementFromPoint ? root : document;
+      const hit = from.elementFromPoint(x, y);
+      // The click is "ours" only if the topmost node at the point is the
+      // target or inside it (light or open-shadow descendant). An ancestor
+      // at the point means the target does not paint there — the event
+      // would go to the ancestor and never reach the target's listeners.
+      const related =
+        !!hit &&
+        (hit === this ||
+          this.contains(hit) ||
+          (this.shadowRoot && this.shadowRoot.contains(hit)));
+      let hitTarget = null;
+      if (hit && !related) {
+        const label = hit.getAttribute ? hit.getAttribute('aria-label') || '' : '';
+        hitTarget =
+          hit.tagName +
+          (hit.id ? '#' + hit.id : '') +
+          (label ? '[' + label.slice(0, 40) + ']' : '');
+      }
       return {
         tag: this.tagName,
-        x: r.left + r.width / 2,
-        y: r.top + r.height / 2,
+        x: x,
+        y: y,
         visible: r.width > 0 && r.height > 0,
+        covered: !!hit && !related,
+        hitTarget: hitTarget,
       };
     }`,
     returnByValue: true,
@@ -113,6 +153,17 @@ export const mouseClick: Tool = async (args) => {
   return {
     tabId: tab.id,
     url: tab.url,
-    data: { ok: true, tag: v.tag, x: v.x, y: v.y, button, clickCount },
+    data: {
+      ok: true,
+      tag: v.tag,
+      x: v.x,
+      y: v.y,
+      button,
+      clickCount,
+      // Diagnostic, not a gate: the click is dispatched either way (the
+      // covering node may be a legitimate event-handling layer), but the
+      // agent learns where the events actually landed.
+      ...(v.covered ? { covered: true, hitTarget: v.hitTarget } : {}),
+    },
   };
 };

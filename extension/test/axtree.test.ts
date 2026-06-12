@@ -1,12 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import {
-  buildTree,
-  collectInteractive,
-  treeHasRefs,
-  type AXNode,
-  type MakeRef,
-} from '../src/tools/axtree.js';
+import { buildTree, collectInteractive, type AXNode, type MakeRef } from '../src/tools/axtree.js';
 
 /** Deterministic ref allocator standing in for refs.ts's newRef. */
 function counterRef(): MakeRef {
@@ -158,16 +152,6 @@ describe('buildTree', () => {
         ref: '@e1',
       },
     ]);
-  });
-});
-
-describe('treeHasRefs', () => {
-  it('finds refs at any depth', () => {
-    expect(treeHasRefs([{ role: 'main', children: [{ role: 'button', ref: '@e1' }] }])).toBe(true);
-  });
-
-  it('is false for a ref-free tree', () => {
-    expect(treeHasRefs([{ role: 'StaticText', name: 'hi' }])).toBe(false);
   });
 });
 

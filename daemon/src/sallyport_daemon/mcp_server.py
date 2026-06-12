@@ -85,11 +85,13 @@ TOOLS: list[Tool] = [
         description=(
             "Return the accessibility tree of the current/target tab. Interactive "
             "elements get stable refs like @e1, @e2 which other tools accept in place "
-            "of CSS selectors. If the a11y tree exposes no interactive elements "
-            "(canvas-style SPAs like Telegram Web), automatically falls back to a "
-            "DOM walk returning visible text + interactive elements with the same "
-            "@eN refs; the result's `source` field says which path ran ('a11y' or "
-            "'dom'). mode forces a path: 'auto' (default), 'a11y', 'dom'. "
+            "of CSS selectors. If the a11y tree exposes suspiciously few "
+            "interactive elements (canvas-style SPAs like Telegram Web render an "
+            "empty or stale tree), a DOM walk runs as a cross-check and whichever "
+            "side finds more actionable elements wins — visible text + "
+            "interactive elements with the same @eN refs; the result's `source` "
+            "field says which path won ('a11y' or 'dom'). mode forces a path: "
+            "'auto' (default), 'a11y', 'dom'. "
             "compact=true returns a flat `elements` list of just the actionable "
             "elements ({ref, role, name, value?}) instead of the full tree — much "
             "smaller; use it when you need something to click, not the page text. "
@@ -155,7 +157,11 @@ TOOLS: list[Tool] = [
             "listeners — common on canvas-heavy UIs, drag-and-drop libraries "
             "(react-dnd), and games. button is 'left' (default), 'middle', or "
             "'right'. clickCount is 1..3 (double/triple click). "
-            "Allowlist-gated. Refuses zero-size elements with `not_visible`."
+            "Allowlist-gated. Refuses zero-size elements with `not_visible`. "
+            "The result reports `covered: true` + `hitTarget` when a "
+            "different element sits at the click point (overlay, wrapper) — "
+            "the events were dispatched there, which is usually why a click "
+            "'did nothing'; try clicking the hitTarget element instead."
         ),
         inputSchema={
             "type": "object",

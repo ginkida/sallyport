@@ -136,14 +136,6 @@ export function buildTree(nodes: AXNode[], makeRef: MakeRef): TreeNode[] {
   return formatChildren(root.childIds);
 }
 
-export function treeHasRefs(nodes: TreeNode[]): boolean {
-  for (const n of nodes) {
-    if (n.ref) return true;
-    if (n.children && treeHasRefs(n.children)) return true;
-  }
-  return false;
-}
-
 export type CompactElement = { ref: string; role: string; name?: string; value?: unknown };
 
 /** Flatten a snapshot tree (a11y or DOM source) to just the actionable

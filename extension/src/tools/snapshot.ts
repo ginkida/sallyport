@@ -1,10 +1,4 @@
-import {
-  buildTree,
-  collectInteractive,
-  treeHasRefs,
-  type AXNode,
-  type TreeNode,
-} from './axtree.js';
+import { buildTree, collectInteractive, type AXNode, type TreeNode } from './axtree.js';
 import { attach, cdp } from './cdp.js';
 import { collectDomTree, type DomTreeNode, type DomTreeResult } from './domtree.js';
 import { BridgeError } from './errors.js';
@@ -100,6 +94,15 @@ async function domSnapshot(tabId: number): Promise<{ tree: TreeNode[]; truncated
   }
 }
 
+// Below this many interactive elements, the a11y tree is not trusted on its
+// own and the DOM walk runs as a cross-check. A tree with zero refs is
+// obviously blind (Telegram Web K renders an empty tree); a tree with one or
+// two can be just as blind — after /k/'s hash-navigation Chrome kept a stale
+// a11y tree whose single "interactive element" belonged to a third-party
+// extension while read_text saw the whole rendered chat. Whichever side
+// finds more actionable elements wins; ties keep a11y (richer semantics).
+const MIN_TRUSTED_AX_REFS = 4;
+
 export const snapshot: Tool = async (args) => {
   const mode = args.mode === 'a11y' || args.mode === 'dom' ? args.mode : 'auto';
   const compact = args.compact === true;
@@ -107,30 +110,42 @@ export const snapshot: Tool = async (args) => {
   await ensureAllowed(tab.url);
   await attach(tab.id!);
   resetRefsForTab(tab.id!);
+  const makeRef = (backendDOMNodeId: number, role: string, name: string): string =>
+    newRef(tab.id!, backendDOMNodeId, role, name);
 
+  let axNodes: AXNode[] = [];
   let tree: TreeNode[] = [];
   let source: 'a11y' | 'dom' = 'a11y';
   let truncated = false;
   if (mode !== 'dom') {
     try {
       const result = await cdp<{ nodes: AXNode[] }>(tab.id!, 'Accessibility.getFullAXTree');
-      tree = buildTree(result.nodes, (backendDOMNodeId, role, name) =>
-        newRef(tab.id!, backendDOMNodeId, role, name),
-      );
+      axNodes = result.nodes;
+      tree = buildTree(axNodes, makeRef);
     } catch (e) {
       if (mode === 'a11y') throw e;
       tree = []; // a11y unavailable on this page — fall through to DOM
     }
   }
-  // No interactive nodes in the a11y tree means the page is effectively
-  // invisible to the agent (Telegram Web K renders an empty tree) — fall
-  // back to walking the DOM for visible text + interactive elements.
-  if (mode === 'dom' || (mode === 'auto' && !treeHasRefs(tree))) {
-    resetRefsForTab(tab.id!); // drop any refs the discarded a11y pass made
-    const dom = await domSnapshot(tab.id!);
-    tree = dom.tree;
-    source = 'dom';
-    truncated = dom.truncated;
+  const axCount = collectInteractive(tree).length;
+  if (mode === 'dom' || (mode === 'auto' && axCount < MIN_TRUSTED_AX_REFS)) {
+    resetRefsForTab(tab.id!); // drop the a11y refs; the DOM pass reallocates from @e1
+    let dom: { tree: TreeNode[]; truncated: boolean } | null = null;
+    try {
+      dom = await domSnapshot(tab.id!);
+    } catch (e) {
+      // The cross-check must not lose a working (if sparse) a11y tree.
+      if (axCount === 0) throw e;
+    }
+    if (dom && (mode === 'dom' || collectInteractive(dom.tree).length > axCount)) {
+      tree = dom.tree;
+      source = 'dom';
+      truncated = dom.truncated;
+    } else {
+      // a11y stays authoritative — rebuild it so its refs are valid again.
+      resetRefsForTab(tab.id!);
+      tree = buildTree(axNodes, makeRef);
+    }
   }
   return {
     tabId: tab.id,

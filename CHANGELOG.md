@@ -6,6 +6,31 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-06-12
+
+### Fixed
+
+- **`snapshot`'s DOM fallback now triggers on suspiciously sparse a11y trees,
+  not only empty ones.** After a hash-navigation in Telegram Web K the page
+  was fully rendered but Chrome kept a stale a11y tree whose single
+  "interactive element" belonged to a third-party extension — one ref is
+  "formally interactive", so the 0.4.0 fallback (zero refs) never fired.
+  In auto mode, fewer than 4 interactive elements now runs the DOM walk as a
+  cross-check and whichever side finds more actionable elements wins (ties
+  keep a11y — richer semantics; a cross-check failure never loses a working
+  a11y tree).
+
+### Added
+
+- **`mouse_click` reports where the events actually landed.** The measure
+  probe (still a fixed literal) now hit-tests the click point with
+  `elementFromPoint` from the element's own root (open shadow trees resolve
+  to the inner node). When the topmost node there is not the target or one
+  of its descendants, the result carries `covered: true` and a `hitTarget`
+  descriptor (tag#id[aria-label]). Diagnostic only — the click is dispatched
+  either way, since the covering node may be the app's legitimate
+  event-handling layer, but a click that "did nothing" now says who ate it.
+
 ## [0.5.0] — 2026-06-12
 
 ### Added
@@ -731,7 +756,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/ginkida/sallyport/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ginkida/sallyport/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ginkida/sallyport/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/ginkida/sallyport/compare/v0.3.2...v0.3.3
