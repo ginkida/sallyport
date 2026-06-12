@@ -12,7 +12,7 @@ from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import ImageContent, TextContent, Tool
 
 from .bridge import Bridge, ExtensionNotConnected, ToolError
 
@@ -85,11 +85,23 @@ TOOLS: list[Tool] = [
         description=(
             "Return the accessibility tree of the current/target tab. Interactive "
             "elements get stable refs like @e1, @e2 which other tools accept in place "
-            "of CSS selectors. Domain must be in allowlist."
+            "of CSS selectors. If the a11y tree exposes no interactive elements "
+            "(canvas-style SPAs like Telegram Web), automatically falls back to a "
+            "DOM walk returning visible text + interactive elements with the same "
+            "@eN refs; the result's `source` field says which path ran ('a11y' or "
+            "'dom'). mode forces a path: 'auto' (default), 'a11y', 'dom'. Domain "
+            "must be in allowlist."
         ),
         inputSchema={
             "type": "object",
-            "properties": {"tabId": {"type": "integer"}},
+            "properties": {
+                "tabId": {"type": "integer"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "a11y", "dom"],
+                    "default": "auto",
+                },
+            },
             "additionalProperties": False,
         },
     ),
@@ -160,13 +172,22 @@ TOOLS: list[Tool] = [
         name="fill",
         description=(
             "Type into an input/textarea/contenteditable. Refuses password fields "
-            "unless allowPassword=true."
+            "unless allowPassword=true. method='value' (default) sets .value and "
+            "dispatches input/change events; method='insertText' clears the field "
+            "and types through CDP Input.insertText with real input events — use "
+            "it when the app ignores programmatic values or concatenates text "
+            "(SPA editors: Telegram, Slack, draft.js)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "selector": {"type": "string"},
                 "value": {"type": "string"},
+                "method": {
+                    "type": "string",
+                    "enum": ["value", "insertText"],
+                    "default": "value",
+                },
                 "allowPassword": {"type": "boolean", "default": False},
                 "tabId": {"type": "integer"},
             },
@@ -215,14 +236,64 @@ TOOLS: list[Tool] = [
     Tool(
         name="screenshot",
         description=(
-            "Take a screenshot of the viewport. format is 'png' (default) or 'jpeg'. "
-            "Returns base64 data; large — prefer snapshot/read_text for understanding."
+            "Take a screenshot of the viewport, returned as a native MCP image "
+            "block (rendered directly — no base64 handling needed). format is "
+            "'png' (default) or 'jpeg' (smaller; quality 1-100, default 80). "
+            "maxWidth downscales the capture to at most that many CSS px wide "
+            "(e.g. 800) to cut size. region={x,y,width,height} crops to a "
+            "viewport-relative CSS-px rectangle (getBoundingClientRect "
+            "coordinates); it is intersected with the viewport. Prefer "
+            "snapshot/read_text for understanding page structure."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "format": {"type": "string", "enum": ["png", "jpeg"], "default": "png"},
                 "quality": {"type": "integer", "minimum": 1, "maximum": 100},
+                "maxWidth": {
+                    "type": "integer",
+                    "minimum": 16,
+                    "description": "Downscale so the image is at most this wide (CSS px)",
+                },
+                "region": {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "width": {"type": "number"},
+                        "height": {"type": "number"},
+                    },
+                    "required": ["x", "y", "width", "height"],
+                    "additionalProperties": False,
+                    "description": "Viewport-relative crop rectangle in CSS px",
+                },
+                "tabId": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="wait_for",
+        description=(
+            "Wait until a CSS selector (or @eN ref) is present AND visible, "
+            "and/or until the page's visible text contains a substring — the "
+            "replacement for blind sleeps between actions. Polls every 250 ms "
+            "up to timeoutMs (default 10000, capped at 30000). At least one of "
+            "selector/text is required; if both are given, both must hold. "
+            "Returns {found, elapsedMs}; a timeout returns found=false rather "
+            "than an error. Domain must be in allowlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "CSS selector or @eN ref"},
+                "text": {"type": "string", "description": "Substring of the page's visible text"},
+                "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 30000,
+                    "default": 10000,
+                },
                 "tabId": {"type": "integer"},
             },
             "additionalProperties": False,
@@ -328,8 +399,8 @@ TOOLS: list[Tool] = [
 
 async def _dispatch_call(
     bridge: Bridge, name: str, arguments: dict[str, Any] | None
-) -> list[TextContent]:
-    """Run a tool through the bridge and wrap the outcome as MCP TextContent.
+) -> list[TextContent | ImageContent]:
+    """Run a tool through the bridge and wrap the outcome as MCP content.
 
     Extracted from `build_server` so the error/format branches can be unit-
     tested directly without standing up an MCP stdio server.
@@ -341,7 +412,28 @@ async def _dispatch_call(
     except ToolError as exc:
         tag = f" [{exc.code}]" if exc.code else ""
         return [TextContent(type="text", text=f"Error{tag}: {exc}")]
+    image = _as_image_content(name, data)
+    if image is not None:
+        return image
     return [TextContent(type="text", text=_format_result(data))]
+
+
+def _as_image_content(name: str, data: Any) -> list[TextContent | ImageContent] | None:
+    """Screenshot results become a native MCP image block (the client renders
+    it inline) instead of a wall of base64 text the model can't see. Anything
+    that doesn't look like the extension's screenshot shape falls back to the
+    text path — never crash a result we already paid a round-trip for."""
+    if name != "screenshot" or not isinstance(data, dict):
+        return None
+    blob = data.get("data")
+    fmt = data.get("format")
+    if not isinstance(blob, str) or not blob or fmt not in ("png", "jpeg"):
+        return None
+    approx_bytes = len(blob) * 3 // 4
+    return [
+        ImageContent(type="image", data=blob, mimeType=f"image/{fmt}"),
+        TextContent(type="text", text=f"screenshot: {fmt}, ~{approx_bytes} bytes"),
+    ]
 
 
 def build_server(bridge: Bridge) -> Server:
@@ -352,7 +444,7 @@ def build_server(bridge: Bridge) -> Server:
         return TOOLS
 
     @server.call_tool()
-    async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
         return await _dispatch_call(bridge, name, arguments)
 
     return server

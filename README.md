@@ -186,14 +186,15 @@ arbitrary JS on that host.
 | `navigate` | Checks the *destination* URL against allowlist. |
 | `reload` | Hard reload via `bypassCache=true`. Allowlist-gated; refs invalidate. |
 | `close_tab` | `tabId` required — no implicit fallback (closing the wrong tab loses work). |
-| `snapshot` | Accessibility tree with stable `@eN` refs (per-tab). |
+| `snapshot` | Accessibility tree with stable `@eN` refs (per-tab). Falls back to a DOM walk (same refs) when the a11y tree exposes no interactive elements — Telegram Web K and similar SPAs. `mode=auto\|a11y\|dom`. |
 | `read_text` | Whole-page or by ref. No raw JS. |
 | `click` | DOM `.click()`. CSS selector or `@eN` ref. |
 | `mouse_click` | Real `Input.dispatchMouseEvent` at element center. Use when `click` doesn't trip pointer listeners (canvas, drag-and-drop). `button` left/middle/right, `clickCount` 1–3. |
-| `fill` | Blocks password fields without `allowPassword=true`. |
+| `fill` | Blocks password fields without `allowPassword=true`. `method=insertText` clears the field and types via CDP with real input events (for SPA editors that ignore programmatic values). |
 | `key_type` | Raw text input via CDP. Blocks when focus is on a password field without `allowPassword=true`. |
 | `send_keys` | `Mod+A`, `Shift+Tab`, etc. `Mod` = `Cmd` on macOS, `Ctrl` elsewhere. Same password-field gate as `key_type`. |
-| `screenshot` | PNG/JPEG, base64. |
+| `screenshot` | PNG/JPEG as a native MCP image block. `maxWidth` downscales, `region={x,y,width,height}` crops (viewport-relative CSS px). |
+| `wait_for` | Poll (250 ms) until a selector/`@eN` ref is visible and/or page text contains a substring. `timeoutMs` ≤ 30 s; timeout returns `{found:false}`, not an error. Replaces blind sleeps. |
 | `evaluate` | Per-domain opt-in. Returns `{type, value}`. |
 | `fetch_in_page` | `fetch()` with page cookies/auth. Returns `{status, contentType, headers, mode, data}`. Allowlist-gated. |
 | `upload` | Attach local files to `<input type=file>` via `DOM.setFileInputFiles`. Paths must be absolute, `..`-free, **and resolve under `~/Downloads/sallyport/`** (override via `SALLYPORT_DOWNLOAD_DIR`) — same sandbox as `save_to_file`, with symlink escapes blocked by `Path.resolve()`. Target must really be a file input. Allowlist-gated. |

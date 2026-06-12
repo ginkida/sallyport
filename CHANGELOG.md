@@ -6,6 +6,54 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-12
+
+### Added
+
+- **`wait_for` tool** — wait until a CSS selector / `@eN` ref is present and
+  visible, and/or until the page's visible text contains a substring, polling
+  every 250 ms up to `timeoutMs` (default 10 s, capped at 30 s — safely under
+  the daemon's 60 s request timeout). Replaces blind `sleep`s between
+  actions. A timeout returns `{found: false}` rather than an error, so the
+  agent can decide what to do next. Selector presence is checked with
+  structured CDP only (`DOM.querySelector` + `DOM.getBoxModel`); the text
+  probe reuses `read_text`'s fixed function. Allowlist-gated.
+- **`snapshot` DOM fallback for a11y-blind SPAs.** When the accessibility
+  tree exposes no interactive elements (Telegram Web K renders an essentially
+  empty tree), `snapshot` now falls back to walking the DOM — visible text
+  plus interactive elements (tag/ARIA-role/contenteditable/tabindex
+  heuristics) with the same per-tab `@eN` refs, so `click`/`fill`/`read_text`
+  work unchanged. The walker (`extension/src/tools/domtree.ts`) is a FIXED
+  serialised literal with no agent input interpolated — the same trust shape
+  as `fetch_in_page`'s fixed body, so it does not require the per-domain
+  `evaluate` flag. It descends open shadow roots, prunes hidden /
+  `aria-hidden` subtrees, reads only the `value` *attribute* of text inputs
+  (never live values, never passwords), and caps output (400 refs / 2000
+  nodes / 200 chars per fragment) with a `truncated` flag. The result gains a
+  `source` field (`'a11y'` | `'dom'`); `mode: 'auto' | 'a11y' | 'dom'`
+  forces a path.
+- **`fill` gains `method: 'insertText'`** — clears the field (select-all +
+  `execCommand('delete')`, with a native-setter fallback) and types the value
+  through CDP `Input.insertText`, producing real input events. Use it for SPA
+  editors that ignore programmatic `.value` or concatenate texts (Telegram,
+  Slack, draft.js). The password gate applies exactly as before; the value
+  itself never enters the fixed clear function — it travels only through
+  `Input.insertText`. Default `method: 'value'` is unchanged.
+- **`screenshot` gains `maxWidth` and `region`.** `maxWidth` downscales the
+  capture to at most that many CSS px wide; `region` crops to a
+  viewport-relative rectangle (`getBoundingClientRect` coordinates),
+  intersected with the viewport. Both map to `Page.captureScreenshot`'s
+  `clip` (math in `extension/src/tools/clip.ts`, unit-tested).
+
+### Changed
+
+- **`screenshot` results are now a native MCP image content block** instead
+  of base64 inside a JSON text blob — MCP clients (Claude Code) render the
+  image directly, eliminating the save-to-file → decode → read-image detour.
+  A short text line with format and approximate byte size accompanies the
+  image. `sallyport-daemon exec screenshot` still prints the JSON shape with
+  the blob truncated, as before.
+
 ## [0.3.3] — 2026-06-11
 
 ### Security
@@ -635,7 +683,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ginkida/sallyport/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/ginkida/sallyport/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ginkida/sallyport/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ginkida/sallyport/compare/v0.3.0...v0.3.1

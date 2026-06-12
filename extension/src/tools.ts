@@ -16,6 +16,7 @@ import { screenshot } from './tools/screenshot.js';
 import { snapshot } from './tools/snapshot.js';
 import { closeTab, listTabs, navigate, reload } from './tools/tabs.js';
 import { upload } from './tools/upload.js';
+import { waitFor } from './tools/wait.js';
 import type { Tool } from './tools/types.js';
 
 export { BridgeError } from './tools/errors.js';
@@ -33,6 +34,7 @@ const tools: Record<string, Tool> = {
   key_type: keyType,
   send_keys: sendKeys,
   screenshot,
+  wait_for: waitFor,
   evaluate,
   fetch_in_page: fetchInPage,
   upload,

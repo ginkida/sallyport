@@ -58,6 +58,7 @@ def test_tools_catalogue_covers_extension() -> None:
         "key_type",
         "send_keys",
         "screenshot",
+        "wait_for",
         "evaluate",
         "fetch_in_page",
         "upload",
@@ -200,6 +201,59 @@ async def test_dispatch_call_tool_error_without_code_omits_brackets() -> None:
     bridge: Any = _FakeBridge(raises=ToolError("something went wrong"))
     out = await _dispatch_call(bridge, "click", {"selector": "@e1"})
     assert out[0].text == "Error: something went wrong"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_call_screenshot_returns_native_image_block() -> None:
+    """A screenshot result becomes ImageContent (the client renders it inline)
+    plus a short text line with format/size — never a wall of base64 text."""
+    bridge: Any = _FakeBridge(result={"format": "png", "data": "aGVsbG8=", "dataLength": 8})
+    out = await _dispatch_call(bridge, "screenshot", {})
+    assert len(out) == 2
+    assert out[0].type == "image"
+    assert out[0].data == "aGVsbG8="
+    assert out[0].mimeType == "image/png"
+    assert out[1].type == "text"
+    assert "png" in out[1].text
+
+
+@pytest.mark.asyncio
+async def test_dispatch_call_screenshot_jpeg_mime_type() -> None:
+    bridge: Any = _FakeBridge(result={"format": "jpeg", "data": "aGk=", "dataLength": 4})
+    out = await _dispatch_call(bridge, "screenshot", {"format": "jpeg"})
+    assert out[0].type == "image"
+    assert out[0].mimeType == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_call_screenshot_malformed_falls_back_to_text() -> None:
+    """A screenshot result that doesn't carry {format, data:str} must not
+    crash the dispatcher — it degrades to the ordinary text formatting."""
+    for weird in ("not a dict", {"format": "png"}, {"format": "bmp", "data": "x"}, {"data": 5}):
+        bridge: Any = _FakeBridge(result=weird)
+        out = await _dispatch_call(bridge, "screenshot", {})
+        assert len(out) == 1
+        assert out[0].type == "text"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_call_non_screenshot_dict_with_data_stays_text() -> None:
+    """Only `screenshot` gets the image treatment — another tool returning a
+    {format, data} shaped dict (e.g. fetch_in_page base64 mode) must remain
+    text so its metadata isn't silently swallowed."""
+    bridge: Any = _FakeBridge(result={"format": "png", "data": "aGk=", "status": 200})
+    out = await _dispatch_call(bridge, "fetch_in_page", {"url": "https://x.example/i.png"})
+    assert len(out) == 1
+    assert out[0].type == "text"
+
+
+def test_wait_for_timeout_is_capped_in_schema() -> None:
+    """wait_for runs inside the daemon's 60 s request timeout; the schema must
+    advertise a cap (extension clamps at 30 s) so an agent can't request a
+    wait that would surface as an opaque wire timeout."""
+    wait_for = next(t for t in TOOLS if t.name == "wait_for")
+    timeout = wait_for.inputSchema["properties"]["timeoutMs"]
+    assert timeout["maximum"] == 30000
 
 
 def test_build_server_wires_a_named_server() -> None:

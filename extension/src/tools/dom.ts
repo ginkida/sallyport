@@ -102,12 +102,47 @@ export const click: Tool = async (args) => {
   return { tabId: tab.id, url: tab.url, data: { ok: true, ...(out.result.value ?? {}) } };
 };
 
+// Focus the target, select its whole content and delete it with real input
+// events (execCommand fires beforeinput/input with a delete inputType), so
+// the subsequent CDP Input.insertText lands in an empty field. Falls back to
+// the native value setter if execCommand is refused. FIXED literal — the
+// value itself never enters this function; it goes through Input.insertText.
+const FILL_CLEAR_FN = `function() {
+  this.focus();
+  const doc = this.ownerDocument;
+  const win = doc.defaultView || window;
+  if (this.isContentEditable) {
+    const sel = win.getSelection();
+    if (sel) {
+      const r = doc.createRange();
+      r.selectNodeContents(this);
+      sel.removeAllRanges();
+      sel.addRange(r);
+    }
+  } else if (typeof this.select === 'function') {
+    try { this.select(); } catch (_) {}
+  }
+  let cleared = false;
+  try { cleared = doc.execCommand('delete', false); } catch (_) {}
+  if (!cleared && !this.isContentEditable && 'value' in this && this.value !== '') {
+    const proto = this.tagName === 'TEXTAREA' ? win.HTMLTextAreaElement : win.HTMLInputElement;
+    const d = proto ? Object.getOwnPropertyDescriptor(proto.prototype, 'value') : null;
+    if (d && d.set) d.set.call(this, ''); else this.value = '';
+    this.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  return { tag: this.tagName };
+}`;
+
 export const fill: Tool = async (args) => {
   const selector = String(args.selector || '');
   if (!selector) throw new BridgeError('bad_args', 'fill: selector required');
   if (args.value === undefined || args.value === null) {
     throw new BridgeError('bad_args', 'fill: value required');
   }
+  if (args.method !== undefined && args.method !== 'value' && args.method !== 'insertText') {
+    throw new BridgeError('bad_args', "fill: method must be 'value' or 'insertText'");
+  }
+  const method = args.method === 'insertText' ? 'insertText' : 'value';
   const value = String(args.value);
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
@@ -120,6 +155,26 @@ export const fill: Tool = async (args) => {
       'password_field',
       'fill: refusing to type into <input type=password>; pass allowPassword=true to override',
     );
+  }
+
+  if (method === 'insertText') {
+    // Clear via the fixed function above, then type through CDP — the page
+    // sees the same composition of events a real keyboard/IME produces,
+    // which frameworks that ignore programmatic .value (Telegram, Slack,
+    // draft.js editors) do react to.
+    const prep = await cdp<{ result: { value?: { tag: string } } }>(
+      tab.id!,
+      'Runtime.callFunctionOn',
+      { objectId, functionDeclaration: FILL_CLEAR_FN, returnByValue: true },
+    );
+    if (value !== '') {
+      await cdp(tab.id!, 'Input.insertText', { text: value });
+    }
+    return {
+      tabId: tab.id,
+      url: tab.url,
+      data: { ok: true, tag: prep.result.value?.tag ?? '', mode: 'insertText' },
+    };
   }
 
   const fnBody = `function(v) {
@@ -161,8 +216,10 @@ export const fill: Tool = async (args) => {
 };
 
 // Trimmed innerText preferred; fall back to textContent (hidden-but-present nodes).
-// Pinned as a const so the ref-branch and body-branch can't drift apart.
-const READ_TEXT_FN = 'function() { return (this.innerText || this.textContent || "").trim(); }';
+// Pinned as a const so the ref-branch and body-branch (and wait_for's text
+// probe) can't drift apart.
+export const READ_TEXT_FN =
+  'function() { return (this.innerText || this.textContent || "").trim(); }';
 
 export const readText: Tool = async (args) => {
   const tab = await resolveTab(args);

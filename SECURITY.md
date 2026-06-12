@@ -60,7 +60,7 @@ the "Tools" table for per-tool notes. Quick reference:
 | Daemon ↔ extension authenticity | HMAC-SHA256, ts±30 s, 4096-nonce cache | `daemon/.../protocol.py`, `extension/src/crypto.ts` |
 | Network exposure | Loopback-only bind (`refuse_non_loopback`) | `daemon/.../__main__.py` |
 | Domain scope | Allowlist enforced before every DOM tool | `extension/src/allowlist.ts`, `extension/src/tools/gates.ts` |
-| Arbitrary JS | Per-domain `allowEvaluate` opt-in | `extension/src/tools/gates.ts:ensureEvaluateAllowed` |
+| Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, keystroke password probe, `snapshot`'s DOM-fallback walker) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `focus.ts`, `domtree.ts` |
 | Password input | `fill` reads the `type` attribute via CDP `DOM.getAttributes` (browser DOM, not page JS); `key_type`/`send_keys` probe `activeElement.type` | `extension/src/tools/dom.ts`, `keyboard.ts` |
 | Closing tabs | Allowlist-gated like other DOM tools | `extension/src/tools/tabs.ts:closeTab` |
 | Filesystem (write) | `save_to_file` sandbox to `~/Downloads/sallyport/` | `daemon/.../local_tools.py:save_to_file` |
