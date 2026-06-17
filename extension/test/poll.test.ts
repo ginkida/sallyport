@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  advanceSettle,
+  INITIAL_SETTLE_STATE,
+  parseMaxSteps,
   parseTimeoutMs,
   parseWaitFor,
   quiescenceSignal,
   QUIESCENCE_PROBE,
   SCROLL_STEP_PROBE,
+  scrollStalled,
 } from '../src/tools/poll.js';
 
 describe('parseTimeoutMs', () => {
@@ -115,5 +119,96 @@ describe('SCROLL_STEP_PROBE (reveal)', () => {
     expect(container.scrollTop).toBe(280);
     const up = fn.call(container, -1);
     expect(up.after).toBe(100); // 280 - 180
+  });
+});
+
+describe('advanceSettle (settle state machine)', () => {
+  const sig = (n: number, len: number) => ({ n, len });
+
+  it('declares settled only after equal readings span the stability window', () => {
+    let s = advanceSettle(INITIAL_SETTLE_STATE, sig(10, 100), 1000, 500);
+    expect(s.settled).toBe(false); // first reading: steadiness not yet confirmable
+    s = advanceSettle(s.state, sig(10, 100), 1300, 500);
+    expect(s.settled).toBe(false); // window opens here (first confirmed-equal reading)
+    expect(s.state.stableSince).toBe(1300);
+    s = advanceSettle(s.state, sig(10, 100), 1799, 500);
+    expect(s.settled).toBe(false); // 499 ms < 500 ms window
+    s = advanceSettle(s.state, sig(10, 100), 1800, 500);
+    expect(s.settled).toBe(true); // 500 ms elapsed since the window opened
+  });
+
+  it('restarts the window when either signal changes', () => {
+    let s = advanceSettle(INITIAL_SETTLE_STATE, sig(1, 1), 0, 500);
+    s = advanceSettle(s.state, sig(1, 1), 400, 500); // window open
+    s = advanceSettle(s.state, sig(2, 1), 800, 500); // n changed → reset
+    expect(s.settled).toBe(false);
+    expect(s.state.stableSince).toBeNull();
+    // a fresh steady stretch must again span the full window from scratch
+    s = advanceSettle(s.state, sig(2, 1), 1000, 500);
+    expect(s.settled).toBe(false);
+    s = advanceSettle(s.state, sig(2, 1), 1600, 500);
+    expect(s.settled).toBe(true);
+  });
+
+  it('never settles on a probe that yields no reading (regression: the {n:-1,len:-1} sentinel)', () => {
+    // Repeated reading-less ticks must NOT compare equal and satisfy the window;
+    // they restart it, so settle falls through to the cap as {settled:false}.
+    let s = advanceSettle(INITIAL_SETTLE_STATE, null, 0, 0);
+    s = advanceSettle(s.state, null, 250, 0);
+    s = advanceSettle(s.state, null, 99_999, 0);
+    expect(s.settled).toBe(false);
+    expect(s.state).toEqual(INITIAL_SETTLE_STATE);
+  });
+
+  it('a reading-less tick resets a window that had already started', () => {
+    let s = advanceSettle(INITIAL_SETTLE_STATE, sig(5, 5), 0, 200);
+    s = advanceSettle(s.state, sig(5, 5), 100, 200); // window open
+    expect(s.state.stableSince).not.toBeNull();
+    s = advanceSettle(s.state, null, 200, 200); // no reading → reset
+    expect(s.state).toEqual(INITIAL_SETTLE_STATE);
+  });
+
+  it('settles on the second equal reading when stableMs is 0', () => {
+    let s = advanceSettle(INITIAL_SETTLE_STATE, sig(3, 3), 0, 0);
+    expect(s.settled).toBe(false); // first reading
+    s = advanceSettle(s.state, sig(3, 3), 0, 0);
+    expect(s.settled).toBe(true);
+  });
+});
+
+describe('parseMaxSteps (reveal)', () => {
+  it('defaults to 20 when undefined', () => {
+    expect(parseMaxSteps(undefined)).toBe(20);
+  });
+
+  it('clamps above the 40 cap and accepts in-range values', () => {
+    expect(parseMaxSteps(999)).toBe(40);
+    expect(parseMaxSteps(40)).toBe(40);
+    expect(parseMaxSteps(5)).toBe(5);
+  });
+
+  it('rejects zero, negatives and non-integers', () => {
+    expect(() => parseMaxSteps(0)).toThrowError(/maxSteps must be a positive integer/);
+    expect(() => parseMaxSteps(-3)).toThrowError(/maxSteps/);
+    expect(() => parseMaxSteps(2.5)).toThrowError(/maxSteps/);
+    expect(() => parseMaxSteps('lots')).toThrowError(/maxSteps/);
+  });
+});
+
+describe('scrollStalled (reveal)', () => {
+  it('is stalled when scrollTop did not move', () => {
+    expect(scrollStalled({ before: 200, after: 200 }, null)).toBe(true);
+  });
+
+  it('is stalled when it bounced back to a position already seen', () => {
+    expect(scrollStalled({ before: 200, after: 380 }, 380)).toBe(true);
+  });
+
+  it('is not stalled on genuine forward progress', () => {
+    expect(scrollStalled({ before: 200, after: 380 }, 200)).toBe(false);
+  });
+
+  it('is not stalled on the first step (no prevAfter yet)', () => {
+    expect(scrollStalled({ before: 0, after: 180 }, null)).toBe(false);
   });
 });

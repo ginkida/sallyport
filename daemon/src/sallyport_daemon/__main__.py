@@ -334,6 +334,73 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _terminate_stale_holder(port: int, config_dir: Path) -> bool:
+    """If ``port`` is held by an ORPHANED sallyport daemon (parent died — a dead
+    session's leftover), SIGTERM it and wait briefly for it to release the
+    socket. Returns True if such a holder was found and signalled (caller should
+    re-probe the bind), False if there is nothing safe to evict — port free, held
+    by a *live* session (parent alive), or by a non-sallyport process.
+
+    Mirrors ``_run_kill_stale``'s policy: only orphans are touched; a daemon with
+    a live parent is someone's working bridge and is never killed automatically.
+    """
+    pids = _listening_pids(port)
+    if not pids:
+        return False
+    by_pid = {p.pid: p for p in find_sallyport_processes(_ps_snapshot(), own_pid=os.getpid())}
+    stale = [pid for pid in pids if pid in by_pid and by_pid[pid].orphaned]
+    if not stale:
+        return False
+    for pid in stale:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(
+                f"Sallyport: port {port} held by orphaned daemon PID {pid} "
+                "(its session is gone) — sent SIGTERM, reclaiming the port.",
+                file=sys.stderr,
+            )
+        except OSError as exc:
+            print(f"Sallyport: could not signal stale PID {pid}: {exc}", file=sys.stderr)
+    deadline = time.monotonic() + 3.0
+    remaining = list(stale)
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.1)
+        remaining = [pid for pid in remaining if _pid_alive(pid)]
+    return True
+
+
+def ensure_port_available(host: str, port: int, config_dir: Path) -> None:
+    """Single-instance guard, run BEFORE binding the WS server.
+
+    Without it, a second daemon spawned while an orphaned one still holds the
+    port fails to bind deep inside a fire-and-forget task — after the pidfile is
+    already written — and lingers as a zombie fighting for the port (the field
+    bug: up to 5 daemons, Connection closed / connected:false). Here we instead:
+    reclaim the port from a stale orphan, or refuse to start with a clear message
+    naming the holder. ``exit(2)`` on refusal, like ``refuse_non_loopback``.
+    """
+    ok, _msg = _probe_bind(host, port)
+    if ok:
+        return
+    # Busy. If a stale orphaned sallyport daemon holds it, evict and re-probe.
+    if _terminate_stale_holder(port, config_dir):
+        ok, _msg = _probe_bind(host, port)
+        if ok:
+            return
+    # Still held — by a live session, a non-sallyport process, or the SIGTERM
+    # was ignored. Refuse loudly with the holder's identity instead of spawning
+    # a doomed second daemon.
+    print(f"Sallyport: refusing to start — {host}:{port} is already in use.", file=sys.stderr)
+    for line in _describe_port_holder(port, config_dir):
+        print(line.strip(), file=sys.stderr)
+    print(
+        "Sallyport: stop that daemon, run `sallyport-daemon doctor --kill-stale`, "
+        "or start with a different --port.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
 async def _watch_parent(
     shutdown: asyncio.Event,
     *,
@@ -458,6 +525,7 @@ async def _run_exec(args: argparse.Namespace, bridge: Bridge, shutdown: asyncio.
 
     ws_task: asyncio.Task[None] | None = None
     if not is_local:
+        ensure_port_available(args.host, args.port, Path(args.secret_file).parent)
         ws_task = asyncio.create_task(bridge.serve_forever(shutdown=shutdown), name="ws-server")
 
     try:
@@ -581,6 +649,11 @@ async def amain(args: argparse.Namespace) -> int:
     # Long-lived modes leave a diagnostic pidfile next to the secret so
     # `doctor` can name the port holder (PID + version + start time).
     pidpath = pidfile_path(secret_path.parent, args.port)
+
+    # Single-instance guard BEFORE binding: reclaim the port from a stale orphan
+    # or refuse with a clear message, instead of spawning a doomed second daemon
+    # that fails to bind deep in an async task and lingers as a zombie.
+    ensure_port_available(args.host, args.port, secret_path.parent)
 
     if args.command == "serve":
         # WS-only mode: just hold the socket open for the extension. Exits

@@ -178,4 +178,15 @@ describe('collectInteractive', () => {
     ];
     expect(collectInteractive(tree).map((e) => e.ref)).toEqual(['@e1', '@e2']);
   });
+
+  it('forwards the input type (DOM-sourced) so a password field is visible', () => {
+    const tree = [
+      { role: 'textbox', name: 'Password', type: 'password', ref: '@e1' },
+      { role: 'textbox', name: 'Email', type: 'email', ref: '@e2' },
+    ];
+    expect(collectInteractive(tree)).toEqual([
+      { ref: '@e1', role: 'textbox', name: 'Password', type: 'password' },
+      { ref: '@e2', role: 'textbox', name: 'Email', type: 'email' },
+    ]);
+  });
 });

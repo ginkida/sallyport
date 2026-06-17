@@ -168,6 +168,10 @@ describe('collectDomTree — snapshot DOM fallback', () => {
     expect(tree[1].role).toBe('textbox');
     expect(tree[1].name).toBeUndefined();
     expect(JSON.stringify(tree)).not.toContain('hunter2');
+    // The real input type is surfaced so a textbox-looking password field is
+    // visible to the agent (the value itself is still never leaked).
+    expect(tree[0].type).toBe('text');
+    expect(tree[1].type).toBe('password');
   });
 
   it('skips hidden inputs entirely', () => {

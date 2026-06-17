@@ -197,30 +197,55 @@ export const QUIESCENCE_PROBE = '(' + quiescenceSignal.toString() + ')(document)
 export type SettleSpec = { stableMs: number; timeoutMs: number };
 export type SettleOutcome = { settled: boolean; elapsedMs: number };
 
+export type Signal = { n: number; len: number };
+export type SettleState = { prev: Signal | null; stableSince: number | null };
+
+export const INITIAL_SETTLE_STATE: SettleState = { prev: null, stableSince: null };
+
+/** Pure per-tick advance of the settle state machine, split out from settleFor
+ * so the decision logic is unit-testable without chrome.
+ *
+ * `sig === null` means the probe produced NO reading this tick — Runtime.evaluate
+ * returned a value-less result because the page-side eval threw. We treat that as
+ * "unknown" and conservatively RESTART the stability window: a reading-less tick
+ * must never be mistaken for a steady DOM. (The old code substituted a fixed
+ * {n:-1,len:-1} sentinel, so two consecutive failures compared equal and falsely
+ * reported settled:true; this is the fix.) settle can therefore only succeed on
+ * two genuine, equal readings. */
+export function advanceSettle(
+  state: SettleState,
+  sig: Signal | null,
+  now: number,
+  stableMs: number,
+): { state: SettleState; settled: boolean } {
+  if (sig === null) return { state: INITIAL_SETTLE_STATE, settled: false };
+  const { prev } = state;
+  if (prev && sig.n === prev.n && sig.len === prev.len) {
+    const stableSince = state.stableSince ?? now;
+    return { state: { prev: sig, stableSince }, settled: now - stableSince >= stableMs };
+  }
+  // changed (or first reading) — (re)start the stability window
+  return { state: { prev: sig, stableSince: null }, settled: false };
+}
+
 /** Wait until the DOM stops changing for `stableMs` — the adaptive replacement
  * for a blind sleep after an action on a busy SPA. Polls the two quiescence
  * signals every POLL_MS; declares settled once both hold steady across the
- * stability window. A page that never quiesces (live feed, animation loop)
- * returns {settled:false} at the cap — NOT an error (mirrors pollFor). */
+ * stability window. A page that never quiesces (live feed, animation loop) — or
+ * whose probe never yields a reading — returns {settled:false} at the cap, NOT
+ * an error (mirrors pollFor). */
 export async function settleFor(tabId: number, spec: SettleSpec): Promise<SettleOutcome> {
   const start = Date.now();
-  let prev: { n: number; len: number } | null = null;
-  let stableSince: number | null = null;
+  let state = INITIAL_SETTLE_STATE;
   for (;;) {
-    const out = await cdp<{ result: { value?: { n: number; len: number } } }>(
-      tabId,
-      'Runtime.evaluate',
-      { expression: QUIESCENCE_PROBE, returnByValue: true },
-    );
-    const sig = out.result.value ?? { n: -1, len: -1 };
+    const out = await cdp<{ result: { value?: Signal } }>(tabId, 'Runtime.evaluate', {
+      expression: QUIESCENCE_PROBE,
+      returnByValue: true,
+    });
     const now = Date.now();
-    if (prev && sig.n === prev.n && sig.len === prev.len) {
-      if (stableSince === null) stableSince = now;
-      if (now - stableSince >= spec.stableMs) return { settled: true, elapsedMs: now - start };
-    } else {
-      stableSince = null; // changed — restart the stability window
-    }
-    prev = sig;
+    const step = advanceSettle(state, out.result.value ?? null, now, spec.stableMs);
+    state = step.state;
+    if (step.settled) return { settled: true, elapsedMs: now - start };
     const elapsedMs = now - start;
     if (elapsedMs + POLL_MS > spec.timeoutMs) return { settled: false, elapsedMs };
     await new Promise((r) => setTimeout(r, POLL_MS));
@@ -239,3 +264,27 @@ export const SCROLL_STEP_PROBE =
   'function(dir) { var b = this.scrollTop; var p = this.clientHeight || 0;' +
   ' this.scrollTop = b + dir * Math.max(1, p * 0.9);' +
   ' return { before: b, after: this.scrollTop, scrollHeight: this.scrollHeight }; }';
+
+const MAX_STEPS = 40;
+const DEFAULT_MAX_STEPS = 20;
+
+/** Parse + validate reveal's `maxSteps` (capped at MAX_STEPS). Pure, so the cap
+ * and the rejections are unit-testable without chrome — mirrors parseTimeoutMs. */
+export function parseMaxSteps(raw: unknown): number {
+  if (raw === undefined) return DEFAULT_MAX_STEPS;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new BridgeError('bad_args', 'reveal: maxSteps must be a positive integer');
+  }
+  return Math.min(n, MAX_STEPS);
+}
+
+/** Has the container stopped scrolling? Either scrollTop didn't move this step,
+ * or it bounced back to a position we already saw — either way we've reached the
+ * end and reveal should stop. Pure, so the stall heuristic is unit-testable. */
+export function scrollStalled(
+  sc: { before: number; after: number },
+  prevAfter: number | null,
+): boolean {
+  return sc.after === sc.before || sc.after === prevAfter;
+}

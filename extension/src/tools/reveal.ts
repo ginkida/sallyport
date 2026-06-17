@@ -4,27 +4,22 @@ import { resolveSelectorOrRef } from './dom.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { matchElements, parsePredicate } from './match.js';
-import { parseTimeoutMs, SCROLL_STEP_PROBE, settleFor } from './poll.js';
+import {
+  parseMaxSteps,
+  parseTimeoutMs,
+  SCROLL_STEP_PROBE,
+  scrollStalled,
+  settleFor,
+} from './poll.js';
 import { buildSnapshotTree } from './snapshot.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
-const MAX_STEPS = 40;
-const DEFAULT_MAX_STEPS = 20;
 // After each scroll, let the virtualiser render the new window before the next
 // snapshot — an adaptive settle (cheaper than a fixed sleep), itself capped so
 // a never-quiescing feed can't stall the loop.
 const STEP_STABLE_MS = 350;
 const STEP_SETTLE_TIMEOUT_MS = 1500;
-
-function parseMaxSteps(raw: unknown): number {
-  if (raw === undefined) return DEFAULT_MAX_STEPS;
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n < 1) {
-    throw new BridgeError('bad_args', 'reveal: maxSteps must be a positive integer');
-  }
-  return Math.min(n, MAX_STEPS);
-}
 
 /** Scroll a virtualised container and re-snapshot until a target element
  * appears (gets an @eN), so off-screen list items become actionable.
@@ -89,7 +84,7 @@ export const reveal: Tool = async (args) => {
       },
     );
     const sc = scrollRes.result.value ?? { before: 0, after: 0 };
-    if (sc.after === sc.before || sc.after === prevAfter) {
+    if (scrollStalled(sc, prevAfter)) {
       // scrollTop didn't move (or bounced back) — we've hit the end.
       return { tabId: tab.id, url: tab.url, data: { found: false, reason: 'stall', steps: step } };
     }

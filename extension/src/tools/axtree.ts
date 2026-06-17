@@ -49,6 +49,11 @@ export type TreeNode = {
   name?: string;
   value?: unknown;
   description?: string;
+  // The element's HTML input type (DOM-sourced snapshots only) — surfaces a
+  // field whose a11y role reads `textbox` but is actually `type=password`,
+  // so the agent doesn't pick it by mistake. The a11y path can't read it
+  // cheaply, so it's absent there.
+  type?: string;
   ref?: string;
   children?: TreeNode[];
 };
@@ -136,7 +141,13 @@ export function buildTree(nodes: AXNode[], makeRef: MakeRef): TreeNode[] {
   return formatChildren(root.childIds);
 }
 
-export type CompactElement = { ref: string; role: string; name?: string; value?: unknown };
+export type CompactElement = {
+  ref: string;
+  role: string;
+  name?: string;
+  value?: unknown;
+  type?: string;
+};
 
 /** Flatten a snapshot tree (a11y or DOM source) to just the actionable
  * elements — the `compact: true` shape. Document order is preserved. */
@@ -148,6 +159,7 @@ export function collectInteractive(nodes: TreeNode[]): CompactElement[] {
         const el: CompactElement = { ref: n.ref, role: n.role };
         if (n.name) el.name = n.name;
         if (n.value !== undefined) el.value = n.value;
+        if (n.type) el.type = n.type;
         out.push(el);
       }
       if (n.children) walk(n.children);

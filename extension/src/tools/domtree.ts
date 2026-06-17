@@ -46,6 +46,10 @@ export type DomDocumentLike = {
 export type DomTreeNode = {
   role: string;
   name?: string;
+  // HTML input type for <input> elements — makes a field that reads as
+  // `textbox` but is actually `type=password` visible in the snapshot, so the
+  // agent doesn't fill into it by mistake (the fill gate already blocks it).
+  type?: string;
   idx?: number;
   ref?: string;
   children?: DomTreeNode[];
@@ -218,6 +222,12 @@ export function collectDomTree(doc: DomDocumentLike, root?: DomNodeLike | null):
     const out: DomTreeNode = { role };
     const name = nameFor(el);
     if (name) out.name = name;
+    // Surface the real input type (esp. password) so a textbox-looking field
+    // that is actually <input type=password> is visible to the agent.
+    if ((el.tagName || '').toUpperCase() === 'INPUT') {
+      const t = (attr(el, 'type') || 'text').toLowerCase();
+      if (t) out.type = t;
+    }
     if (els.length < MAX_ELS) {
       out.idx = els.length;
       els.push(el);
