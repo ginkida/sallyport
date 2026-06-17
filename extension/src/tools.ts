@@ -10,9 +10,12 @@ import { BridgeError } from './tools/errors.js';
 import { evaluate } from './tools/evaluate.js';
 import { click, fill, readText } from './tools/dom.js';
 import { fetchInPage } from './tools/fetch.js';
+import { find } from './tools/find.js';
 import { keyType, sendKeys } from './tools/keyboard.js';
 import { mouseClick } from './tools/mouse.js';
+import { reveal } from './tools/reveal.js';
 import { screenshot } from './tools/screenshot.js';
+import { settle } from './tools/settle.js';
 import { snapshot } from './tools/snapshot.js';
 import { closeTab, listTabs, navigate, reload } from './tools/tabs.js';
 import { upload } from './tools/upload.js';
@@ -35,6 +38,9 @@ const tools: Record<string, Tool> = {
   send_keys: sendKeys,
   screenshot,
   wait_for: waitFor,
+  settle,
+  find,
+  reveal,
   evaluate,
   fetch_in_page: fetchInPage,
   upload,
