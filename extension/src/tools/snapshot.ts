@@ -120,6 +120,63 @@ async function domSnapshot(
 // finds more actionable elements wins; ties keep a11y (richer semantics).
 const MIN_TRUSTED_AX_REFS = 4;
 
+export type SnapshotResult = { tree: TreeNode[]; source: 'a11y' | 'dom'; truncated: boolean };
+
+/** Whole-page snapshot core: build the a11y tree, cross-check against the DOM
+ * walk when it looks blind (mode=dom, or auto + fewer than MIN_TRUSTED_AX_REFS
+ * actionable elements), and let whichever side finds more actionable elements
+ * win (ties keep a11y). Mints a FRESH @eN ref space for the tab as a side
+ * effect (resets refs first), so the refs in the returned tree are exactly the
+ * tab's live refs (invariant #7). The caller must have already done resolveTab
+ * + ensureAllowed + attach. Whole-page only: the scoped path (snapshot
+ * selector=…) has its own resolve-before-reset choreography and does NOT go
+ * through here. Shared by `snapshot`, `find` and `reveal` so they can't drift
+ * on the a11y-vs-DOM decision. */
+export async function buildSnapshotTree(
+  tabId: number,
+  mode: 'auto' | 'a11y' | 'dom',
+): Promise<SnapshotResult> {
+  resetRefsForTab(tabId);
+  const makeRef = (backendDOMNodeId: number, role: string, name: string): string =>
+    newRef(tabId, backendDOMNodeId, role, name);
+
+  let axNodes: AXNode[] = [];
+  let tree: TreeNode[] = [];
+  let source: 'a11y' | 'dom' = 'a11y';
+  let truncated = false;
+  if (mode !== 'dom') {
+    try {
+      const result = await cdp<{ nodes: AXNode[] }>(tabId, 'Accessibility.getFullAXTree');
+      axNodes = result.nodes;
+      tree = buildTree(axNodes, makeRef);
+    } catch (e) {
+      if (mode === 'a11y') throw e;
+      tree = []; // a11y unavailable on this page — fall through to DOM
+    }
+  }
+  const axCount = collectInteractive(tree).length;
+  if (mode === 'dom' || (mode === 'auto' && axCount < MIN_TRUSTED_AX_REFS)) {
+    resetRefsForTab(tabId); // drop the a11y refs; the DOM pass reallocates from @e1
+    let dom: { tree: TreeNode[]; truncated: boolean } | null = null;
+    try {
+      dom = await domSnapshot(tabId);
+    } catch (e) {
+      // The cross-check must not lose a working (if sparse) a11y tree.
+      if (axCount === 0) throw e;
+    }
+    if (dom && (mode === 'dom' || collectInteractive(dom.tree).length > axCount)) {
+      tree = dom.tree;
+      source = 'dom';
+      truncated = dom.truncated;
+    } else {
+      // a11y stays authoritative — rebuild it so its refs are valid again.
+      resetRefsForTab(tabId);
+      tree = buildTree(axNodes, makeRef);
+    }
+  }
+  return { tree, source, truncated };
+}
+
 export const snapshot: Tool = async (args) => {
   const mode = args.mode === 'a11y' || args.mode === 'dom' ? args.mode : 'auto';
   const compact = args.compact === true;
@@ -155,44 +212,7 @@ export const snapshot: Tool = async (args) => {
     };
   }
 
-  resetRefsForTab(tab.id!);
-  const makeRef = (backendDOMNodeId: number, role: string, name: string): string =>
-    newRef(tab.id!, backendDOMNodeId, role, name);
-
-  let axNodes: AXNode[] = [];
-  let tree: TreeNode[] = [];
-  let source: 'a11y' | 'dom' = 'a11y';
-  let truncated = false;
-  if (mode !== 'dom') {
-    try {
-      const result = await cdp<{ nodes: AXNode[] }>(tab.id!, 'Accessibility.getFullAXTree');
-      axNodes = result.nodes;
-      tree = buildTree(axNodes, makeRef);
-    } catch (e) {
-      if (mode === 'a11y') throw e;
-      tree = []; // a11y unavailable on this page — fall through to DOM
-    }
-  }
-  const axCount = collectInteractive(tree).length;
-  if (mode === 'dom' || (mode === 'auto' && axCount < MIN_TRUSTED_AX_REFS)) {
-    resetRefsForTab(tab.id!); // drop the a11y refs; the DOM pass reallocates from @e1
-    let dom: { tree: TreeNode[]; truncated: boolean } | null = null;
-    try {
-      dom = await domSnapshot(tab.id!);
-    } catch (e) {
-      // The cross-check must not lose a working (if sparse) a11y tree.
-      if (axCount === 0) throw e;
-    }
-    if (dom && (mode === 'dom' || collectInteractive(dom.tree).length > axCount)) {
-      tree = dom.tree;
-      source = 'dom';
-      truncated = dom.truncated;
-    } else {
-      // a11y stays authoritative — rebuild it so its refs are valid again.
-      resetRefsForTab(tab.id!);
-      tree = buildTree(axNodes, makeRef);
-    }
-  }
+  const { tree, source, truncated } = await buildSnapshotTree(tab.id!, mode);
   return {
     tabId: tab.id,
     url: tab.url,

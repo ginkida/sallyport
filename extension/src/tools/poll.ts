@@ -167,3 +167,75 @@ export async function runEmbeddedWait(tabId: number, spec: WaitSpec): Promise<Wa
     return { found: false, elapsedMs: 0, error: e instanceof Error ? e.message : String(e) };
   }
 }
+
+// --- settle: DOM quiescence -------------------------------------------------
+
+type QuiescenceDoc = {
+  getElementsByTagName: (t: string) => { length: number };
+  body: { innerHTML: string } | null;
+};
+
+/** Two cheap, side-effect-free quiescence signals sampled each tick:
+ * `n` = total element count (catches nodes added/removed — virtualized lists
+ * settling, a spinner appearing/vanishing) and `len` = body HTML size (catches
+ * in-place text/attribute churn that doesn't change the node count). We read
+ * only the `.length`, never the content, so no field value can leak
+ * (invariant #5). Pure + self-contained so it serialises cleanly — the same
+ * shape as domtree's collectDomTree. */
+export function quiescenceSignal(doc: QuiescenceDoc): { n: number; len: number } {
+  return {
+    n: doc.getElementsByTagName('*').length,
+    len: doc.body ? doc.body.innerHTML.length : 0,
+  };
+}
+
+// FIXED literal — `document` is a fixed reference, NOT agent input — so it
+// carries the same trust shape as read_text's body probe / keyboard.ts's
+// ACTIVE_FIELD_PROBE and needs no per-domain evaluate flag.
+export const QUIESCENCE_PROBE = '(' + quiescenceSignal.toString() + ')(document)';
+
+export type SettleSpec = { stableMs: number; timeoutMs: number };
+export type SettleOutcome = { settled: boolean; elapsedMs: number };
+
+/** Wait until the DOM stops changing for `stableMs` — the adaptive replacement
+ * for a blind sleep after an action on a busy SPA. Polls the two quiescence
+ * signals every POLL_MS; declares settled once both hold steady across the
+ * stability window. A page that never quiesces (live feed, animation loop)
+ * returns {settled:false} at the cap — NOT an error (mirrors pollFor). */
+export async function settleFor(tabId: number, spec: SettleSpec): Promise<SettleOutcome> {
+  const start = Date.now();
+  let prev: { n: number; len: number } | null = null;
+  let stableSince: number | null = null;
+  for (;;) {
+    const out = await cdp<{ result: { value?: { n: number; len: number } } }>(
+      tabId,
+      'Runtime.evaluate',
+      { expression: QUIESCENCE_PROBE, returnByValue: true },
+    );
+    const sig = out.result.value ?? { n: -1, len: -1 };
+    const now = Date.now();
+    if (prev && sig.n === prev.n && sig.len === prev.len) {
+      if (stableSince === null) stableSince = now;
+      if (now - stableSince >= spec.stableMs) return { settled: true, elapsedMs: now - start };
+    } else {
+      stableSince = null; // changed — restart the stability window
+    }
+    prev = sig;
+    const elapsedMs = now - start;
+    if (elapsedMs + POLL_MS > spec.timeoutMs) return { settled: false, elapsedMs };
+    await new Promise((r) => setTimeout(r, POLL_MS));
+  }
+}
+
+// --- reveal: scroll a virtualised container ---------------------------------
+
+// FIXED literal used by `reveal` to scroll a virtualised container (`this`) by
+// ~90% of its viewport. The direction (1 down / -1 up) travels as a STRUCTURED
+// callFunctionOn argument, NEVER interpolated into the body — same trust shape
+// as the aim probes — so reveal needs no allowEvaluate. Lives here next to
+// QUIESCENCE_PROBE so both serialised DOM probes stay in one import-safe module
+// (poll.ts pulls in no chrome at load, so they're vitest-testable).
+export const SCROLL_STEP_PROBE =
+  'function(dir) { var b = this.scrollTop; var p = this.clientHeight || 0;' +
+  ' this.scrollTop = b + dir * Math.max(1, p * 0.9);' +
+  ' return { before: b, after: this.scrollTop, scrollHeight: this.scrollHeight }; }';

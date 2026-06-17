@@ -6,6 +6,44 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-06-17
+
+SPA-robustness release: three generic, site-agnostic tools that make heavy
+single-page apps (Telegram Web, Threads) reliably driveable — semantic
+location, virtualized-list reveal, and DOM-quiescence waiting. All reuse the
+fixed serialized-probe pattern (agent input only as structured arguments,
+never interpolated), stay behind the allowlist, and need no `allowEvaluate`,
+so the trust model is untouched.
+
+### Added
+
+- **`find` — semantic locator** — snapshot the page and return `@eN` refs of
+  interactive elements matching a predicate (`role` exact or one-of, `name`
+  substring / `nameExact`, `value`), ranked exact-name-first and capped by
+  `limit`. Replaces guessing brittle CSS against framework-hashed classnames
+  on SPAs. The match runs extension-side over the snapshot's flat element list
+  (`match.ts`) — `find` adds no page probe of its own, so it needs no
+  `allowEvaluate`. Empty matches is a normal not-found, not an error.
+- **`reveal` — scroll a virtualized container until a target appears** — so
+  off-screen list items (older chat messages, feed posts) that have no `@eN`
+  become reachable. Re-resolves the `container` and re-snapshots each step;
+  terminates on found, stall (reached the end), `maxSteps` (≤40), or
+  `timeoutMs` (≤30 000). Uses a fixed scroll probe with the direction as a
+  structured argument (no `allowEvaluate`); scrolls the page as a side effect
+  (within `mouse_click`'s precedent).
+- **`settle` — DOM-quiescence wait** — wait until the DOM stops changing for
+  `stableMs` (element count and body size both steady), the adaptive
+  replacement for a blind sleep after an action on a busy SPA. Fixed
+  quiescence probe (reads only `.length`, never field content), polls every
+  250 ms up to `timeoutMs` (≤30 000). A page that never quiesces (live feed,
+  animation) returns `settled: false` at the cap — not an error.
+
+### Changed
+
+- **`snapshot`'s a11y-vs-DOM tree-building extracted into `buildSnapshotTree`**
+  (no behaviour change) so `find` and `reveal` reuse the exact same decision
+  and per-tab ref choreography instead of duplicating it.
+
 ## [0.7.0] — 2026-06-12
 
 Loop-efficiency release: an agent iterating on a schedule pays per
@@ -830,7 +868,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ginkida/sallyport/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ginkida/sallyport/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ginkida/sallyport/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/ginkida/sallyport/compare/v0.5.0...v0.5.1

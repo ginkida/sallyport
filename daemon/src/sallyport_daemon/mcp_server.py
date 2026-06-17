@@ -399,6 +399,132 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="reveal",
+        description=(
+            "Scroll a virtualized container and re-snapshot until a target "
+            "element appears (gets an @eN), so off-screen list items become "
+            "actionable. container is the scrollport (CSS selector — more "
+            "robust than @eN across re-renders). The target predicate is the "
+            "same as find (role/name/nameExact/value). Scrolls in direction "
+            "('down' default / 'up') up to maxSteps (<=40) or timeoutMs "
+            "(<=30000), whichever comes first. Terminates on: found, stall "
+            "(reached the end), max_steps, or timeout. Returns {found, matches?, "
+            "steps, reason?, source}. NOTE: this scrolls the page. Structured "
+            "CDP only (fixed scroll probe), no evaluate flag. Domain must be in "
+            "allowlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "container": {
+                    "type": "string",
+                    "description": "CSS selector or @eN of the scroll container",
+                },
+                "role": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                    "description": "Target role (string) or list of roles (match any one)",
+                },
+                "name": {"type": "string", "description": "Target accessible name/label substring"},
+                "nameExact": {"type": "boolean", "default": False},
+                "value": {"type": "string", "description": "Substring of the target's value"},
+                "direction": {
+                    "type": "string",
+                    "enum": ["down", "up"],
+                    "default": "down",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "a11y", "dom"],
+                    "default": "auto",
+                },
+                "maxSteps": {"type": "integer", "minimum": 1, "maximum": 40, "default": 20},
+                "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 30000,
+                    "default": 10000,
+                },
+                "tabId": {"type": "integer"},
+            },
+            "required": ["container"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="find",
+        description=(
+            "Semantic locator: snapshot the page and return @eN refs of "
+            "interactive elements matching a predicate, instead of guessing CSS "
+            "against hashed SPA classnames. Give any of: role (a string, or a "
+            "list = match any one), name (substring; nameExact=true for an "
+            "exact case-insensitive match), value (substring). Results are "
+            "ranked (exact-name first) and capped by limit. Returns {source, "
+            "matches:[{ref,role,name,value,score}], total}. Empty matches is a "
+            "normal not-found, not an error. The match runs in the extension "
+            "over the snapshot — no page JS, no evaluate flag. Domain must be "
+            "in allowlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "role": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                    "description": "Role to match (string), or a list of roles (match any one)",
+                },
+                "name": {"type": "string", "description": "Accessible name/label substring"},
+                "nameExact": {"type": "boolean", "default": False},
+                "value": {"type": "string", "description": "Substring of the element's value"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "a11y", "dom"],
+                    "default": "auto",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                "tabId": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="settle",
+        description=(
+            "Wait until the DOM stops changing for stableMs (element count AND "
+            "body size both hold steady) — the adaptive replacement for a blind "
+            "sleep after an action on a busy SPA. Polls every 250 ms up to "
+            "timeoutMs (capped at 30000). Returns {settled, elapsedMs}. A page "
+            "that never quiesces (live feed, animation loop) returns "
+            "settled=false at the cap — not an error. Structured CDP only (fixed "
+            "quiescence probe), no evaluate flag needed. Domain must be in "
+            "allowlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "stableMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10000,
+                    "default": 500,
+                    "description": "Window of no DOM change required to call it settled",
+                },
+                "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 30000,
+                    "default": 10000,
+                },
+                "tabId": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="evaluate",
         description=(
             "Run arbitrary JavaScript in the page context. REQUIRES the domain to have "
