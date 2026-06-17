@@ -105,12 +105,12 @@ describe('matchElements', () => {
 
   it('matches value as a substring on String(value)', () => {
     const withVals = [el('@e1', 'textbox', 'A', 'hello world'), el('@e2', 'textbox', 'B', 42)];
-    expect(matchElements(withVals, parsePredicate({ value: 'world' }, 'find')).map((m) => m.ref)).toEqual(
-      ['@e1'],
-    );
-    expect(matchElements(withVals, parsePredicate({ value: '42' }, 'find')).map((m) => m.ref)).toEqual([
-      '@e2',
-    ]);
+    expect(
+      matchElements(withVals, parsePredicate({ value: 'world' }, 'find')).map((m) => m.ref),
+    ).toEqual(['@e1']);
+    expect(
+      matchElements(withVals, parsePredicate({ value: '42' }, 'find')).map((m) => m.ref),
+    ).toEqual(['@e2']);
   });
 
   it('ANDs all provided fields', () => {

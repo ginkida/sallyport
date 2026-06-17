@@ -81,9 +81,10 @@ describe('quiescenceSignal / QUIESCENCE_PROBE (settle)', () => {
   });
 
   it('tolerates a missing body', () => {
-    expect(
-      quiescenceSignal({ getElementsByTagName: () => ({ length: 3 }), body: null }),
-    ).toEqual({ n: 3, len: 0 });
+    expect(quiescenceSignal({ getElementsByTagName: () => ({ length: 3 }), body: null })).toEqual({
+      n: 3,
+      len: 0,
+    });
   });
 
   it('is self-contained: QUIESCENCE_PROBE runs with no closure refs', () => {

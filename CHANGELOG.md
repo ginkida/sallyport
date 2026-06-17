@@ -6,6 +6,15 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-06-17
+
+SPA-robustness release: three generic, site-agnostic tools that make heavy
+single-page apps (Telegram Web, Threads) reliably driveable — semantic
+location, virtualized-list reveal, and DOM-quiescence waiting. All reuse the
+fixed serialized-probe pattern (agent input only as structured arguments,
+never interpolated), stay behind the allowlist, and need no `allowEvaluate`,
+so the trust model is untouched.
+
 ### Added
 
 - **`find` — semantic locator** — snapshot the page and return `@eN` refs of
@@ -859,7 +868,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ginkida/sallyport/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ginkida/sallyport/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ginkida/sallyport/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/ginkida/sallyport/compare/v0.5.0...v0.5.1

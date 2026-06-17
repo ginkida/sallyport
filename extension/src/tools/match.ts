@@ -76,7 +76,12 @@ function scoreOne(
       nameScore = n === nameQ ? 100 : n.startsWith(nameQ) ? 50 : 10;
     }
   }
-  if (valueQ !== undefined && !String(el.value ?? '').toLowerCase().includes(valueQ)) {
+  if (
+    valueQ !== undefined &&
+    !String(el.value ?? '')
+      .toLowerCase()
+      .includes(valueQ)
+  ) {
     return null;
   }
 

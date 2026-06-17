@@ -59,12 +59,20 @@ export const reveal: Tool = async (args) => {
       return { tabId: tab.id, url: tab.url, data: { found: true, matches, steps: step, source } };
     }
     if (step === maxSteps) {
-      return { tabId: tab.id, url: tab.url, data: { found: false, reason: 'max_steps', steps: step } };
+      return {
+        tabId: tab.id,
+        url: tab.url,
+        data: { found: false, reason: 'max_steps', steps: step },
+      };
     }
     // Stop before a scroll+settle that would overshoot the budget (kept well
     // under the daemon's 60 s request timeout).
     if (Date.now() - start + STEP_SETTLE_TIMEOUT_MS > timeoutMs) {
-      return { tabId: tab.id, url: tab.url, data: { found: false, reason: 'timeout', steps: step } };
+      return {
+        tabId: tab.id,
+        url: tab.url,
+        data: { found: false, reason: 'timeout', steps: step },
+      };
     }
     // Re-resolve the container each pass — virtualised lists recycle nodes, so
     // a held objectId can go stale. A CSS selector re-queries fresh; a missing
@@ -89,5 +97,9 @@ export const reveal: Tool = async (args) => {
     await settleFor(tab.id!, { stableMs: STEP_STABLE_MS, timeoutMs: STEP_SETTLE_TIMEOUT_MS });
   }
   // The loop always returns; this satisfies the type checker.
-  return { tabId: tab.id, url: tab.url, data: { found: false, reason: 'max_steps', steps: maxSteps } };
+  return {
+    tabId: tab.id,
+    url: tab.url,
+    data: { found: false, reason: 'max_steps', steps: maxSteps },
+  };
 };
