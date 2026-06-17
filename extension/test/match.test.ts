@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { CompactElement } from '../src/tools/axtree.js';
-import { matchElements, parsePredicate } from '../src/tools/match.js';
+import { matchElements, parseLimit, parsePredicate } from '../src/tools/match.js';
 
 const el = (ref: string, role: string, name?: string, value?: unknown): CompactElement => ({
   ref,
@@ -119,5 +119,24 @@ describe('matchElements', () => {
         (m) => m.ref,
       ),
     ).toEqual(['@e2']);
+  });
+});
+
+describe('parseLimit (find)', () => {
+  it('defaults to 10 when undefined', () => {
+    expect(parseLimit(undefined)).toBe(10);
+  });
+
+  it('clamps above the 50 cap and accepts in-range values', () => {
+    expect(parseLimit(999)).toBe(50);
+    expect(parseLimit(50)).toBe(50);
+    expect(parseLimit(3)).toBe(3);
+  });
+
+  it('rejects zero, negatives and non-integers', () => {
+    expect(() => parseLimit(0)).toThrowError(/limit must be a positive integer/);
+    expect(() => parseLimit(-1)).toThrowError(/limit/);
+    expect(() => parseLimit(1.5)).toThrowError(/limit/);
+    expect(() => parseLimit('all')).toThrowError(/limit/);
   });
 });

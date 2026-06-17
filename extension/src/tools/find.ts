@@ -1,23 +1,10 @@
 import { collectInteractive } from './axtree.js';
 import { attach } from './cdp.js';
-import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
-import { matchElements, parsePredicate } from './match.js';
+import { matchElements, parseLimit, parsePredicate } from './match.js';
 import { buildSnapshotTree } from './snapshot.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
-
-const DEFAULT_LIMIT = 10;
-const MAX_LIMIT = 50;
-
-function parseLimit(raw: unknown): number {
-  if (raw === undefined) return DEFAULT_LIMIT;
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n < 1) {
-    throw new BridgeError('bad_args', 'find: limit must be a positive integer');
-  }
-  return Math.min(n, MAX_LIMIT);
-}
 
 /** Semantic locator: snapshot the page, then return @eN refs of interactive
  * elements matching a role/name/value predicate — instead of guessing CSS

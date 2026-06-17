@@ -209,16 +209,22 @@ export const fill: Tool = async (args) => {
         this.textContent = v;
         this.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: v, bubbles: true }));
       }
-      return { tag: this.tagName, mode: 'contenteditable' };
+      return {
+        tag: this.tagName,
+        mode: 'contenteditable',
+        applied: (this.innerText || this.textContent || ''),
+      };
     }
     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
       || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
     if (setter) setter.call(this, v); else this.value = v;
     this.dispatchEvent(new Event('input', { bubbles: true }));
     this.dispatchEvent(new Event('change', { bubbles: true }));
-    return { tag: this.tagName, mode: 'value' };
+    // Read back the live value so the handler can tell whether the set actually
+    // stuck (React-controlled inputs revert a programmatic .value on render).
+    return { tag: this.tagName, mode: 'value', applied: ('value' in this ? String(this.value) : '') };
   }`;
-  const out = await cdp<{ result: { value?: { tag: string; mode: string } } }>(
+  const out = await cdp<{ result: { value?: { tag: string; mode: string; applied: string } } }>(
     tab.id!,
     'Runtime.callFunctionOn',
     {
@@ -228,11 +234,39 @@ export const fill: Tool = async (args) => {
       returnByValue: true,
     },
   );
+  const res = out.result.value ?? { tag: '', mode: 'value', applied: '' };
+  // Verify the value actually landed. React-controlled inputs silently revert a
+  // programmatic .value on their next render, so method:value can no-op while
+  // still returning ok:true — a footgun (you think the field is filled; it's
+  // empty). On a mismatch, fall back to the same keyboard-level insertText path
+  // method:insertText uses (frameworks DO observe it). The password gate already
+  // passed above, so the fallback can't slip text into a password field.
+  const stuck = res.applied === value || (value !== '' && res.applied.includes(value));
+  if (!stuck) {
+    await cdp(tab.id!, 'Runtime.callFunctionOn', {
+      objectId,
+      functionDeclaration: FILL_CLEAR_FN,
+      returnByValue: true,
+    });
+    if (value !== '') await cdp(tab.id!, 'Input.insertText', { text: value });
+    const fbWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+    return {
+      tabId: tab.id,
+      url: tab.url,
+      data: {
+        ok: true,
+        tag: res.tag,
+        mode: 'insertText',
+        fallbackFrom: 'value',
+        ...(fbWait ? { wait: fbWait } : {}),
+      },
+    };
+  }
   const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
   return {
     tabId: tab.id,
     url: tab.url,
-    data: { ok: true, ...(out.result.value ?? {}), ...(wait ? { wait } : {}) },
+    data: { ok: true, tag: res.tag, mode: res.mode, ...(wait ? { wait } : {}) },
   };
 };
 

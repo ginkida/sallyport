@@ -784,3 +784,82 @@ async def test_watch_parent_exits_on_shutdown() -> None:
     shutdown.set()
     await asyncio.wait_for(task, timeout=5.0)
     assert not task.cancelled()
+
+
+# --- ensure_port_available: single-instance startup guard --------------------
+
+
+def test_ensure_port_available_passes_when_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m, "_probe_bind", lambda host, port: (True, "free"))
+    m.ensure_port_available("127.0.0.1", 10086, Path("/nonexistent"))  # no exit, no raise
+
+
+def test_ensure_port_available_evicts_stale_orphan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A port held by an ORPHANED sallyport daemon is reclaimed (SIGTERM); the
+    re-probe then succeeds and startup proceeds."""
+    import signal as _signal
+
+    import sallyport_daemon.__main__ as m
+
+    probes = {"n": 0}
+
+    def fake_probe(host: str, port: int) -> tuple[bool, str]:
+        probes["n"] += 1
+        return (probes["n"] > 1, "")  # busy first, free after eviction
+
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(m, "_probe_bind", fake_probe)
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [100])
+    monkeypatch.setattr(m, "_ps_snapshot", lambda: "100 1 03:00:00 sallyport-daemon\n")
+    monkeypatch.setattr(m.os, "getpid", lambda: 999)
+    monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(m.time, "sleep", lambda *a: None)
+
+    m.ensure_port_available("127.0.0.1", 10086, Path("/nonexistent"))
+    assert killed == [(100, _signal.SIGTERM)]
+    assert probes["n"] == 2  # re-probed after the eviction
+
+
+def test_ensure_port_available_refuses_live_holder(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A port held by a LIVE-session daemon (parent alive) is never auto-killed;
+    the guard refuses with a clear message naming the holder and exits 2."""
+    import sallyport_daemon.__main__ as m
+
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(m, "_probe_bind", lambda host, port: (False, "busy"))
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [200])
+    monkeypatch.setattr(m, "_ps_snapshot", lambda: "200 150 00:05:00 sallyport-daemon serve\n")
+    monkeypatch.setattr(m.os, "getpid", lambda: 999)
+    monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    with pytest.raises(SystemExit) as exc:
+        m.ensure_port_available("127.0.0.1", 10086, Path("/nonexistent"))
+    assert exc.value.code == 2
+    assert killed == []  # a live daemon is someone's working bridge — left alone
+    err = capsys.readouterr().err
+    assert "already in use" in err
+    assert "PID 200" in err
+
+
+def test_ensure_port_available_refuses_non_sallyport_holder(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A non-sallyport process on the port is reported and refused, never killed."""
+    import sallyport_daemon.__main__ as m
+
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(m, "_probe_bind", lambda host, port: (False, "busy"))
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [777])
+    monkeypatch.setattr(m, "_ps_snapshot", lambda: "777 1 01:00 some-other-server\n")
+    monkeypatch.setattr(m.os, "getpid", lambda: 999)
+    monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    with pytest.raises(SystemExit) as exc:
+        m.ensure_port_available("127.0.0.1", 10086, Path("/nonexistent"))
+    assert exc.value.code == 2
+    assert killed == []

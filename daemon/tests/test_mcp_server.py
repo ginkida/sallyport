@@ -145,6 +145,33 @@ async def test_status_does_not_queue_behind_call_lock() -> None:
     assert out["connected"] is False
 
 
+def test_status_connected_reflects_ws_state() -> None:
+    """`connected` must mirror the WebSocket's real protocol state, not just a
+    non-None client reference: a CLOSING/CLOSED socket lingering in the slot
+    must report connected:false so `status` doesn't lie just before a tool call
+    fails with ExtensionNotConnected."""
+    from sallyport_daemon.bridge import Bridge
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+
+    class _FakeWS:
+        def __init__(self, state_name: str | None) -> None:
+            if state_name is not None:
+                self.state = type("S", (), {"name": state_name})()
+
+    bridge._client = _FakeWS("OPEN")  # type: ignore[assignment]  # noqa: SLF001
+    assert bridge.connected is True
+    assert bridge._status()["connected"] is True  # noqa: SLF001
+    bridge._client = _FakeWS("CLOSING")  # type: ignore[assignment]  # noqa: SLF001
+    assert bridge.connected is False
+    bridge._client = _FakeWS("CLOSED")  # type: ignore[assignment]  # noqa: SLF001
+    assert bridge.connected is False
+    assert bridge._status()["connected"] is False  # noqa: SLF001
+    # No introspectable state → trust the reference (don't regress to false).
+    bridge._client = _FakeWS(None)  # type: ignore[assignment]  # noqa: SLF001
+    assert bridge.connected is True
+
+
 def test_tool_schemas_are_well_formed() -> None:
     """Every Tool has a non-empty description and a valid object inputSchema."""
     for tool in TOOLS:

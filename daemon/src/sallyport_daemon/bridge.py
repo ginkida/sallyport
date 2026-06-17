@@ -64,7 +64,19 @@ class Bridge:
 
     @property
     def connected(self) -> bool:
-        return self._client is not None
+        # Reflect the WS's real protocol state, not just the Python reference.
+        # A half-open / closing socket lingers as a non-None _client until the
+        # read loop's finally clears it (and a dead TCP peer isn't noticed until
+        # the next ping_timeout). Reading `.state` keeps `status` from lying
+        # `connected: true` while the connection is already CLOSING/CLOSED.
+        # Compared by name to stay robust across websockets' enum location.
+        ws = self._client
+        if ws is None:
+            return False
+        state = getattr(ws, "state", None)
+        if state is None:
+            return True  # can't introspect — trust the reference
+        return getattr(state, "name", None) == "OPEN"
 
     # 16 MiB: enough for a full-page PNG screenshot at common viewport sizes,
     # plus headroom. Larger frames are rejected by `websockets` automatically

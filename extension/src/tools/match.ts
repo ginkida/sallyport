@@ -55,6 +55,21 @@ export function parsePredicate(args: Record<string, unknown>, tool: string): Pre
   return pred;
 }
 
+const DEFAULT_LIMIT = 10;
+const MAX_LIMIT = 50;
+
+/** Parse + validate find's result `limit` (capped at MAX_LIMIT). Pure, so the
+ * documented ≤50 cap and the rejections are unit-testable — lives next to
+ * parsePredicate so all of find's arg parsing stays chrome-free and covered. */
+export function parseLimit(raw: unknown): number {
+  if (raw === undefined) return DEFAULT_LIMIT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new BridgeError('bad_args', 'find: limit must be a positive integer');
+  }
+  return Math.min(n, MAX_LIMIT);
+}
+
 function scoreOne(
   el: CompactElement,
   pred: Predicate,

@@ -6,6 +6,61 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-06-17
+
+Robustness + correctness pass, driven by real-session feedback on 0.8.0:
+daemon process/connection handling, the `fill` footgun, and hardening of the
+new SPA tools.
+
+### Added
+
+- **`snapshot` (compact) and `find` surface an input's `type`.** A field whose
+  accessibility role reads `textbox` but is actually `<input type=password>` is
+  now visible (`type: "password"`) before you act on it, so a mislabelled ref
+  is no longer a surprise at fill time. DOM-sourced snapshots only (the a11y
+  path can't read it cheaply); the field value itself is still never exposed.
+
+### Fixed
+
+- **The daemon no longer proliferates when the port is held.** A startup
+  single-instance guard probes the bind before serving: it reclaims the port
+  from an *orphaned* sallyport daemon (parent died — a dead session's leftover,
+  SIGTERM + re-probe) or refuses to start with a clear message naming the
+  holder, instead of spawning a second daemon that fails to bind deep in an
+  async task and lingers as a zombie fighting for the port. A live-session
+  daemon or a non-sallyport process is never auto-killed.
+- **`status` reflects real WebSocket liveness.** `connected` now reads the
+  socket's protocol state (`OPEN`) instead of a merely-non-null reference, so a
+  half-open / closing connection reports `connected: false` rather than lying
+  `true` just before a tool call fails with `extension is not connected`.
+- **`fill` (method=value) no longer silently no-ops on React-controlled
+  inputs.** After setting `.value` it reads the value back; if a framework
+  reverted it, it auto-falls-back to the keyboard-level `insertText` path (the
+  result then carries `mode: "insertText"`, `fallbackFrom: "value"`) instead of
+  returning `ok: true` on an empty field. The password gate still runs first,
+  so the fallback can't slip text into a password field.
+- **`settle` no longer reports `settled: true` when the quiescence probe never
+  yields a reading.** A value-less probe response (page-side eval threw, so
+  `Runtime.evaluate` returned no value) was substituted with a fixed
+  `{n:-1,len:-1}` sentinel, so two consecutive failures compared equal and
+  falsely satisfied the stability window. A reading-less tick now conservatively
+  restarts the window, so `settle` can only succeed on two genuine equal
+  readings and otherwise falls through to `settled: false` at the cap. The
+  per-tick decision is extracted as the pure `advanceSettle` and unit-tested
+  (this also indirectly hardens `reveal`, whose inter-step adaptive settle reuses
+  it).
+
+### Changed
+
+- **MCP schema descriptions tightened to match handler output:** `reveal`'s
+  `source` is marked optional (returned only on the found path), `settle`
+  documents the `stableMs` cap (≤10 000), and `find` documents the optional
+  `truncated` flag (set when the underlying snapshot was capped).
+- **`reveal`/`find` arg parsing and `reveal`'s stall heuristic extracted into
+  pure, unit-tested helpers** (`parseMaxSteps`/`scrollStalled` in `poll.ts`,
+  `parseLimit` in `match.ts`) — no behaviour change, closing the test gap on the
+  documented `limit ≤50` / `maxSteps ≤40` caps and the scroll-end detection.
+
 ## [0.8.0] — 2026-06-17
 
 SPA-robustness release: three generic, site-agnostic tools that make heavy
@@ -868,7 +923,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/ginkida/sallyport/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/ginkida/sallyport/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ginkida/sallyport/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ginkida/sallyport/compare/v0.5.1...v0.6.0
