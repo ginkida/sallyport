@@ -28,9 +28,11 @@ export type StorageBackend = {
 export type Deps = {
   storage: StorageBackend;
   /** Persist transient WS-related state via the same shape as chrome.alarms.
-   * Tests pass no-op implementations; production wires real chrome.alarms. */
+   * Tests pass no-op implementations; production wires real chrome.alarms.
+   * `periodInMinutes` drives the recurring keep-alive wake-up; `delayInMinutes`
+   * the one-shot reconnect backoff. */
   alarms: {
-    create(name: string, options: { delayInMinutes: number }): void;
+    create(name: string, options: { delayInMinutes?: number; periodInMinutes?: number }): void;
     clear(name: string): void;
   };
   /** Called whenever the connection state changes. Production pushes via
@@ -42,17 +44,33 @@ export type Deps = {
   extensionVersion: string;
   /** WebSocket factory — production uses the global; tests inject a fake. */
   WebSocket: typeof WebSocket;
-  /** Backoff overrides for tests (defaults: 1s base, 30s max). */
+  /** Backoff overrides for tests (defaults: 1s base, 5s max). */
   reconnectBaseMs?: number;
   reconnectMaxMs?: number;
+  /** Keep-alive ping cadence override for tests (default 20s). */
+  keepaliveIntervalMs?: number;
 };
 
 const ALARM_RECONNECT = 'sallyport_reconnect';
+// Recurring wake-up that keeps the MV3 service worker (and therefore the WS)
+// alive while we are — or should be — connected, and resurrects it if Chrome
+// suspended it anyway. See ALARM_KEEPALIVE handling in onKeepaliveAlarm().
+const ALARM_KEEPALIVE = 'sallyport_keepalive';
 // Exponential backoff: 1s, 2s, 4s, ..., capped at MAX. Resets on a clean
-// connection. Keeps us from hammering a daemon that is briefly down or
-// gone for the day.
+// connection. The daemon is on loopback (127.0.0.1) and its most common
+// outage is a sub-second Claude-Code restart window, so the cap is kept
+// short — a 30s cap left the popup looking dead long after the daemon was
+// back. Backoff still grows enough to not hammer a daemon that is gone.
 const RECONNECT_BASE_MS = 1000;
-const RECONNECT_MAX_MS = 30000;
+const RECONNECT_MAX_MS = 5000;
+// Application-level ping cadence. MV3 terminates an idle service worker after
+// ~30s; sending (and receiving the daemon's pong) over the WS resets that
+// timer (Chrome 116+), so a 20s ping keeps both the worker and the socket
+// alive between tool calls. The daemon answers `ping` with `pong`.
+const KEEPALIVE_INTERVAL_MS = 20000;
+// chrome.alarms' production floor is 30s; 0.5 min is the tightest recurring
+// wake-up Chrome will honour.
+const KEEPALIVE_ALARM_PERIOD_MIN = 0.5;
 
 const DEFAULT_SERVER_URL = 'ws://127.0.0.1:10086/ws';
 
@@ -64,6 +82,8 @@ export class BridgeConnection {
   private shouldReconnect = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
+  /** Periodic ping while connected — keeps the MV3 worker + socket alive. */
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
   private lastError: string | null = null;
   /** Session-local mirror of settings.paused. Set synchronously (before any
    * await) in pause()/resume() so an in-flight connect() observes a pause
@@ -110,6 +130,7 @@ export class BridgeConnection {
     }
     if (this.paused) return; // pause() raced us; it sets state/lastError itself
     this.shouldReconnect = true;
+    this.ensureKeepaliveAlarm();
     await this.connect(settings.serverUrl || DEFAULT_SERVER_URL, secret, epoch);
   }
 
@@ -207,12 +228,15 @@ export class BridgeConnection {
     }
     this.state = 'disconnected';
     this.shouldReconnect = true;
+    this.ensureKeepaliveAlarm();
     await this.connect(settings.serverUrl || DEFAULT_SERVER_URL, secret, epoch);
   }
 
   async disconnect(): Promise<void> {
     this.epoch++; // invalidate any start()/connect() parked on an await
     this.shouldReconnect = false;
+    this.stopKeepalive();
+    this.clearKeepaliveAlarm();
     this.clearReconnectTimer();
     this.reconnectAttempt = 0;
     if (this.ws) {
@@ -226,9 +250,26 @@ export class BridgeConnection {
     this.state = 'disconnected';
   }
 
-  /** Called by the host when a chrome.alarms wake-up fires. */
+  /** Called by the host when the reconnect-backoff alarm fires. */
   async onAlarm(): Promise<void> {
     await this.reconnectNow();
+  }
+
+  /**
+   * Called by the host when the recurring keep-alive alarm fires. Two jobs:
+   *  - if we're connected, send a ping so the worker's idle timer resets even
+   *    in the gap between tool calls (and a dead socket surfaces);
+   *  - if we should be connected but aren't (the worker was suspended, the
+   *    socket died, and no backoff timer survived the suspension), kick a
+   *    reconnect. `_scheduledRetry` is a no-op while paused / already
+   *    connecting, so a cold-start `start()` and this handler don't double up.
+   */
+  async onKeepaliveAlarm(): Promise<void> {
+    if (this.state === 'connected') {
+      await this.sendSigned('ping', {});
+      return;
+    }
+    if (this.shouldReconnect) await this._scheduledRetry();
   }
 
   private async connect(url: string, secretB64: string, epoch: number): Promise<void> {
@@ -291,6 +332,7 @@ export class BridgeConnection {
         this.lastError = null;
         this.reconnectAttempt = 0;
         this.clearReconnectTimer();
+        this.startKeepalive(ws);
         this.pushStatus();
       } catch (e) {
         this.lastError = (e as Error).message;
@@ -333,6 +375,7 @@ export class BridgeConnection {
       if (this.ws === ws) {
         this.ws = null;
         this.state = 'disconnected';
+        this.stopKeepalive();
         this.pushStatus();
         if (this.shouldReconnect) this.scheduleReconnect();
       }
@@ -359,6 +402,39 @@ export class BridgeConnection {
     this.deps.alarms.clear(ALARM_RECONNECT);
   }
 
+  /** Begin pinging `ws` on a fixed cadence while it remains the live socket.
+   * The interval lives only as long as the worker does; the keep-alive alarm
+   * is the backstop that survives a worker suspension. */
+  private startKeepalive(ws: WebSocket): void {
+    this.stopKeepalive();
+    const interval = this.deps.keepaliveIntervalMs ?? KEEPALIVE_INTERVAL_MS;
+    this.keepaliveTimer = setInterval(() => {
+      if (this.ws !== ws || this.state !== 'connected') {
+        this.stopKeepalive();
+        return;
+      }
+      void this.sendSigned('ping', {});
+    }, interval);
+    // Under Node (the vitest harness) an unref'd interval doesn't pin the
+    // process open between test runs; a no-op on the browser timer ID.
+    (this.keepaliveTimer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  private stopKeepalive(): void {
+    if (this.keepaliveTimer !== null) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
+  }
+
+  private ensureKeepaliveAlarm(): void {
+    this.deps.alarms.create(ALARM_KEEPALIVE, { periodInMinutes: KEEPALIVE_ALARM_PERIOD_MIN });
+  }
+
+  private clearKeepaliveAlarm(): void {
+    this.deps.alarms.clear(ALARM_KEEPALIVE);
+  }
+
   private scheduleReconnect(): void {
     if (!this.shouldReconnect) return;
     this.clearReconnectTimer();
@@ -377,6 +453,10 @@ export class BridgeConnection {
     switch (env.type) {
       case 'ping':
         await this.sendSigned('pong', {});
+        break;
+      case 'pong':
+        // Reply to our keep-alive ping. Receiving it already reset the
+        // worker's idle timer; nothing else to do.
         break;
       case 'hello_ack':
         // Server confirmed pairing — nothing else to do.
@@ -426,4 +506,11 @@ export class BridgeConnection {
   }
 }
 
-export { ALARM_RECONNECT, RECONNECT_BASE_MS, RECONNECT_MAX_MS, DEFAULT_SERVER_URL };
+export {
+  ALARM_RECONNECT,
+  ALARM_KEEPALIVE,
+  RECONNECT_BASE_MS,
+  RECONNECT_MAX_MS,
+  KEEPALIVE_INTERVAL_MS,
+  DEFAULT_SERVER_URL,
+};

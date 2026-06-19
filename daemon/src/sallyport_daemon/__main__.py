@@ -31,7 +31,15 @@ from pathlib import Path
 
 from .bridge import Bridge, ExtensionNotConnected, ToolError
 from .mcp_server import TOOLS, run_stdio
-from .pidfile import pidfile_path, read_pidfile, remove_pidfile, write_pidfile
+from .pidfile import (
+    pidfile_path,
+    read_pidfile,
+    read_status,
+    remove_pidfile,
+    remove_status,
+    status_path,
+    write_pidfile,
+)
 from .secret import DEFAULT_PATH, check_perms, encode_b64, load_or_create
 
 DEFAULT_HOST = "127.0.0.1"
@@ -287,6 +295,44 @@ def _describe_port_holder(port: int, config_dir: Path) -> list[str]:
     return lines
 
 
+def _describe_extension_connection(config_dir: Path, port: int) -> list[str]:
+    """Human lines on whether the extension is attached to the running daemon
+    right now, read from the status file the daemon keeps. Empty when there is
+    no live daemon to ask (no file, or its writer PID is dead — a stale
+    snapshot from a daemon that already exited). Turns the most opaque failure
+    — "connected: false at tool time" — into an up-front, legible check."""
+    data = read_status(status_path(config_dir, port))
+    if data is None:
+        return []
+    pid = data.get("pid")
+    if not isinstance(pid, int):
+        return []
+    # Trust the snapshot only if its writer is the process actually listening on
+    # the port — mirrors _describe_port_holder's lsof cross-check. Guards against
+    # PID reuse after a crash that skipped remove_status, and against reporting a
+    # connection while the port is in fact free. No lsof (Windows / stripped
+    # container) → fall back to bare liveness so the feature still works there.
+    listeners = _listening_pids(port)
+    if listeners:
+        if pid not in listeners:
+            return []
+    elif not _pid_alive(pid):
+        return []  # stale snapshot — the daemon that wrote it is gone
+    if data.get("connected"):
+        attached = data.get("clientAttachedAt")
+        since = (
+            f" (for {time.time() - attached:.0f}s)" if isinstance(attached, (int, float)) else ""
+        )
+        return [f"extension: connected{since}"]
+    lines = ["extension: NOT connected — open Chrome and check the Sallyport popup"]
+    err = data.get("lastHandshakeError")
+    at = data.get("lastHandshakeErrorAt")
+    if isinstance(err, str) and err:
+        ago = f" ({time.time() - at:.0f}s ago)" if isinstance(at, (int, float)) else ""
+        lines.append(f"last rejected handshake: {err}{ago}")
+    return lines
+
+
 def _run_kill_stale() -> None:
     """SIGTERM orphaned sallyport-daemon processes (``ProcInfo.orphaned``).
 
@@ -484,6 +530,11 @@ def _run_doctor(args: argparse.Namespace, secret: bytes, created: bool, secret_p
         # the pidfile the daemon writes next to the secret. Best-effort.
         for line in _describe_port_holder(args.port, secret_path.parent):
             print(line)
+    # If a daemon is live (its own or another session's), report whether the
+    # extension is attached to it and the last rejected handshake — the piece
+    # that previously needed the worker console + lsof to diagnose.
+    for line in _describe_extension_connection(secret_path.parent, args.port):
+        print(f"  {line}")
     print()
     print("Pairing secret — paste this whole block into the extension popup:")
     print()
@@ -647,13 +698,20 @@ async def amain(args: argparse.Namespace) -> int:
         return await _run_exec(args, bridge, shutdown)
 
     # Long-lived modes leave a diagnostic pidfile next to the secret so
-    # `doctor` can name the port holder (PID + version + start time).
+    # `doctor` can name the port holder (PID + version + start time), plus a
+    # volatile status file so it can also report live extension connectivity.
     pidpath = pidfile_path(secret_path.parent, args.port)
+    statuspath = status_path(secret_path.parent, args.port)
 
     # Single-instance guard BEFORE binding: reclaim the port from a stale orphan
     # or refuse with a clear message, instead of spawning a doomed second daemon
     # that fails to bind deep in an async task and lingers as a zombie.
     ensure_port_available(args.host, args.port, secret_path.parent)
+
+    # Only now that the port is safely ours: enable the status file. Writing it
+    # before the guard would let a daemon about to be REFUSED clobber the live
+    # holder's snapshot (same ordering rule as write_pidfile below).
+    bridge.set_status_path(statuspath)
 
     if args.command == "serve":
         # WS-only mode: just hold the socket open for the extension. Exits
@@ -667,6 +725,7 @@ async def amain(args: argparse.Namespace) -> int:
             await bridge.serve_forever(shutdown=shutdown)
         finally:
             remove_pidfile(pidpath)
+            remove_status(statuspath)
         return 0
 
     write_pidfile(pidpath, args.port)
@@ -699,6 +758,7 @@ async def amain(args: argparse.Namespace) -> int:
                 await asyncio.gather(*drain, return_exceptions=True)
     finally:
         remove_pidfile(pidpath)
+        remove_status(statuspath)
 
     # Re-raise the first real exception (other than expected cancellation).
     for t in done:

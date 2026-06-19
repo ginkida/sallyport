@@ -25,6 +25,7 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 
 from sallyport_daemon.bridge import Bridge, ExtensionNotConnected, ToolError
+from sallyport_daemon.pidfile import read_status
 from sallyport_daemon.protocol import Envelope, Signer
 
 pytestmark = pytest.mark.asyncio
@@ -677,6 +678,121 @@ async def test_unserialisable_tool_args_fail_fast(harness: BridgeHarness) -> Non
         assert await call_task == {"tabs": []}
     finally:
         await ext.close()
+
+
+async def test_ping_gets_pong(harness: BridgeHarness) -> None:
+    """The extension keeps its MV3 worker alive by pinging on a cadence; the
+    daemon must answer so the extension gets inbound traffic and can tell a
+    live daemon from a dead one."""
+    ext = await FakeExtension.connect(harness.url)
+    try:
+        await ext.handshake()
+        await ext.send("ping", {})
+        pong = await ext.recv()
+        assert pong.type == "pong"
+        # The connection is still usable for real work afterwards.
+        call_task = asyncio.create_task(harness.bridge.call_tool("list_tabs", {}))
+        req = await ext.recv()
+        await ext.send("tool_result", {"ok": True, "data": {"tabs": []}}, id=req.id)
+        assert await call_task == {"tabs": []}
+    finally:
+        await ext.close()
+
+
+async def _await_status(spath: Any, predicate: Any) -> dict[str, Any]:
+    """Poll the volatile status file until ``predicate`` holds (it is written
+    asynchronously from the connection lifecycle)."""
+    data: dict[str, Any] | None = None
+    for _ in range(100):
+        data = read_status(spath)
+        if data is not None and predicate(data):
+            return data
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"status file never satisfied predicate; last={data}")
+
+
+async def test_status_file_tracks_connection(harness: BridgeHarness, tmp_path: Any) -> None:
+    spath = tmp_path / "daemon.status.json"
+    harness.bridge.set_status_path(spath)
+    # Initial snapshot exists and reports no client.
+    initial = read_status(spath)
+    assert initial is not None
+    assert initial["connected"] is False
+
+    ext = await FakeExtension.connect(harness.url)
+    try:
+        await ext.handshake()
+        attached = await _await_status(spath, lambda d: d["connected"] is True)
+        assert isinstance(attached["clientAttachedAt"], (int, float))
+        assert attached["clientsTotal"] >= 1
+    finally:
+        await ext.close()
+
+    detached = await _await_status(spath, lambda d: d["connected"] is False)
+    assert detached["clientAttachedAt"] is None
+
+
+async def test_status_file_records_rejected_handshake(
+    harness: BridgeHarness, tmp_path: Any
+) -> None:
+    spath = tmp_path / "daemon.status.json"
+    harness.bridge.set_status_path(spath)
+    ext = await FakeExtension.connect(harness.url)
+    try:
+        # Correctly signed, but the first frame is not a hello → rejected.
+        await ext.send("tool_call", {"name": "list_tabs", "args": {}}, id="x")
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(ext.ws.wait_closed(), timeout=2.0)
+    finally:
+        await ext.close()
+
+    data = await _await_status(spath, lambda d: bool(d.get("lastHandshakeError")))
+    assert "authentication failed" in data["lastHandshakeError"]
+    assert isinstance(data["lastHandshakeErrorAt"], (int, float))
+
+
+async def test_status_file_records_origin_rejection(harness: BridgeHarness, tmp_path: Any) -> None:
+    from websockets.typing import Origin
+
+    spath = tmp_path / "daemon.status.json"
+    harness.bridge.set_status_path(spath)
+    ws = await websockets.connect(harness.url, origin=Origin("https://evil.example"))
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(ws.recv(), timeout=2.0)
+    data = await _await_status(spath, lambda d: bool(d.get("lastHandshakeError")))
+    assert "rejected browser-page origin" in data["lastHandshakeError"]
+    assert "evil.example" in data["lastHandshakeError"]
+
+
+async def test_status_file_truncates_attacker_origin(harness: BridgeHarness, tmp_path: Any) -> None:
+    """The origin path interpolates an attacker-controlled header; the recorded
+    reason must be capped (defence against an unbounded write)."""
+    from websockets.typing import Origin
+
+    spath = tmp_path / "daemon.status.json"
+    harness.bridge.set_status_path(spath)
+    long_origin = "https://" + "a" * 500 + ".example"
+    ws = await websockets.connect(harness.url, origin=Origin(long_origin))
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(ws.recv(), timeout=2.0)
+    data = await _await_status(spath, lambda d: bool(d.get("lastHandshakeError")))
+    assert len(data["lastHandshakeError"]) == 200
+
+
+async def test_status_file_records_no_hello_timeout(tmp_path: Any) -> None:
+    h = BridgeHarness(hello_timeout=0.2)
+    await h.start()
+    spath = tmp_path / "daemon.status.json"
+    h.bridge.set_status_path(spath)
+    try:
+        ws = await websockets.connect(h.url)
+        # Never send hello — the daemon hangs up and records why.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(ws.recv(), timeout=2.0)
+        data = await _await_status(spath, lambda d: bool(d.get("lastHandshakeError")))
+        assert "no signed hello" in data["lastHandshakeError"]
+    finally:
+        await h.stop()
 
 
 async def test_tool_result_without_id_is_silently_dropped(

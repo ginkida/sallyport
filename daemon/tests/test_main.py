@@ -687,6 +687,136 @@ def test_describe_port_holder_empty_without_lsof(monkeypatch: pytest.MonkeyPatch
     assert m._describe_port_holder(10086, Path("/nonexistent")) == []
 
 
+def test_describe_extension_connection_connected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import time as _time
+
+    import sallyport_daemon.__main__ as m
+    from sallyport_daemon.pidfile import status_path
+
+    status_path(tmp_path, 10086).write_text(
+        json.dumps(
+            {
+                "pid": 100,
+                "connected": True,
+                "clientAttachedAt": _time.time() - 30,
+                "clientsTotal": 1,
+            }
+        )
+    )
+    # The recorded PID is the process actually listening on the port.
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [100])
+    text = "\n".join(m._describe_extension_connection(tmp_path, 10086))
+    assert "extension: connected" in text
+    assert "for " in text
+
+
+def test_describe_extension_connection_not_connected_names_last_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import time as _time
+
+    import sallyport_daemon.__main__ as m
+    from sallyport_daemon.pidfile import status_path
+
+    status_path(tmp_path, 10086).write_text(
+        json.dumps(
+            {
+                "pid": 100,
+                "connected": False,
+                "clientAttachedAt": None,
+                "lastHandshakeError": "authentication failed: bad mac",
+                "lastHandshakeErrorAt": _time.time() - 4,
+            }
+        )
+    )
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [100])
+    text = "\n".join(m._describe_extension_connection(tmp_path, 10086))
+    assert "NOT connected" in text
+    assert "last rejected handshake: authentication failed: bad mac" in text
+
+
+def test_describe_extension_connection_pid_not_listening_is_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """PID reuse after a crash that skipped remove_status: the file's PID is
+    alive but is NOT the process holding the port — must be treated as stale,
+    mirroring _describe_port_holder's lsof cross-check."""
+    import sallyport_daemon.__main__ as m
+    from sallyport_daemon.pidfile import status_path
+
+    status_path(tmp_path, 10086).write_text(json.dumps({"pid": 100, "connected": True}))
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [55555])  # someone else holds it
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: True)
+    assert m._describe_extension_connection(tmp_path, 10086) == []
+
+
+def test_describe_extension_connection_stale_pid_is_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No lsof (empty listeners) + a dead recorded PID: the daemon that wrote
+    it is gone, so `doctor` must report nothing rather than a dead connection."""
+    import sallyport_daemon.__main__ as m
+    from sallyport_daemon.pidfile import status_path
+
+    status_path(tmp_path, 10086).write_text(json.dumps({"pid": 999999, "connected": True}))
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [])
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: False)
+    assert m._describe_extension_connection(tmp_path, 10086) == []
+
+
+def test_describe_extension_connection_missing_is_empty(tmp_path: Path) -> None:
+    import sallyport_daemon.__main__ as m
+
+    assert m._describe_extension_connection(tmp_path, 10086) == []
+
+
+async def test_doctor_reports_live_extension_connection(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """When a status file from a live daemon exists, `doctor` surfaces the
+    extension connection state alongside its other checks."""
+    import sallyport_daemon.__main__ as m
+    from sallyport_daemon.pidfile import status_path
+
+    port = _free_port()
+    status_path(tmp_path, port).write_text(
+        json.dumps({"pid": 100, "connected": False, "lastHandshakeError": "no signed hello"})
+    )
+    # Simulate the daemon (PID 100) holding the port so the cross-check passes.
+    monkeypatch.setattr(m, "_listening_pids", lambda p: [100])
+    ns = parse_args(["--secret-file", str(tmp_path / "s"), "--port", str(port), "doctor"])
+    await amain(ns)
+    out = capsys.readouterr().out
+    assert "extension: NOT connected" in out
+    assert "last rejected handshake: no signed hello" in out
+
+
+async def test_refused_start_does_not_clobber_foreign_status_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A second daemon that is refused at the single-instance guard must NOT
+    overwrite the live holder's status file — its set_status_path now runs only
+    after the guard succeeds (regression for the pre-guard clobber)."""
+    import sallyport_daemon.__main__ as m
+    from sallyport_daemon.pidfile import status_path
+
+    port = _free_port()
+    live = status_path(tmp_path, port)
+    original = json.dumps({"pid": 4242, "connected": True, "clientsTotal": 1})
+    live.write_text(original)
+
+    def _refuse(host: str, p: int, cfg: Path) -> None:
+        raise SystemExit(2)
+
+    monkeypatch.setattr(m, "ensure_port_available", _refuse)
+    ns = parse_args(["--secret-file", str(tmp_path / "s"), "--port", str(port), "serve"])
+    with pytest.raises(SystemExit):
+        await amain(ns)
+    assert live.read_text() == original  # untouched by the refused daemon
+
+
 def test_kill_stale_terminates_only_orphans(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

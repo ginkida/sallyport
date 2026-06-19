@@ -26,10 +26,12 @@ export type HelloBody = {
 export type EnvelopeIn =
   | { type: 'hello_ack'; body: Record<string, never> }
   | { type: 'ping'; body: Record<string, never> }
+  | { type: 'pong'; body: Record<string, never> }
   | { type: 'tool_call'; id: string; body: ToolCallBody };
 
 export type EnvelopeOut =
   | { type: 'hello'; body: HelloBody }
+  | { type: 'ping'; body: Record<string, never> }
   | { type: 'pong'; body: Record<string, never> }
   | { type: 'tool_result'; id: string; body: ToolResultBody };
 

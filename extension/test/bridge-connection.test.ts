@@ -18,7 +18,13 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { createHmac } from 'node:crypto';
-import { BridgeConnection, type Deps, type StatusSnapshot } from '../src/bridge-connection.js';
+import {
+  ALARM_KEEPALIVE,
+  BridgeConnection,
+  RECONNECT_MAX_MS,
+  type Deps,
+  type StatusSnapshot,
+} from '../src/bridge-connection.js';
 import { Signer } from '../src/crypto.js';
 import { canonicalJson } from '../src/protocol.js';
 
@@ -354,8 +360,10 @@ describe('BridgeConnection — reconnect & backoff', () => {
     const ws1 = FakeWebSocket.instances[0];
 
     ws1.simulateClose();
-    // Alarm safety-net was registered.
-    expect(alarmCalls.create).toEqual(['sallyport_reconnect']);
+    // start() registered the recurring keep-alive alarm; close() added the
+    // one-shot reconnect-backoff alarm safety-net.
+    expect(alarmCalls.create).toContain('sallyport_keepalive');
+    expect(alarmCalls.create).toContain('sallyport_reconnect');
     // setTimeout(reconnectNow, ~10ms) will fire and create a fresh WS.
     await until(() => FakeWebSocket.instances.length === 2);
   });
@@ -387,6 +395,143 @@ describe('BridgeConnection — reconnect & backoff', () => {
     const start = Date.now();
     await until(() => FakeWebSocket.instances.length === lenBefore + 1);
     expect(Date.now() - start).toBeLessThan(100); // well below base*2^3
+  });
+
+  it('caps the reconnect-backoff constant short for the loopback daemon', () => {
+    // Guard against re-raising the cap (30s left the popup looking dead long
+    // after a sub-second daemon restart).
+    expect(RECONNECT_MAX_MS).toBeLessThanOrEqual(5000);
+  });
+
+  it('clamps backoff growth at the cap once the exponential overshoots it', async () => {
+    // base=10, max=30: the uncapped delay at attempt≥6 is ≥640ms. Proving the
+    // next retry fires well under that exercises Math.min(max, base*2**n) — the
+    // actual clamp — not just the constant. Without the clamp this would hang
+    // past the assertion (640ms) and fail.
+    const { deps } = makeDeps({ reconnectBaseMs: 10, reconnectMaxMs: 30 });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    for (let i = 0; i < 6; i++) {
+      const wsi = FakeWebSocket.instances.at(-1)!;
+      wsi.simulateClose();
+      await until(() => FakeWebSocket.instances.length === i + 2);
+    }
+    const before = FakeWebSocket.instances.length;
+    const start = Date.now();
+    FakeWebSocket.instances.at(-1)!.simulateClose();
+    await until(() => FakeWebSocket.instances.length === before + 1);
+    expect(Date.now() - start).toBeLessThan(300); // clamped to ~30ms, not 640ms
+  });
+});
+
+describe('BridgeConnection — keep-alive', () => {
+  it('registers the keep-alive alarm on start and clears it on disconnect', async () => {
+    const { deps, alarmCalls } = makeDeps();
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    expect(alarmCalls.create).toContain(ALARM_KEEPALIVE);
+    await bridge.disconnect();
+    expect(alarmCalls.clear).toContain(ALARM_KEEPALIVE);
+  });
+
+  it('pings on a fixed cadence while connected', async () => {
+    const { deps } = makeDeps({ keepaliveIntervalMs: 20 });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.simulateOpen();
+    await until(() => ws.sent.length === 1); // hello
+    ws.sent = [];
+    await until(() => ws.sent.length >= 1);
+    expect(JSON.parse(ws.sent[0]).type).toBe('ping');
+  });
+
+  it('stops pinging once the socket closes', async () => {
+    const { deps } = makeDeps({
+      keepaliveIntervalMs: 20,
+      reconnectBaseMs: 100000,
+      reconnectMaxMs: 100000,
+    });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.simulateOpen();
+    await until(() => ws.sent.length === 1);
+    ws.simulateClose();
+    ws.sent = [];
+    await new Promise<void>((r) => setTimeout(r, 80)); // several ping intervals
+    expect(ws.sent).toHaveLength(0);
+  });
+
+  it('accepts an inbound pong with no reply, state preserved', async () => {
+    const { deps } = makeDeps({ keepaliveIntervalMs: 100000 }); // suppress auto-ping
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.simulateOpen();
+    await until(() => ws.sent.length === 1);
+    ws.sent = [];
+    ws.simulateMessage(JSON.stringify(signEnvelope('pong', {})));
+    await flush();
+    expect(ws.sent).toHaveLength(0);
+    expect(bridge.status().state).toBe('connected');
+  });
+
+  it('onKeepaliveAlarm pings when connected', async () => {
+    const { deps } = makeDeps({ keepaliveIntervalMs: 100000 });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.simulateOpen();
+    await until(() => ws.sent.length === 1);
+    ws.sent = [];
+    await bridge.onKeepaliveAlarm();
+    await until(() => ws.sent.length === 1);
+    expect(JSON.parse(ws.sent[0]).type).toBe('ping');
+  });
+
+  it('onKeepaliveAlarm resurrects a connection whose backoff timer was lost', async () => {
+    // Models a worker suspended while connected: the socket died but the
+    // setTimeout backoff is far out (here: never within the test). The
+    // recurring keep-alive alarm is the backstop that reconnects.
+    const { deps } = makeDeps({ reconnectBaseMs: 100000, reconnectMaxMs: 100000 });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    FakeWebSocket.instances[0].simulateOpen();
+    await until(() => bridge.status().state === 'connected');
+    FakeWebSocket.instances[0].simulateClose();
+    const before = FakeWebSocket.instances.length;
+    await bridge.onKeepaliveAlarm();
+    expect(FakeWebSocket.instances.length).toBe(before + 1);
+  });
+
+  it('onKeepaliveAlarm short-circuits on a paused cold start (never started)', async () => {
+    // start() bailed before setting shouldReconnect, so the alarm returns at
+    // the shouldReconnect check without entering the retry path.
+    const { deps } = makeDeps({ storage: makeStorage({ secret: SECRET_B64, paused: true }) });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const before = FakeWebSocket.instances.length;
+    await bridge.onKeepaliveAlarm();
+    expect(FakeWebSocket.instances.length).toBe(before);
+  });
+
+  it('onKeepaliveAlarm honours a pause that landed after a drop (in-flight guard)', async () => {
+    // Drives the paused guard *inside* _attemptReconnect: shouldReconnect is
+    // true (we were connected), the socket dropped, then storage flips to
+    // paused. The alarm-driven retry must not open a rival socket.
+    const storage = makeStorage({ secret: SECRET_B64 });
+    const { deps } = makeDeps({ storage, reconnectBaseMs: 100000, reconnectMaxMs: 100000 });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    FakeWebSocket.instances[0].simulateOpen();
+    await until(() => bridge.status().state === 'connected');
+
+    FakeWebSocket.instances[0].simulateClose(); // shouldReconnect stays true
+    await storage.setSettings({ paused: true });
+    const before = FakeWebSocket.instances.length;
+    await bridge.onKeepaliveAlarm();
+    expect(FakeWebSocket.instances.length).toBe(before);
   });
 });
 
@@ -618,7 +763,7 @@ describe('BridgeConnection — pair / unpair / pause / resume', () => {
 
   it('pause stops the connection, resume restarts', async () => {
     const storage = makeStorage({ secret: SECRET_B64 });
-    const { deps } = makeDeps({ storage });
+    const { deps, alarmCalls } = makeDeps({ storage });
     const bridge = new BridgeConnection(deps);
     await bridge.start();
     FakeWebSocket.instances[0].simulateOpen();
@@ -627,11 +772,17 @@ describe('BridgeConnection — pair / unpair / pause / resume', () => {
     expect((await storage.getSettings()).paused).toBe(true);
     expect(bridge.status().state).toBe('disconnected');
     expect(bridge.status().lastError).toBe('paused');
+    // pause() routes through disconnect() and must stop the recurring keep-alive
+    // alarm — otherwise the worker keeps waking while the user expects it idle.
+    expect(alarmCalls.clear).toContain(ALARM_KEEPALIVE);
 
+    alarmCalls.create.length = 0; // ignore the start()-time registration
     await bridge.resume();
     expect((await storage.getSettings()).paused).toBe(false);
     // resume calls start() which calls connect(); state goes to 'connecting'.
     expect(bridge.status().state).toBe('connecting');
+    // resume() must re-register the keep-alive alarm via start().
+    expect(alarmCalls.create).toContain(ALARM_KEEPALIVE);
   });
 });
 

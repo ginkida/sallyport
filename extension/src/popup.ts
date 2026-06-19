@@ -12,6 +12,7 @@ import {
 import { matchAllowlist, normalizePattern, validatePattern } from './allowlist.js';
 import { extractSecret } from './pairing.js';
 import { extractHostname, formatRelativeTime, matchesAuditFilter } from './format.js';
+import { nextReconnectKick } from './reconnect-kick.js';
 
 type Status = {
   state: 'disconnected' | 'connecting' | 'connected' | 'no_secret';
@@ -208,6 +209,12 @@ async function renderCurrentTab(connected: boolean): Promise<void> {
 // allowlist/audit writes.
 let liveConnected = false;
 
+// Whether we've already kicked an immediate reconnect for the current
+// disconnected episode. Reset once we see a live connection, so a drop while
+// the popup stays open re-kicks once but a daemon that's simply down isn't
+// hammered every poll (the backoff handles the retries between kicks).
+let kickedReconnect = false;
+
 async function refreshStatus(): Promise<void> {
   const [resp, settings] = await Promise.all([
     send<{ ok: boolean; status: Status }>({ type: 'GET_STATUS' }),
@@ -217,6 +224,15 @@ async function refreshStatus(): Promise<void> {
   if (!status) return;
 
   liveConnected = status.state === 'connected' && !settings.paused;
+
+  // Opening the popup shouldn't sit through the reconnect backoff when the
+  // daemon is reachable again — fire an immediate attempt. RECONNECT is a
+  // no-op while paused / unpaired / already connected, so this is safe. The
+  // once-per-episode latch (nextReconnectKick) keeps the 2s poll from hammering
+  // a daemon that is simply down.
+  const kick = nextReconnectKick(status.state, settings.paused, kickedReconnect);
+  kickedReconnect = kick.kicked;
+  if (kick.kick) void send({ type: 'RECONNECT' });
 
   setView(status.state);
   renderBadge(status.state, settings.paused);
@@ -603,3 +619,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 void refreshStatus();
+
+// The service worker pushes a STATUS message on every state change, but if
+// Chrome suspended it there are no pushes — poll while the popup is open so a
+// stale "connected" can never linger on screen and the reconnect kick above
+// keeps the connection honest. Cheap: the popup is short-lived and the call
+// is a single message round-trip.
+setInterval(() => void refreshStatus(), 2000);

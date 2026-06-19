@@ -11,6 +11,7 @@ import asyncio
 import logging
 import secrets as _secrets
 import time
+from pathlib import Path
 from typing import Any
 
 import websockets
@@ -46,6 +47,7 @@ class Bridge:
         port: int,
         request_timeout: float = 60.0,
         hello_timeout: float = 10.0,
+        status_path: Path | None = None,
     ) -> None:
         self._signer = Signer(secret)
         self._host = host
@@ -61,6 +63,14 @@ class Bridge:
         # tool_calls can race. We make it impossible from this side.
         self._call_lock = asyncio.Lock()
         self._started_monotonic = time.monotonic()
+        # Diagnostic connection snapshot (see pidfile.write_status). None in
+        # short-lived modes (exec / unit tests) — set via set_status_path for
+        # long-lived serve / MCP daemons so `doctor` can report live state.
+        self._status_path = status_path
+        self._client_attached_at: float | None = None
+        self._clients_total = 0
+        self._last_handshake_error: str | None = None
+        self._last_handshake_error_at: float | None = None
 
     @property
     def connected(self) -> bool:
@@ -123,6 +133,7 @@ class Bridge:
         origin = ws.request.headers.get("Origin") if ws.request is not None else None
         if origin is not None and not origin.startswith("chrome-extension://"):
             log.warning("ws: rejecting connection with browser-page origin %r", origin)
+            self._record_handshake_error(f"rejected browser-page origin: {origin}")
             await ws.close(code=1008, reason="forbidden origin")
             return
 
@@ -135,6 +146,7 @@ class Bridge:
             raw = await asyncio.wait_for(ws.recv(), timeout=self._hello_timeout)
         except (asyncio.TimeoutError, websockets.ConnectionClosed):
             log.warning("ws: closing client that sent no hello within %.0fs", self._hello_timeout)
+            self._record_handshake_error(f"no signed hello within {self._hello_timeout:.0f}s")
             await ws.close(code=1008, reason="hello required")
             return
         try:
@@ -148,6 +160,7 @@ class Bridge:
             # canonicaliser stack — same treatment as any malformed frame.
             # Don't echo the reason to a possibly-attacker peer.
             log.warning("ws: rejecting unauthenticated client: %s", exc)
+            self._record_handshake_error(f"authentication failed: {exc}")
             await ws.close(code=1008, reason="authentication failed")
             return
 
@@ -159,6 +172,9 @@ class Bridge:
                 await ws.close(code=1008, reason="another client is already connected")
                 return
             self._client = ws
+            self._client_attached_at = time.time()
+            self._clients_total += 1
+            self._write_status()
 
         log.info("ws: client attached from %s", ws.remote_address)
         try:
@@ -173,6 +189,8 @@ class Bridge:
             async with self._client_lock:
                 if self._client is ws:
                     self._client = None
+                    self._client_attached_at = None
+                    self._write_status()
             # Cancel pending requests so the caller doesn't hang forever.
             for fut in list(self._pending.values()):
                 if not fut.done():
@@ -202,8 +220,15 @@ class Bridge:
                 # re-acks a (harmless) mid-session hello.
                 ack = self._signer.sign(Envelope(type="hello_ack", body={}))
                 await self._send_raw(ws, ack)
+            elif env.type == "ping":
+                # The extension pings on a fixed cadence to keep its MV3
+                # service worker (and this socket) alive between tool calls.
+                # Answer so it gets inbound traffic too and can tell a live
+                # daemon from a dead one.
+                pong = self._signer.sign(Envelope(type="pong", body={}))
+                await self._send_raw(ws, pong)
             elif env.type == "pong":
-                pass  # keepalive (we don't currently send pings; reserved)
+                pass  # reply to a daemon-initiated ping (none yet; reserved)
             elif env.type == "tool_result":
                 if env.id is None:
                     continue
@@ -253,6 +278,40 @@ class Bridge:
             "pendingCalls": len(self._pending),
             "uptimeS": round(time.monotonic() - self._started_monotonic, 1),
         }
+
+    def set_status_path(self, path: Path | None) -> None:
+        """Enable the diagnostic status file (long-lived modes only) and write
+        an initial snapshot so `doctor` reports state even before a client."""
+        self._status_path = path
+        self._write_status()
+
+    def _write_status(self) -> None:
+        """Persist a connection snapshot for `doctor`. No-op without a path
+        (exec / tests). Best-effort: a failed write never affects the bridge."""
+        if self._status_path is None:
+            return
+        from .pidfile import write_status
+
+        write_status(
+            self._status_path,
+            {
+                "connected": self.connected,
+                "port": self._port,
+                "clientAttachedAt": self._client_attached_at,
+                "clientsTotal": self._clients_total,
+                "lastHandshakeError": self._last_handshake_error,
+                "lastHandshakeErrorAt": self._last_handshake_error_at,
+            },
+        )
+
+    def _record_handshake_error(self, reason: str) -> None:
+        """Note why a peer failed to attach (wrong secret, no hello, bad
+        origin) so `doctor` can surface it. The reason is daemon-authored or a
+        ProtocolError string — never secret material — but cap it defensively
+        since the origin path echoes an attacker-controlled header."""
+        self._last_handshake_error = reason[:200]
+        self._last_handshake_error_at = time.time()
+        self._write_status()
 
     async def call_tool(self, name: str, args: dict[str, Any]) -> Any:
         # Built-ins answer BEFORE the call lock on purpose: `status` exists

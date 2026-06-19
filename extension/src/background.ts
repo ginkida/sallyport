@@ -1,4 +1,5 @@
 import {
+  ALARM_KEEPALIVE,
   ALARM_RECONNECT,
   BridgeConnection,
   type StatusSnapshot,
@@ -75,6 +76,7 @@ const bridge = new BridgeConnection({
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_RECONNECT) void bridge.onAlarm();
+  else if (alarm.name === ALARM_KEEPALIVE) void bridge.onKeepaliveAlarm();
 });
 
 async function bootBridge(): Promise<void> {

@@ -6,6 +6,49 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-06-19
+
+Connection-reliability pass: the bridge would intermittently go "now it
+works, now it doesn't" because the MV3 service worker slept between tool
+calls (dropping the socket) and then sat out a 30 s reconnect backoff —
+while diagnosing it meant reading `lsof` and the worker console.
+
+### Fixed
+
+- **The service worker no longer sleeps mid-session and silently drops the
+  WS.** While connected the extension now sends an application-level `ping`
+  every 20 s; the daemon answers `pong`. WebSocket traffic resets MV3's ~30 s
+  idle timer (Chrome 116+), so the worker — and the socket — stay alive
+  between tool calls instead of being torn down and rebuilt on the next
+  action. A recurring `chrome.alarms` keep-alive (0.5 min) is the backstop:
+  if Chrome suspended the worker anyway, the alarm wakes it and reconnects,
+  so the connection self-heals without waiting for the user to act. The
+  daemon's existing `ping`/`pong` handlers (previously dead code, "reserved")
+  are now the live keep-alive path.
+- **Reconnect backoff is short for the loopback daemon.** The cap dropped
+  from 30 s to 5 s (`RECONNECT_MAX_MS`): the daemon is on `127.0.0.1` and its
+  common outage is a sub-second Claude-Code restart window, so a 30 s cap left
+  the popup looking dead long after the daemon was back. Opening the popup now
+  also fires an immediate reconnect attempt (once per disconnected episode)
+  instead of sitting through the remaining backoff.
+- **The popup can no longer show a stale "connected".** It polls the live
+  status every 2 s while open, so a worker that was suspended (and therefore
+  pushed no status update) can't leave a misleading green state on screen.
+
+### Added
+
+- **`doctor` reports live extension connectivity and the last rejected
+  handshake.** A long-lived daemon now keeps a volatile
+  `daemon-<port>.status.json` next to its pidfile, rewritten on every
+  connect / disconnect / rejected-handshake. `doctor` reads it (cross-checking
+  the writer PID against the process actually listening on the port, mirroring
+  its pidfile check, so a stale or PID-reused snapshot is ignored) and prints
+  `extension: connected (for Ns)` or `extension: NOT connected` plus
+  `last rejected handshake: …`. This turns the previously console-and-`lsof`-
+  only diagnosis — e.g. an extension paired with the wrong secret — into an
+  up-front line. The file never holds secret material; the handshake reason is
+  daemon-authored or a `ProtocolError` string, capped defensively.
+
 ## [0.9.0] — 2026-06-19
 
 ### Added
@@ -945,7 +988,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/ginkida/sallyport/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ginkida/sallyport/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/ginkida/sallyport/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/ginkida/sallyport/compare/v0.7.0...v0.8.0
