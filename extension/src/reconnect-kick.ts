@@ -16,7 +16,11 @@ export type KickDecision = {
   kicked: boolean;
 };
 
-export function nextReconnectKick(state: KickState, paused: boolean, kicked: boolean): KickDecision {
+export function nextReconnectKick(
+  state: KickState,
+  paused: boolean,
+  kicked: boolean,
+): KickDecision {
   // A live connection clears the latch so a later drop re-kicks once.
   if (state === 'connected') return { kick: false, kicked: false };
   // Kick once when we land in disconnected while paired and not paused.
