@@ -191,6 +191,7 @@ arbitrary JS on that host.
 | `click` | DOM `.click()`. CSS selector or `@eN` ref. Optional `waitFor` polls for the click's effect in the same call. |
 | `mouse_click` | Real `Input.dispatchMouseEvent` as a full hover→press→release sequence. Auto-aims around partial overlays; a fully covered target reports `covered`/`hitTarget`/`hitTargetRef`. Explicit `x`/`y` (viewport CSS px) as manual aim. `button` left/middle/right, `clickCount` 1–3, optional `waitFor`. |
 | `fill` | Blocks password fields without `allowPassword=true`. `method=insertText` clears the field and types via CDP with real input events (for SPA editors that ignore programmatic values). Optional `waitFor`. |
+| `select_option` | Choose an option in a native `<select>` (the OS popup can't be driven via CDP). Sets the value in the DOM and fires `input`/`change` instead of opening the menu. One of `value`/`label`/`index`; array for `<select multiple>`. `wrong_element` for non-`<select>` targets — custom JS comboboxes (react-select, MUI) stay on `click`/`find`/`reveal`. Optional `waitFor`. |
 | `key_type` | Raw text input via CDP. Blocks when focus is on a password field without `allowPassword=true`. |
 | `send_keys` | `Mod+A`, `Shift+Tab`, etc. `Mod` = `Cmd` on macOS, `Ctrl` elsewhere. Same password-field gate as `key_type`. |
 | `screenshot` | PNG/JPEG as a native MCP image block. `maxWidth` downscales, `region={x,y,width,height}` crops (viewport-relative CSS px). Hidden tabs fail fast with `tab_not_visible`; `bringToFront=true` activates the tab first (steals focus). |
@@ -301,6 +302,7 @@ Claude Code, and ask it to do anything web-shaped. Watch the popup's
 | `evaluate_not_allowed` | Edit the allowlist entry and re-add with **allow evaluate()** checked. |
 | `password_field` (from `fill`) | `fill` refuses `<input type=password>` by default. Pass `allowPassword=true` if you really mean it. |
 | `wrong_element` (from `upload`) | Selector resolved to something other than `<input type=file>`. Re-`snapshot` and pick a real file-input ref. |
+| `wrong_element` (from `select_option`) | Target isn't a native `<select>` — it's a custom JS combobox (react-select, MUI, Radix). Those live in the DOM: `click`/`mouse_click` to open, then `click` the option (use `find`/`reveal` to locate it). |
 | `unsafe_path` (from `upload`) | Path contains `..`, isn't absolute, or resolves outside the sandbox (default `~/Downloads/sallyport/`). Stage the file via `save_to_file` first (writes to the sandbox), then upload. Widen the sandbox via `SALLYPORT_DOWNLOAD_DIR` if you really need to upload from elsewhere. |
 | `not_visible` (from `mouse_click`) | Element has zero size — likely `display:none` or detached. Snapshot again; if it's hidden by design, drive the toggle that reveals it. |
 | `mouse_click` reports `covered: true` | Another node sits on top of the target at every probe point. The result includes `hitTarget` (what ate the click) and `hitTargetRef` — an `@eN` for that node; click it directly, or aim manually with `mouse_click x= y=`. |

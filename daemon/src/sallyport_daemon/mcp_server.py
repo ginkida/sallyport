@@ -284,6 +284,61 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="select_option",
+        description=(
+            "Set the value of a NATIVE <select> dropdown (single or multiple) "
+            "WITHOUT opening the OS popup — it sets the selection in the DOM and "
+            "fires input+change. Use this for <select>: the OS dropdown popup is "
+            "drawn by the operating system, not the page, so it cannot be driven "
+            "via clicks/keys (keys are ignored, Escape just closes it); this is "
+            "the reliable path. selector is a CSS selector or @eN ref. Give "
+            "EXACTLY ONE of: value (option value), label (visible option text, "
+            "trimmed), or index (0-based). Pass an array for <select multiple> "
+            "(e.g. value=['a','c']); a single string/int selects one. Errors: "
+            "wrong_element when the target is not a real <select> — custom JS "
+            "comboboxes (react-select, MUI, Radix) live in the DOM, so open them "
+            "with click/mouse_click and pick the option with click (find/reveal "
+            "locate it) instead; not_found lists the available options; bad_args "
+            "for a disabled option/select or an array against a single-select. "
+            "waitFor polls after the change lands. Returns {ok, tag, multiple, "
+            "selected:[{index,value,label}], wait?}."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector or @eN ref of the <select>",
+                },
+                "value": {
+                    "description": "option.value to select; array for <select multiple>",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                },
+                "label": {
+                    "description": "visible option text to select; array for <select multiple>",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                },
+                "index": {
+                    "description": "0-based option index; array for <select multiple>",
+                    "oneOf": [
+                        {"type": "integer", "minimum": 0},
+                        {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                    ],
+                },
+                "tabId": {"type": "integer"},
+                "waitFor": _WAIT_FOR_SCHEMA,
+            },
+            "required": ["selector"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="key_type",
         description=(
             "Insert raw text via CDP Input.insertText (no key events). Refuses "

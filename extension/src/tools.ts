@@ -15,6 +15,7 @@ import { keyType, sendKeys } from './tools/keyboard.js';
 import { mouseClick } from './tools/mouse.js';
 import { reveal } from './tools/reveal.js';
 import { screenshot } from './tools/screenshot.js';
+import { selectOption } from './tools/select.js';
 import { settle } from './tools/settle.js';
 import { snapshot } from './tools/snapshot.js';
 import { closeTab, listTabs, navigate, reload } from './tools/tabs.js';
@@ -34,6 +35,7 @@ const tools: Record<string, Tool> = {
   click,
   mouse_click: mouseClick,
   fill,
+  select_option: selectOption,
   key_type: keyType,
   send_keys: sendKeys,
   screenshot,

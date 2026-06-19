@@ -55,6 +55,7 @@ def test_tools_catalogue_covers_extension() -> None:
         "click",
         "mouse_click",
         "fill",
+        "select_option",
         "key_type",
         "send_keys",
         "screenshot",

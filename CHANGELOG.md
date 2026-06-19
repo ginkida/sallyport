@@ -6,6 +6,28 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-06-19
+
+### Added
+
+- **`select_option` tool — drive native `<select>` dropdowns reliably.** A
+  native `<select>`'s popup is drawn by the OS menu layer, not the page
+  renderer, so CDP `Input.*` events never reach it (keys ignored, `Escape`
+  dismisses) — there was no working way to choose an option. `select_option`
+  does what every mature framework does: it sets the selection in the DOM and
+  fires bubbling `input` + `change`, never opening the popup. Choose by `value`,
+  `label` (visible text), or `index`; pass an array for `<select multiple>`.
+  Single-select uses the native `HTMLSelectElement` value setter (the React-safe
+  path `fill` uses); multi-select sets `option.selected`. Allowlist-gated and
+  needs **no** `allowEvaluate` — the function body is a fixed literal and the
+  choice travels as a structured `callFunctionOn` argument (same trust shape as
+  the aim probes). Errors: `wrong_element` for non-`<select>` targets (custom JS
+  comboboxes like react-select/MUI live in the DOM — keep using
+  `click`/`find`/`reveal` for those, and the message says so), `not_found`
+  (lists the available options), `bad_args` for a disabled option/select or an
+  array against a single-select. The matcher (`planSelection`) and arg parser
+  (`buildSpec`) are pure and unit-tested.
+
 ## [0.8.1] — 2026-06-17
 
 Robustness + correctness pass, driven by real-session feedback on 0.8.0:
@@ -923,7 +945,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ginkida/sallyport/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/ginkida/sallyport/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/ginkida/sallyport/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ginkida/sallyport/compare/v0.6.0...v0.7.0
