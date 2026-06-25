@@ -15,8 +15,8 @@ Claude Code ── MCP/stdio ──▶ daemon ── WS+HMAC ──▶ extension
 
 | Status | Number |
 |---|---|
-| Daemon tests (pytest) | 268 |
-| Extension tests (vitest) | 293 |
+| Daemon tests (pytest) | 340 |
+| Extension tests (vitest) | 529 |
 | Lint / typecheck (ruff, mypy, eslint, prettier, tsc) | all green |
 
 ## What's in the box
@@ -188,19 +188,23 @@ arbitrary JS on that host.
 | `close_tab` | `tabId` required — no implicit fallback (closing the wrong tab loses work). |
 | `snapshot` | Accessibility tree with stable `@eN` refs (per-tab), pruned of layout noise. Cross-checks against a DOM walk (same refs) when the a11y tree looks suspiciously sparse — Telegram Web K and similar SPAs. `mode=auto\|a11y\|dom`; `compact=true` → flat list of actionable elements only; `selector` scopes to one subtree. |
 | `read_text` | Whole-page or by ref. No raw JS. Capped at 20 000 chars by default (`maxChars` overrides; cut results carry `truncated`/`totalChars`). |
+| `get_state` | Cheap one-element probe (CSS or `@eN`) — `{exists, visible, tag, text, box?, inViewport?}` without a full snapshot. Verify an action's effect or re-check a ref in one round-trip. Never errors on a missing node: returns `{exists:false, reason}` (`not_found`/`unknown_ref`/`detached`), so it is safe to poll. Does **not** read input `.value` (no password readback). Structured CDP only. |
+| `console_tail` | Recent page console errors/warnings + uncaught exceptions for a tab (`{enabled, entries:[{ts,level,text,origin}]}`) — tell "the handler threw and the page is wedged" from "merely slow". **Opt-in** (popup setting, off by default; returns `{enabled:false}` when off). Capture starts at first attach (no replay); entries are **origin-filtered to the allowlist**. Pure CDP event capture, no `evaluate`. |
 | `click` | DOM `.click()`. CSS selector or `@eN` ref. Optional `waitFor` polls for the click's effect in the same call. |
 | `mouse_click` | Real `Input.dispatchMouseEvent` as a full hover→press→release sequence. Auto-aims around partial overlays; a fully covered target reports `covered`/`hitTarget`/`hitTargetRef`. Explicit `x`/`y` (viewport CSS px) as manual aim. `button` left/middle/right, `clickCount` 1–3, optional `waitFor`. |
+| `hover` | Hover the pointer over an element/point without clicking (the `mouseMoved` preamble only). For CSS `:hover`-only menus, tooltips, row-action UIs. `selector`/`@eN` (auto-aimed, reports `covered`/`hitTargetRef`) or viewport `x`/`y`; optional `waitFor` to hover→wait-for-menu. Strictly weaker than `mouse_click`; the `:hover` state is transient. |
 | `fill` | Blocks password fields without `allowPassword=true`. `method=insertText` clears the field and types via CDP with real input events (for SPA editors that ignore programmatic values). Optional `waitFor`. |
 | `select_option` | Choose an option in a native `<select>` (the OS popup can't be driven via CDP). Sets the value in the DOM and fires `input`/`change` instead of opening the menu. One of `value`/`label`/`index`; array for `<select multiple>`. `wrong_element` for non-`<select>` targets — custom JS comboboxes (react-select, MUI) stay on `click`/`find`/`reveal`. Optional `waitFor`. |
 | `key_type` | Raw text input via CDP. Blocks when focus is on a password field without `allowPassword=true`. |
 | `send_keys` | `Mod+A`, `Shift+Tab`, etc. `Mod` = `Cmd` on macOS, `Ctrl` elsewhere. Same password-field gate as `key_type`. |
 | `screenshot` | PNG/JPEG as a native MCP image block. `maxWidth` downscales, `region={x,y,width,height}` crops (viewport-relative CSS px). Hidden tabs fail fast with `tab_not_visible`; `bringToFront=true` activates the tab first (steals focus). |
 | `wait_for` | Poll (250 ms) until a selector/`@eN` ref is visible and/or page text contains a substring; `absent=true` waits until it is GONE. `timeoutMs` ≤ 30 s; timeout returns `{found:false}`, not an error. Replaces blind sleeps. Prefer the embedded `waitFor` on the preceding action when there is one. |
+| `scroll` | Deterministic scrolling — the predicate-less companion to `reveal`. `selector` → `scrollIntoView`; or scroll the page (or a `selector` container) by `dx`/`dy` (negatives = up/left) or `to='top'\|'bottom'`. Returns `{x, y, scrollHeight, atBottom}` so a lazy-load loop knows when to stop. Fixed scroll probe, no `evaluate`. |
 | `evaluate` | Per-domain opt-in. Returns `{type, value}`. |
 | `fetch_in_page` | `fetch()` with page cookies/auth. Returns `{status, contentType, headers, mode, data}`. Allowlist-gated. |
 | `upload` | Attach local files to `<input type=file>` via `DOM.setFileInputFiles`. Paths must be absolute, `..`-free, **and resolve under `~/Downloads/sallyport/`** (override via `SALLYPORT_DOWNLOAD_DIR`) — same sandbox as `save_to_file`, with symlink escapes blocked by `Path.resolve()`. Target must really be a file input. Allowlist-gated. |
 | `save_to_file` | **Daemon-local** — writes base64 to `~/Downloads/sallyport/<filename>` (override via `SALLYPORT_DOWNLOAD_DIR`). Sandboxed: no path separators or `..`. |
-| `status` | **Daemon-answered** health check: `{connected, version, port, pendingCalls, uptimeS}`. No browser round-trip and never queues behind a running call — use it as preflight before browser work. |
+| `status` | **Daemon-answered** health check: `{connected, version, port, pendingCalls, uptimeS, lastCalls, lastError}`. `lastCalls` is a ring of recent tool **outcomes** (`{tool, ok, ms, code?}` — never the args) and `lastError` the latest failure, so a loop can attribute a stall to a specific tool/code. No browser round-trip and never queues behind a running call — use it as preflight before browser work. |
 
 All tools accept `tabId` to target a specific tab; otherwise they use the
 active tab in the current window. There is no implicit "last touched tab"
@@ -209,7 +213,9 @@ memo — explicit IDs win, the active tab is the only fallback.
 For agents running on a schedule, the cheap iteration shape is: `status`
 (skip everything if the extension is detached) → scoped reads
 (`snapshot selector=… compact=true`, `read_text ref=…`) → actions with
-embedded `waitFor` instead of separate `wait_for` calls. Driven tabs are
+embedded `waitFor` instead of separate `wait_for` calls → verify with
+`get_state ref=…` (one element) instead of re-snapshotting the whole page.
+Driven tabs are
 kept awake automatically, so the loop keeps working while the browser
 window sits in the background (see Troubleshooting for the trade-offs).
 

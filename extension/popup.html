@@ -100,6 +100,10 @@
           <input type="checkbox" id="keep-awake"> keep automated tabs awake
         </label>
         <div class="muted small">Unfreezes background tabs while the bridge drives them; the page believes it is focused (e.g. Telegram sends read receipts).</div>
+        <label class="checkbox">
+          <input type="checkbox" id="capture-console"> capture page console errors
+        </label>
+        <div class="muted small">Records console errors/warnings + uncaught exceptions on driven tabs, readable via the console_tail tool. Off by default — it widens the debugger's CDP footprint.</div>
         <div class="muted small adv-section-label">Available tools (<span id="tool-count">0</span>)</div>
         <ul id="tool-list" class="muted small tool-list"></ul>
       </details>

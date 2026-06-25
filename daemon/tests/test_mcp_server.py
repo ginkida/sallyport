@@ -52,8 +52,11 @@ def test_tools_catalogue_covers_extension() -> None:
         "close_tab",
         "snapshot",
         "read_text",
+        "get_state",
+        "console_tail",
         "click",
         "mouse_click",
+        "hover",
         "fill",
         "select_option",
         "key_type",
@@ -63,6 +66,7 @@ def test_tools_catalogue_covers_extension() -> None:
         "settle",
         "find",
         "reveal",
+        "scroll",
         "evaluate",
         "fetch_in_page",
         "upload",
@@ -144,6 +148,86 @@ async def test_status_does_not_queue_behind_call_lock() -> None:
     async with bridge._call_lock:  # noqa: SLF001 - simulating a slow in-flight call
         out = await asyncio.wait_for(bridge.call_tool("status", {}), timeout=1.0)
     assert out["connected"] is False
+
+
+async def test_status_carries_empty_call_ring_initially() -> None:
+    """A fresh daemon reports an empty ring and no last error — and `status`
+    itself is never recorded (it's the introspection, not a tracked call)."""
+    from sallyport_daemon.bridge import Bridge
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+    await bridge.call_tool("status", {})
+    out = bridge._status()  # noqa: SLF001
+    assert out["lastCalls"] == []
+    assert out["lastError"] is None
+
+
+async def test_call_ring_records_failure_without_args() -> None:
+    """A failing tool call lands in the ring + lastError as an OUTCOME, and the
+    args (which may carry credentials) never appear anywhere in the snapshot."""
+    from sallyport_daemon.bridge import Bridge, ExtensionNotConnected
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+    with pytest.raises(ExtensionNotConnected):
+        await bridge.call_tool("fill", {"selector": "#pw", "value": "hunter2-topsecret"})
+    out = bridge._status()  # noqa: SLF001
+    assert len(out["lastCalls"]) == 1
+    entry = out["lastCalls"][0]
+    assert entry["tool"] == "fill"
+    assert entry["ok"] is False
+    assert isinstance(entry["ms"], int)
+    assert out["lastError"]["tool"] == "fill"
+    # The credential in args must not leak into the diagnostic anywhere.
+    assert "hunter2-topsecret" not in repr(out["lastCalls"])
+    assert "hunter2-topsecret" not in repr(out["lastError"])
+
+
+def test_record_call_ring_caps_and_evicts_oldest() -> None:
+    from sallyport_daemon.bridge import LAST_CALLS_MAXLEN, Bridge
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+    for i in range(LAST_CALLS_MAXLEN + 5):
+        bridge._record_call(f"t{i}", ok=True, ms=i, code=None, error=None)  # noqa: SLF001
+    calls = bridge._status()["lastCalls"]  # noqa: SLF001
+    assert len(calls) == LAST_CALLS_MAXLEN
+    assert calls[0]["tool"] == "t5"  # oldest five evicted
+    assert calls[-1]["tool"] == f"t{LAST_CALLS_MAXLEN + 4}"
+    assert all(isinstance(c["ms"], int) for c in calls)
+    assert all("args" not in c for c in calls)
+
+
+def test_record_call_failure_caps_error_and_tags_code() -> None:
+    from sallyport_daemon.bridge import MAX_CALL_ERROR, Bridge
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+    bridge._record_call("fill", ok=False, ms=3, code="password_field", error="x" * 500)  # noqa: SLF001
+    out = bridge._status()  # noqa: SLF001
+    err = out["lastError"]
+    assert err["code"] == "password_field"
+    assert len(err["error"]) <= MAX_CALL_ERROR
+    entry = out["lastCalls"][-1]
+    assert entry["code"] == "password_field"
+    # The compact ring entry omits the (potentially long) error string.
+    assert "error" not in entry
+
+
+async def test_successful_local_tool_records_ok_outcome(tmp_path: Any) -> None:
+    """A successful call records ok=True with an integer ms — and still no
+    args. save_to_file is the no-extension success path."""
+    import os
+
+    from sallyport_daemon.bridge import Bridge
+
+    os.environ["SALLYPORT_DOWNLOAD_DIR"] = str(tmp_path)
+    try:
+        bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+        await bridge.call_tool("save_to_file", {"data": "aGk=", "filename": "note.txt"})
+        calls = bridge._status()["lastCalls"]  # noqa: SLF001
+        assert calls[-1] == {"tool": "save_to_file", "ok": True, "ms": calls[-1]["ms"]}
+        assert isinstance(calls[-1]["ms"], int)
+        assert bridge._status()["lastError"] is None  # noqa: SLF001
+    finally:
+        del os.environ["SALLYPORT_DOWNLOAD_DIR"]
 
 
 def test_status_connected_reflects_ws_state() -> None:
@@ -260,7 +344,20 @@ async def test_dispatch_call_tool_error_with_code_tags_the_code() -> None:
         raises=ToolError("foo.example not allowed", code="domain_not_allowed")
     )
     out = await _dispatch_call(bridge, "navigate", {"url": "https://foo.example"})
-    assert out[0].text == "Error [domain_not_allowed]: foo.example not allowed"
+    # The human error line is byte-identical; a recovery hint is appended below.
+    lines = out[0].text.split("\n")
+    assert lines[0] == "Error [domain_not_allowed]: foo.example not allowed"
+    assert lines[1].startswith("hint: ")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_call_unknown_code_appends_no_hint() -> None:
+    """A code with no taxonomy entry leaves the error a single line — the hint
+    is strictly additive, never invented."""
+    bridge: Any = _FakeBridge(raises=ToolError("weird", code="some_unmapped_code"))
+    out = await _dispatch_call(bridge, "click", {"selector": "@e1"})
+    assert out[0].text == "Error [some_unmapped_code]: weird"
+    assert "\n" not in out[0].text
 
 
 @pytest.mark.asyncio
@@ -268,6 +365,53 @@ async def test_dispatch_call_tool_error_without_code_omits_brackets() -> None:
     bridge: Any = _FakeBridge(raises=ToolError("something went wrong"))
     out = await _dispatch_call(bridge, "click", {"selector": "@e1"})
     assert out[0].text == "Error: something went wrong"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_call_appends_structured_detail_json() -> None:
+    """A ToolError carrying structured detail (select_option's available
+    options) gets a compact, parseable `detail:` line under the error — the
+    human line + recovery hint stay intact above it."""
+    import json as _json
+
+    bridge: Any = _FakeBridge(
+        raises=ToolError(
+            "no <option> matched",
+            code="not_found",
+            detail={"missing": ["x"], "available": [{"value": "a", "label": "A"}]},
+        )
+    )
+    out = await _dispatch_call(bridge, "select_option", {"selector": "#s", "value": "x"})
+    lines = out[0].text.split("\n")
+    assert lines[0] == "Error [not_found]: no <option> matched"
+    detail_lines = [ln for ln in lines if ln.startswith("detail: ")]
+    assert len(detail_lines) == 1
+    parsed = _json.loads(detail_lines[0][len("detail: ") :])
+    assert parsed["available"][0]["value"] == "a"
+    assert parsed["missing"] == ["x"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_call_omits_detail_line_when_absent() -> None:
+    """No detail → no detail line. The feature is strictly additive."""
+    bridge: Any = _FakeBridge(raises=ToolError("no <option> matched", code="not_found"))
+    out = await _dispatch_call(bridge, "select_option", {"selector": "#s"})
+    assert "detail:" not in out[0].text
+
+
+@pytest.mark.asyncio
+async def test_dispatch_call_drops_oversized_detail_rather_than_truncating() -> None:
+    """An oversized detail is dropped (the prose still carries the gist), never
+    truncated into unparseable JSON."""
+    bridge: Any = _FakeBridge(
+        raises=ToolError(
+            "huge",
+            code="not_found",
+            detail={"available": [{"value": str(i), "label": "x" * 50} for i in range(500)]},
+        )
+    )
+    out = await _dispatch_call(bridge, "select_option", {"selector": "#s"})
+    assert "detail:" not in out[0].text
 
 
 @pytest.mark.asyncio

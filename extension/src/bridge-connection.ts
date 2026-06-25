@@ -11,7 +11,7 @@ export type StatusSnapshot = {
 
 export type ToolHandlerResult =
   | { ok: true; data: unknown }
-  | { ok: false; error: string; code?: string };
+  | { ok: false; error: string; code?: string; detail?: unknown };
 export type ToolHandler = (
   name: string,
   args: Record<string, unknown>,
@@ -475,6 +475,20 @@ export class BridgeConnection {
     if (!id) return;
     const call = env.body as { name: string; args?: Record<string, unknown> };
     const result = await this.deps.runTool(call.name, call.args || {});
+    // Deliberate non-action: we do NOT fast-fail-reconnect when a tool_result
+    // send drops on a dead socket. The premise "a dropped result burns the
+    // daemon's 60s request timeout" does not hold — the daemon cancels every
+    // pending future the instant the client socket closes (its _handle_client
+    // finally raises ExtensionNotConnected "extension disconnected
+    // mid-request"), so the MCP caller is freed immediately, not after 60s.
+    // Recovery is already prompt too: the WS 'close' handler schedules a 1–5s
+    // reconnect, the 20s keep-alive ping surfaces a half-dead socket, and the
+    // 0.5min keep-alive alarm is the suspended-worker backstop. A send-failure
+    // reconnect trigger here would add another concurrent reconnect path to the
+    // state machine 0.10.0 stabilised (rival-socket / orphaned this.ws class)
+    // for no real gain — an in-flight result whose socket already died cannot
+    // be re-delivered by reconnecting anyway (its request context died with the
+    // socket). So sendSigned stays a quiet no-op on a non-OPEN socket.
     try {
       await this.sendSigned('tool_result', result, id);
     } catch (e) {

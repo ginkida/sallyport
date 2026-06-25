@@ -32,12 +32,40 @@ export type WaitSpec = {
   absent: boolean;
 };
 
+// Why a wait ended unsatisfied — present only on the not-found path, so the
+// agent can branch instead of collapsing three very different situations into
+// one identical {found:false}: 'timeout' (the condition was simply not true
+// yet — retrying longer may help), 'bad_ref' (a stale @eN after a re-render —
+// re-snapshot), 'invalid_selector' (a malformed CSS selector the agent itself
+// typed — a PERMANENT error, retrying never helps), 'error' (anything else).
+export type WaitReason = 'invalid_selector' | 'bad_ref' | 'timeout' | 'error';
+
 export type WaitOutcome = {
   found: boolean;
   elapsedMs: number;
   timeoutMs?: number;
   error?: string;
+  reason?: WaitReason;
 };
+
+/** Classify a thrown wait error into a stable WaitReason. The embedded waitFor
+ * FOLDS errors into the outcome (the action it followed already succeeded, so a
+ * wait blow-up must stay non-fatal) — without this, a typo'd CSS selector
+ * (permanent) and a not-yet-present element (retryable) both surfaced as the
+ * same {found:false}. Pure, so the mapping is unit-testable without chrome.
+ *
+ * selectorVisible throws BridgeError('bad_ref') on a stale @eN; DOM.querySelector
+ * rejects on malformed CSS with a raw CDP error mentioning the selector / query.
+ * Conservative: only a clear selector-query rejection becomes 'invalid_selector',
+ * everything unrecognised stays the generic 'error'. */
+export function classifyWaitError(e: unknown): Exclude<WaitReason, 'timeout'> {
+  if (e instanceof BridgeError && e.code === 'bad_ref') return 'bad_ref';
+  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+  if (msg.includes('selector') || msg.includes('while querying') || msg.includes('dom error')) {
+    return 'invalid_selector';
+  }
+  return 'error';
+}
 
 export function parseTimeoutMs(raw: unknown, tool: string): number {
   if (raw === undefined) return DEFAULT_TIMEOUT_MS;
@@ -151,7 +179,7 @@ export async function pollFor(tabId: number, spec: WaitSpec): Promise<WaitOutcom
     const elapsedMs = Date.now() - start;
     if (ok) return { found: true, elapsedMs };
     if (elapsedMs + POLL_MS > spec.timeoutMs) {
-      return { found: false, elapsedMs, timeoutMs: spec.timeoutMs };
+      return { found: false, elapsedMs, timeoutMs: spec.timeoutMs, reason: 'timeout' };
     }
     await new Promise((r) => setTimeout(r, POLL_MS));
   }
@@ -164,7 +192,12 @@ export async function runEmbeddedWait(tabId: number, spec: WaitSpec): Promise<Wa
   try {
     return await pollFor(tabId, spec);
   } catch (e) {
-    return { found: false, elapsedMs: 0, error: e instanceof Error ? e.message : String(e) };
+    return {
+      found: false,
+      elapsedMs: 0,
+      error: e instanceof Error ? e.message : String(e),
+      reason: classifyWaitError(e),
+    };
   }
 }
 
@@ -288,3 +321,31 @@ export function scrollStalled(
 ): boolean {
   return sc.after === sc.before || sc.after === prevAfter;
 }
+
+// --- scroll: standalone deterministic scrolling -----------------------------
+// The two probes the `scroll` tool serialises. FIXED literals — no agent input
+// is interpolated into the bodies; the scroll-by deltas and the `to` keyword
+// travel as STRUCTURED callFunctionOn arguments (same trust shape as
+// SCROLL_STEP_PROBE's `dir`), so `scroll` needs no per-domain evaluate flag.
+// Living here keeps every serialised DOM probe in one chrome-free, vitest-
+// testable module.
+
+// Bring `this` element into the centre of the viewport, then report the page's
+// resulting scroll offset (best-effort; falls back to 0 with no defaultView).
+export const SCROLL_INTO_VIEW_PROBE =
+  "function() { this.scrollIntoView({ block: 'center', inline: 'center' });" +
+  ' var w = this.ownerDocument && this.ownerDocument.defaultView;' +
+  ' return { x: w ? w.scrollX : 0, y: w ? w.scrollY : 0 }; }';
+
+// Scroll `this` (a container element or the page's scrollingElement) by a
+// structured delta, or jump to top/bottom when `to` is set. `dx`/`dy`/`to` are
+// callFunctionOn arguments, NEVER interpolated. Returns the resulting position
+// plus scrollHeight/clientHeight so the caller can tell whether it bottomed out
+// (lazy-load termination) without a second probe.
+export const SCROLL_BY_PROBE =
+  'function(dx, dy, to) {' +
+  " if (to === 'top') { this.scrollTop = 0; this.scrollLeft = 0; }" +
+  " else if (to === 'bottom') { this.scrollTop = this.scrollHeight; }" +
+  ' else { this.scrollTop = this.scrollTop + dy; this.scrollLeft = this.scrollLeft + dx; }' +
+  ' return { x: this.scrollLeft, y: this.scrollTop,' +
+  ' scrollHeight: this.scrollHeight, clientHeight: this.clientHeight }; }';

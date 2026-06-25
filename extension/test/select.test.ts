@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { BridgeError } from '../src/tools/errors.js';
 import {
   buildSpec,
+  planError,
   planSelection,
   SELECT_APPLY_PROBE,
   type OptionLike,
@@ -216,5 +217,68 @@ describe('buildSpec', () => {
 
   it('rejects an empty value array', () => {
     expect(caught(() => buildSpec({ value: [] })).code).toBe('bad_args');
+  });
+});
+
+describe('planError → structured detail (select_option)', () => {
+  it('not_found carries {missing, available} so the agent can re-issue programmatically', () => {
+    const err = planError({
+      ok: false,
+      code: 'not_found',
+      missing: ['x'],
+      available: [
+        { value: 'a', label: 'A' },
+        { value: 'b', label: 'B' },
+      ],
+    });
+    expect(err).toBeInstanceOf(BridgeError);
+    expect(err.code).toBe('not_found');
+    expect(err.detail).toEqual({
+      missing: ['x'],
+      available: [
+        { value: 'a', label: 'A' },
+        { value: 'b', label: 'B' },
+      ],
+    });
+  });
+
+  it('attaches NO detail to wrong_element / bad_args failures', () => {
+    expect(planError({ ok: false, code: 'wrong_element', tag: 'DIV' }).detail).toBeUndefined();
+    expect(
+      planError({ ok: false, code: 'bad_args', reason: 'not_multiple' }).detail,
+    ).toBeUndefined();
+    expect(
+      planError({ ok: false, code: 'bad_args', reason: 'disabled', target: 'select' }).detail,
+    ).toBeUndefined();
+    expect(
+      planError({ ok: false, code: 'bad_args', reason: 'disabled', target: 'option', index: 2 })
+        .detail,
+    ).toBeUndefined();
+  });
+
+  it('detail mirrors only static <option> value/label — never a field value (by construction)', () => {
+    const err = planError({
+      ok: false,
+      code: 'not_found',
+      missing: ['nope'],
+      available: [{ value: 'us', label: 'United States' }],
+    });
+    const detail = err.detail as { available: { value: string; label: string }[] };
+    for (const o of detail.available) {
+      expect(Object.keys(o).sort()).toEqual(['label', 'value']);
+    }
+  });
+});
+
+describe('BridgeError detail (by construction)', () => {
+  it('defaults to undefined when not provided (so password gates carry none)', () => {
+    expect(
+      new BridgeError('password_field', 'refusing to type into a password field').detail,
+    ).toBeUndefined();
+    expect(new BridgeError('bad_args', 'x').detail).toBeUndefined();
+  });
+
+  it('stores a provided structural detail', () => {
+    expect(new BridgeError('not_found', 'x', { available: [] }).detail).toEqual({ available: [] });
   });
 });

@@ -15,8 +15,16 @@ from mcp.server.stdio import stdio_server
 from mcp.types import ImageContent, TextContent, Tool
 
 from .bridge import Bridge, ExtensionNotConnected, ToolError
+from .error_taxonomy import format_error_hint
 
 log = logging.getLogger("sallyport.mcp")
+
+# Cap on the appended structured-detail JSON line. Producers cap their own
+# detail (select_option bounds `available` to 50 options); this is a defensive
+# ceiling so a future producer can't bloat the tool output — an oversized detail
+# is dropped (the human message still carries the gist), never truncated into
+# unparseable JSON.
+MAX_DETAIL_JSON = 4000
 
 
 # Embedded post-action wait, shared by navigate/click/mouse_click/fill.
@@ -38,8 +46,11 @@ _WAIT_FOR_SCHEMA: dict[str, Any] = {
         "succeeds, poll until selector/text is present-and-visible (or gone, "
         "with absent=true). Saves the follow-up wait_for round-trip — prefer "
         "this over a separate wait_for call. The result gains "
-        "wait:{found, elapsedMs}; a wait timeout or error never fails the "
-        "action itself."
+        "wait:{found, elapsedMs, reason?}; a wait timeout or error never fails "
+        "the action itself. On found=false, reason says why so you can branch: "
+        "'timeout' (not true yet — retry/longer may help), 'bad_ref' (stale "
+        "@eN after a re-render — re-snapshot), 'invalid_selector' (malformed "
+        "CSS you passed — permanent, fix the selector), 'error' (other)."
     ),
 }
 
@@ -178,6 +189,79 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="get_state",
+        description=(
+            "Cheap single-element probe — answer 'is this still here / visible / "
+            "where / what does it say' WITHOUT a full snapshot. selector is a CSS "
+            "selector or an @eN ref. Use it to verify an action's effect or "
+            "re-check a ref after navigation in one tiny round-trip instead of "
+            "re-snapshotting the whole page. It NEVER errors on a missing element: "
+            "a vanished node returns {exists:false, reason} (reason is "
+            "'not_found' for a CSS miss, 'unknown_ref' for an @eN this tab never "
+            "minted / lost on navigation, 'detached' for a ref whose node died) — "
+            "so it is safe to poll. On a hit returns {exists:true, visible, tag, "
+            "text, box?:{x,y,width,height}, inViewport?, ref?, role?, name?}: "
+            "`visible` is true when the element has a laid-out box (matches "
+            "wait_for); `box`/`inViewport` (viewport-relative CSS px, the same "
+            "coordinates mouse_click's x/y take) appear only when visible; `text` "
+            "is trimmed innerText capped at 2000 chars (override maxChars, max "
+            "20000; truncated/textLen mark a cut). Does NOT read input .value (so "
+            "it can't expose a password field's contents — use snapshot's `type` "
+            "or fill's read-back for field state). Structured CDP only, no "
+            "evaluate flag. Domain must be in allowlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "CSS selector or @eN ref"},
+                "maxChars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20000,
+                    "default": 2000,
+                    "description": "Cap on returned text characters",
+                },
+                "tabId": {"type": "integer"},
+            },
+            "required": ["selector"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="console_tail",
+        description=(
+            "Read the page's recent console errors/warnings and uncaught "
+            "exceptions for a tab — so you can tell 'the click succeeded but the "
+            "SPA's handler threw and the page is wedged' from a page that's "
+            "merely slow. Returns {enabled, entries:[{ts, level, text, "
+            "origin}], truncated?} (oldest→newest; level is 'error'|'warning'). "
+            "OPT-IN: capture must be turned on in the extension popup "
+            "(off by default) — when it's off you get {enabled:false, "
+            "entries:[]}, NOT an error, so an empty result isn't misread as 'no "
+            "errors'. Capture begins at the first bridge attach with the "
+            "setting on — there is NO history replay, so errors thrown before "
+            "then aren't captured. Entries are origin-filtered to the allowlist "
+            "(a tab that navigated cross-origin won't leak a non-allowlisted "
+            "origin's console). limit caps how many recent entries return "
+            "(default 50, max 50). Structured CDP event capture only — no JS "
+            "eval. Domain must be in allowlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "default": 50,
+                    "description": "Max recent entries to return",
+                },
+                "tabId": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="click",
         description=(
             "Click an element via DOM .click(). selector can be a CSS selector or a "
@@ -244,6 +328,44 @@ TOOLS: list[Tool] = [
                     "minimum": 1,
                     "maximum": 3,
                     "default": 1,
+                },
+                "tabId": {"type": "integer"},
+                "waitFor": _WAIT_FOR_SCHEMA,
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="hover",
+        description=(
+            "Hover the pointer over an element/point WITHOUT clicking — a real "
+            "Input.dispatchMouseEvent mouseMoved (the hover step mouse_click "
+            "sends before pressing). Use it for CSS :hover-only dropdown menus, "
+            "tooltips and 'show actions on row hover' UIs that a click would "
+            "dismiss or mis-activate. Target is EITHER selector (CSS or @eN, "
+            "auto-aimed like mouse_click — reports covered/hitTarget/hitTargetRef "
+            "when an overlay sits on top) OR explicit viewport x+y (CSS px, "
+            "rejected if outside the viewport). Pair with waitFor to "
+            "hover-then-wait-for-the-menu in one call, then click the item. "
+            "Strictly weaker than mouse_click: no press/release, nothing is "
+            "activated. NOTE: the :hover state is transient — a synthetic "
+            "mouseMoved holds it only until the next mouse move, so do the "
+            "follow-up action promptly. Allowlist-gated. Returns {ok, tag?, x, "
+            "y, covered?, hitTarget?, hitTargetRef?, wait?}."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "CSS selector or @eN ref"},
+                "x": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Viewport X in CSS px (use with y, instead of selector)",
+                },
+                "y": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Viewport Y in CSS px (use with x, instead of selector)",
                 },
                 "tabId": {"type": "integer"},
                 "waitFor": _WAIT_FOR_SCHEMA,
@@ -433,8 +555,9 @@ TOOLS: list[Tool] = [
             "both: wait until the selector/text is GONE (spinner finished, "
             "modal closed). Polls every 250 ms up to timeoutMs (default 10000, "
             "capped at 30000). At least one of selector/text is required; if "
-            "both are given, both must hold. Returns {found, elapsedMs}; a "
-            "timeout returns found=false rather than an error. NOTE: when the "
+            "both are given, both must hold. Returns {found, elapsedMs, "
+            "reason?}; a timeout returns found=false (reason='timeout') rather "
+            "than an error. NOTE: when the "
             "wait directly follows a navigate/click/mouse_click/fill, pass "
             "waitFor on that call instead — one round-trip less. Domain must "
             "be in allowlist."
@@ -512,6 +635,41 @@ TOOLS: list[Tool] = [
                 "tabId": {"type": "integer"},
             },
             "required": ["container"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="scroll",
+        description=(
+            "Deterministic scrolling — the predicate-less companion to reveal "
+            "(which only scrolls while hunting a target and stops on match). Two "
+            "modes. (1) Bring an element into view: pass selector (CSS or @eN) "
+            "with no dx/dy/to — scrollIntoView({block:'center'}); returns "
+            "{mode:'into_view', x, y}. (2) Scroll the page, or a container if "
+            "selector is given, by a delta or to an edge: dx/dy are CSS-px "
+            "deltas (negative = left/up), OR to='top'|'bottom' jumps to the "
+            "edge (don't combine to with dx/dy). Use it to trigger lazy-load / "
+            "infinite-scroll feeds (page down repeatedly) — the result "
+            "{mode, x, y, scrollHeight, atBottom} tells you when you've "
+            "bottomed out so the loop can stop. Structured CDP only (fixed "
+            "scroll probe), no evaluate flag. Domain must be in allowlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "Element to bring into view, or the container to scroll",
+                },
+                "dx": {"type": "number", "description": "Horizontal scroll delta in CSS px (±)"},
+                "dy": {"type": "number", "description": "Vertical scroll delta in CSS px (±)"},
+                "to": {
+                    "type": "string",
+                    "enum": ["top", "bottom"],
+                    "description": "Jump to an edge instead of a delta",
+                },
+                "tabId": {"type": "integer"},
+            },
             "additionalProperties": False,
         },
     ),
@@ -689,9 +847,13 @@ TOOLS: list[Tool] = [
             "Instant daemon/extension health check — answered by the daemon "
             "itself, no browser round-trip, and it never queues behind a "
             "running tool call. Returns {connected, version, port, "
-            "pendingCalls, uptimeS}. Use it as loop-iteration preflight: if "
-            "connected=false, skip the browser work instead of burning a "
-            "60 s timeout."
+            "pendingCalls, uptimeS, lastCalls, lastError}. lastCalls is the "
+            "last few tool OUTCOMES (oldest→newest) as {tool, ok, ms, code?} "
+            "— outcomes only, never the args — and lastError is the most "
+            "recent failure {tool, code, error} or null, so you can attribute "
+            "'it just timed out' to a specific tool/code. Use it as "
+            "loop-iteration preflight: if connected=false, skip the browser "
+            "work instead of burning a 60 s timeout."
         ),
         inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
     ),
@@ -712,7 +874,22 @@ async def _dispatch_call(
         return [TextContent(type="text", text=f"Error: {exc}")]
     except ToolError as exc:
         tag = f" [{exc.code}]" if exc.code else ""
-        return [TextContent(type="text", text=f"Error{tag}: {exc}")]
+        text = f"Error{tag}: {exc}"
+        # Append a compact, machine-readable recovery hint on a NEW line when the
+        # code has one — the human error line above stays byte-identical.
+        hint = format_error_hint(exc.code)
+        if hint:
+            text = f"{text}\n{hint}"
+        # Append structured failure detail (e.g. select_option's available
+        # options) as a compact JSON line so the agent can branch on it without
+        # parsing the prose. Skip an oversized blob rather than emit a truncated
+        # (unparseable) one — the human message still carries the gist.
+        detail = getattr(exc, "detail", None)
+        if detail is not None:
+            dumped = json.dumps(detail, ensure_ascii=False, separators=(",", ":"))
+            if len(dumped) <= MAX_DETAIL_JSON:
+                text = f"{text}\ndetail: {dumped}"
+        return [TextContent(type="text", text=text)]
     image = _as_image_content(name, data)
     if image is not None:
         return image

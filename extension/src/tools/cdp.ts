@@ -1,5 +1,67 @@
 import { getSettings } from '../storage.js';
+import { clearConsole, ensureConsoleCapture } from './console-capture.js';
+import { BridgeError } from './errors.js';
 import { clearRefsForTab } from './refs.js';
+
+// Cap on the chrome error text we echo back: a debugger attach failure can
+// embed a chrome:// or page URL, so bound it the same way the daemon caps a
+// handshake-rejection reason (reason[:200]) before it travels to the agent.
+const MAX_ATTACH_MSG = 200;
+
+/** Map a `chrome.debugger.attach` rejection to a STABLE BridgeError code so an
+ * autonomous loop can branch (retry a transient conflict, skip a forbidden
+ * page, give up on a closed tab) instead of looping blind on one opaque
+ * string. Best-effort OVERLAY: every unmatched message still surfaces as
+ * `attach_failed` carrying the (capped) original text — unknown errors are
+ * classified-as-generic, never swallowed. Pure + chrome-free so it is
+ * unit-testable; Chrome's wording is not a stable API, hence the always-present
+ * fallback.
+ *
+ *  - `attach_forbidden_url`     restricted page the debugger may not touch
+ *                               (chrome://, devtools://, the extension gallery)
+ *  - `attach_debugger_conflict` another client holds the tab (DevTools open,
+ *                               another extension, or a tab mid-drag) — retryable
+ *  - `attach_target_closed`     the tab/target is gone — give up on this tabId
+ *  - `attach_failed`            anything else, original message preserved
+ */
+export function classifyAttachError(msg: string): BridgeError {
+  const raw = msg || '';
+  const m = raw.toLowerCase();
+  const detail = raw.slice(0, MAX_ATTACH_MSG);
+  const has = (...needles: string[]): boolean => needles.some((n) => m.includes(n));
+
+  let code = 'attach_failed';
+  if (
+    has(
+      'cannot access a chrome',
+      'cannot access contents',
+      'extensions gallery',
+      'chrome web store',
+      'devtools://',
+      'chrome-extension://',
+      'cannot attach to extension',
+      'cannot be debugged',
+    )
+  ) {
+    code = 'attach_forbidden_url';
+  } else if (
+    has('already attached', 'another debugger', 'attached client', 'dragging a tab', 'be edited')
+  ) {
+    code = 'attach_debugger_conflict';
+  } else if (
+    has(
+      'no tab with given id',
+      'no target with given id',
+      'no target',
+      'cannot attach to this target',
+      'target closed',
+      'tab was closed',
+    )
+  ) {
+    code = 'attach_target_closed';
+  }
+  return new BridgeError(code, `attach failed: ${detail}`);
+}
 
 /** One CDP attachment per tab. Detach happens when the tab closes or the
  * user clicks "Cancel" on the debugger banner — we listen for both so the
@@ -14,6 +76,7 @@ if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
   chrome.tabs.onRemoved.addListener((tabId) => {
     attached.delete(tabId);
     clearRefsForTab(tabId);
+    clearConsole(tabId);
   });
 }
 
@@ -22,6 +85,7 @@ if (typeof chrome !== 'undefined' && chrome.debugger?.onDetach) {
     if (source.tabId !== undefined) {
       attached.delete(source.tabId);
       clearRefsForTab(source.tabId);
+      clearConsole(source.tabId);
     }
   });
 }
@@ -33,11 +97,20 @@ export async function attach(tabId: number): Promise<void> {
       attached.add(tabId);
     } catch (e) {
       const msg = (e as Error).message || String(e);
-      if (!msg.includes('already attached')) throw e;
+      // "already attached" is assumed to be OUR own prior attachment (the
+      // common case after an MV3 worker restart drops the `attached` set) —
+      // proceed. Everything else is a real failure: surface it with a stable,
+      // classified code instead of the opaque chrome string.
+      if (!msg.includes('already attached')) throw classifyAttachError(msg);
       attached.add(tabId);
     }
   }
-  await keepAwake(tabId);
+  // Read settings once and drive the two opt-in, best-effort features. Console
+  // capture is gated here so Runtime.enable is NEVER issued on the
+  // unconditional attach path — only when the user turned the setting on.
+  const settings = await getSettings();
+  if (settings.keepAwake) await keepAwake(tabId);
+  if (settings.captureConsole) await ensureConsoleCapture(tabId);
 }
 
 /** Chrome freezes background tabs and (on macOS) fully-occluded windows:
@@ -57,10 +130,8 @@ export async function attach(tabId: number): Promise<void> {
  * (`tab_not_visible` / bringToFront). Side effect worth knowing: a page
  * that believes it is active behaves like one (Telegram sends read
  * receipts / presence) — the popup setting "Keep automated tabs awake"
- * turns this off. */
+ * turns this off (gated by the caller in `attach`). */
 async function keepAwake(tabId: number): Promise<void> {
-  const settings = await getSettings();
-  if (!settings.keepAwake) return;
   try {
     await cdp(tabId, 'Page.setWebLifecycleState', { state: 'active' });
   } catch {

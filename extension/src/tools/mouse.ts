@@ -83,12 +83,58 @@ async function dispatchClick(
   }
 }
 
-function parseCoord(raw: unknown, name: string): number {
+/** The hover preamble alone: a single `mouseMoved` with no button pressed —
+ * exactly the first step dispatchClick sends to set the :hover state before a
+ * press, exposed standalone for the `hover` tool. Strictly weaker than a click
+ * (no press/release, so nothing is activated). The state is transient: a CDP
+ * synthetic mouseMoved drives :hover only until the next mouse move. */
+async function dispatchHover(tabId: number, x: number, y: number): Promise<void> {
+  await cdp(tabId, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved',
+    x,
+    y,
+    button: 'none',
+    buttons: 0,
+    pointerType: 'mouse',
+  });
+}
+
+function parseCoord(raw: unknown, name: string, tool: string): number {
   const v = Number(raw);
   if (!Number.isFinite(v) || v < 0) {
-    throw new BridgeError('bad_args', `mouse_click: ${name} must be a non-negative number`);
+    throw new BridgeError('bad_args', `${tool}: ${name} must be a non-negative number`);
   }
   return v;
+}
+
+export type PointerTarget =
+  | { mode: 'coord'; x: number; y: number }
+  | { mode: 'selector'; selector: string };
+
+/** Disambiguate a pointer tool's target: exactly one of a selector/@eN OR an
+ * explicit viewport x+y (both coords required, non-negative, finite). Shared by
+ * `mouse_click` and `hover`; `tool` names the caller in the error messages. The
+ * viewport-bounds check needs CDP and lives in validateViewportPoint — this
+ * stays pure so the selector-vs-coord rules and coord validation are
+ * unit-testable. */
+export function parsePointerTarget(args: Record<string, unknown>, tool: string): PointerTarget {
+  const selector = String(args.selector || '');
+  const hasX = args.x !== undefined && args.x !== null;
+  const hasY = args.y !== undefined && args.y !== null;
+  if (hasX !== hasY) {
+    throw new BridgeError('bad_args', `${tool}: x and y must be given together`);
+  }
+  const coordMode = hasX && hasY;
+  if (coordMode && selector) {
+    throw new BridgeError('bad_args', `${tool}: pass either selector or x/y, not both`);
+  }
+  if (!coordMode && !selector) {
+    throw new BridgeError('bad_args', `${tool}: selector or x/y required`);
+  }
+  if (coordMode) {
+    return { mode: 'coord', x: parseCoord(args.x, 'x', tool), y: parseCoord(args.y, 'y', tool) };
+  }
+  return { mode: 'selector', selector };
 }
 
 /** Selector mode: run the serialised `findClickPoint` against the resolved
@@ -166,20 +212,41 @@ async function aimAtElement(
   }
 }
 
+/** Coordinate-mode guard shared by mouse_click and hover: measure the viewport
+ * via the fixed POINT_INFO_PROBE and reject a point outside it (CDP silently
+ * drops events beyond the viewport, which would read as "nothing happened").
+ * Returns the PointInfo (carrying what currently sits at the point) so the
+ * caller can echo a hitTarget diagnostic. */
+async function validateViewportPoint(
+  tabId: number,
+  x: number,
+  y: number,
+  tool: string,
+): Promise<PointInfo | null> {
+  const docEval = await cdp<{ result: { objectId?: string } }>(tabId, 'Runtime.evaluate', {
+    expression: 'document',
+  });
+  let info: PointInfo | null = null;
+  if (docEval.result.objectId) {
+    const infoRes = await cdp<{ result: { value?: PointInfo } }>(tabId, 'Runtime.callFunctionOn', {
+      objectId: docEval.result.objectId,
+      functionDeclaration: POINT_INFO_PROBE,
+      arguments: [{ value: x }, { value: y }],
+      returnByValue: true,
+    });
+    info = infoRes.result.value ?? null;
+  }
+  if (info && info.vw > 0 && info.vh > 0 && (x > info.vw || y > info.vh)) {
+    throw new BridgeError(
+      'bad_args',
+      `${tool}: point (${x}, ${y}) is outside the viewport (${info.vw}x${info.vh})`,
+    );
+  }
+  return info;
+}
+
 export const mouseClick: Tool = async (args) => {
-  const selector = String(args.selector || '');
-  const hasX = args.x !== undefined && args.x !== null;
-  const hasY = args.y !== undefined && args.y !== null;
-  if (hasX !== hasY) {
-    throw new BridgeError('bad_args', 'mouse_click: x and y must be given together');
-  }
-  const coordMode = hasX && hasY;
-  if (coordMode && selector) {
-    throw new BridgeError('bad_args', 'mouse_click: pass either selector or x/y, not both');
-  }
-  if (!coordMode && !selector) {
-    throw new BridgeError('bad_args', 'mouse_click: selector or x/y required');
-  }
+  const target = parsePointerTarget(args, 'mouse_click');
 
   const button = String(args.button ?? 'left').toLowerCase();
   if (!(button in BUTTON_BITS)) {
@@ -200,35 +267,12 @@ export const mouseClick: Tool = async (args) => {
   await ensureAllowed(tab.url);
   await attach(tab.id!);
 
-  if (coordMode) {
-    // Manual aim: the agent picked a viewport point (from a screenshot or
-    // the hit diagnostics). Validate it against the viewport — CDP silently
-    // drops events outside it, which would read as "click did nothing".
-    const x = parseCoord(args.x, 'x');
-    const y = parseCoord(args.y, 'y');
-    const docEval = await cdp<{ result: { objectId?: string } }>(tab.id!, 'Runtime.evaluate', {
-      expression: 'document',
-    });
-    let info: PointInfo | null = null;
-    if (docEval.result.objectId) {
-      const infoRes = await cdp<{ result: { value?: PointInfo } }>(
-        tab.id!,
-        'Runtime.callFunctionOn',
-        {
-          objectId: docEval.result.objectId,
-          functionDeclaration: POINT_INFO_PROBE,
-          arguments: [{ value: x }, { value: y }],
-          returnByValue: true,
-        },
-      );
-      info = infoRes.result.value ?? null;
-    }
-    if (info && info.vw > 0 && info.vh > 0 && (x > info.vw || y > info.vh)) {
-      throw new BridgeError(
-        'bad_args',
-        `mouse_click: point (${x}, ${y}) is outside the viewport (${info.vw}x${info.vh})`,
-      );
-    }
+  if (target.mode === 'coord') {
+    // Manual aim: the agent picked a viewport point (from a screenshot or the
+    // hit diagnostics). validateViewportPoint rejects an off-screen point — CDP
+    // silently drops events outside the viewport ("click did nothing").
+    const { x, y } = target;
+    const info = await validateViewportPoint(tab.id!, x, y, 'mouse_click');
     await dispatchClick(tab.id!, x, y, button, clickCount);
     const coordWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
     return {
@@ -246,7 +290,7 @@ export const mouseClick: Tool = async (args) => {
     };
   }
 
-  const objectId = await resolveSelectorOrRef(tab.id!, selector, 'mouse_click');
+  const objectId = await resolveSelectorOrRef(tab.id!, target.selector, 'mouse_click');
   const { point, hitTargetRef } = await aimAtElement(tab.id!, objectId);
   if (!point.visible) {
     throw new BridgeError('not_visible', `mouse_click: element ${point.tag} has zero size`);
@@ -270,6 +314,70 @@ export const mouseClick: Tool = async (args) => {
       // covering node may be a legitimate event-handling layer), but the
       // agent learns where the events actually landed — and gets a ref to
       // click the covering node directly.
+      ...(point.covered
+        ? {
+            covered: true,
+            hitTarget: point.hitTarget,
+            ...(hitTargetRef ? { hitTargetRef } : {}),
+          }
+        : {}),
+    },
+  };
+};
+
+/** Hover over an element/point without clicking — the standalone hover preamble
+ * (`Input.dispatchMouseEvent{mouseMoved}`). Unblocks CSS `:hover`-only menus,
+ * tooltips and "show actions on row hover" UIs that a click would dismiss or
+ * mis-activate. Target is a selector/@eN (auto-aimed via the same probes as
+ * mouse_click, reporting `covered`/`hitTargetRef` when an overlay sits on top)
+ * or explicit viewport x/y. Strictly weaker than mouse_click: no press/release,
+ * nothing is activated. Pair with embedded `waitFor` to hover→wait-for-menu in
+ * one call. The :hover state is transient — a synthetic mouseMoved holds it only
+ * until the next mouse move. */
+export const hover: Tool = async (args) => {
+  const target = parsePointerTarget(args, 'hover');
+  const waitSpec = parseWaitFor(args.waitFor, 'hover');
+
+  const tab = await resolveTab(args);
+  await ensureAllowed(tab.url);
+  await attach(tab.id!);
+
+  if (target.mode === 'coord') {
+    const { x, y } = target;
+    const info = await validateViewportPoint(tab.id!, x, y, 'hover');
+    await dispatchHover(tab.id!, x, y);
+    const coordWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+    return {
+      tabId: tab.id,
+      url: tab.url,
+      data: {
+        ok: true,
+        x,
+        y,
+        ...(info?.hitTarget ? { hitTarget: info.hitTarget } : {}),
+        ...(coordWait ? { wait: coordWait } : {}),
+      },
+    };
+  }
+
+  const objectId = await resolveSelectorOrRef(tab.id!, target.selector, 'hover');
+  const { point, hitTargetRef } = await aimAtElement(tab.id!, objectId);
+  if (!point.visible) {
+    throw new BridgeError('not_visible', `hover: element ${point.tag} has zero size`);
+  }
+
+  await dispatchHover(tab.id!, point.x, point.y);
+  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+
+  return {
+    tabId: tab.id,
+    url: tab.url,
+    data: {
+      ok: true,
+      tag: point.tag,
+      x: point.x,
+      y: point.y,
+      ...(wait ? { wait } : {}),
       ...(point.covered
         ? {
             covered: true,

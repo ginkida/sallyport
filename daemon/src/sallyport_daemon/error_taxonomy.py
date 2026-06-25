@@ -1,0 +1,111 @@
+"""Static recovery hints for tool-error codes.
+
+A frozen, repo-authored table keyed by the stable ``BridgeError`` / ``ToolError``
+code strings (the same tokens that already round-trip on the wire). When a tool
+call fails with a known code, :func:`format_error_hint` yields one compact,
+machine-readable line that the MCP layer appends *after* the human ``Error
+[code]: message`` text (the human line stays byte-identical). It tells a tight
+autonomous loop whether the failure is worth retrying and how to recover —
+"when I see code X do Y" — without per-tool wiring.
+
+Security: this is purely advisory and keyed only by the daemon's own verified
+code constants — a compromised page controls only the ``code`` string, which
+already round-trips today, and the daemon still enforces every gate on each
+actual retry. The recovery text deliberately describes only **user-driven
+popup steps** or **structured-tool alternatives**; it NEVER suggests flipping
+``allowPassword`` / ``allowEvaluate`` as an automatic action, so it can't be
+read as a way to talk the bridge into weakening invariant #4 or #5. Codes that
+are *success, not error* (``wait_for`` / ``settle`` returning ``found:false`` /
+``settled:false``) deliberately have no entry — they never reach the error path.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from types import MappingProxyType
+
+# code -> compact recovery line. Each value embeds a `retryable=yes|no` flag so
+# a loop can branch programmatically, followed by the human-actionable recovery.
+_ERROR_HINTS: Mapping[str, str] = MappingProxyType(
+    {
+        "domain_not_allowed": (
+            "retryable=no; the page's domain isn't in the allowlist — the user must add it "
+            "in the extension popup (Allowlist tab); list_tabs shows which tabs you can "
+            "already drive."
+        ),
+        "evaluate_not_allowed": (
+            "retryable=no; this domain hasn't enabled evaluate — prefer the structured "
+            "tools (click/fill/read_text/find/fetch_in_page); enabling evaluate is a "
+            "user decision in the popup, not something to retry."
+        ),
+        "password_field": (
+            "retryable=no; refusing to type into a password field — this needs explicit "
+            "user intent, not an automatic retry; pick a non-password field if that was a "
+            "mis-target."
+        ),
+        "tab_not_visible": (
+            "retryable=yes; a hidden tab can't render a frame — activate it first "
+            "(screenshot bringToFront=true, or switch to it) then retry, or use "
+            "snapshot/read_text which don't need a visible tab."
+        ),
+        "not_visible": (
+            "retryable=yes; the target has zero size / isn't laid out yet — wait_for (or "
+            "settle) until it renders then retry, or re-snapshot to pick a visible element."
+        ),
+        "bad_ref": (
+            "retryable=yes; the @eN ref is stale (the page re-rendered or navigated) — run "
+            "snapshot/find for a fresh ref then retry; get_state reports {exists:false} "
+            "without erroring."
+        ),
+        "not_found": (
+            "retryable=yes; no element matched — confirm it has rendered with find or "
+            "wait_for, then retry with a fresh selector/@eN."
+        ),
+        "wrong_element": (
+            "retryable=no; the target isn't the expected element type (e.g. select_option "
+            "on a custom combobox) — open it with click/mouse_click and pick the option "
+            "with click (find/reveal locate it)."
+        ),
+        "unsafe_path": (
+            "retryable=no; the path is outside the sandbox — place the file under "
+            "~/Downloads/sallyport/ (or SALLYPORT_DOWNLOAD_DIR) and retry; save_to_file "
+            "writes there."
+        ),
+        "attach_debugger_conflict": (
+            "retryable=yes; another client holds the tab (DevTools open / another extension "
+            "/ a tab mid-drag) — close DevTools or retry shortly."
+        ),
+        "attach_target_closed": (
+            "retryable=no; the target tab is gone — re-run list_tabs and pick a live tab, "
+            "or navigate with newTab=true."
+        ),
+        "attach_forbidden_url": (
+            "retryable=no; this page can't be debugged (chrome://, devtools://, the web "
+            "store) — operate on a normal http(s) tab instead."
+        ),
+        "attach_failed": (
+            "retryable=yes; the debugger attach failed — retry once; if it persists, check "
+            "the tab is a normal page and reload it."
+        ),
+        "unserialisable_result": (
+            "retryable=no; the result couldn't be serialised for the wire — narrow the "
+            "request (scope a snapshot, lower maxChars) so the payload is smaller/plainer."
+        ),
+    }
+)
+
+
+def format_error_hint(code: str | None) -> str | None:
+    """Return the compact ``hint: …`` recovery line for *code*, or ``None`` when
+    the code has no entry (unknown, or a success-not-error condition). The MCP
+    layer appends the returned line after the human error text."""
+    if not code:
+        return None
+    entry = _ERROR_HINTS.get(code)
+    return f"hint: {entry}" if entry else None
+
+
+def known_codes() -> frozenset[str]:
+    """The set of codes carrying a recovery hint — exposed for the anti-rot test
+    that pins these against the real thrown-code universe."""
+    return frozenset(_ERROR_HINTS)

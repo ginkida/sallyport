@@ -11,6 +11,7 @@ import asyncio
 import logging
 import secrets as _secrets
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +31,22 @@ class ExtensionNotConnected(Exception):
 # LOCAL_TOOLS (local_tools.py) these need Bridge state, so they live here.
 BUILTIN_TOOLS = frozenset({"status"})
 
+# Diagnostic last-call ring surfaced via `status`: how many recent calls to
+# keep, and the cap on the echoed error string (mirrors the handshake-reason
+# cap). The ring records call OUTCOMES only — tool name, ok, ms, code — never
+# the args, which for fill/key_type/send_keys would carry credentials.
+LAST_CALLS_MAXLEN = 10
+MAX_CALL_ERROR = 200
+
 
 class ToolError(Exception):
-    def __init__(self, message: str, code: str | None = None) -> None:
+    def __init__(self, message: str, code: str | None = None, detail: Any = None) -> None:
         super().__init__(message)
         self.code = code
+        # Optional structured failure metadata forwarded verbatim from the
+        # extension's tool_result body (e.g. select_option's available options).
+        # Surfaced by the MCP layer as a compact JSON line under the error.
+        self.detail = detail
 
 
 class Bridge:
@@ -71,6 +83,11 @@ class Bridge:
         self._clients_total = 0
         self._last_handshake_error: str | None = None
         self._last_handshake_error_at: float | None = None
+        # Diagnostic ring of recent tool-call outcomes (no args — see
+        # LAST_CALLS_MAXLEN) + the most recent failure, surfaced via `status`
+        # so a loop can attribute "it just timed out" to a specific tool/code.
+        self._last_calls: deque[dict[str, Any]] = deque(maxlen=LAST_CALLS_MAXLEN)
+        self._last_error: dict[str, Any] | None = None
 
     @property
     def connected(self) -> bool:
@@ -277,6 +294,11 @@ class Bridge:
             "port": self._port,
             "pendingCalls": len(self._pending),
             "uptimeS": round(time.monotonic() - self._started_monotonic, 1),
+            # Recent tool-call outcomes (oldest→newest) + the latest failure, so
+            # a loop can attribute a stall to a specific tool/code. Outcomes
+            # only — never the args.
+            "lastCalls": list(self._last_calls),
+            "lastError": self._last_error,
         }
 
     def set_status_path(self, path: Path | None) -> None:
@@ -316,7 +338,9 @@ class Bridge:
     async def call_tool(self, name: str, args: dict[str, Any]) -> Any:
         # Built-ins answer BEFORE the call lock on purpose: `status` exists
         # so a loop iteration can fail fast / report progress even while a
-        # slow tool call (e.g. a 30 s embedded wait) holds the lock.
+        # slow tool call (e.g. a 30 s embedded wait) holds the lock. It is also
+        # deliberately NOT recorded in the last-call ring — it IS the
+        # introspection, so logging it would be self-referential noise.
         if name == "status":
             return self._status()
 
@@ -325,16 +349,53 @@ class Bridge:
         # ToolError from this module).
         from .local_tools import LOCAL_TOOLS, PRE_CALL_VALIDATORS
 
-        async with self._call_lock:
-            if name in LOCAL_TOOLS:
-                return await LOCAL_TOOLS[name](args)
-            # Daemon-side pre-call validation (sandbox membership for
-            # `upload`, etc.) runs BEFORE the WS round-trip so both MCP
-            # and `sallyport-daemon exec` get the same authoritative gate.
-            validator = PRE_CALL_VALIDATORS.get(name)
-            if validator is not None:
-                validator(args)
-            return await self._call_tool_locked(name, args)
+        started = time.monotonic()
+        try:
+            async with self._call_lock:
+                if name in LOCAL_TOOLS:
+                    result = await LOCAL_TOOLS[name](args)
+                else:
+                    # Daemon-side pre-call validation (sandbox membership for
+                    # `upload`, etc.) runs BEFORE the WS round-trip so both MCP
+                    # and `sallyport-daemon exec` get the same authoritative gate.
+                    validator = PRE_CALL_VALIDATORS.get(name)
+                    if validator is not None:
+                        validator(args)
+                    result = await self._call_tool_locked(name, args)
+        except Exception as exc:
+            # CancelledError is a BaseException, so a cancelled call is NOT
+            # recorded here — only genuinely completed (errored) calls are.
+            self._record_call(
+                name,
+                ok=False,
+                ms=round((time.monotonic() - started) * 1000),
+                code=getattr(exc, "code", None),
+                error=str(exc),
+            )
+            raise
+        self._record_call(
+            name, ok=True, ms=round((time.monotonic() - started) * 1000), code=None, error=None
+        )
+        return result
+
+    def _record_call(
+        self, name: str, *, ok: bool, ms: int, code: str | None, error: str | None
+    ) -> None:
+        """Append a tool-call OUTCOME to the diagnostic ring (and, on failure,
+        set lastError). Records the tool name, ok, integer ms and — on failure —
+        the BridgeError code; NEVER the args (which for fill/key_type/send_keys
+        carry credentials). The compact ring entry omits the error string; the
+        full (capped) message lives only in lastError."""
+        entry: dict[str, Any] = {"tool": name, "ok": ok, "ms": ms}
+        if not ok and code:
+            entry["code"] = code
+        self._last_calls.append(entry)
+        if not ok:
+            self._last_error = {
+                "tool": name,
+                "code": code,
+                "error": (error or "")[:MAX_CALL_ERROR],
+            }
 
     async def _call_tool_locked(self, name: str, args: dict[str, Any]) -> Any:
         if self._client is None:
@@ -375,4 +436,8 @@ class Bridge:
             raise ToolError("extension returned a non-object tool_result body", code="bad_args")
         if result.get("ok") is True:
             return result.get("data")
-        raise ToolError(result.get("error", "unknown error"), code=result.get("code"))
+        raise ToolError(
+            result.get("error", "unknown error"),
+            code=result.get("code"),
+            detail=result.get("detail"),
+        )

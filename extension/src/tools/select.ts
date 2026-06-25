@@ -240,8 +240,11 @@ export function buildSpec(args: Record<string, unknown>): SelectSpec {
 
 /** Map a page-side failure to a `BridgeError` with a stable code the daemon
  * forwards. `wrong_element` actively routes the agent to the click/find/reveal
- * flow for custom (non-`<select>`) comboboxes. */
-function planError(f: SelectFailure): BridgeError {
+ * flow for custom (non-`<select>`) comboboxes. `not_found` additionally carries
+ * a structured `detail` so the agent can re-issue programmatically instead of
+ * regexing the option list back out of the prose. Exported for the unit test
+ * that pins the detail shape + the no-detail-on-other-failures contract. */
+export function planError(f: SelectFailure): BridgeError {
   if (f.code === 'wrong_element') {
     const tag = (f.tag ?? 'unknown').toLowerCase();
     return new BridgeError(
@@ -259,6 +262,11 @@ function planError(f: SelectFailure): BridgeError {
     return new BridgeError(
       'not_found',
       `select_option: no <option> matched ${JSON.stringify(f.missing)}. Available: [${avail}]`,
+      // Structured echo of the SAME data so the agent can re-issue without
+      // regexing the prose. Only the missing keys + each <option>'s static
+      // value/label (already capped at 50 in planSelection) — never a field's
+      // live `.value`, so no password-readback channel.
+      { missing: f.missing, available: f.available },
     );
   }
   // f.code === 'bad_args'

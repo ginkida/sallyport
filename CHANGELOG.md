@@ -6,6 +6,135 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-06-25
+
+### Added
+
+- **`console_tail` tool — see the page's console errors instead of looping a
+  silently-broken page.** A click could succeed, a snapshot could succeed, yet
+  the page's JS quietly threw and wedged — with zero signal. `console_tail`
+  surfaces recent `console.error`/`warning` + uncaught exceptions per tab as
+  `{enabled, entries:[{ts, level, text, origin}], truncated?}`. This is the
+  first `chrome.debugger.onEvent` surface in the project, so it is deliberately
+  conservative: **opt-in** (a new popup setting, default off — when off the tool
+  returns `{enabled:false, entries:[]}`, not an error); the `Runtime.enable`
+  that turns events on is issued **lazily and only when the setting is on**,
+  never on the unconditional `attach()` hot path; the buffer is a bounded
+  per-tab ring (≤50 entries × ≤1024-char text) cleared on tab close / debugger
+  detach; and reads are **origin-filtered to the allowlist** (each entry tagged
+  with its producing-script origin from the event stack trace, fail-closed on an
+  unknown origin) so a tab that navigated cross-origin while buffering can't
+  leak a non-allowlisted origin's console. Capture starts at the first attach
+  with the setting on — no history replay. Pure CDP event subscription: no
+  `Runtime.evaluate`, no interpolation.
+- **Tool errors can carry structured `detail` — `select_option`'s not_found is
+  the first.** A failure's rich data (for `select_option`, the available
+  options + the missing keys) was collapsed into English prose, forcing the
+  agent to regex the option list back out of the message. `BridgeError` now
+  takes an optional `detail` that rides the tool_result error body (additive
+  key — the MAC covers the body wholesale, so `PROTOCOL_VERSION` stays 1) and
+  the MCP layer appends it as a compact, parseable `detail: {…}` JSON line under
+  the error (the human line + recovery hint are unchanged). `select_option`'s
+  not_found populates `detail={missing, available:[{value,label}]}` (already
+  capped at 50 options) so the agent can re-issue programmatically. By
+  construction `detail` carries only structural metadata — `<option>`
+  value/label, keys, counts, indices — **never a value read from a node**, so it
+  opens no password-readback channel (tests pin that the password-gated paths
+  populate no detail, and that only not_found among select failures does). An
+  oversized detail is dropped rather than truncated into unparseable JSON.
+- **`status` now carries a recent-call ring + last error for stall
+  attribution.** "It just timed out" gave a loop nothing to act on. The daemon
+  now keeps a small bounded ring (`LAST_CALLS_MAXLEN`=10) of recent tool
+  **outcomes** and surfaces them via the existing `status` builtin:
+  `lastCalls:[{tool, ok, ms, code?}]` (oldest→newest) plus
+  `lastError:{tool, code, error}` (or null). It records outcomes only — tool
+  name, ok, integer wall-clock ms, and the `BridgeError` code — and **never the
+  args** (which for `fill`/`key_type`/`send_keys` carry credentials; a test
+  enforces no leak), with the error string capped. `status` stays a pre-lock
+  builtin (it still answers `connected:false` with no extension and never
+  queues behind a running call), and is itself never recorded.
+- **`hover` tool — pointer hover without a click.** CSS `:hover`-only dropdown
+  menus, tooltips and "show actions on row hover" UIs were reachable only by
+  clicking something first (which often dismisses or mis-activates). `hover`
+  issues just the `Input.dispatchMouseEvent{mouseMoved}` step `mouse_click`
+  already sends as its hover preamble — no press/release, so nothing is
+  activated (strictly weaker than a click). Target is a selector/@eN (auto-aimed
+  with the same overlay diagnostics as `mouse_click` — `covered`/`hitTargetRef`)
+  or explicit viewport `x`/`y`; pair with embedded `waitFor` to
+  hover→wait-for-menu in one call. The `:hover` state is transient (a synthetic
+  mouseMoved holds it only until the next move). `mouse_click` and `hover` now
+  share the pure `parsePointerTarget` disambiguation and the
+  `validateViewportPoint` guard.
+- **`scroll` tool — deterministic, predicate-less scrolling.** `reveal` only
+  scrolls while hunting a target predicate and stops the moment it matches, so
+  there was no way to "just page down to trigger a lazy-load / infinite-scroll
+  feed" or "bring this element into view" without `evaluate`. `scroll` fills the
+  gap: `selector` → `scrollIntoView({block:'center'})`, or scroll the page (or a
+  `selector` container) by a `dx`/`dy` delta (negatives scroll up/left) or
+  `to:'top'|'bottom'`. The result `{x, y, scrollHeight, atBottom}` tells a
+  lazy-load loop when it has bottomed out. Structured CDP only — fixed
+  `SCROLL_BY_PROBE`/`SCROLL_INTO_VIEW_PROBE` literals with the deltas and the
+  `to` keyword carried as structured `callFunctionOn` arguments (never
+  interpolated, the blessed `SCROLL_STEP_PROBE` shape), so no per-domain
+  `evaluate` flag; allowlist-gated; the `@eN` ref space is untouched.
+
+- **`get_state` tool — a cheap single-element liveness/visibility/box/text
+  probe.** The dominant cost in an automation loop is verification: after
+  every action the only way to ask "is `@e5` still there / visible / did its
+  text change / where is it now" was to re-`snapshot` the whole page (tens of
+  KB, a full `@eN` ref-space reset) and re-find the element. `get_state`
+  answers that in one tiny round-trip and — critically — never throws for a
+  vanished node: a missing element returns `{exists:false, reason}`
+  (`not_found` for a CSS miss, `unknown_ref` for an `@eN` this tab never
+  minted or lost on navigation, `detached` for a ref whose node died), so it
+  is safe to poll instead of ending a loop on `bad_ref`. A hit returns
+  `{exists:true, visible, tag, text, box?, inViewport?, ref?, role?, name?}`
+  with `box`/`inViewport` in viewport-relative CSS px (the same coordinates
+  `mouse_click`'s `x`/`y` take). Structured CDP only — a FIXED probe literal
+  with the text cap as its sole structured argument (the same trust shape as
+  `read_text`), so no per-domain `evaluate` flag — allowlist-gated, mints no
+  refs, and reads **no** input `.value` (it cannot expose a password field's
+  contents).
+- **CDP debugger-attach failures now carry a stable, classified error code.**
+  Every tool attaches the debugger first; when that failed the raw Chrome
+  string ("Cannot access a chrome:// URL", "Another debugger is already
+  attached…", "No tab with given id…") propagated code-less, so an autonomous
+  loop had nothing to branch on and would retry blindly. `attach()` now maps
+  the rejection (`cdp.ts:classifyAttachError`) to `attach_forbidden_url`
+  (restricted page — give up), `attach_debugger_conflict` (DevTools/another
+  client/tab mid-drag — retryable), `attach_target_closed` (tab gone — drop
+  this tabId), or `attach_failed` (anything else, original text preserved).
+  Best-effort overlay: Chrome's wording isn't a stable API, so an unmatched
+  message still surfaces as `attach_failed` rather than being swallowed, and
+  the echoed text is capped at 200 chars (it can embed a page URL). The
+  existing "already attached → assume it's our own prior attachment, proceed"
+  behaviour is unchanged.
+- **Embedded `waitFor` outcomes now carry a `reason` on the not-found path.**
+  The embedded wait folds its errors into the result (the action it followed
+  already succeeded, so a wait blow-up must stay non-fatal), which meant a
+  typo'd CSS selector (permanent), a stale `@eN` after a re-render
+  (re-snapshot), and a not-yet-present element (retry) all collapsed into the
+  same `{found:false}` — so an agent would burn a full 30 s poll on a condition
+  it had itself malformed. `WaitOutcome` gains `reason?:
+  'timeout'|'bad_ref'|'invalid_selector'|'error'` (`poll.ts:classifyWaitError`):
+  `timeout` from `pollFor` (so standalone `wait_for` gets it for free), the
+  others derived in the embedded path's catch. No wire change — `reason` rides
+  the existing tool-result data, not the envelope, so no canonical-vector
+  regeneration.
+- **Tool errors now carry a machine-readable recovery hint.** A frozen
+  daemon-side table (`error_taxonomy.py`) keyed by the stable error codes
+  appends one compact `hint: retryable=yes|no; …` line after the existing
+  `Error [code]: message` text (the human line is unchanged), so a tight
+  autonomous loop can branch "when I see code X do Y" — retry a stale `bad_ref`
+  after a fresh snapshot, give up on a `domain_not_allowed` (the user must
+  allowlist it), open a custom combobox with `click` on `wrong_element`, and so
+  on — across every tool with zero per-tool wiring. The hints describe only
+  user-driven popup steps or structured-tool alternatives and never advertise
+  `allowPassword`/`allowEvaluate` as automatic actions (a test enforces this);
+  another test pins the table's keys to the real thrown-code universe so a
+  renamed code can't leave a dead hint behind. Codes that are success-not-error
+  (`wait_for`/`settle` returning `found:false`) deliberately have no entry.
+
 ## [0.10.0] — 2026-06-19
 
 Connection-reliability pass: the bridge would intermittently go "now it
@@ -988,7 +1117,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/ginkida/sallyport/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ginkida/sallyport/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ginkida/sallyport/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/ginkida/sallyport/compare/v0.8.0...v0.8.1

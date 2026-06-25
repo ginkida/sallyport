@@ -67,7 +67,16 @@ const bridge = new BridgeConnection({
       return { ok: true, data };
     } catch (e) {
       const code = e instanceof BridgeError ? e.code : 'error';
-      return { ok: false, error: e instanceof Error ? e.message : String(e), code };
+      // Forward a tool's structured failure detail (currently select_option's
+      // not_found) on the error body. Additive optional key — the daemon reads
+      // it only when present.
+      const detail = e instanceof BridgeError ? e.detail : undefined;
+      return {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+        code,
+        ...(detail !== undefined ? { detail } : {}),
+      };
     }
   },
   extensionVersion: chrome.runtime.getManifest().version,

@@ -8,16 +8,19 @@
 import { appendAudit, getSettings, redactAuditArgs, type AuditEntry } from './storage.js';
 import { BridgeError } from './tools/errors.js';
 import { evaluate } from './tools/evaluate.js';
+import { consoleTail } from './tools/console.js';
 import { click, fill, readText } from './tools/dom.js';
 import { fetchInPage } from './tools/fetch.js';
 import { find } from './tools/find.js';
 import { keyType, sendKeys } from './tools/keyboard.js';
-import { mouseClick } from './tools/mouse.js';
+import { hover, mouseClick } from './tools/mouse.js';
 import { reveal } from './tools/reveal.js';
 import { screenshot } from './tools/screenshot.js';
 import { selectOption } from './tools/select.js';
 import { settle } from './tools/settle.js';
+import { scroll } from './tools/scroll.js';
 import { snapshot } from './tools/snapshot.js';
+import { getState } from './tools/state.js';
 import { closeTab, listTabs, navigate, reload } from './tools/tabs.js';
 import { upload } from './tools/upload.js';
 import { waitFor } from './tools/wait.js';
@@ -32,8 +35,11 @@ const tools: Record<string, Tool> = {
   close_tab: closeTab,
   snapshot,
   read_text: readText,
+  get_state: getState,
+  console_tail: consoleTail,
   click,
   mouse_click: mouseClick,
+  hover,
   fill,
   select_option: selectOption,
   key_type: keyType,
@@ -43,6 +49,7 @@ const tools: Record<string, Tool> = {
   settle,
   find,
   reveal,
+  scroll,
   evaluate,
   fetch_in_page: fetchInPage,
   upload,

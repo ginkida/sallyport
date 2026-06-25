@@ -2,15 +2,19 @@ import { describe, expect, it } from 'vitest';
 
 import {
   advanceSettle,
+  classifyWaitError,
   INITIAL_SETTLE_STATE,
   parseMaxSteps,
   parseTimeoutMs,
   parseWaitFor,
   quiescenceSignal,
   QUIESCENCE_PROBE,
+  SCROLL_BY_PROBE,
+  SCROLL_INTO_VIEW_PROBE,
   SCROLL_STEP_PROBE,
   scrollStalled,
 } from '../src/tools/poll.js';
+import { BridgeError } from '../src/tools/errors.js';
 
 describe('parseTimeoutMs', () => {
   it('defaults when undefined', () => {
@@ -192,6 +196,91 @@ describe('parseMaxSteps (reveal)', () => {
     expect(() => parseMaxSteps(-3)).toThrowError(/maxSteps/);
     expect(() => parseMaxSteps(2.5)).toThrowError(/maxSteps/);
     expect(() => parseMaxSteps('lots')).toThrowError(/maxSteps/);
+  });
+});
+
+describe('SCROLL_BY_PROBE / SCROLL_INTO_VIEW_PROBE (scroll)', () => {
+  it('SCROLL_BY_PROBE scrolls by a structured delta (negatives allowed) and reports position', () => {
+    const fn = new Function(`return (${SCROLL_BY_PROBE});`)() as (
+      this: { scrollTop: number; scrollLeft: number; scrollHeight: number; clientHeight: number },
+      dx: number,
+      dy: number,
+      to: string | null,
+    ) => { x: number; y: number; scrollHeight: number; clientHeight: number };
+    const el = { scrollTop: 100, scrollLeft: 0, scrollHeight: 2000, clientHeight: 500 };
+    expect(fn.call(el, 0, 300, null).y).toBe(400);
+    expect(el.scrollTop).toBe(400);
+    expect(fn.call(el, 0, -150, null).y).toBe(250); // negative scrolls up
+    expect(fn.call(el, 40, 0, null).x).toBe(40); // horizontal axis too
+  });
+
+  it('SCROLL_BY_PROBE jumps to an edge when `to` is set', () => {
+    const fn = new Function(`return (${SCROLL_BY_PROBE});`)() as (
+      this: { scrollTop: number; scrollLeft: number; scrollHeight: number; clientHeight: number },
+      dx: number,
+      dy: number,
+      to: string | null,
+    ) => { x: number; y: number };
+    const el = { scrollTop: 100, scrollLeft: 9, scrollHeight: 2000, clientHeight: 500 };
+    expect(fn.call(el, 0, 0, 'bottom').y).toBe(2000);
+    const top = fn.call(el, 0, 0, 'top');
+    expect(top.y).toBe(0);
+    expect(top.x).toBe(0);
+  });
+
+  it('SCROLL_INTO_VIEW_PROBE calls scrollIntoView and returns the page offset', () => {
+    const fn = new Function(`return (${SCROLL_INTO_VIEW_PROBE});`)() as (this: unknown) => {
+      x: number;
+      y: number;
+    };
+    let called = false;
+    const el = {
+      scrollIntoView: () => {
+        called = true;
+      },
+      ownerDocument: { defaultView: { scrollX: 5, scrollY: 800 } },
+    };
+    expect(fn.call(el)).toEqual({ x: 5, y: 800 });
+    expect(called).toBe(true);
+  });
+
+  it('SCROLL_INTO_VIEW_PROBE tolerates a missing defaultView', () => {
+    const fn = new Function(`return (${SCROLL_INTO_VIEW_PROBE});`)() as (this: unknown) => {
+      x: number;
+      y: number;
+    };
+    const el = { scrollIntoView: () => {}, ownerDocument: { defaultView: null } };
+    expect(fn.call(el)).toEqual({ x: 0, y: 0 });
+  });
+});
+
+describe('classifyWaitError (embedded waitFor)', () => {
+  it('maps a stale @eN BridgeError to bad_ref', () => {
+    expect(classifyWaitError(new BridgeError('bad_ref', 'unknown ref "@e5"'))).toBe('bad_ref');
+  });
+
+  it('does not treat other BridgeError codes as bad_ref', () => {
+    expect(classifyWaitError(new BridgeError('domain_not_allowed', 'nope'))).toBe('error');
+  });
+
+  it('maps a malformed-CSS query rejection to invalid_selector', () => {
+    for (const msg of [
+      "'div[' is not a valid selector.",
+      'Invalid selector',
+      'DOM Error while querying',
+      "Failed to execute 'querySelector'",
+    ]) {
+      expect(classifyWaitError(new Error(msg))).toBe('invalid_selector');
+    }
+  });
+
+  it('falls back to error for an unrecognised failure', () => {
+    expect(classifyWaitError(new Error('socket hung up'))).toBe('error');
+  });
+
+  it('tolerates a non-Error throwable', () => {
+    expect(classifyWaitError('boom')).toBe('error');
+    expect(classifyWaitError(null)).toBe('error');
   });
 });
 

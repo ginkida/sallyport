@@ -25,6 +25,11 @@ export type Settings = {
    * attached (cdp.ts:keepAwake). Default on; the page then behaves as if
    * active (e.g. Telegram sends read receipts during automation). */
   keepAwake: boolean;
+  /** Capture page console errors/warnings + uncaught exceptions on driven
+   * tabs (console-capture.ts), readable via the `console_tail` tool. Default
+   * OFF — it lazily enables CDP `Runtime.enable` (widening the observable CDP
+   * footprint), so it is opt-in. */
+  captureConsole: boolean;
 };
 
 export const DEFAULT_SERVER_URL = 'ws://127.0.0.1:10086/ws';
@@ -74,6 +79,7 @@ export async function getSettings(): Promise<Settings> {
     serverUrl: v?.serverUrl || DEFAULT_SERVER_URL,
     paused: !!v?.paused,
     keepAwake: v?.keepAwake !== false, // default on
+    captureConsole: !!v?.captureConsole, // default off (opt-in)
   };
 }
 

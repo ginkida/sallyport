@@ -358,6 +358,7 @@ $('#status-advanced').addEventListener('toggle', async () => {
   ]);
   ($('#settings-url') as HTMLInputElement).value = s.serverUrl;
   ($('#keep-awake') as HTMLInputElement).checked = s.keepAwake;
+  ($('#capture-console') as HTMLInputElement).checked = s.captureConsole;
   const ul = $('#tool-list') as HTMLUListElement;
   ul.innerHTML = '';
   if (tools?.tools) {
@@ -373,6 +374,12 @@ $('#status-advanced').addEventListener('toggle', async () => {
 $('#keep-awake').addEventListener('change', async () => {
   // Takes effect on the next tool call — keepAwake is re-read per attach.
   await setSettings({ keepAwake: ($('#keep-awake') as HTMLInputElement).checked });
+});
+
+$('#capture-console').addEventListener('change', async () => {
+  // Takes effect on the next tool call — captureConsole is re-read per attach,
+  // which lazily issues Runtime.enable for the driven tab when on.
+  await setSettings({ captureConsole: ($('#capture-console') as HTMLInputElement).checked });
 });
 
 $('#settings-save').addEventListener('click', async () => {
