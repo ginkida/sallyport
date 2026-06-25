@@ -6,6 +6,22 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-06-25
+
+### Fixed
+
+- **The status popup's "Advanced" section is reachable again** — keep-awake,
+  the Daemon URL, the tools list, and 0.11.0's new "capture page console
+  errors" toggle. `#status-advanced` carried a `hidden` class (`display:none`)
+  since the first public release (v0.2.0) that nothing ever removed, so the
+  whole `<details>` was dead. It went unnoticed because every control inside it
+  had a working default — until 0.11.0 added the off-by-default
+  `captureConsole` toggle, which then couldn't be switched on from the UI (so
+  `console_tail` couldn't be enabled). Removed the stray `hidden`; the
+  disclosure now shows (collapsed) whenever the extension is paired, and the
+  Daemon URL is reachable even while disconnected. Extension-only — the daemon
+  is unchanged from 0.11.0.
+
 ## [0.11.0] — 2026-06-25
 
 ### Added
@@ -1117,7 +1133,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/ginkida/sallyport/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/ginkida/sallyport/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ginkida/sallyport/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ginkida/sallyport/compare/v0.8.1...v0.9.0
