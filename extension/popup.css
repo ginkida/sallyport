@@ -129,34 +129,47 @@ button:disabled:hover { border-color: var(--border); }
 .status-title { font-weight: 600; font-size: 14px; }
 .status-sub { margin-top: 2px; word-break: break-all; }
 
-.stats { display: flex; gap: 8px; margin-bottom: 10px; }
-.stat {
-  flex: 1; background: var(--panel); border: 1px solid var(--border);
-  border-radius: 6px; padding: 10px; text-align: center;
-}
-.stat-num { font-size: 20px; font-weight: 600; color: var(--fg); }
-.stat-lbl { color: var(--muted); font-size: 11px; margin-top: 2px; }
-
-.quick-allow { margin: 10px 0; }
-.actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.status-summary { margin: -2px 0 10px; }
+.actions { display: flex; gap: 6px; align-items: center; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
 .actions button { flex: 1; }
+.actions button.ghost { flex: 0 0 auto; background: none; border-color: transparent; color: var(--muted); }
+.actions button.ghost:hover { color: var(--danger); border-color: rgba(232, 90, 90, 0.3); }
 
 /* ──────────────── Current-tab widget ──────────────── */
 .current-tab {
   background: var(--panel); border: 1px solid var(--border);
-  border-radius: 6px; padding: 10px; margin: 10px 0;
+  border-radius: 8px; padding: 12px; margin: 10px 0;
 }
+.ct-label { margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.04em; font-size: 10px; }
 .ct-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .ct-host { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg); flex: 1; min-width: 0; word-break: break-all; }
 .ct-state.ok { color: var(--ok); font-size: 11px; }
 .ct-state.miss { color: var(--warn); font-size: 11px; }
 #ct-add { width: 100%; margin-top: 8px; }
 
-/* ──────────────── Advanced disclosure (status tab) ──────────────── */
-#status-advanced { margin: 14px 0 0; font-size: 12px; color: var(--muted); }
-#status-advanced summary { cursor: pointer; padding: 4px 0; user-select: none; }
-#status-advanced summary:hover { color: var(--fg); }
-#status-advanced .adv-section-label { margin: 12px 0 4px; }
+/* ──────────────── Recent activity (status tab) ──────────────── */
+.activity {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; margin: 10px 0;
+}
+.activity-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.activity-list { margin: 0; }
+.activity-list li { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; font-size: 12px; }
+.activity-list .ok { color: var(--ok); }
+.activity-list .fail { color: var(--danger); }
+.activity-list .act-tool { font-family: ui-monospace, monospace; color: var(--fg); flex: 1; min-width: 0; }
+.activity-list .act-time { font-size: 11px; white-space: nowrap; }
+.activity-error { color: var(--danger); font-size: 11px; margin-top: 6px; word-break: break-word; }
+.activity-error:empty { display: none; }
+.icon-btn { background: none; border: none; color: var(--muted); cursor: pointer; padding: 0 4px; font-size: 14px; line-height: 1; }
+.icon-btn:hover { color: var(--fg); border: none; }
+
+/* ──────────────── Disclosures (Settings / Advanced, status tab) ──────────────── */
+.disclosure { margin: 12px 0 0; font-size: 12px; color: var(--muted); }
+.disclosure summary { cursor: pointer; padding: 6px 0; user-select: none; }
+.disclosure summary:hover { color: var(--fg); }
+.disclosure .hint { margin: 2px 0 8px; }
+.disclosure .adv-section-label { margin: 12px 0 4px; }
 .tool-list { max-height: 140px; overflow-y: auto; padding: 4px 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; }
 .tool-list li { padding: 2px 0; font-family: ui-monospace, monospace; font-size: 11px; }
 

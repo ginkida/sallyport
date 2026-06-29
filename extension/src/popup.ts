@@ -129,15 +129,52 @@ function renderStatusCard(status: Status, paused: boolean): void {
   $('#actions-block').classList.toggle('hidden', paused);
 }
 
-async function renderStats(connected: boolean): Promise<void> {
-  $('#status-stats').classList.toggle('hidden', !connected);
-  $('#quick-allow').classList.toggle('hidden', !connected);
+async function renderSummary(connected: boolean): Promise<void> {
+  const el = $('#status-summary');
+  el.classList.toggle('hidden', !connected);
   if (!connected) return;
   const [allow, audit] = await Promise.all([getAllowlist(), getAudit()]);
-  ($('#stat-allow') as HTMLElement).textContent = String(allow.length);
   const hourAgo = Date.now() - 60 * 60 * 1000;
   const recent = audit.filter((e) => e.ts >= hourAgo).length;
-  ($('#stat-recent') as HTMLElement).textContent = String(recent);
+  const sites = `${allow.length} site${allow.length === 1 ? '' : 's'} allowed`;
+  const calls = `${recent} call${recent === 1 ? '' : 's'} in the last hour`;
+  el.textContent = `${sites} · ${calls}`;
+}
+
+/** Compact tail of the audit log on the Status tab — the at-a-glance
+ * "is it working / what just failed" view. Full history lives in the Audit tab.
+ * Sourced from the extension's own audit log (the daemon's status-ring is not
+ * reachable from the popup). */
+async function renderActivity(connected: boolean): Promise<void> {
+  $('#activity').classList.toggle('hidden', !connected);
+  if (!connected) return;
+  const log = await getAudit();
+  const ul = $('#activity-list') as HTMLUListElement;
+  ul.innerHTML = '';
+  const recent = log.slice(-4).reverse();
+  if (recent.length === 0) {
+    ul.innerHTML = '<li class="muted small">No tool calls yet.</li>';
+  } else {
+    const now = Date.now();
+    for (const e of recent) {
+      const li = document.createElement('li');
+      const mark = document.createElement('span');
+      mark.className = e.ok ? 'ok' : 'fail';
+      mark.textContent = e.ok ? '✓' : '✕';
+      const tool = document.createElement('span');
+      tool.className = 'act-tool';
+      tool.textContent = e.tool;
+      const time = document.createElement('span');
+      time.className = 'act-time muted';
+      time.textContent = formatRelativeTime(e.ts, now);
+      li.append(mark, tool, time);
+      ul.appendChild(li);
+    }
+  }
+  const lastErr = [...log].reverse().find((e) => !e.ok && !!e.error);
+  ($('#activity-error') as HTMLElement).textContent = lastErr
+    ? `last error · ${lastErr.tool}: ${lastErr.error}`
+    : '';
 }
 
 // -------------------------------------------------------------------------
@@ -175,13 +212,15 @@ async function renderCurrentTab(connected: boolean): Promise<void> {
   const addBtn = $('#ct-add') as HTMLButtonElement;
   if (match.matched) {
     stateEl.className = 'ct-state ok';
-    stateEl.textContent = `✓ allowed (${match.entry?.pattern ?? ''})`;
+    stateEl.textContent = '✓ allowed';
+    stateEl.title = `matches ${match.entry?.pattern ?? ''}`;
     addBtn.classList.add('hidden');
   } else {
     stateEl.className = 'ct-state miss';
-    stateEl.textContent = '✕ not in allowlist';
+    stateEl.textContent = '✕ not allowed';
+    stateEl.title = '';
     addBtn.classList.remove('hidden');
-    addBtn.textContent = `Add ${host} to allowlist`;
+    addBtn.textContent = '+ Allow this site';
     addBtn.onclick = async () => {
       // Re-fetch fresh — the list rendered into `match` above may be stale
       // by now (context menu, another popup) and we'd otherwise stomp on
@@ -244,7 +283,8 @@ async function refreshStatus(): Promise<void> {
   }
 
   renderStatusCard(status, settings.paused);
-  await renderStats(liveConnected);
+  await renderSummary(liveConnected);
+  await renderActivity(liveConnected);
   await renderCurrentTab(liveConnected);
   // Keep the Advanced URL field in sync (only when closed — don't clobber
   // typing).
@@ -346,8 +386,16 @@ $('#resume-btn').addEventListener('click', async () => {
 });
 
 // -------------------------------------------------------------------------
-// Status Advanced — daemon URL + tools list
+// Status Settings (toggles) + Advanced (daemon URL, tools list)
 // -------------------------------------------------------------------------
+
+$('#status-settings').addEventListener('toggle', async () => {
+  const d = $('#status-settings') as HTMLDetailsElement;
+  if (!d.open) return;
+  const s = await getSettings();
+  ($('#keep-awake') as HTMLInputElement).checked = s.keepAwake;
+  ($('#capture-console') as HTMLInputElement).checked = s.captureConsole;
+});
 
 $('#status-advanced').addEventListener('toggle', async () => {
   const adv = $('#status-advanced') as HTMLDetailsElement;
@@ -357,8 +405,6 @@ $('#status-advanced').addEventListener('toggle', async () => {
     send<{ ok: boolean; tools: string[] }>({ type: 'LIST_TOOLS' }),
   ]);
   ($('#settings-url') as HTMLInputElement).value = s.serverUrl;
-  ($('#keep-awake') as HTMLInputElement).checked = s.keepAwake;
-  ($('#capture-console') as HTMLInputElement).checked = s.captureConsole;
   const ul = $('#tool-list') as HTMLUListElement;
   ul.innerHTML = '';
   if (tools?.tools) {
@@ -370,6 +416,8 @@ $('#status-advanced').addEventListener('toggle', async () => {
     }
   }
 });
+
+$('#activity-refresh').addEventListener('click', () => void renderActivity(liveConnected));
 
 $('#keep-awake').addEventListener('change', async () => {
   // Takes effect on the next tool call — keepAwake is re-read per attach.
@@ -392,40 +440,6 @@ $('#settings-save').addEventListener('click', async () => {
   await send({ type: 'RECONNECT' });
   flash('#status-flash', 'saved — reconnecting');
   await refreshStatus();
-});
-
-// -------------------------------------------------------------------------
-// Quick-add allowlist (status tab)
-// -------------------------------------------------------------------------
-
-async function submitQuickAdd(): Promise<void> {
-  const input = $('#quick-allow-input') as HTMLInputElement;
-  const errEl = $('#quick-allow-error') as HTMLElement;
-  errEl.textContent = '';
-  const pattern = normalizePattern(input.value);
-  const err = validatePattern(pattern);
-  if (err) {
-    errEl.textContent = err;
-    return;
-  }
-  const list = await getAllowlist();
-  if (list.some((e) => e.pattern === pattern)) {
-    errEl.textContent = 'already in the allowlist';
-    return;
-  }
-  list.push({ pattern, allowEvaluate: false, addedAt: Date.now() });
-  await setAllowlist(list);
-  input.value = '';
-  flash('#status-flash', `added ${pattern}`);
-  await Promise.all([renderStats(liveConnected), renderCurrentTab(liveConnected)]);
-}
-
-$('#quick-allow-add').addEventListener('click', () => void submitQuickAdd());
-$('#quick-allow-input').addEventListener('keydown', (e) => {
-  if ((e as KeyboardEvent).key === 'Enter') {
-    e.preventDefault();
-    void submitQuickAdd();
-  }
 });
 
 // -------------------------------------------------------------------------
@@ -612,13 +626,17 @@ chrome.storage.onChanged.addListener((changes, area) => {
   // in sync without forcing the user to click Refresh.
   if (changes.sallyport_audit) {
     if (activeTabId() === 'audit') void renderAudit();
-    // Stats card on Status shows "calls (1h)" — keep that fresh too.
-    if (activeTabId() === 'status') void renderStats(liveConnected);
+    // Status summary ("calls (1h)") + the recent-activity strip both read the
+    // audit log — keep them fresh as calls land.
+    if (activeTabId() === 'status') {
+      void renderSummary(liveConnected);
+      void renderActivity(liveConnected);
+    }
   }
   if (changes.sallyport_allowlist) {
     if (activeTabId() === 'allowlist') void renderAllowlist();
     if (activeTabId() === 'status') {
-      void renderStats(liveConnected);
+      void renderSummary(liveConnected);
       void renderCurrentTab(liveConnected);
     }
   }

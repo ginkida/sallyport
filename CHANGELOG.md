@@ -6,6 +6,23 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.2] — 2026-06-29
+
+### Changed
+
+- **Popup Status tab rebuilt for simplicity.** The most-used screen now leads
+  with what matters: a one-line summary (sites allowed · calls in the last
+  hour), a prominent **This tab** card with a single **+ Allow this site**
+  button, and a new **Recent activity** strip — the last few tool calls
+  (✓/✕ + tool + relative time) plus the latest error — so you can tell "it
+  threw and the page is wedged" from "merely slow" without opening the Audit
+  tab. Settings (keep-awake, capture-console) and Advanced (Daemon URL, tools
+  list) are now two clearly-labelled disclosures instead of one catch-all
+  "Advanced", so the 0.11.1-fixed console-capture toggle is easy to find. The
+  duplicate "add any other domain" box (the Allowlist tab already does this)
+  and the bulky stat cards are gone, and Unpair is de-emphasised next to
+  Pause/Reconnect. Extension-only — the daemon is unchanged.
+
 ## [0.11.1] — 2026-06-25
 
 ### Fixed
@@ -1133,7 +1150,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.11.2...HEAD
+[0.11.2]: https://github.com/ginkida/sallyport/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/ginkida/sallyport/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/ginkida/sallyport/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ginkida/sallyport/compare/v0.9.0...v0.10.0

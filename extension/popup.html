@@ -54,34 +54,26 @@
 
       <div id="status-error" class="error"></div>
 
-      <div id="status-stats" class="stats hidden">
-        <div class="stat">
-          <div class="stat-num" id="stat-allow">0</div>
-          <div class="stat-lbl">allowed sites</div>
-        </div>
-        <div class="stat">
-          <div class="stat-num" id="stat-recent">0</div>
-          <div class="stat-lbl">calls (1h)</div>
-        </div>
-      </div>
+      <div id="status-summary" class="status-summary muted small hidden"></div>
 
-      <!-- Current-tab quick add — only shown when on a real http(s) tab -->
+      <!-- This tab — one-click allow for the active site (only on http(s) tabs) -->
       <div id="current-tab" class="current-tab hidden">
+        <div class="ct-label muted small">This tab</div>
         <div class="ct-row">
-          <span class="muted small">Current tab:</span>
           <span id="ct-host" class="ct-host"></span>
           <span id="ct-state" class="ct-state"></span>
         </div>
-        <button id="ct-add" class="hidden">Add this site to the allowlist</button>
+        <button id="ct-add" class="primary hidden">+ Allow this site</button>
       </div>
 
-      <div id="quick-allow" class="quick-allow hidden">
-        <label class="muted small" for="quick-allow-input">Add any other domain</label>
-        <div class="row">
-          <input type="text" id="quick-allow-input" placeholder="example.com">
-          <button id="quick-allow-add">Add</button>
+      <!-- Recent activity — compact tail of the audit log; full history in the Audit tab -->
+      <div id="activity" class="activity hidden">
+        <div class="activity-head">
+          <span class="muted small">Recent activity</span>
+          <button id="activity-refresh" class="icon-btn" title="Refresh" aria-label="Refresh activity">⟳</button>
         </div>
-        <div id="quick-allow-error" class="error"></div>
+        <ul id="activity-list" class="activity-list"></ul>
+        <div id="activity-error" class="activity-error"></div>
       </div>
 
       <div id="paused-block" class="block hidden">
@@ -89,21 +81,25 @@
         <button id="resume-btn" class="primary">Resume</button>
       </div>
 
-      <details id="status-advanced" class="advanced">
+      <details id="status-settings" class="disclosure">
+        <summary>Settings</summary>
+        <label class="checkbox">
+          <input type="checkbox" id="keep-awake"> keep automated tabs awake
+        </label>
+        <div class="muted small hint">Unfreezes background tabs while the bridge drives them; the page believes it is focused (e.g. Telegram sends read receipts).</div>
+        <label class="checkbox">
+          <input type="checkbox" id="capture-console"> capture page console errors
+        </label>
+        <div class="muted small hint">Records console errors/warnings + uncaught exceptions on driven tabs, readable via the console_tail tool. Off by default — it widens the debugger's CDP footprint.</div>
+      </details>
+
+      <details id="status-advanced" class="disclosure">
         <summary>Advanced</summary>
         <label class="muted small" for="settings-url">Daemon URL</label>
         <div class="row">
           <input type="text" id="settings-url" placeholder="ws://127.0.0.1:10086/ws">
           <button id="settings-save">Save</button>
         </div>
-        <label class="checkbox">
-          <input type="checkbox" id="keep-awake"> keep automated tabs awake
-        </label>
-        <div class="muted small">Unfreezes background tabs while the bridge drives them; the page believes it is focused (e.g. Telegram sends read receipts).</div>
-        <label class="checkbox">
-          <input type="checkbox" id="capture-console"> capture page console errors
-        </label>
-        <div class="muted small">Records console errors/warnings + uncaught exceptions on driven tabs, readable via the console_tail tool. Off by default — it widens the debugger's CDP footprint.</div>
         <div class="muted small adv-section-label">Available tools (<span id="tool-count">0</span>)</div>
         <ul id="tool-list" class="muted small tool-list"></ul>
       </details>
@@ -111,7 +107,7 @@
       <div id="actions-block" class="actions hidden">
         <button id="pause-btn">Pause</button>
         <button id="reconnect-btn">Reconnect</button>
-        <button id="unpair-btn" class="danger">Unpair</button>
+        <button id="unpair-btn" class="danger ghost">Unpair</button>
       </div>
 
       <div id="status-flash" class="flash"></div>
