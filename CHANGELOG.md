@@ -6,6 +6,20 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Broker tab-ownership gate no longer confuses a boolean tabId with an int
+  (invariant #13).** `OwnershipRegistry.owns()` guarded with `isinstance(tab_id,
+  int)`, but in Python `isinstance(True, int)` is True and `True == 1`, so a
+  broker client that owned the tab with Chrome id 1 could send `{"tabId": true}`
+  and pass the gate — and because the extension resolves a non-numeric tabId to
+  the human's *active* tab, act on a tab it didn't own. Every tabId type-guard in
+  `ownership.py` now routes through `_is_tab_id` (`type(x) is int`, which excludes
+  bool), so a bool tabId is refused with `tab_not_owned` and never forwarded, and
+  a bool key can't clobber an owned int entry. Found by the internal security
+  audit; narrow in practice (needs to own tab id 1/0) but a real hole in the
+  authoritative gate. +2 tests.
+
 ### Changed
 
 - **A shim that can't attach to the broker now explains why.** When a plain

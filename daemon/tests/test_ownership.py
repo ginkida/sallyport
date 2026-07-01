@@ -48,6 +48,36 @@ def test_owns_rejects_non_int_tabid() -> None:
     assert reg.owns("A", None) is False
 
 
+def test_owns_rejects_bool_tabid_even_when_int_key_collides() -> None:
+    """`isinstance(True, int)` is True and `True == 1` / `False == 0`, so a JSON
+    `true`/`false` tabId would otherwise slip the ownership gate onto owned tab
+    id 1/0 (`True in {1: ...}` is True). `type(x) is int` must reject bools
+    regardless of a colliding owned int key, and record_create must not let a
+    bool key clobber the int-1 entry (invariant #13)."""
+    reg = OwnershipRegistry()
+    reg.record_create("A", 1, "e1", opened_at=1.0)
+    reg.record_create("A", 0, "e0", opened_at=1.0)
+    assert reg.owns("A", 1) is True
+    assert reg.owns("A", 0) is True
+    assert reg.owns("A", True) is False
+    assert reg.owns("A", False) is False
+    # A bool tabId must not upsert (and must not clobber the int-1 entry).
+    reg.record_create("A", True, "evil", opened_at=2.0)
+    assert reg.epoch_for("A", 1) == "e1"
+    assert reg.owned_tab_ids("A") == {0, 1}
+
+
+def test_gate_rejects_bool_tabid() -> None:
+    """End-to-end: even when the client owns tab id 1, a `tabId: true` act call
+    is refused with tab_not_owned — never forwarded (where the extension would
+    resolve a non-numeric tabId to the human's active tab)."""
+    reg = OwnershipRegistry()
+    reg.record_create("A", 1, "e1", opened_at=1.0)
+    with pytest.raises(ToolError) as exc:
+        ensure_owns(reg, "A", "click", {"tabId": True})
+    assert exc.value.code == "tab_not_owned"
+
+
 def test_record_create_does_not_clobber_epoch_with_none() -> None:
     reg = OwnershipRegistry()
     reg.record_create("A", 5, "e1", opened_at=1.0, window=7)

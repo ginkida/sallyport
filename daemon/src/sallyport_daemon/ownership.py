@@ -19,7 +19,7 @@ preserved.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeGuard
 
 from .bridge import ToolError
 
@@ -45,6 +45,15 @@ UNGATED_TOOLS = frozenset({"list_tabs"})
 EPOCH_ARG = "expectedEpoch"
 
 
+def _is_tab_id(value: Any) -> TypeGuard[int]:
+    """A Chrome tab id is an int — but NOT a bool. ``isinstance(True, int)`` is
+    True and ``True == 1``/``False == 0``, so a JSON ``true`` would collide with
+    tab id 1 in the owned-tab dict (``True in {1: ...}`` is True) and slip the
+    ownership gate onto a tab the client doesn't own. ``type(x) is int`` excludes
+    bool, closing that hole (security invariant #13)."""
+    return type(value) is int
+
+
 @dataclass
 class OwnedTab:
     """One owned tab. ``epoch`` is the extension's create-time marker (None until
@@ -67,7 +76,7 @@ class OwnershipRegistry:
         self._owned: dict[str, dict[int, OwnedTab]] = {}
 
     def owns(self, client_id: str, tab_id: Any) -> bool:
-        return isinstance(tab_id, int) and tab_id in self._owned.get(client_id, {})
+        return _is_tab_id(tab_id) and tab_id in self._owned.get(client_id, {})
 
     def epoch_for(self, client_id: str, tab_id: int) -> str | None:
         tab = self._owned.get(client_id, {}).get(tab_id)
@@ -90,7 +99,7 @@ class OwnershipRegistry:
         with ``None`` — an in-place navigate echoes the tabId but mints no new
         epoch, so a missing epoch in the result means 'unchanged', not 'cleared'.
         """
-        if not isinstance(tab_id, int):
+        if not _is_tab_id(tab_id):
             return
         tabs = self._owned.setdefault(client_id, {})
         existing = tabs.get(tab_id)
@@ -168,7 +177,7 @@ def record_result(
     if not isinstance(result, dict):
         return
     tab_id = result.get("tabId")
-    if not isinstance(tab_id, int):
+    if not _is_tab_id(tab_id):
         return
     registry.record_create(
         client_id,
@@ -193,7 +202,7 @@ def record_close(
     if client_id is None or name != CLOSE_TOOL:
         return
     tab_id = args.get("tabId")
-    if isinstance(tab_id, int):
+    if _is_tab_id(tab_id):
         registry.drop_tab(client_id, tab_id)
 
 
