@@ -6,6 +6,7 @@ import {
   type ToolHandlerResult,
 } from './bridge-connection.js';
 import { BridgeError, runTool, TOOL_NAMES } from './tools.js';
+import { isTrustedPopupSender } from './ipc.js';
 import {
   clearSecret,
   getAllowlist,
@@ -178,7 +179,14 @@ type PopupMessage =
   | { type: 'RECONNECT' }
   | { type: 'LIST_TOOLS' };
 
-chrome.runtime.onMessage.addListener((msg: PopupMessage, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg: PopupMessage, sender, sendResponse) => {
+  // Fail-closed: only the extension's own popup may drive PAIR/UNPAIR/PAUSE/etc.
+  // (defence-in-depth against a future content script / externally_connectable —
+  // see ipc.ts). Reject synchronously so no message port is kept open.
+  if (!isTrustedPopupSender(sender, chrome.runtime.id)) {
+    sendResponse({ ok: false, error: 'untrusted sender' });
+    return;
+  }
   (async () => {
     try {
       switch (msg.type) {

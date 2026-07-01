@@ -8,6 +8,16 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **The popup↔service-worker control channel is now sender-gated
+  (defence-in-depth).** The `chrome.runtime.onMessage` handler for
+  PAIR/UNPAIR/PAUSE/RESUME/RECONNECT ignored `sender`. It is same-extension-only
+  today (no `externally_connectable`, no content scripts), so nothing untrusted
+  can reach it — but the trust assumption lived only in the manifest. A new
+  fail-closed `isTrustedPopupSender` gate now rejects any message not from the
+  extension's own pages (own id, no `tab`), so a future content script or
+  `externally_connectable` entry can't silently turn PAIR (secret injection) or
+  UNPAIR (secret wipe) into a web-reachable surface. Raised by the audit's
+  completeness critic. +4 tests.
 - **`send_keys` re-checks the password gate at every focus boundary (invariant
   #5).** The gate probed `document.activeElement` once up front, but `send_keys`
   dispatches a whole sequence — so `keys="tab <secret>"` on a login page (username
