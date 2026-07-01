@@ -102,8 +102,8 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "(which shows only your tabs)."
         ),
         "tab_gone": (
-            "retryable=no; a tab you owned has closed or its id was recycled — open a fresh "
-            "one with navigate(newTab:true); list_tabs shows the tabs you still own."
+            "retryable=no; the tab you targeted has closed or its id was recycled — open a "
+            "fresh one with navigate(newTab:true); list_tabs shows the tabs still available."
         ),
         "bringtofront_forbidden": (
             "retryable=no; broker mode won't foreground a tab (it would steal the human's "

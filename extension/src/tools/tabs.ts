@@ -17,6 +17,25 @@ async function openTab(url: string): Promise<chrome.tabs.Tab> {
   return isBrokerMode() ? createAgentTab(url) : chrome.tabs.create({ url, active: true });
 }
 
+/** `chrome.tabs.get`, but a vanished tab — closed, crashed, or its id recycled
+ * out from under us — fails fast with a classified `tab_gone` the agent can
+ * branch on ("open a fresh tab") instead of the raw "No tab with id: N", which
+ * would reach the daemon as an opaque code:'error' the agent can't act on.
+ * Broker mode already catches a vanished OWNED tab via the epoch confirm
+ * (tools.ts:runTool); this closes the standalone path and any explicit tabId
+ * that raced a tab close. */
+async function getTabOrGone(tabId: number): Promise<chrome.tabs.Tab> {
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch {
+    throw new BridgeError(
+      'tab_gone',
+      `tab ${tabId} is gone (closed, or its id was recycled) — ` +
+        `open a fresh one with navigate(newTab:true)`,
+    );
+  }
+}
+
 /** Resolve which tab a tool should operate on.
  *
  * Stateless across calls — no "last touched tab" memo. Callers must either
@@ -25,7 +44,7 @@ async function openTab(url: string): Promise<chrome.tabs.Tab> {
 export async function resolveTab(args: Record<string, unknown>): Promise<chrome.tabs.Tab> {
   const explicit = typeof args.tabId === 'number' ? (args.tabId as number) : null;
   if (explicit !== null) {
-    return await chrome.tabs.get(explicit);
+    return await getTabOrGone(explicit);
   }
   const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!active || active.id === undefined) {
@@ -171,7 +190,7 @@ export const closeTab: Tool = async (args) => {
   // agent could enumerate tabs via list_tabs and selectively close any
   // non-allowlisted ones (banking, email, in-progress forms), losing user
   // work behind the allowlist's back.
-  const tab = await chrome.tabs.get(tabId);
+  const tab = await getTabOrGone(tabId);
   await ensureAllowed(tab.url);
   await chrome.tabs.remove(tabId);
   return { tabId, url: tab.url, data: { closed: tabId } };

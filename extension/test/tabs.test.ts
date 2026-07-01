@@ -10,7 +10,7 @@
  */
 
 import { beforeEach, describe, expect, it } from 'vitest';
-import { isBlankTarget, listTabs, navigate } from '../src/tools/tabs.js';
+import { closeTab, isBlankTarget, listTabs, navigate, resolveTab } from '../src/tools/tabs.js';
 import { setAllowlist } from '../src/storage.js';
 import { clearAllEpochs, getEpoch, mintEpoch, setBrokerMode } from '../src/tools/ownership.js';
 import { resetAgentWindow } from '../src/tools/agent-window.js';
@@ -296,5 +296,44 @@ describe('list_tabs — owner-scoped in broker mode (invariant #13)', () => {
     setBrokerMode(true);
     const res = await listTabs({});
     expect((res.data as { tabs: unknown[] }).tabs).toEqual([]);
+  });
+});
+
+describe('vanished tab fast-fails with tab_gone (#12)', () => {
+  // Real chrome.tabs.get rejects with "No tab with id: N" for a closed/recycled
+  // id; the shared mock hands back a synthetic tab, so override it to reject.
+  function makeTabGone(id: number): void {
+    installChromeMock({});
+    const chromeMock = (
+      globalThis as unknown as {
+        chrome: { tabs: { get: (tabId: number) => Promise<unknown> } };
+      }
+    ).chrome;
+    chromeMock.tabs.get = (tabId: number) =>
+      tabId === id
+        ? Promise.reject(new Error(`No tab with id: ${tabId}.`))
+        : Promise.resolve({ id: tabId, url: 'https://done.example/', status: 'complete' });
+  }
+
+  it('resolveTab maps a missing explicit tabId to tab_gone (not a raw error)', async () => {
+    makeTabGone(42);
+    await expect(resolveTab({ tabId: 42 })).rejects.toMatchObject({ code: 'tab_gone' });
+  });
+
+  it('close_tab on a vanished tab reports tab_gone before the allowlist check', async () => {
+    makeTabGone(42);
+    await expect(closeTab({ tabId: 42 })).rejects.toMatchObject({ code: 'tab_gone' });
+  });
+
+  it('navigate over a vanished explicit tab reports tab_gone', async () => {
+    makeTabGone(42);
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    await expect(navigate({ tabId: 42, url: ALLOW })).rejects.toMatchObject({ code: 'tab_gone' });
+  });
+
+  it('still resolves a live explicit tab (no false positive)', async () => {
+    installChromeMock({ tabs: [{ id: 7, url: 'https://live.example/' }] });
+    const tab = await resolveTab({ tabId: 7 });
+    expect(tab.id).toBe(7);
   });
 });

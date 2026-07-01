@@ -8,6 +8,19 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A tool targeting a vanished tab now fails fast with `tab_gone`** instead of a
+  raw, uncoded `"No tab with id: N"`. Any tool given an explicit `tabId` for a
+  tab that has closed (or whose id was recycled) — in standalone mode, where the
+  broker's epoch-confirm doesn't run — used to surface an opaque `code:'error'`
+  an agent couldn't branch on; `resolveTab`/`close_tab` now classify it as
+  `tab_gone` (retryable=no, hint: open a fresh tab). The `tab_gone` recovery hint
+  was reworded to read correctly in both modes. No wire/gate/invariant change.
+- **The MCP tool descriptions now disambiguate four confusable pairs** so the
+  model picks the right tool first try: `click`→escalate to `mouse_click` when a
+  click doesn't register, `settle`→prefer `wait_for` when you have a concrete
+  signal, `snapshot`→`find` is cheaper for a few elements, and
+  `fetch_in_page`→`network_tail` reads a response the page already fetched.
+  Description text only.
 - **`doctor` now emits an absolute-path `claude mcp add` line.** A GUI-launched
   Claude Code frequently doesn't inherit the shell PATH, so the old bare
   `claude mcp add sallyport sallyport-daemon` produced an entry that silently
