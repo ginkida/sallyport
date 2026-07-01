@@ -8,6 +8,20 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **The WebSocket accept path now caps concurrent pre-auth handshakes
+  (invariant #8).** Only one extension client is ever legitimately connected, but
+  the WS leg — unlike the broker socket, which has `MAX_PENDING_HANDSHAKES` — put
+  no bound on how many peers could sit in the ≤`hello_timeout` pre-auth wait at
+  once. A local loopback peer could open many never-hello sockets and exhaust
+  fds/tasks, starving the real extension's accept path — contradicting
+  SECURITY.md's claim that an unauthenticated peer can't deny service to the
+  extension. `_handle_client` now refuses a connection (close 1013) once
+  `MAX_PENDING_HANDSHAKES` (32) peers are mid-handshake, incrementing a counter
+  only for the pre-auth phase and decrementing it in a `finally` so the cap
+  self-drains on close/timeout and can't wedge. The auth phase was extracted into
+  `_authenticate_client` (mirrors the broker's authenticate/serve split) with no
+  behavioural change to origin/hello/second-client handling. Found by the
+  internal security audit. +1 e2e test.
 - **The popup↔service-worker control channel is now sender-gated
   (defence-in-depth).** The `chrome.runtime.onMessage` handler for
   PAIR/UNPAIR/PAUSE/RESUME/RECONNECT ignored `sender`. It is same-extension-only

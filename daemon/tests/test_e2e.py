@@ -270,6 +270,46 @@ async def test_silent_client_is_closed_after_hello_timeout() -> None:
         await h.stop()
 
 
+async def test_pending_handshake_flood_is_capped() -> None:
+    """An unauthenticated peer can't open unbounded never-hello connections to
+    starve the real extension's accept path: once MAX_PENDING_HANDSHAKES peers
+    are mid-handshake the next connection is refused (1013), and the cap drains
+    as silent peers close/time out so the real extension still attaches."""
+    h = BridgeHarness(hello_timeout=5.0)
+    await h.start()
+    h.bridge.MAX_PENDING_HANDSHAKES = 2  # small cap for the test
+    await asyncio.sleep(0.1)  # let the start() probe connection drain
+    silent: list[Any] = []
+    try:
+        # Fill the pending slots with peers that connect but never send hello.
+        for _ in range(2):
+            silent.append(await websockets.connect(h.url))
+        await asyncio.sleep(0.1)  # let the server register both handshakes
+
+        # The next connection is refused with 1013 (server busy), before hello.
+        extra = await websockets.connect(h.url)
+        with pytest.raises(websockets.ConnectionClosed) as exc_info:
+            await asyncio.wait_for(extra.recv(), timeout=2.0)
+        rcvd = exc_info.value.rcvd
+        assert rcvd is not None
+        assert rcvd.code == 1013
+
+        # Free the pending slots; the cap drains and the real extension attaches.
+        for ws in silent:
+            await ws.close()
+        silent.clear()
+        await asyncio.sleep(0.2)
+        ext = await FakeExtension.connect(h.url)
+        try:
+            await ext.handshake()
+        finally:
+            await ext.close()
+    finally:
+        for ws in silent:
+            await ws.close()
+        await h.stop()
+
+
 async def test_browser_page_origin_is_rejected(harness: BridgeHarness) -> None:
     """A web page can open a cross-origin WebSocket to 127.0.0.1; the daemon
     must refuse browser-page Origins before they can even attempt a hello."""

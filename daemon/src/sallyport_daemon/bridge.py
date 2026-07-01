@@ -96,6 +96,10 @@ class Bridge:
         self._status_path = status_path
         self._client_attached_at: float | None = None
         self._clients_total = 0
+        # Connections currently in the pre-auth handshake (≤ hello_timeout each).
+        # Bounded by MAX_PENDING_HANDSHAKES so an unauthenticated peer can't flood
+        # the accept path and starve the real extension.
+        self._pending_handshakes = 0
         self._last_handshake_error: str | None = None
         self._last_handshake_error_at: float | None = None
         # Diagnostic ring of recent tool-call outcomes (no args — see
@@ -135,6 +139,12 @@ class Bridge:
     # with a 1009 close, which is exactly what we want — the offending client
     # gets disconnected and we don't run out of memory holding a hostile blob.
     MAX_FRAME_BYTES = 16 * 1024 * 1024
+    # Cap on connections simultaneously in the pre-auth handshake. A legitimate
+    # extension holds at most one connection (reconnect closes the old), so this
+    # is generous headroom, not a throttle on real use — the WS analogue of the
+    # broker's MAX_PENDING_HANDSHAKES (invariant #8: an unauthenticated peer can't
+    # deny service to the real extension).
+    MAX_PENDING_HANDSHAKES = 32
 
     async def serve_forever(self, *, shutdown: asyncio.Event | None = None) -> None:
         """Run the WS server until cancelled or until ``shutdown`` is set.
@@ -166,31 +176,32 @@ class Bridge:
                     except Exception:  # noqa: BLE001,S110 - best effort on shutdown
                         log.debug("ws: error closing client during shutdown", exc_info=True)
 
-    async def _handle_client(self, ws: ServerConnection) -> None:
-        # A web page can open a cross-origin WebSocket to 127.0.0.1 without
-        # any special permission. The real extension's service worker sends a
+    async def _authenticate_client(self, ws: ServerConnection) -> bool:
+        """Pre-slot authentication: refuse browser-page origins, then require a
+        valid signed hello within ``hello_timeout``. Returns ``True`` iff the peer
+        authenticated; on any failure it closes ``ws`` (no reason echoed to a
+        possibly-hostile peer) and returns ``False``. Runs BEFORE the single-client
+        slot is claimed, so an unauthenticated peer can neither occupy the slot
+        (denying service to the real extension) nor learn whether an extension is
+        currently attached."""
+        # A web page can open a cross-origin WebSocket to 127.0.0.1 without any
+        # special permission. The real extension's service worker sends a
         # chrome-extension:// Origin; non-browser clients send none (and must
-        # still pass the signed-hello gate below). Anything else is a browser
-        # page and is refused outright.
+        # still pass the signed-hello gate below). Anything else is a browser page
+        # and is refused outright.
         origin = ws.request.headers.get("Origin") if ws.request is not None else None
         if origin is not None and not origin.startswith("chrome-extension://"):
             log.warning("ws: rejecting connection with browser-page origin %r", origin)
             self._record_handshake_error(f"rejected browser-page origin: {origin}")
             await ws.close(code=1008, reason="forbidden origin")
-            return
-
-        # Authenticate BEFORE claiming the single-client slot: the first
-        # frame must be a valid signed hello, within _hello_timeout. An
-        # unauthenticated peer therefore can neither occupy the slot
-        # (denying service to the real extension) nor learn whether an
-        # extension is currently attached.
+            return False
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=self._hello_timeout)
         except (asyncio.TimeoutError, websockets.ConnectionClosed):
             log.warning("ws: closing client that sent no hello within %.0fs", self._hello_timeout)
             self._record_handshake_error(f"no signed hello within {self._hello_timeout:.0f}s")
             await ws.close(code=1008, reason="hello required")
-            return
+            return False
         try:
             if isinstance(raw, bytes):
                 raise ProtocolError("binary frame before hello")
@@ -204,6 +215,32 @@ class Bridge:
             log.warning("ws: rejecting unauthenticated client: %s", exc)
             self._record_handshake_error(f"authentication failed: {exc}")
             await ws.close(code=1008, reason="authentication failed")
+            return False
+        return True
+
+    async def _handle_client(self, ws: ServerConnection) -> None:
+        # Bound concurrent PRE-AUTH handshakes: refuse before the hello wait / any
+        # crypto once too many peers are simultaneously mid-handshake, so an
+        # unauthenticated peer can't open many never-hello sockets and starve the
+        # real extension's accept path. Check-then-increment is atomic under
+        # single-threaded asyncio (no await between), so no lock is needed.
+        if self._pending_handshakes >= self.MAX_PENDING_HANDSHAKES:
+            log.warning(
+                "ws: refusing connection — %d handshakes already pending",
+                self._pending_handshakes,
+            )
+            self._record_handshake_error("too many pending handshakes")
+            await ws.close(code=1013, reason="server busy")
+            return
+        self._pending_handshakes += 1
+        try:
+            authenticated = await self._authenticate_client(ws)
+        finally:
+            # Success moves the peer to the single-client slot below; failure
+            # closed it; a never-hello peer frees its slot on timeout. Decrement
+            # exactly once here so a flood can't permanently wedge the cap.
+            self._pending_handshakes -= 1
+        if not authenticated:
             return
 
         # Only one client at a time. If another is already attached, drop the
