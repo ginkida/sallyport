@@ -54,6 +54,23 @@ _WAIT_FOR_SCHEMA: dict[str, Any] = {
     ),
 }
 
+# Shared schema for every tool's `tabId` so the broker-mode rule (invariant #13)
+# is visible in the schema the model reads, not learned reactively from a
+# tab_required error on the first call. `status` reports which mode you're in.
+_TAB_ID_SCHEMA: dict[str, Any] = {
+    "type": "integer",
+    "description": (
+        "Target tab. In BROKER mode (a shared broker daemon serving several "
+        "sessions) a tabId is REQUIRED on every act/read tool — there is no "
+        "active-tab fallback — and must reference a tab THIS session created "
+        "(navigate with no tabId, or newTab:true, opens one you own and returns "
+        "its tabId), else the call fails with tab_required/tab_not_owned. In "
+        "STANDALONE mode it is optional for most tools (defaults to the active "
+        "tab in the current window); a few tools (e.g. close_tab) require it in "
+        "both modes."
+    ),
+}
+
 # Mirrors the tool registry in extension/src/tools.ts. Kept short and explicit
 # so Claude knows the shape of every call without guessing.
 TOOLS: list[Tool] = [
@@ -86,7 +103,7 @@ TOOLS: list[Tool] = [
             "properties": {
                 "url": {"type": "string"},
                 "newTab": {"type": "boolean", "default": False},
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
             },
             "required": ["url"],
@@ -105,7 +122,7 @@ TOOLS: list[Tool] = [
         ),
         inputSchema={
             "type": "object",
-            "properties": {"tabId": {"type": "integer"}},
+            "properties": {"tabId": _TAB_ID_SCHEMA},
             "required": ["tabId"],
             "additionalProperties": False,
         },
@@ -121,7 +138,7 @@ TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
                 "bypassCache": {"type": "boolean", "default": False},
             },
             "additionalProperties": False,
@@ -153,7 +170,7 @@ TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "a11y", "dom"],
@@ -191,7 +208,7 @@ TOOLS: list[Tool] = [
                     "default": 20000,
                     "description": "Cap on returned characters",
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -229,7 +246,7 @@ TOOLS: list[Tool] = [
                     "default": 2000,
                     "description": "Cap on returned text characters",
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "required": ["selector"],
             "additionalProperties": False,
@@ -264,7 +281,7 @@ TOOLS: list[Tool] = [
                     "default": 50,
                     "description": "Max recent entries to return",
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -316,7 +333,7 @@ TOOLS: list[Tool] = [
                     "default": 20,
                     "description": "Max recent entries to return",
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -333,7 +350,7 @@ TOOLS: list[Tool] = [
             "type": "object",
             "properties": {
                 "selector": {"type": "string"},
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
             },
             "required": ["selector"],
@@ -389,7 +406,7 @@ TOOLS: list[Tool] = [
                     "maximum": 3,
                     "default": 1,
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
             },
             "additionalProperties": False,
@@ -427,7 +444,7 @@ TOOLS: list[Tool] = [
                     "minimum": 0,
                     "description": "Viewport Y in CSS px (use with x, instead of selector)",
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
             },
             "additionalProperties": False,
@@ -458,7 +475,7 @@ TOOLS: list[Tool] = [
                     "default": "value",
                 },
                 "allowPassword": {"type": "boolean", "default": False},
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
             },
             "required": ["selector", "value"],
@@ -513,7 +530,7 @@ TOOLS: list[Tool] = [
                         {"type": "array", "items": {"type": "integer", "minimum": 0}},
                     ],
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
             },
             "required": ["selector"],
@@ -533,7 +550,7 @@ TOOLS: list[Tool] = [
             "properties": {
                 "text": {"type": "string"},
                 "allowPassword": {"type": "boolean", "default": False},
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "required": ["text"],
             "additionalProperties": False,
@@ -552,7 +569,7 @@ TOOLS: list[Tool] = [
             "properties": {
                 "keys": {"type": "string"},
                 "allowPassword": {"type": "boolean", "default": False},
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "required": ["keys"],
             "additionalProperties": False,
@@ -604,7 +621,7 @@ TOOLS: list[Tool] = [
                     "additionalProperties": False,
                     "description": "Viewport-relative crop rectangle in CSS px",
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -641,7 +658,7 @@ TOOLS: list[Tool] = [
                     "default": False,
                     "description": "Wait until GONE instead of present",
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -695,7 +712,7 @@ TOOLS: list[Tool] = [
                     "maximum": 30000,
                     "default": 10000,
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "required": ["container"],
             "additionalProperties": False,
@@ -731,7 +748,7 @@ TOOLS: list[Tool] = [
                     "enum": ["top", "bottom"],
                     "description": "Jump to an edge instead of a delta",
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -770,7 +787,7 @@ TOOLS: list[Tool] = [
                     "default": "auto",
                 },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -804,7 +821,7 @@ TOOLS: list[Tool] = [
                     "maximum": 30000,
                     "default": 10000,
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -820,7 +837,7 @@ TOOLS: list[Tool] = [
             "type": "object",
             "properties": {
                 "code": {"type": "string"},
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "required": ["code"],
             "additionalProperties": False,
@@ -845,7 +862,7 @@ TOOLS: list[Tool] = [
                 "headers": {"type": "object", "additionalProperties": {"type": "string"}},
                 "body": {"type": "string"},
                 "returnAs": {"type": "string", "enum": ["auto", "text", "base64"]},
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "required": ["url"],
             "additionalProperties": False,
@@ -876,7 +893,7 @@ TOOLS: list[Tool] = [
                     "minItems": 1,
                     "description": "Absolute paths to local files",
                 },
-                "tabId": {"type": "integer"},
+                "tabId": _TAB_ID_SCHEMA,
             },
             "required": ["selector", "paths"],
             "additionalProperties": False,
