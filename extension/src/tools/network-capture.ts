@@ -63,13 +63,27 @@ export interface NetworkEntry {
 
 export const NETWORK_MAX_ENTRIES = 100;
 export const NETWORK_MAX_BODY = 256 * 1024;
-// Total response-body bytes returned in ONE network_tail result. Keeps the
-// serialised frame under MAX_FRAME_BYTES (16 MiB) even with JSON escaping and
-// regardless of `limit`: bodies past the budget (oldest first) drop to metadata
-// (bodyOmitted). A same-origin RPC report (e.g. Metrika's /i-proxy/ gateway with
-// a signed per-session key) often can't be replayed with fetch_in_page, so the
-// per-body cap is generous and it is the aggregate that is bounded.
-export const NETWORK_RESPONSE_BUDGET = 6 * 1024 * 1024;
+// Total response-body WIRE BYTES returned in ONE network_tail result. Measured
+// as the UTF-8 length of each body's JSON-serialised form (see bodyWireBytes) —
+// NOT its `.length` in UTF-16 code units, which undercounts badly: a control
+// char escapes to `\uXXXX` (6 bytes) and a CJK unit is 3 UTF-8 bytes, so a
+// code-unit budget could pass a result that serialises past the 16 MiB frame cap
+// and 1009-closes the WS. Bodies past the budget (oldest first) drop to metadata
+// (bodyOmitted). 10 MiB leaves >=6 MiB headroom under MAX_FRAME_BYTES for the
+// envelope, per-entry metadata, and HMAC framing. A same-origin RPC report (e.g.
+// Metrika's /i-proxy/ gateway with a signed per-session key) often can't be
+// replayed with fetch_in_page, so the per-body cap is generous and it is the
+// aggregate wire size that is bounded.
+export const NETWORK_RESPONSE_BUDGET = 10 * 1024 * 1024;
+
+const WIRE_ENCODER = new TextEncoder();
+
+/** Wire cost of a captured body: the UTF-8 byte length of its JSON-serialised
+ * form — exactly what counts against the 16 MiB frame cap once the tool result
+ * is stringified and sent. Pure. */
+export function bodyWireBytes(body: string): number {
+  return WIRE_ENCODER.encode(JSON.stringify(body)).length;
+}
 const DEFAULT_NETWORK_LIMIT = 20;
 const NETWORK_MAX_PENDING = 512;
 
@@ -164,11 +178,13 @@ export function filterNetworkEntries(
   return { entries: out.slice(-opts.limit), total: out.length };
 }
 
-/** Keep response bodies for the NEWEST entries within a total byte budget; older
- * bodies beyond it are dropped (metadata + `size` kept, `bodyOmitted` set) so one
- * result never exceeds the 16 MiB WS frame cap regardless of the requested
- * `limit`. Clones the entries it strips — never mutates the ring buffer.
- * `entries` arrive oldest→newest. Pure. */
+/** Keep response bodies for the NEWEST entries within a total WIRE-BYTE budget;
+ * older bodies beyond it are dropped (metadata + `size` kept, `bodyOmitted` set)
+ * so one result never exceeds the 16 MiB WS frame cap regardless of the requested
+ * `limit`. The budget is measured in serialised wire bytes (bodyWireBytes), not
+ * UTF-16 `.length`, so JSON-escape/UTF-8 expansion can't sneak the frame over the
+ * cap. Clones the entries it strips — never mutates the ring buffer. `entries`
+ * arrive oldest→newest. Pure. */
 export function applyResponseBudget(
   entries: NetworkEntry[],
   budget = NETWORK_RESPONSE_BUDGET,
@@ -179,8 +195,9 @@ export function applyResponseBudget(
   for (let i = out.length - 1; i >= 0; i--) {
     const e = out[i];
     if (typeof e.body !== 'string') continue;
-    if (used + e.body.length <= budget) {
-      used += e.body.length;
+    const cost = bodyWireBytes(e.body);
+    if (used + cost <= budget) {
+      used += cost;
     } else {
       // Clone without the body so the ring buffer's entry is untouched.
       out[i] = {

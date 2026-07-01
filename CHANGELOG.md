@@ -8,6 +8,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **`network_tail` body budget now counts wire bytes, so it can't blow the 16 MiB
+  frame cap (invariant #6).** The aggregate response-body budget summed
+  `body.length` (UTF-16 code units), but the tool result goes on the wire as
+  JSON-escaped UTF-8 — a control char becomes `\uXXXX` (6 bytes), a CJK unit 3
+  bytes. A page returning control-char/CJK bodies (capture opt-in on, origin
+  allowlisted) could serialise a result several times its code-unit size, exceed
+  the daemon's 16 MiB frame cap, and get 1009-closed — and since the ring
+  survives the auto-reconnect, every retry re-wedged the connection (in broker
+  mode, the shared WS for all sessions). The budget is now measured in real wire
+  bytes (`bodyWireBytes` = UTF-8 length of the JSON-serialised body) with a 10 MiB
+  ceiling that leaves ≥6 MiB headroom under the frame cap. Found by the internal
+  security audit. +3 tests.
 - **Broker tab-ownership gate no longer confuses a boolean tabId with an int
   (invariant #13).** `OwnershipRegistry.owns()` guarded with `isinstance(tab_id,
   int)`, but in Python `isinstance(True, int)` is True and `True == 1`, so a

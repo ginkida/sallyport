@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 
 import {
   applyResponseBudget,
+  bodyWireBytes,
   clipBody,
   filterNetworkEntries,
   isDataContentType,
   NETWORK_MAX_BODY,
   NETWORK_MAX_ENTRIES,
+  NETWORK_RESPONSE_BUDGET,
   originFromUrl,
   parseNetworkArgs,
   shapeNetworkEntry,
@@ -209,10 +211,11 @@ describe('applyResponseBudget', () => {
   });
 
   it('keeps the NEWEST bodies within budget and drops older ones to metadata', () => {
-    // oldest→newest; the 200-byte budget fits only the last two 100-byte bodies.
+    // oldest→newest. Each 100-char ASCII body serialises to 102 wire bytes
+    // (100 + 2 quotes), so a 210-byte budget fits the last two, not the third.
     const { entries, omitted } = applyResponseBudget(
       [withBody(1, 100), withBody(2, 100), withBody(3, 100)],
-      200,
+      210,
     );
     expect(omitted).toBe(1);
     expect(entries[0].body).toBeUndefined();
@@ -220,6 +223,29 @@ describe('applyResponseBudget', () => {
     expect(entries[0].size).toBe(100); // metadata retained
     expect(entries[1].body?.length).toBe(100);
     expect(entries[2].body?.length).toBe(100);
+  });
+
+  it('counts WIRE bytes not code units — a control-char body that fits by .length is omitted', () => {
+    // 10x U+0001: .length === 10, but each escapes to \uXXXX (6 bytes) so the
+    // wire cost is ~62 bytes. A code-unit budget of 30 would keep it; the
+    // wire-byte budget must omit it. Regression for the 16 MiB frame-cap bug.
+    const ctrl: NetworkEntry = {
+      ts: 1,
+      method: 'GET',
+      url: 'https://api.example.com/x',
+      status: 200,
+      type: 'xhr',
+      contentType: 'application/json',
+      size: 10,
+      origin: 'https://api.example.com',
+      body: '\u0001'.repeat(10),
+    };
+    expect(ctrl.body!.length).toBe(10); // fits a naive code-unit budget of 30
+    expect(bodyWireBytes(ctrl.body!)).toBeGreaterThan(30); // but not the wire budget
+    const { entries, omitted } = applyResponseBudget([ctrl], 30);
+    expect(omitted).toBe(1);
+    expect(entries[0].body).toBeUndefined();
+    expect(entries[0].bodyOmitted).toBe(true);
   });
 
   it('does not mutate the input entries (the ring buffer stays intact)', () => {
@@ -243,5 +269,13 @@ describe('applyResponseBudget', () => {
     const { entries, omitted } = applyResponseBudget([noBody], 10);
     expect(omitted).toBe(0);
     expect(entries[0].bodyOmitted).toBeUndefined();
+  });
+
+  it('keeps the default budget safely under the 16 MiB frame cap', () => {
+    // The budget is now wire bytes, so it directly bounds body cost; keep ample
+    // headroom for the envelope, per-entry metadata, and HMAC framing.
+    const FRAME_CAP = 16 * 1024 * 1024;
+    expect(NETWORK_RESPONSE_BUDGET).toBeLessThanOrEqual(12 * 1024 * 1024);
+    expect(FRAME_CAP - NETWORK_RESPONSE_BUDGET).toBeGreaterThanOrEqual(4 * 1024 * 1024);
   });
 });
