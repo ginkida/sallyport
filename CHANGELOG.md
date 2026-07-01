@@ -8,6 +8,17 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **`send_keys` re-checks the password gate at every focus boundary (invariant
+  #5).** The gate probed `document.activeElement` once up front, but `send_keys`
+  dispatches a whole sequence — so `keys="tab <secret>"` on a login page (username
+  field focused, password next in tab order) tabbed focus into the
+  `<input type=password>` and typed the secret straight in, bypassing the gate,
+  and (returning ok) logged the keystrokes to the audit log unredacted. The gate
+  is now re-asserted before any segment that follows a focus-moving key
+  (Tab/Shift+Tab, arrows, Enter, Home/End/PageUp/Down); focus landing on a
+  password field now fails with `password_field` before the credential segment,
+  which also fires the audit-redaction path. `allowPassword=true` still opts in.
+  Found by the internal security audit. +4 tests.
 - **`network_tail` body budget now counts wire bytes, so it can't blow the 16 MiB
   frame cap (invariant #6).** The aggregate response-body budget summed
   `body.length` (UTF-16 code units), but the tool result goes on the wire as

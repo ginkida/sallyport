@@ -24,6 +24,36 @@ const SPECIAL: Record<string, { key: string; code: string; vkc: number; text?: s
   pagedown: { key: 'PageDown', code: 'PageDown', vkc: 34 },
 };
 
+// Keys whose default action can move focus to another element (Tab between form
+// controls; arrows/Home/End/PageUp/Down within composite widgets; Enter can
+// submit/advance). After a segment ending in one of these, focus may have landed
+// on a field the one-shot password probe never saw — so the gate is re-checked
+// before the NEXT segment is dispatched (invariant #5, see dispatchKeys).
+const FOCUS_MOVING_KEYS = new Set([
+  'tab',
+  'enter',
+  'return',
+  'arrowup',
+  'arrowdown',
+  'arrowleft',
+  'arrowright',
+  'home',
+  'end',
+  'pageup',
+  'pagedown',
+]);
+
+/** True when a keystroke segment's terminal key can move focus (so the password
+ * gate must be re-asserted before the following segment). Pure / tested. */
+export function isFocusMovingKey(seg: string): boolean {
+  const parts = seg
+    .split('+')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (parts.length === 0) return false;
+  return FOCUS_MOVING_KEYS.has(parts[parts.length - 1]);
+}
+
 const MODIFIERS: Record<string, { bit: number; key: string; code: string; vkc: number }> = {
   alt: { bit: 1, key: 'Alt', code: 'AltLeft', vkc: 18 },
   ctrl: { bit: 2, key: 'Control', code: 'ControlLeft', vkc: 17 },
@@ -60,14 +90,23 @@ function resolveKey(k: string): { key: string; code: string; vkc: number; text?:
   throw new BridgeError('bad_key', `send_keys: unknown key "${k}"`);
 }
 
-async function dispatchKeys(tabId: number, keysStr: string): Promise<void> {
+async function dispatchKeys(tabId: number, keysStr: string, allowPassword: boolean): Promise<void> {
   const os = await getOs();
   const modKey = os === 'mac' ? MODIFIERS.cmd : MODIFIERS.ctrl;
   const segments = keysStr.trim().split(/\s+/);
-  for (const seg of segments) {
+  for (let s = 0; s < segments.length; s++) {
+    const seg = segments[s];
+    // Re-assert the password gate at a focus boundary: if the PREVIOUS segment
+    // could have moved focus (Tab/arrows/Enter/…), re-probe before dispatching
+    // this one — otherwise `tab secret` would deposit the credential into a
+    // password field the single up-front probe never saw, and (returning ok)
+    // even log it unredacted. Throwing here fires the force-redaction path too.
+    if (s > 0 && isFocusMovingKey(segments[s - 1])) {
+      await ensureNotPasswordField(tabId, allowPassword, 'send_keys');
+    }
     const parts = seg
       .split('+')
-      .map((s) => s.trim())
+      .map((p) => p.trim())
       .filter(Boolean);
     if (parts.length === 0) continue;
     let modBits = 0;
@@ -190,7 +229,8 @@ export const sendKeys: Tool = async (args) => {
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
-  await ensureNotPasswordField(tab.id!, args.allowPassword === true, 'send_keys');
-  await dispatchKeys(tab.id!, keys);
+  const allowPassword = args.allowPassword === true;
+  await ensureNotPasswordField(tab.id!, allowPassword, 'send_keys');
+  await dispatchKeys(tab.id!, keys, allowPassword);
   return { tabId: tab.id, url: tab.url, data: { ok: true } };
 };

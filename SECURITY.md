@@ -155,7 +155,13 @@ The keystroke gate (`key_type` / `send_keys`) finds the focused element
 by walking `document.activeElement` down through **open** shadow roots
 (`fill` resolves a specific node by selector/ref and reads its `type`
 attribute via CDP `DOM.getAttributes`, so it is immune to the in-page
-getter trick below). Two cases the keystroke gate cannot reach:
+getter trick below). Within a `send_keys` sequence the gate is
+**re-asserted after any focus-moving key** (Tab/Shift+Tab, arrows,
+Enter, Home/End/PageUp/Down), so a `tab <secret>` sequence can't tab
+focus into a password field and type the secret past a single up-front
+probe — it fails with `password_field` before the credential segment,
+which also triggers the audit-log redaction path. Two cases the
+keystroke gate still cannot reach:
 
 - **Closed shadow roots.** `element.shadowRoot` is `null` to page
   script for `attachShadow({mode:'closed'})`, so a focused
