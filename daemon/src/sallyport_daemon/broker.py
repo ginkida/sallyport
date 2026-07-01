@@ -120,7 +120,7 @@ async def authenticate_connection(
     """
     try:
         raw = await asyncio.wait_for(read_frame(reader), timeout=hello_timeout)
-    except (TimeoutError, FramingError, OSError):
+    except (asyncio.TimeoutError, FramingError, OSError):
         await _close_quietly(writer)
         return None
     if raw is None:  # clean EOF before a hello ever arrived
@@ -443,7 +443,7 @@ async def run_shim(
     await write_frame(sock_writer, _dump_json(signer.sign(Envelope(type="hello", body={}))))
     try:
         ack = await asyncio.wait_for(read_frame(sock_reader), timeout=hello_timeout)
-    except (TimeoutError, FramingError, OSError) as exc:
+    except (asyncio.TimeoutError, FramingError, OSError) as exc:
         raise BrokerError("broker handshake failed") from exc
     if ack is None:
         raise BrokerError("broker closed before hello_ack")

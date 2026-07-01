@@ -30,7 +30,7 @@ from sallyport_daemon.broker import (
     run_shim,
     start_broker_server,
 )
-from sallyport_daemon.framing import read_frame, write_frame
+from sallyport_daemon.framing import FramingError, read_frame, write_frame
 from sallyport_daemon.protocol import Envelope, ProtocolError, Signer
 
 SECRET = bytes(range(32))
@@ -475,8 +475,14 @@ async def _open_authed(
     for _ in range(tries):
         reader, writer = await asyncio.open_unix_connection(str(sock_path))
         signer = Signer(SECRET)
-        await write_frame(writer, _dump_json(signer.sign(Envelope(type="hello", body={}))))
-        ack = await asyncio.wait_for(read_frame(reader), timeout=2)
+        try:
+            await write_frame(writer, _dump_json(signer.sign(Envelope(type="hello", body={}))))
+            ack = await asyncio.wait_for(read_frame(reader), timeout=2)
+        except (OSError, FramingError):
+            # Refused before the cap decrement landed. On Linux a
+            # refuse-before-read close arrives as an RST (ConnectionResetError),
+            # not the clean EOF macOS gives — treat both as "not accepted, retry".
+            ack = None
         if ack is not None and signer.verify(_parse_json(ack)).type == "hello_ack":
             return reader, writer
         await _drain_close(writer)
@@ -521,9 +527,14 @@ async def test_connection_cap_rejects_excess_then_frees_on_disconnect(sock_path:
     server = await start_broker_server(bridge, SECRET, sock_path, max_clients=1)
     try:
         r1, w1 = await _open_authed(sock_path)  # fills the single slot
-        # A second connection is refused outright — read sees a clean EOF.
+        # A second connection is refused outright — the read sees a clean EOF
+        # (macOS) or an RST (Linux refuse-before-read); both mean "refused".
         r2, w2 = await asyncio.open_unix_connection(str(sock_path))
-        assert await asyncio.wait_for(read_frame(r2), timeout=5) is None
+        try:
+            refused = await asyncio.wait_for(read_frame(r2), timeout=5)
+        except (OSError, FramingError):
+            refused = None
+        assert refused is None
         await _drain_close(w2)
         # Free the slot; the broker's decrement lets a fresh client in again.
         await _drain_close(w1)
