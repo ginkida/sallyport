@@ -136,6 +136,24 @@ async def test_status_answers_without_extension() -> None:
     assert out["pendingCalls"] == 0
     assert isinstance(out["version"], str)
     assert out["uptimeS"] >= 0
+    # Introspection fields: run mode + why the extension leg last failed (none
+    # yet on a fresh standalone daemon).
+    assert out["mode"] == "standalone"
+    assert out["lastHandshakeError"] is None
+    assert out["lastHandshakeErrorAt"] is None
+
+
+async def test_status_reports_broker_mode() -> None:
+    """status.mode tells an agent whether it's in broker mode — so the tabId
+    requirement and create-own navigate aren't surprises. It's a broker-global
+    property, identical for every caller (never a per-client oracle)."""
+    from sallyport_daemon.bridge import Bridge
+
+    standalone = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+    assert standalone._status()["mode"] == "standalone"  # noqa: SLF001
+    broker = Bridge(secret=bytes(32), host="127.0.0.1", port=10086, broker_mode=True)
+    assert broker._status()["mode"] == "broker"  # noqa: SLF001
+    assert broker._status(client_id="c1")["mode"] == "broker"  # noqa: SLF001
 
 
 async def test_status_does_not_queue_behind_call_lock() -> None:

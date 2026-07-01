@@ -41,6 +41,18 @@ uses [Semantic Versioning](https://semver.org/).
   `no_active_tab`, `snapshot_failed`, `fetch_failed`, `eval_threw`, `no_url`, and
   `unknown_tool`, each with a `retryable=yes|no|maybe` flag and a concrete next
   step. Advisory text only — no gate, wire, or invariant change.
+- **The agent can now see its run mode and why a connection failed.** `status`
+  gained `mode` (`broker`/`standalone`) so a broker-mode agent knows up front
+  that an explicit owned `tabId` is required — instead of discovering it via a
+  `tab_required` error on its first call — plus `lastHandshakeError` /
+  `lastHandshakeErrorAt`: when `connected` is false these say WHY the extension
+  leg failed to attach (wrong secret, clock skew, no hello), telling "extension
+  rejected / never attached" apart from "attached but slow". Every tool's
+  `tabId` schema now spells out the broker rule (required, must be a tab this
+  session created) instead of being a bare, undescribed integer. Read-only
+  status fields + schema text — no wire/gate/invariant change, and no `clientId`
+  is exposed (`mode` and the handshake reason are broker-global / describe the
+  shared extension leg, not any client's activity).
 
 ## [0.12.0] — 2026-07-01
 

@@ -337,6 +337,10 @@ class Bridge:
             last_error = self._last_error if self._last_error_client == client_id else None
         return {
             "connected": self.connected,
+            # Run mode, so an agent knows WHY tabId is required and navigate with
+            # no tabId is create-own (broker) vs the active-tab fallback
+            # (standalone). Broker-global, not a per-client oracle.
+            "mode": "broker" if self._broker_mode else "standalone",
             "version": daemon_version(),
             "port": self._port,
             "pendingCalls": len(self._pending),
@@ -346,6 +350,13 @@ class Bridge:
             # only — never the args.
             "lastCalls": last_calls,
             "lastError": last_error,
+            # Why the extension leg last failed to attach (wrong secret, clock
+            # skew >30s, no hello, bad origin) — describes the SHARED extension
+            # connection, not any client's activity, so it's safe for every
+            # caller. Lets an agent tell "extension rejected / never attached"
+            # apart from "attached but slow" when connected is false.
+            "lastHandshakeError": self._last_handshake_error,
+            "lastHandshakeErrorAt": self._last_handshake_error_at,
         }
 
     def set_status_path(self, path: Path | None) -> None:
