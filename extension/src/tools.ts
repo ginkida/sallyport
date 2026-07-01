@@ -15,6 +15,7 @@ import { fetchInPage } from './tools/fetch.js';
 import { find } from './tools/find.js';
 import { keyType, sendKeys } from './tools/keyboard.js';
 import { hover, mouseClick } from './tools/mouse.js';
+import { networkTail } from './tools/network.js';
 import { reveal } from './tools/reveal.js';
 import { screenshot } from './tools/screenshot.js';
 import { selectOption } from './tools/select.js';
@@ -38,6 +39,7 @@ const tools: Record<string, Tool> = {
   read_text: readText,
   get_state: getState,
   console_tail: consoleTail,
+  network_tail: networkTail,
   click,
   mouse_click: mouseClick,
   hover,

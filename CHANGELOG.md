@@ -4,6 +4,29 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`network_tail` — read the DATA behind canvas dashboards.** A chart drawn on
+  `<canvas>` (Yandex Metrika, Chart.js, ECharts, WebGL) has no readable DOM, so
+  `snapshot`/`read_text` find nothing and the only fallback was a screenshot +
+  vision — slow and imprecise. But the numbers arrived as JSON on the wire:
+  `network_tail` surfaces a tab's recent XHR/fetch responses
+  (`{enabled, entries:[{ts, method, url, status, type, contentType, size, body?,
+  bodyTruncated?}], truncated?}`) so an agent pulls exact figures instead of
+  eyeballing pixels — then, for a clipped body, re-fetches that URL with
+  `fetch_in_page`. Same conservative security shape as `console_tail`: **opt-in**
+  (popup "capture API responses", default off → `{enabled:false, entries:[]}`),
+  a lazy `Network.enable` issued only when on (never on the unconditional
+  `attach()` path), scoped to XHR/Fetch, bodies only for textual data
+  content-types and capped, **no** request/response headers captured (no
+  `Authorization`/`Cookie` leak), a bounded per-tab ring cleared on
+  tab-close/detach, and entries **origin-filtered to the allowlist** (fail-closed
+  — a dashboard whose data API is on another host needs that host allowlisted
+  too). Owner-gated in broker mode like every tab-touching tool (#13). No wire
+  change.
+
 ## [0.12.0] — 2026-07-01
 
 ### Added

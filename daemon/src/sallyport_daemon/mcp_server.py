@@ -270,6 +270,53 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="network_tail",
+        description=(
+            "Read the page's recent XHR/fetch responses for a tab — the DATA "
+            "behind canvas dashboards. A chart drawn on <canvas> (Yandex "
+            "Metrika, Chart.js, ECharts, WebGL) has NO readable DOM, so "
+            "snapshot/read_text find nothing and a screenshot needs slow, "
+            "imprecise vision — but the numbers arrived as JSON on the wire, and "
+            "this surfaces those response bodies so you pull exact figures "
+            "instead. Returns {enabled, entries:[{ts, method, url, status, type, "
+            "contentType, size, body?, bodyTruncated?}], truncated?} "
+            "(oldest→newest; type is 'xhr'|'fetch'; body is the response text, "
+            "omitted for binary/unavailable). OPT-IN: capture must be turned on "
+            "in the extension popup ('capture API responses', off by default) — "
+            "when it's off you get {enabled:false, entries:[]}, NOT an error. "
+            "Capture begins at the first bridge attach with the setting on — "
+            "there is NO history replay, so RELOAD the tab (or navigate) after "
+            "enabling so the dashboard re-fetches its data, then read. Entries "
+            "are origin-filtered to the allowlist (a dashboard whose data API is "
+            "on another host needs THAT host allowlisted too). Use filter (URL "
+            "substring, e.g. 'stat' or 'api') to narrow to the data endpoint; "
+            "limit caps recent entries (default 20, max 100). A too-big body is "
+            "clipped (bodyTruncated=true) — re-pull the full payload with "
+            "fetch_in_page on the same url. Structured CDP event capture only — "
+            "no JS eval. Domain must be in allowlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "string",
+                    "description": (
+                        "Only return entries whose URL contains this substring (e.g. 'stat', 'api')"
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 20,
+                    "description": "Max recent entries to return",
+                },
+                "tabId": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="click",
         description=(
             "Click an element via DOM .click(). selector can be a CSS selector or a "

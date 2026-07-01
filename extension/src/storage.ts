@@ -30,6 +30,11 @@ export type Settings = {
    * OFF — it lazily enables CDP `Runtime.enable` (widening the observable CDP
    * footprint), so it is opt-in. */
   captureConsole: boolean;
+  /** Capture XHR/fetch response bodies on driven tabs (network-capture.ts),
+   * readable via the `network_tail` tool — the data behind canvas dashboards.
+   * Default OFF — it lazily enables CDP `Network.enable` and reads response
+   * bodies (widening the observable CDP footprint), so it is opt-in. */
+  captureNetwork: boolean;
 };
 
 export const DEFAULT_SERVER_URL = 'ws://127.0.0.1:10086/ws';
@@ -80,6 +85,7 @@ export async function getSettings(): Promise<Settings> {
     paused: !!v?.paused,
     keepAwake: v?.keepAwake !== false, // default on
     captureConsole: !!v?.captureConsole, // default off (opt-in)
+    captureNetwork: !!v?.captureNetwork, // default off (opt-in)
   };
 }
 

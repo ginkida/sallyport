@@ -1,6 +1,7 @@
 import { getSettings } from '../storage.js';
 import { clearConsole, ensureConsoleCapture } from './console-capture.js';
 import { BridgeError } from './errors.js';
+import { clearNetwork, ensureNetworkCapture } from './network-capture.js';
 import { clearRefsForTab } from './refs.js';
 
 // Cap on the chrome error text we echo back: a debugger attach failure can
@@ -77,6 +78,7 @@ if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
     attached.delete(tabId);
     clearRefsForTab(tabId);
     clearConsole(tabId);
+    clearNetwork(tabId);
   });
 }
 
@@ -86,6 +88,7 @@ if (typeof chrome !== 'undefined' && chrome.debugger?.onDetach) {
       attached.delete(source.tabId);
       clearRefsForTab(source.tabId);
       clearConsole(source.tabId);
+      clearNetwork(source.tabId);
     }
   });
 }
@@ -111,6 +114,7 @@ export async function attach(tabId: number): Promise<void> {
   const settings = await getSettings();
   if (settings.keepAwake) await keepAwake(tabId);
   if (settings.captureConsole) await ensureConsoleCapture(tabId);
+  if (settings.captureNetwork) await ensureNetworkCapture(tabId);
 }
 
 /** Chrome freezes background tabs and (on macOS) fully-occluded windows:

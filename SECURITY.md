@@ -300,14 +300,20 @@ For *security-relevant* additions, also check:
 6. **Does it produce binary blobs as output?** Truncated in audit
    automatically via `truncateAuditValue`; safe.
 7. **Does it subscribe to CDP events** (`chrome.debugger.onEvent`, e.g.
-   `console_tail` / `console-capture.ts`)? Keep it opt-in behind a popup
-   setting (default off) and enable the underlying domain (`Runtime.enable`,
-   …) lazily — never on the unconditional `attach()` path, so the observable
+   `console_tail` / `console-capture.ts`, `network_tail` /
+   `network-capture.ts`)? Keep it opt-in behind a popup setting (default off)
+   and enable the underlying domain (`Runtime.enable`, `Network.enable`, …)
+   lazily — never on the unconditional `attach()` path, so the observable
    CDP footprint only widens for users who asked for it. Buffer with a hard
    per-tab cap, clear on `tabs.onRemoved` / `debugger.onDetach`, and tag each
    captured item with its producing origin so reads can be filtered to the
    allowlist (fail-closed on an unknown origin — a tab can navigate
    cross-origin while buffering, so the read-time tab URL alone isn't enough).
+   If it captures response **bodies** (`network_tail`), that is a read
+   amplification: restrict to textual data content-types, cap each body, and
+   never capture request/response headers (no `Authorization`/`Cookie`
+   exfiltration). Response bodies can still carry sensitive same-origin data,
+   so the opt-in default-off + allowlist origin filter are load-bearing.
 
 ## Reporting
 

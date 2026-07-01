@@ -91,6 +91,10 @@
           <input type="checkbox" id="capture-console"> capture page console errors
         </label>
         <div class="muted small hint">Records console errors/warnings + uncaught exceptions on driven tabs, readable via the console_tail tool. Off by default — it widens the debugger's CDP footprint.</div>
+        <label class="checkbox">
+          <input type="checkbox" id="capture-network"> capture API responses (canvas dashboards)
+        </label>
+        <div class="muted small hint">Records XHR/fetch JSON responses on driven tabs, readable via the network_tail tool — the data behind canvas charts (e.g. Metrika) without screenshots. Off by default — it reads response bodies and widens the debugger's CDP footprint.</div>
       </details>
 
       <details id="status-advanced" class="disclosure">
