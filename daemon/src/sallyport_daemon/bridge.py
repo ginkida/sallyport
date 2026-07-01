@@ -24,7 +24,15 @@ log = logging.getLogger("sallyport.ws")
 
 
 class ExtensionNotConnected(Exception):
-    pass
+    """Raised when a tool call arrives but no extension is connected. Carries a
+    stable ``code`` so the MCP layer tags it and appends a recovery hint exactly
+    like a ToolError — a looping agent can then branch on ``[not_connected]``
+    (poll status, it auto-reconnects) instead of a bare, unclassifiable
+    ``Error:`` line that burns the tool timeout."""
+
+    def __init__(self, message: str, *, code: str = "not_connected") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # Tools answered by the daemon itself, before locks and routing. Unlike
@@ -485,6 +493,7 @@ class Bridge:
         if self._client is None:
             raise ExtensionNotConnected(
                 "extension is not connected — open Chrome and check the Sallyport popup",
+                code="not_connected",
             )
         req_id = _secrets.token_hex(8)
         try:

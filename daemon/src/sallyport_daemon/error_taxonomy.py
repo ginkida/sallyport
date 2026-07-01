@@ -110,6 +110,44 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "focus) — snapshot/read_text need no visible tab; screenshot works only when the "
             "tab is already the active one in its window."
         ),
+        "not_connected": (
+            "retryable=yes; no extension is attached right now — it auto-reconnects with "
+            "backoff, so poll the status builtin until connected=true instead of burning the "
+            "tool timeout; if it never connects, open Chrome and check the Sallyport popup is "
+            "paired and not paused."
+        ),
+        "bad_args": (
+            "retryable=no; the arguments don't match the tool's schema (the message says which "
+            "field) — fix the call before retrying; an identical retry fails the same way."
+        ),
+        "paused": (
+            "retryable=no while paused; the user paused Sallyport from the popup — ask them to "
+            "click Resume, then retry (poll status to see when it clears)."
+        ),
+        "no_active_tab": (
+            "retryable=yes; there's no active tab to fall back to — pass an explicit tabId "
+            "(list_tabs shows candidates) or navigate(newTab:true) to make one, then retry."
+        ),
+        "snapshot_failed": (
+            "retryable=yes; the snapshot couldn't be built (the page was mid-render or "
+            "navigating) — settle or wait_for a concrete selector, then re-snapshot."
+        ),
+        "fetch_failed": (
+            "retryable=maybe; the in-page fetch failed (network error, CORS, or a blocked "
+            "request) — verify the URL and that its host is allowlisted, then retry."
+        ),
+        "eval_threw": (
+            "retryable=no; the evaluated JavaScript threw (the message carries the page error) "
+            "— fix the script before retrying; an identical retry throws the same way."
+        ),
+        "no_url": (
+            "retryable=no; the tab has no navigable URL yet (a blank/new tab) — navigate to a "
+            "page first, then retry."
+        ),
+        "unknown_tool": (
+            "retryable=no; no tool by that name is registered — check the advertised tool list; "
+            "a retry with the same name won't succeed."
+        ),
     }
 )
 

@@ -27,6 +27,19 @@ uses [Semantic Versioning](https://semver.org/).
   too). Owner-gated in broker mode like every tab-touching tool (#13). No wire
   change.
 
+### Changed
+
+- **More failures now carry a machine-readable recovery hint**, so an autonomous
+  agent can branch on whether a retry is worth it instead of looping blind. The
+  connection failure `not_connected` (a tool called before the extension is
+  attached) is now **tagged and hinted like a tool error** — `Error
+  [not_connected]: … / hint: retryable=yes; poll status until it auto-reconnects`
+  — instead of a bare, unclassifiable `Error:` line that burned the 60 s tool
+  timeout. Recovery hints were also added for `bad_args`, `paused`,
+  `no_active_tab`, `snapshot_failed`, `fetch_failed`, `eval_threw`, `no_url`, and
+  `unknown_tool`, each with a `retryable=yes|no|maybe` flag and a concrete next
+  step. Advisory text only — no gate, wire, or invariant change.
+
 ## [0.12.0] — 2026-07-01
 
 ### Added

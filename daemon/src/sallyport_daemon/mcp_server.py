@@ -929,7 +929,14 @@ async def _dispatch_call(
     try:
         data = await bridge.call_tool(name, arguments or {}, client_id)
     except ExtensionNotConnected as exc:
-        return [TextContent(type="text", text=f"Error: {exc}")]
+        # Tag + hint it like a ToolError so a looping agent can branch on
+        # [not_connected] (poll status until it auto-reconnects) instead of a
+        # bare, unclassifiable line that burns the tool timeout.
+        text = f"Error [{exc.code}]: {exc}"
+        hint = format_error_hint(exc.code)
+        if hint:
+            text = f"{text}\n{hint}"
+        return [TextContent(type="text", text=text)]
     except ToolError as exc:
         tag = f" [{exc.code}]" if exc.code else ""
         text = f"Error{tag}: {exc}"

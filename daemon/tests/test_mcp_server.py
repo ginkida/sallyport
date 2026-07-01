@@ -369,7 +369,10 @@ async def test_dispatch_call_extension_not_connected_returns_error_text() -> Non
     bridge: Any = _FakeBridge(raises=ExtensionNotConnected("extension is not connected"))
     out = await _dispatch_call(bridge, "snapshot", {})
     assert len(out) == 1
-    assert out[0].text == "Error: extension is not connected"
+    # Tagged with the stable [not_connected] code and carrying a retryable hint,
+    # so a looping agent can poll status instead of burning the tool timeout.
+    assert out[0].text.startswith("Error [not_connected]: extension is not connected")
+    assert "\nhint: retryable=yes;" in out[0].text
 
 
 @pytest.mark.asyncio
