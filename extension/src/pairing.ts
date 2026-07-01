@@ -48,3 +48,29 @@ function tryToken(token: string): SecretCandidate | null {
   if (decoded.length < MIN_SECRET_BYTES) return null;
   return { token, bytes: decoded.length };
 }
+
+/** The daemon always generates a 32-byte secret (`SECRET_BYTES` in secret.py);
+ * there is no override. A pasted secret that decodes to any other length is
+ * almost certainly a truncated or mangled copy that will mac-mismatch. */
+export const EXPECTED_SECRET_BYTES = 32;
+
+export type SecretDetection =
+  | { kind: 'empty' }
+  | { kind: 'none' }
+  | { kind: 'ok'; token: string; bytes: number }
+  | { kind: 'wrong_length'; token: string; bytes: number };
+
+/** Classify pasted pairing text for the popup: nothing typed, no secret found,
+ * a good 32-byte secret, or a plausible-but-wrong-length one. The wrong-length
+ * case still carries the token — the length check is a heuristic, not a hard
+ * gate, so the user may still pair — but it flags WHY the daemon is likely to
+ * reject it, instead of a confident "✓" followed by an opaque mac mismatch. */
+export function classifySecretInput(text: string): SecretDetection {
+  if (!text.trim()) return { kind: 'empty' };
+  const cand = extractSecret(text);
+  if (!cand) return { kind: 'none' };
+  if (cand.bytes === EXPECTED_SECRET_BYTES) {
+    return { kind: 'ok', token: cand.token, bytes: cand.bytes };
+  }
+  return { kind: 'wrong_length', token: cand.token, bytes: cand.bytes };
+}

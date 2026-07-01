@@ -15,6 +15,12 @@ uses [Semantic Versioning](https://semver.org/).
   an agent couldn't branch on; `resolveTab`/`close_tab` now classify it as
   `tab_gone` (retryable=no, hint: open a fresh tab). The `tab_gone` recovery hint
   was reworded to read correctly in both modes. No wire/gate/invariant change.
+- **The popup warns when a pasted secret isn't 32 bytes.** The daemon's secret
+  is always 32 bytes; a truncated or mangled paste used to show a confident
+  "✓ secret detected (24 bytes)" and only fail later at pair time with an opaque
+  mac mismatch. Pairing now flags "⚠ secret is N bytes — the daemon's is 32; did
+  you copy the whole line?" up front — it still lets you try (the length check is
+  a heuristic, not a hard gate). UI only.
 - **The MCP tool descriptions now disambiguate four confusable pairs** so the
   model picks the right tool first try: `click`→escalate to `mouse_click` when a
   click doesn't register, `settle`→prefer `wait_for` when you have a concrete

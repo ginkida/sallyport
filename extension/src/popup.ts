@@ -10,7 +10,7 @@ import {
   type AuditEntry,
 } from './storage.js';
 import { matchAllowlist, normalizePattern, validatePattern } from './allowlist.js';
-import { extractSecret } from './pairing.js';
+import { classifySecretInput, EXPECTED_SECRET_BYTES } from './pairing.js';
 import { extractHostname, formatRelativeTime, matchesAuditFilter } from './format.js';
 import { nextReconnectKick } from './reconnect-kick.js';
 
@@ -305,25 +305,37 @@ function updatePairDetection(): void {
   const detect = $('#pair-detect');
   const submit = $('#pair-submit') as HTMLButtonElement;
 
-  if (!text.trim()) {
-    detect.textContent = '';
-    detect.className = 'detect';
-    detectedSecret = null;
-    submit.disabled = true;
-    return;
-  }
-
-  const candidate = extractSecret(text);
-  if (candidate) {
-    detect.textContent = `✓ secret detected (${candidate.bytes} bytes)`;
-    detect.className = 'detect ok';
-    detectedSecret = candidate.token;
-    submit.disabled = false;
-  } else {
-    detect.textContent = '⚠ no valid secret found in pasted text';
-    detect.className = 'detect warn';
-    detectedSecret = null;
-    submit.disabled = true;
+  const d = classifySecretInput(text);
+  switch (d.kind) {
+    case 'empty':
+      detect.textContent = '';
+      detect.className = 'detect';
+      detectedSecret = null;
+      submit.disabled = true;
+      return;
+    case 'none':
+      detect.textContent = '⚠ no valid secret found in pasted text';
+      detect.className = 'detect warn';
+      detectedSecret = null;
+      submit.disabled = true;
+      return;
+    case 'ok':
+      detect.textContent = `✓ secret detected (${d.bytes} bytes)`;
+      detect.className = 'detect ok';
+      detectedSecret = d.token;
+      submit.disabled = false;
+      return;
+    case 'wrong_length':
+      // Plausible base64, but not the daemon's 32 bytes — almost always a
+      // truncated paste. Flag it now, but still let the user try (heuristic,
+      // not a hard gate) rather than surfacing an opaque mac mismatch later.
+      detect.textContent =
+        `⚠ secret is ${d.bytes} bytes — the daemon's is ${EXPECTED_SECRET_BYTES}; ` +
+        `did you copy the whole line?`;
+      detect.className = 'detect warn';
+      detectedSecret = d.token;
+      submit.disabled = false;
+      return;
   }
 }
 

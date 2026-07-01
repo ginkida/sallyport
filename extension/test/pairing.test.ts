@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractSecret } from '../src/pairing.js';
+import { classifySecretInput, EXPECTED_SECRET_BYTES, extractSecret } from '../src/pairing.js';
 
 // A 32-byte secret base64-encodes to exactly 44 chars ending in '='.
 const SECRET_32 = 'A'.repeat(43) + '=';
@@ -73,5 +73,36 @@ describe('extractSecret', () => {
     // 25 chars — not a multiple of 4. Even if the chars are all valid b64
     // alphabet, the length disqualifies it before atob is called.
     expect(extractSecret('A'.repeat(25))).toBeNull();
+  });
+});
+
+describe('classifySecretInput (#15 — non-32-byte warning)', () => {
+  it('reports empty for whitespace-only input', () => {
+    expect(classifySecretInput('')).toEqual({ kind: 'empty' });
+    expect(classifySecretInput('   \n ')).toEqual({ kind: 'empty' });
+  });
+
+  it('reports none when no plausible secret is present', () => {
+    expect(classifySecretInput('paste the secret here')).toEqual({ kind: 'none' });
+  });
+
+  it('reports ok for exactly the daemon 32-byte secret', () => {
+    expect(classifySecretInput(SECRET_32)).toEqual({
+      kind: 'ok',
+      token: SECRET_32,
+      bytes: EXPECTED_SECRET_BYTES,
+    });
+  });
+
+  it('flags a plausible but wrong-length secret (truncated paste) yet keeps the token', () => {
+    // 16 decoded bytes — valid base64, below the daemon's 32, so pairing would
+    // mac-mismatch. Warn, but still carry the token so the user may try.
+    const out = classifySecretInput(SECRET_16);
+    expect(out).toEqual({ kind: 'wrong_length', token: SECRET_16, bytes: 16 });
+  });
+
+  it('extracts + classifies the 32-byte secret out of the full banner', () => {
+    const banner = `Sallyport secret:\n\n  ${SECRET_32}\n\n${'='.repeat(40)}`;
+    expect(classifySecretInput(banner)).toMatchObject({ kind: 'ok', bytes: 32 });
   });
 });
