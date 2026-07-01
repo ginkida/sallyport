@@ -8,6 +8,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A shim that can't attach to the broker now explains why.** When a plain
+  `sallyport-daemon` session tried to auto-attach to a running broker and the
+  handshake was refused, it printed a bare transport symptom (`broker closed
+  before hello_ack`) and exited 1. It now prints the two real causes — the
+  broker was started with a different secret than this session reads, or the
+  broker is at its client cap (`MAX_BROKER_CLIENTS`) — with the socket/secret
+  paths and the note that it can't fall back to standalone (the broker owns the
+  port). Message only; no behaviour change.
 - **A tool targeting a vanished tab now fails fast with `tab_gone`** instead of a
   raw, uncoded `"No tab with id: N"`. Any tool given an explicit `tabId` for a
   tab that has closed (or whose id was recycled) — in standalone mode, where the

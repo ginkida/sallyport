@@ -33,6 +33,7 @@ from typing import Any
 
 from .bridge import Bridge, ExtensionNotConnected, ToolError
 from .broker import (
+    MAX_BROKER_CLIENTS,
     BrokerError,
     broker_is_available,
     broker_socket_path,
@@ -754,11 +755,32 @@ async def _open_stdio_streams() -> tuple[asyncio.StreamReader, asyncio.StreamWri
     return reader, writer
 
 
+def _shim_failure_message(err: BrokerError, *, sock_path: Path, secret_path: Path) -> str:
+    """Actionable message for a broker-attach failure. The shim cannot fall back
+    to standalone (the broker owns the port), so name the two things that
+    actually cause a refused handshake — a secret mismatch or a full client cap —
+    and the fix, instead of leaving the user with a bare transport symptom like
+    'broker closed before hello_ack'."""
+    return (
+        f"Sallyport: could not attach to the broker at {sock_path} ({err}). "
+        f"Two usual causes: (1) the broker was started with a different secret "
+        f"than this session reads from {secret_path} — align them (copy the "
+        f"broker's secret, or delete it so both regenerate together); (2) the "
+        f"broker is at its client cap (MAX_BROKER_CLIENTS={MAX_BROKER_CLIENTS}) — "
+        f"free a slot. The broker owns the port, so this session can't start "
+        f"standalone; fix the cause and retry, or stop the broker to run "
+        f"standalone."
+    )
+
+
 async def _run_shim(
     secret: bytes,
     sock_reader: asyncio.StreamReader,
     sock_writer: asyncio.StreamWriter,
     shutdown: asyncio.Event,
+    *,
+    sock_path: Path,
+    secret_path: Path,
 ) -> int:
     """Default-mode shim: relay this stdio MCP session to a running broker.
 
@@ -786,7 +808,10 @@ async def _run_shim(
     # A broker-handshake failure surfaces as the shim task's stored exception.
     shim_result = results[0]
     if isinstance(shim_result, BrokerError):
-        print(f"Sallyport: {shim_result}", file=sys.stderr)
+        print(
+            _shim_failure_message(shim_result, sock_path=sock_path, secret_path=secret_path),
+            file=sys.stderr,
+        )
         return 1
     return 0
 
@@ -885,7 +910,14 @@ async def amain(args: argparse.Namespace) -> int:
                     f"Sallyport: attached to broker via {sock_path} (shim mode).",
                     file=sys.stderr,
                 )
-                return await _run_shim(secret, sock_reader, sock_writer, shutdown)
+                return await _run_shim(
+                    secret,
+                    sock_reader,
+                    sock_writer,
+                    shutdown,
+                    sock_path=sock_path,
+                    secret_path=secret_path,
+                )
 
     # Long-lived modes leave a diagnostic pidfile next to the secret so
     # `doctor` can name the port holder (PID + version + start time), plus a

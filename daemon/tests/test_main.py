@@ -326,6 +326,31 @@ async def test_doctor_does_not_fail_on_live_broker(
     assert "Some checks FAILED" not in out
 
 
+def test_shim_failure_message_names_causes_and_paths(tmp_path: Path) -> None:
+    """A refused broker handshake surfaces as a bare BrokerError symptom; the
+    shim message must translate it into the two real causes (secret mismatch,
+    client cap) + the paths, since it can't fall back to standalone."""
+    from sallyport_daemon.__main__ import _shim_failure_message
+    from sallyport_daemon.broker import MAX_BROKER_CLIENTS, BrokerError
+
+    sock = tmp_path / "broker-10086.sock"
+    secret = tmp_path / "secret"
+    msg = _shim_failure_message(
+        BrokerError("broker closed before hello_ack"),
+        sock_path=sock,
+        secret_path=secret,
+    )
+    # Original symptom is preserved for diagnosis...
+    assert "broker closed before hello_ack" in msg
+    # ...wrapped with both actionable causes and the concrete paths.
+    assert str(sock) in msg
+    assert str(secret) in msg
+    assert "secret" in msg
+    assert f"MAX_BROKER_CLIENTS={MAX_BROKER_CLIENTS}" in msg
+    # And it's explicit that standalone fallback isn't possible.
+    assert "standalone" in msg
+
+
 async def test_show_secret_prints_and_exits(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
