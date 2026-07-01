@@ -22,12 +22,14 @@ import ipaddress
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from .bridge import Bridge, ExtensionNotConnected, ToolError
 from .broker import (
@@ -293,6 +295,32 @@ def _listening_pids(port: int) -> list[int]:
     return [int(tok) for tok in res.stdout.split() if tok.isdigit()]
 
 
+def _pid_is_broker(pid: int, command: str | None, recorded: dict[str, Any] | None) -> bool:
+    """True if this pid is a POSITIVELY-IDENTIFIED broker — its argv carries the
+    ``broker`` token, or the port pidfile records ``mode==broker`` for this pid.
+    Shared by the port-holder description AND doctor's exit-code decision so the
+    two can never disagree about whether a holder is a broker. Conservative: an
+    unknown/foreign holder is NOT a broker (so it still fails the port check)."""
+    return (command is not None and _is_broker_command(command)) or (
+        recorded is not None and recorded.get("pid") == pid and recorded.get("mode") == "broker"
+    )
+
+
+def _port_held_by_broker(port: int, config_dir: Path) -> bool:
+    """True when the port is held by a live, positively-identified broker — the
+    one holder doctor must NOT flag as a failure, since new sessions auto-attach
+    to it as shims. Any unknown/foreign holder returns False (still a failure)."""
+    pids = _listening_pids(port)
+    if not pids:
+        return False
+    by_pid = {p.pid: p for p in find_sallyport_processes(_ps_snapshot(), own_pid=-1)}
+    recorded = read_pidfile(pidfile_path(config_dir, port))
+    return any(
+        _pid_is_broker(pid, proc.command if (proc := by_pid.get(pid)) else None, recorded)
+        for pid in pids
+    )
+
+
 def _describe_port_holder(port: int, config_dir: Path) -> list[str]:
     """Human lines identifying who holds the port: PID, command, age, and —
     when the holder's pidfile survives — the daemon version it runs. Returns
@@ -308,9 +336,7 @@ def _describe_port_holder(port: int, config_dir: Path) -> list[str]:
         proc = by_pid.get(pid)
         # A broker is detected either from its command line or its pidfile mode;
         # it is long-lived by design, not a stale orphan to reap.
-        is_broker = (proc is not None and _is_broker_command(proc.command)) or (
-            recorded is not None and recorded.get("pid") == pid and recorded.get("mode") == "broker"
-        )
+        is_broker = _pid_is_broker(pid, proc.command if proc else None, recorded)
         bits = [f"port {port} is held by PID {pid}"]
         if recorded and recorded.get("pid") == pid:
             bits.append(f"sallyport {recorded.get('version', '?')}")
@@ -574,7 +600,17 @@ def _run_doctor(args: argparse.Namespace, secret: bytes, created: bool, secret_p
     )
 
     port_ok, port_msg = _probe_bind(args.host, args.port)
-    checks.append((port_ok, port_msg))
+    # A live broker legitimately owns the port — new sessions auto-attach to it
+    # as shims, so that must NOT read as a failure (doctor would otherwise exit 1
+    # on the very multi-session setup broker mode exists for). Only a
+    # POSITIVELY-identified broker relaxes the check; an unknown/foreign holder
+    # still fails.
+    if not port_ok and _port_held_by_broker(args.port, secret_path.parent):
+        checks.append(
+            (True, f"port {args.port} held by your broker — new sessions auto-attach as shims")
+        )
+    else:
+        checks.append((port_ok, port_msg))
 
     all_ok = all(ok for ok, _ in checks)
     for ok, msg in checks:
@@ -598,7 +634,17 @@ def _run_doctor(args: argparse.Namespace, secret: bytes, created: bool, secret_p
     print("  1. chrome://extensions -> Load unpacked -> extension/dist (build it first).")
     print("  2. Open the Sallyport popup, paste the block above, click Pair.")
     print("  3. Allowlist tab -> add a domain (every tool rejects URLs until you do).")
-    print("  4. Register with Claude Code:  claude mcp add sallyport sallyport-daemon")
+    # Resolve an absolute path so a GUI-launched Claude Code (which often lacks
+    # ~/.local/bin on PATH) can actually spawn the daemon; fall back to the
+    # module form on the current interpreter if the console script isn't found.
+    daemon_path = shutil.which("sallyport-daemon")
+    if daemon_path:
+        print(f"  4. Register with Claude Code:  claude mcp add sallyport {daemon_path}")
+    else:
+        print(
+            "  4. Register with Claude Code:  "
+            f"claude mcp add sallyport {sys.executable} -m sallyport_daemon"
+        )
     if not all_ok:
         print()
         print("Some checks FAILED — fix the lines above, then re-run: sallyport-daemon doctor")

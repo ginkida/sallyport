@@ -261,6 +261,71 @@ async def test_doctor_flags_port_in_use(capsys: pytest.CaptureFixture[str], tmp_
         held.close()
 
 
+async def test_doctor_registration_names_resolved_daemon_path(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`claude mcp add` gets an ABSOLUTE daemon path — a GUI-launched Claude Code
+    often lacks ~/.local/bin on PATH, so a bare name fails to spawn later."""
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m.shutil, "which", lambda _name: "/opt/venv/bin/sallyport-daemon")
+    port = _free_port()
+    ns = parse_args(["--secret-file", str(tmp_path / "s"), "--port", str(port), "doctor"])
+    assert await amain(ns) == 0
+    assert "claude mcp add sallyport /opt/venv/bin/sallyport-daemon" in capsys.readouterr().out
+
+
+async def test_doctor_registration_falls_back_to_module_form(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the console script isn't on PATH, the registration line uses the
+    module form (never an empty/bare command)."""
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m.shutil, "which", lambda _name: None)
+    port = _free_port()
+    ns = parse_args(["--secret-file", str(tmp_path / "s"), "--port", str(port), "doctor"])
+    assert await amain(ns) == 0
+    out = capsys.readouterr().out
+    assert "claude mcp add sallyport" in out
+    assert "-m sallyport_daemon" in out
+
+
+def test_port_held_by_broker_detects_broker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """_port_held_by_broker is True for a positively-identified broker (a
+    `broker` argv token) and False for a plain daemon / unknown holder."""
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [100])
+    monkeypatch.setattr(
+        m, "_ps_snapshot", lambda: "100 1 03:00:00 /opt/venv/bin/sallyport-daemon broker\n"
+    )
+    assert m._port_held_by_broker(10086, tmp_path) is True  # noqa: SLF001
+    monkeypatch.setattr(
+        m, "_ps_snapshot", lambda: "100 1 03:00:00 /opt/venv/bin/sallyport-daemon\n"
+    )
+    assert m._port_held_by_broker(10086, tmp_path) is False  # noqa: SLF001
+
+
+async def test_doctor_does_not_fail_on_live_broker(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live broker holding the port is the multi-session setup broker mode
+    exists for — doctor reports it OK (exit 0), not FAIL/exit 1."""
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m, "_probe_bind", lambda host, port: (False, "cannot bind: in use"))
+    monkeypatch.setattr(m, "_port_held_by_broker", lambda port, cfg: True)
+    monkeypatch.setattr(m, "_describe_port_holder", lambda port, cfg: [])
+    ns = parse_args(["--secret-file", str(tmp_path / "s"), "--port", "10086", "doctor"])
+    assert await amain(ns) == 0
+    out = capsys.readouterr().out
+    assert "held by your broker" in out
+    assert "Some checks FAILED" not in out
+
+
 async def test_show_secret_prints_and_exits(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
