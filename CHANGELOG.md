@@ -4,6 +4,29 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **`doctor` now emits an absolute-path `claude mcp add` line.** A GUI-launched
+  Claude Code frequently doesn't inherit the shell PATH, so the old bare
+  `claude mcp add sallyport sallyport-daemon` produced an entry that silently
+  failed to spawn. `doctor` now resolves the console script's absolute path
+  (`shutil.which`), falling back to `python -m sallyport_daemon` on the current
+  interpreter when the script isn't on PATH — never a bare command name. The
+  README's registration steps (standalone + broker) mirror the same guidance.
+- **`doctor` no longer reports a healthy broker as a failure.** When the port is
+  held by a positively-identified broker (the intended multi-session setup),
+  `doctor`'s port check now reports **OK** and exits `0` instead of flagging a
+  conflict — the broker-detection is shared with the port-holder description so
+  the message and the exit code can't drift. An unknown or foreign holder still
+  fails. Diagnostic-only; no wire/gate/invariant change.
+- **README onboarding accuracy.** Documented that the extension is not on PyPI
+  (`pip install sallyport` ships only the daemon — clone the repo to build
+  `extension/`), refreshed the stale test counts, and corrected the Kimi
+  comparison so the `network` row points at the gated `network_tail` subset
+  Sallyport now ships rather than implying no network capture exists.
+
 ## [0.13.0] — 2026-07-01
 
 ### Added

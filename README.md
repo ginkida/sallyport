@@ -15,8 +15,8 @@ Claude Code ── MCP/stdio ──▶ daemon ── WS+HMAC ──▶ extension
 
 | Status | Number |
 |---|---|
-| Daemon tests (pytest) | 340 |
-| Extension tests (vitest) | 529 |
+| Daemon tests (pytest) | 439 |
+| Extension tests (vitest) | 594 |
 | Lint / typecheck (ruff, mypy, eslint, prettier, tsc) | all green |
 
 ## What's in the box
@@ -80,8 +80,13 @@ drive it.
 
 ### 1. Build the extension
 
+The extension is **not** on PyPI — `pip install sallyport` (step 2) gives you
+only the daemon. The extension lives in this repo's `extension/` directory, so
+you need a checkout to build it:
+
 ```sh
-cd extension
+git clone https://github.com/ginkida/sallyport
+cd sallyport/extension
 npm install
 npm run build
 ```
@@ -138,16 +143,20 @@ sallyport-daemon --show-secret
 Add an MCP server entry — either edit `~/.claude/mcp.json` directly, or:
 
 ```sh
-claude mcp add sallyport sallyport-daemon
+# Use the ABSOLUTE path. A GUI-launched Claude Code often doesn't inherit your
+# shell PATH, so a bare "sallyport-daemon" command silently fails to spawn.
+claude mcp add sallyport "$(which sallyport-daemon)"
 ```
 
-Producing:
+`sallyport-daemon doctor` prints this exact line with the path already resolved
+(and falls back to `python -m sallyport_daemon` if the console script isn't on
+PATH) — copy it from there if you're unsure. The result:
 
 ```json
 {
   "mcpServers": {
     "sallyport": {
-      "command": "sallyport-daemon",
+      "command": "/Users/you/.local/bin/sallyport-daemon",
       "args": []
     }
   }
@@ -189,8 +198,8 @@ several sessions — and you, working in the same browser — share one extensio
 sallyport-daemon broker
 ```
 
-Now register and use Sallyport exactly as above (`claude mcp add sallyport
-sallyport-daemon`) from **as many project folders as you like**. Each plain
+Now register and use Sallyport exactly as above (absolute-path
+`claude mcp add`, step 3) from **as many project folders as you like**. Each plain
 `sallyport-daemon` session **auto-detects** the running broker and attaches to it
 as a thin relay over a `0600` Unix-domain socket (`broker-10086.sock`, next to
 the secret); with no broker running, a session falls back to standalone, exactly
@@ -198,9 +207,10 @@ as before. Pair the extension once, against the broker.
 
 You can leave the broker running in the background (`sallyport-daemon broker &`,
 `nohup`, or your own service manager); it's meant to be long-lived. `doctor`
-recognises it as an intentional broker rather than a stale daemon, so
-`sallyport-daemon doctor --kill-stale` reports it and leaves it running — stop it
-explicitly with `kill <pid>` (or Ctrl-C) when you're done.
+recognises it as an intentional broker rather than a stale daemon: its port check
+reports the busy port as **OK** (a broker holding it is the intended setup, not a
+conflict), and `sallyport-daemon doctor --kill-stale` reports it and leaves it
+running — stop it explicitly with `kill <pid>` (or Ctrl-C) when you're done.
 
 What you get:
 
@@ -272,7 +282,7 @@ features are deliberately *not* here:
 
 | Kimi feature | Why Sallyport omits it | If you need the behaviour |
 |---|---|---|
-| `network` (start/stop/list/detail HTTP capture via `Network.enable`) | Captures auth headers, cookies, and response bodies on every request, with no per-domain gate that makes any sense. Adding it would defeat the whole "explicit boundaries" framing. | Use `fetch_in_page` against the specific URL, or Chrome's own DevTools. |
+| `network` (start/stop/list/detail HTTP capture via `Network.enable`) | Kimi's version captures auth headers, cookies, and every request body with no per-domain gate — that ungated shape is what Sallyport omits. | Use `network_tail`: a gated subset — opt-in per popup, **response bodies only** (no headers/cookies), origin-filtered to the allowlist. Or `fetch_in_page` against a specific URL. |
 | `save_as_pdf` (`Page.printToPDF`) | Niche — `screenshot` (full-page PNG/JPEG) already covers "preserve what's on screen" for the agent tasks we've seen. | Speak up if you hit a case where selectable PDF text matters; trivial to add. |
 | `_session` (per-agent Chrome tab groups, coloured) | Cosmetic flair that complicates tab handling without solving a real problem at current scale. | Use `list_tabs` to find what you opened. |
 
