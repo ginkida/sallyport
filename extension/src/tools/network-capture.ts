@@ -56,10 +56,20 @@ export interface NetworkEntry {
   /** Response body text, capped; omitted for binary/compressed/unavailable. */
   body?: string;
   bodyTruncated?: boolean;
+  /** Body dropped because the result hit NETWORK_RESPONSE_BUDGET (metadata +
+   * `size` kept). Narrow with `filter` + a small `limit` to get its full body. */
+  bodyOmitted?: boolean;
 }
 
 export const NETWORK_MAX_ENTRIES = 100;
-export const NETWORK_MAX_BODY = 64 * 1024;
+export const NETWORK_MAX_BODY = 256 * 1024;
+// Total response-body bytes returned in ONE network_tail result. Keeps the
+// serialised frame under MAX_FRAME_BYTES (16 MiB) even with JSON escaping and
+// regardless of `limit`: bodies past the budget (oldest first) drop to metadata
+// (bodyOmitted). A same-origin RPC report (e.g. Metrika's /i-proxy/ gateway with
+// a signed per-session key) often can't be replayed with fetch_in_page, so the
+// per-body cap is generous and it is the aggregate that is bounded.
+export const NETWORK_RESPONSE_BUDGET = 6 * 1024 * 1024;
 const DEFAULT_NETWORK_LIMIT = 20;
 const NETWORK_MAX_PENDING = 512;
 
@@ -152,6 +162,42 @@ export function filterNetworkEntries(
     out = out.filter((e) => e.url.toLowerCase().includes(needle));
   }
   return { entries: out.slice(-opts.limit), total: out.length };
+}
+
+/** Keep response bodies for the NEWEST entries within a total byte budget; older
+ * bodies beyond it are dropped (metadata + `size` kept, `bodyOmitted` set) so one
+ * result never exceeds the 16 MiB WS frame cap regardless of the requested
+ * `limit`. Clones the entries it strips — never mutates the ring buffer.
+ * `entries` arrive oldest→newest. Pure. */
+export function applyResponseBudget(
+  entries: NetworkEntry[],
+  budget = NETWORK_RESPONSE_BUDGET,
+): { entries: NetworkEntry[]; omitted: number } {
+  const out = entries.slice();
+  let used = 0;
+  let omitted = 0;
+  for (let i = out.length - 1; i >= 0; i--) {
+    const e = out[i];
+    if (typeof e.body !== 'string') continue;
+    if (used + e.body.length <= budget) {
+      used += e.body.length;
+    } else {
+      // Clone without the body so the ring buffer's entry is untouched.
+      out[i] = {
+        ts: e.ts,
+        method: e.method,
+        url: e.url,
+        status: e.status,
+        type: e.type,
+        contentType: e.contentType,
+        size: e.size,
+        origin: e.origin,
+        bodyOmitted: true,
+      };
+      omitted++;
+    }
+  }
+  return { entries: out, omitted };
 }
 
 /** Parse `network_tail`'s args: `limit` (default 20, capped at the ring size)

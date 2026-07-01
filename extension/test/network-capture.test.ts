@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  applyResponseBudget,
   clipBody,
   filterNetworkEntries,
   isDataContentType,
@@ -184,5 +185,63 @@ describe('parseNetworkArgs', () => {
   it('passes through a string filter and rejects a non-string one', () => {
     expect(parseNetworkArgs({ filter: 'api' })).toEqual({ limit: 20, filter: 'api' });
     expect(() => parseNetworkArgs({ filter: 42 })).toThrow(/filter must be a string/);
+  });
+});
+
+describe('applyResponseBudget', () => {
+  const withBody = (id: number, bodyLen: number): NetworkEntry => ({
+    ts: id,
+    method: 'GET',
+    url: `https://api.example.com/r${id}`,
+    status: 200,
+    type: 'xhr',
+    contentType: 'application/json',
+    size: bodyLen,
+    origin: 'https://api.example.com',
+    body: 'x'.repeat(bodyLen),
+  });
+
+  it('keeps every body when under budget', () => {
+    const { entries, omitted } = applyResponseBudget([withBody(1, 100), withBody(2, 100)], 1000);
+    expect(omitted).toBe(0);
+    expect(entries.map((e) => e.body?.length)).toEqual([100, 100]);
+    expect(entries.some((e) => e.bodyOmitted)).toBe(false);
+  });
+
+  it('keeps the NEWEST bodies within budget and drops older ones to metadata', () => {
+    // oldest→newest; the 200-byte budget fits only the last two 100-byte bodies.
+    const { entries, omitted } = applyResponseBudget(
+      [withBody(1, 100), withBody(2, 100), withBody(3, 100)],
+      200,
+    );
+    expect(omitted).toBe(1);
+    expect(entries[0].body).toBeUndefined();
+    expect(entries[0].bodyOmitted).toBe(true);
+    expect(entries[0].size).toBe(100); // metadata retained
+    expect(entries[1].body?.length).toBe(100);
+    expect(entries[2].body?.length).toBe(100);
+  });
+
+  it('does not mutate the input entries (the ring buffer stays intact)', () => {
+    const input = [withBody(1, 100), withBody(2, 100)];
+    applyResponseBudget(input, 100); // forces one omit
+    expect(input[0].body?.length).toBe(100);
+    expect(input[0].bodyOmitted).toBeUndefined();
+  });
+
+  it('passes through entries that have no body', () => {
+    const noBody: NetworkEntry = {
+      ts: 1,
+      method: 'GET',
+      url: 'https://api.example.com/x',
+      status: 204,
+      type: 'fetch',
+      contentType: 'application/json',
+      size: 0,
+      origin: 'https://api.example.com',
+    };
+    const { entries, omitted } = applyResponseBudget([noBody], 10);
+    expect(omitted).toBe(0);
+    expect(entries[0].bodyOmitted).toBeUndefined();
   });
 });

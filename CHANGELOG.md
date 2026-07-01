@@ -20,7 +20,9 @@ uses [Semantic Versioning](https://semver.org/).
   (popup "capture API responses", default off → `{enabled:false, entries:[]}`),
   a lazy `Network.enable` issued only when on (never on the unconditional
   `attach()` path), scoped to XHR/Fetch, bodies only for textual data
-  content-types and capped, **no** request/response headers captured (no
+  content-types and capped (~256 KiB each, with a total-size budget so a big
+  result never overflows the WS frame — oldest bodies drop to metadata as
+  `bodyOmitted`), **no** request/response headers captured (no
   `Authorization`/`Cookie` leak), a bounded per-tab ring cleared on
   tab-close/detach, and entries **origin-filtered to the allowlist** (fail-closed
   — a dashboard whose data API is on another host needs that host allowlisted

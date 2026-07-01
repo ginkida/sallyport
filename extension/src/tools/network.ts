@@ -16,7 +16,12 @@ import { matchAllowlist } from '../allowlist.js';
 import { getAllowlist, getSettings } from '../storage.js';
 import { attach } from './cdp.js';
 import { ensureAllowed } from './gates.js';
-import { filterNetworkEntries, parseNetworkArgs, readNetwork } from './network-capture.js';
+import {
+  applyResponseBudget,
+  filterNetworkEntries,
+  parseNetworkArgs,
+  readNetwork,
+} from './network-capture.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
@@ -35,17 +40,20 @@ export const networkTail: Tool = async (args) => {
 
   const list = await getAllowlist();
   const isAllowed = (origin: string): boolean => matchAllowlist(origin, list).matched;
-  const { entries, total } = filterNetworkEntries(readNetwork(tab.id!), isAllowed, {
+  const { entries: matched, total } = filterNetworkEntries(readNetwork(tab.id!), isAllowed, {
     filter,
     limit,
   });
+  // Bound the aggregate body size so the result frame stays under the 16 MiB cap
+  // regardless of `limit`; oldest bodies past the budget drop to metadata.
+  const { entries, omitted } = applyResponseBudget(matched);
   return {
     tabId: tab.id,
     url: tab.url,
     data: {
       enabled: true,
       entries,
-      ...(total > entries.length ? { truncated: true } : {}),
+      ...(total > matched.length || omitted > 0 ? { truncated: true } : {}),
     },
   };
 };
