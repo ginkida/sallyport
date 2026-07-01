@@ -165,7 +165,9 @@ TOOLS: list[Tool] = [
             "selector (CSS or @eN) scopes the snapshot to one subtree (always a "
             "DOM walk, source='dom') — on big SPAs snapshot just the panel you "
             "work with (chat list, composer) instead of the whole page; combine "
-            "with compact for the smallest result. Domain must be in allowlist."
+            "with compact for the smallest result. To locate a few specific "
+            "elements by role/name, `find` is cheaper than scanning a full "
+            "snapshot. Domain must be in allowlist."
         ),
         inputSchema={
             "type": "object",
@@ -342,7 +344,10 @@ TOOLS: list[Tool] = [
         name="click",
         description=(
             "Click an element via DOM .click(). selector can be a CSS selector or a "
-            "@eN ref from snapshot. Refs are more reliable on SPAs. waitFor "
+            "@eN ref from snapshot. Refs are more reliable on SPAs. Try this "
+            "first for buttons/links; if the click doesn't register (SPA "
+            "pointer-event routers, canvas or drag-and-drop UIs), escalate to "
+            "mouse_click, which fires a real pointer sequence. waitFor "
             "polls for the click's effect (panel opened, item selected) in the "
             "same call."
         ),
@@ -797,7 +802,10 @@ TOOLS: list[Tool] = [
         description=(
             "Wait until the DOM stops changing for stableMs (element count AND "
             "body size both hold steady) — the adaptive replacement for a blind "
-            "sleep after an action on a busy SPA. Polls every 250 ms up to "
+            "sleep after an action on a busy SPA. Use this when you have NO "
+            "concrete thing to wait for; when you do (a selector appearing, a "
+            "spinner leaving, text showing up), wait_for is a sharper signal. "
+            "Polls every 250 ms up to "
             "timeoutMs (capped at 30000); stableMs is capped at 10000. Returns "
             "{settled, elapsedMs}. A page that never quiesces (live feed, "
             "animation loop), or whose probe never yields a reading, returns "
@@ -848,7 +856,10 @@ TOOLS: list[Tool] = [
         description=(
             "Run fetch() from the page's JS context, with its cookies/auth. Use this "
             "to download image/binary URLs you found via snapshot or evaluate "
-            "(e.g. card photos from a logged-in 2gis session). The page's host must "
+            "(e.g. card photos from a logged-in 2gis session), or to issue a "
+            "fresh request. To read a response the page ALREADY fetched "
+            "(canvas-dashboard data), use network_tail instead — no re-issue, "
+            "and it works when a signed request can't be replayed. The page's host must "
             "be in the allowlist; does NOT require the per-domain evaluate flag "
             "because the function body is fixed (only URL/method/headers/body are "
             "interpolated). Returns {status, contentType, headers, mode, data} where "
