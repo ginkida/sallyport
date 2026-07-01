@@ -2,6 +2,7 @@ import { attach, cdp } from './cdp.js';
 import { computeClip, type Region } from './clip.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
+import { assertBringToFrontAllowed } from './ownership.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
@@ -79,10 +80,13 @@ async function ensureVisible(tabId: number, bringToFront: boolean): Promise<void
 export const screenshot: Tool = async (args) => {
   const region = parseRegion(args.region);
   const maxWidth = parseMaxWidth(args.maxWidth);
+  const bringToFront = args.bringToFront === true;
+  // Broker mode forbids foregrounding the agent tab (focus-theft mitigation).
+  assertBringToFrontAllowed(bringToFront);
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
-  await ensureVisible(tab.id!, args.bringToFront === true);
+  await ensureVisible(tab.id!, bringToFront);
   const format = args.format === 'jpeg' ? 'jpeg' : 'png';
   const params: Record<string, unknown> = { format };
   if (format === 'jpeg') params.quality = typeof args.quality === 'number' ? args.quality : 80;

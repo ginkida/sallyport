@@ -70,6 +70,59 @@ the "Tools" table for per-tool notes. Quick reference:
 | Concurrent calls | Daemon `_call_lock` serialises MCP tool calls | `daemon/.../bridge.py` |
 | Multiple WS clients | Slot claimed only after verified signed hello; second authenticated client rejected with 1008 | `daemon/.../bridge.py:_handle_client` |
 | Unauthenticated slot-squatting / probing | Hello-before-slot + 10 s hello deadline + browser-page Origins refused | `daemon/.../bridge.py:_handle_client` |
+| Tab ownership (broker mode) | Daemon `ensure_owns` gate before every tab-touching call; `(clientId,tabId,epoch)` registry; extension epoch confirm | `daemon/.../ownership.py`, `extension/src/tools/ownership.ts` |
+| MCP-client auth (broker mode) | Signed `hello` before any disclosure/action; server-minted connection-bound `clientId`; per-connection nonce cache | `daemon/.../broker.py:authenticate_connection` |
+| Broker socket exposure | `0600` AF_UNIX socket beside the secret (same uid gate); authenticated-client cap (16), with half-open handshakes bounded separately so a never-hello peer can't consume an earned slot | `daemon/.../broker.py:start_broker_server` |
+
+## Broker mode
+
+`sallyport-daemon broker` lets one process own the single browser/extension leg
+and serve **several** Claude Code sessions at once (plus the human, working in the
+same browser). It changes the threat model in two ways, each met by a new
+load-bearing invariant.
+
+**The MCP leg becomes a network-ish surface.** A standalone daemon's MCP leg is a
+private stdio pipe between Claude Code and the daemon. A broker's MCP leg is an
+AF_UNIX socket any local process *could* `connect()` to. The four-part floor that
+protects the extension WS leg is reused wholesale: a `0600` socket bound beside
+the secret (only the owning uid can reach it — the loopback-bind analogue,
+invariant #2), a signed `hello` as the first frame within a 10 s deadline, HMAC +
+constant-time compare + per-connection nonce cache on every frame, and the same
+secret-backed credential. An unauthenticated peer is closed before anything is
+disclosed and learns nothing — not even whether an extension is attached
+(**invariant #14, MCP-client auth earned-not-grabbed**). The `clientId` that
+scopes ownership is **server-minted, connection-bound, and ephemeral**: a peer
+cannot forge another's id because it cannot inject into another's socket.
+
+**One browser is now shared by mutually-distrusting drivers.** Each session must
+be confined to the tabs it created, and the human's tabs must stay invisible and
+untouchable. This is **invariant #13 (tab ownership)**: the daemon is the
+authoritative gate — it alone knows the `clientId` — and refuses any
+tab-touching call whose `tabId` is not owned by the caller (`tab_not_owned`), or
+that omits `tabId` entirely (`tab_required` — the active-tab fallback is disabled
+in broker mode, so a tabId-less `navigate` opens a *new owned* tab instead of
+clobbering the human's focused one). Ownership keys on `(tabId, epoch)`, never
+`tabId` alone: the extension mints a create-time `epoch` so a recycled Chrome
+tabId resolves to `tab_gone` rather than the wrong page. `list_tabs` is
+owner-scoped at both layers (extension filters to agent-created tabs, daemon
+re-scopes per-client, **fail-closed**), and `screenshot bringToFront` is refused
+(`bringtofront_forbidden`) so automation can't yank the human's focus. The
+diagnostic `status` ring (recent tool outcomes + last error) is owner-scoped too:
+a session sees only its own calls, never another client's tools, codes, or
+server-minted `clientId` — so the shared ring can't become a cross-client
+activity oracle.
+
+**Honest framing — what broker mode is and isn't.** It is a **software partition**
+of one shared browser profile, bounded by the allowlist + ownership + secret-gated
+auth. It is **not** a Chrome-profile wall and **not** multi-tenant OS isolation.
+There is **one shared secret**, so there is **no cryptographic isolation between
+secret-holders** — every "another client can't…" claim above rests on
+*connection binding* (you can't inject into another's socket) and on not handing
+the secret around, not on distinct keys. The security floor is **same-uid**: any
+process running as the user can read the secret, pair, and drive the browser
+within the allowlist. The extension layer (epoch confirm, owner-scoped
+`list_tabs`) is defence-in-depth; the daemon gate is authoritative. If the broker
+process itself is compromised, all partitions fall at once.
 
 ## Known limitations
 
@@ -188,6 +241,41 @@ guard it: `test_no_local_tool_shadowing` parses the extension's
 `tools.ts` registry and asserts it is disjoint from `LOCAL_TOOLS`, and
 `test_tools_catalogue_covers_extension` pins the expected catalogue so
 any new name needs an explicit `expected` update.
+
+### Broker mode: a create that crashes mid-flight can leak an untracked tab
+
+The daemon records ownership of a created tab from the tool *result*. If a
+`navigate{newTab:true}` runs to completion in the extension but its result never
+reaches the daemon (the session dies mid-call), the tab exists but the registry
+never learns of it — so it is neither owned nor reaped. v1 closes this lazily:
+the extension reconciles `epochByTab` against the live tab set on every
+service-worker wake, and a session's tabs return to "unowned" (usable by the
+human) on disconnect. There is **no unsolicited extension→daemon event channel**
+in v1 (adding one would cost a `PROTOCOL_VERSION` bump + vector regeneration), so
+reaping is on next-call / next-wake, not instant.
+
+**Exploitability:** none in the adversarial sense — the floor is same-uid, and an
+orphaned tab is just a tab the human can see and close. It is a tidiness gap, not
+a confinement hole.
+
+### Broker mode: tool calls are fair-by-arrival, not round-robin-fair
+
+All MCP tool calls across all sessions serialise through one daemon lock (the
+single browser can do one thing at a time, invariant #8). The lock is FIFO **by
+arrival**, so a session that pipelines many calls can delay a latecomer from
+another session until its queue drains. Every call is still bounded by the 60 s
+request timeout, and `status` answers without taking the lock, so a stall is
+always attributable. A per-owner round-robin scheduler is designed but deferred
+(it is a fairness optimisation on an already-correct lock, and a custom scheduler
+in the per-call critical path carries more risk than the benefit warrants for
+v1). DoS here is **within the trusted set** (the user's own sessions).
+
+### Broker mode: the dedicated agent window is presentation, not isolation
+
+Agent-created tabs open in one non-focused window to keep them out of the human's
+way. Ownership never keys on `windowId` (the human may drag a tab between
+windows), so the window is purely cosmetic separation — it is **not** a security
+boundary. Confinement is the daemon ownership gate, not the window.
 
 ## Adding a new tool safely
 

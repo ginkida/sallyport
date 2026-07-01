@@ -4,7 +4,68 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.12.0] — 2026-07-01
+
+### Added
+
+- **Broker mode — one browser, many Claude Code sessions, the human too.** A new
+  `sallyport-daemon broker` runs one long-lived process that owns the single
+  extension/WS leg and serves **N** Claude Code sessions at once over a `0600`
+  **AF_UNIX socket** (`broker-<port>.sock`, beside the secret). Plain
+  `sallyport-daemon` sessions **auto-detect** a running broker and attach to it
+  as a thin **stdio shim** (framed, HMAC-signed relay) — registration is
+  unchanged (`claude mcp add …`), and with no broker present they run standalone
+  exactly as before. The socket is the loopback-bind analogue (invariant #2): the
+  kernel uid gate that protects the secret protects the socket. AF_UNIX, not a
+  loopback TCP port, so no other-process-reachable surface is opened.
+- **Per-client tab ownership (new invariant #13).** In broker mode each session
+  may act **only on tabs it created**; the human's tabs and other sessions' tabs
+  are invisible and untouchable. The daemon is the authoritative gate (it alone
+  knows the per-connection, server-minted `clientId`); tabs are keyed
+  `(clientId, tabId, epoch)` where the extension mints a create-time `epoch` so a
+  recycled Chrome tabId can't silently retarget a call. The extension is an
+  identity-blind defence-in-depth layer (epoch confirm → `tab_gone`; `epochByTab`
+  persisted to `chrome.storage.session`, reconciled on service-worker wake).
+- **MCP-client auth, earned-not-grabbed (new invariant #14).** A shim must prove
+  a valid signed `hello` (reusing the same HMAC `Signer` the extension uses,
+  per-connection nonce cache) before anything is disclosed or done — the
+  multi-slot analogue of the extension's hello-before-slot gate. A connecting
+  peer learns nothing on failure (no reason echoed).
+- **Owner-scoped `list_tabs`.** In broker mode `list_tabs` returns only the
+  caller's own tabs — filtered at the extension (to agent-created tabs) **and**
+  re-scoped per-client at the daemon, **fail-closed** (unknown/empty owner → empty
+  list, never the whole profile). Invariant #3's "`list_tabs` is the only ungated
+  tool" tightens to "owner-scoped at both layers" in broker mode.
+- **Owner-scoped `status`.** In broker mode the diagnostic ring (recent tool
+  outcomes + last error) is scoped per caller: a session sees only its own calls,
+  never another client's tools, codes, or server-minted `clientId` — the shared
+  ring can't become a cross-client activity oracle. Standalone keeps the full view.
+- **Focus-theft mitigation.** Agent-created tabs open in a dedicated, **non-focused**
+  window (`focused:false`) with `active:false`, kept out of the human's windows so
+  automation never steals focus or clutters their workspace; `screenshot`'s
+  `bringToFront` is refused in broker mode (`bringtofront_forbidden`). A tabId-less
+  `navigate` in broker mode is a **create-own** (a fresh owned tab) rather than a
+  clobber of the human's focused tab.
+- **New error codes** (with recovery hints): `tab_required` (a tab-touching tool
+  called with no tabId in broker mode — the active-tab fallback is disabled),
+  `tab_not_owned` (collapses not-yours / never-existed / recycled so it is not an
+  existence oracle), `tab_gone` (a tab you owned closed or was recycled),
+  `bringtofront_forbidden`.
+- **Connection cap, earned-not-grabbed** (`MAX_BROKER_CLIENTS = 16`): the cap
+  counts **authenticated** clients. A connection arriving with no free slot is
+  refused before auth (no disclosure); half-open handshakes are bounded by a
+  separate budget, so a never-hello peer can occupy only a short-lived pending
+  slot — never an earned client slot — and can't lock real sessions out (bounding
+  resource use against a runaway client, DoS within the same-uid trusted set).
+- **Long-lived broker is recognised, not reaped.** A detached broker re-parents to
+  PID 1 and would otherwise look like a stale orphan; its pidfile is stamped
+  `mode: broker` and its command is detected, so `doctor --kill-stale` and the
+  port-reclaim guard report it and leave it running (stop it with `kill <pid>`).
+
+The wire format is **unchanged** — broker mode adds a new internal channel
+(broker↔shim envelopes of type `mcp`) and one additive `hello_ack` body field
+(`{broker: bool}`); `PROTOCOL_VERSION` stays `1` and the canonical-JSON vectors
+are untouched. Standalone mode is byte-for-byte the previous behaviour.
 
 ## [0.11.2] — 2026-06-29
 
@@ -1150,7 +1211,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/ginkida/sallyport/compare/v0.11.2...v0.12.0
 [0.11.2]: https://github.com/ginkida/sallyport/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/ginkida/sallyport/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/ginkida/sallyport/compare/v0.10.0...v0.11.0

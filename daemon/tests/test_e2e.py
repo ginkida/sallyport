@@ -42,7 +42,12 @@ def _free_port() -> int:
 class BridgeHarness:
     """Owns a Bridge instance bound to an ephemeral port plus its serve task."""
 
-    def __init__(self, request_timeout: float = 2.0, hello_timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        request_timeout: float = 2.0,
+        hello_timeout: float = 10.0,
+        broker_mode: bool = False,
+    ) -> None:
         self.port = _free_port()
         self.bridge = Bridge(
             secret=SECRET,
@@ -50,6 +55,7 @@ class BridgeHarness:
             port=self.port,
             request_timeout=request_timeout,
             hello_timeout=hello_timeout,
+            broker_mode=broker_mode,
         )
         self._task: asyncio.Task[None] | None = None
 
@@ -125,6 +131,37 @@ async def test_hello_handshake(harness: BridgeHarness) -> None:
         await ext.handshake()
     finally:
         await ext.close()
+
+
+async def test_hello_ack_reports_standalone_mode_by_default(harness: BridgeHarness) -> None:
+    """A non-broker daemon tells the extension broker:false in the hello_ack, so
+    the extension keeps single-client behaviour (no owner-scoping / focus
+    mitigation)."""
+    ext = await FakeExtension.connect(harness.url)
+    try:
+        await ext.send("hello", {"extensionVersion": "test"})
+        ack = await ext.recv()
+        assert ack.type == "hello_ack"
+        assert ack.body == {"broker": False}
+    finally:
+        await ext.close()
+
+
+async def test_hello_ack_reports_broker_mode() -> None:
+    """A broker daemon signals broker:true so the extension enables the
+    broker-only behaviours the daemon gate can't reach (list_tabs scoping, focus
+    mitigation)."""
+    h = BridgeHarness(broker_mode=True)
+    await h.start()
+    ext = await FakeExtension.connect(h.url)
+    try:
+        await ext.send("hello", {"extensionVersion": "test"})
+        ack = await ext.recv()
+        assert ack.type == "hello_ack"
+        assert ack.body == {"broker": True}
+    finally:
+        await ext.close()
+        await h.stop()
 
 
 async def test_tool_call_roundtrip(harness: BridgeHarness) -> None:

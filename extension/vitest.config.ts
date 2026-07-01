@@ -27,6 +27,7 @@ export default defineConfig({
         'src/tools/refs.ts',
         'src/tools/gates.ts',
         'src/tools/errors.ts',
+        'src/tools/ownership.ts',
       ],
       thresholds: {
         'src/protocol.ts': {
@@ -79,6 +80,12 @@ export default defineConfig({
           branches: 100,
           functions: 100,
           statements: 80,
+        },
+        'src/tools/ownership.ts': {
+          lines: 95,
+          branches: 90,
+          functions: 95,
+          statements: 95,
         },
       },
     },

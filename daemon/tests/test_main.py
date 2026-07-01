@@ -8,10 +8,12 @@ with a fake extension, "no extension" timeout, bad args, and bad tool name.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import socket
 
 # AsyncIterator no longer used after fixture became sync
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +98,12 @@ def test_parse_args_list_tools() -> None:
 def test_parse_args_serve() -> None:
     ns = parse_args(["--port", "9999", "serve"])
     assert ns.command == "serve"
+    assert ns.port == 9999
+
+
+def test_parse_args_broker() -> None:
+    ns = parse_args(["--port", "9999", "broker"])
+    assert ns.command == "broker"
     assert ns.port == 9999
 
 
@@ -189,7 +197,6 @@ async def test_doctor_reports_ok_and_prints_secret(
     assert "free to bind" in out
     # The printed block must contain a valid base64 secret of >= 16 bytes.
     import base64
-    import contextlib
 
     found = False
     for line in out.splitlines():
@@ -464,8 +471,6 @@ async def test_serve_runs_ws_without_mcp(
 
     # The daemon should still be running — cancel it explicitly.
     daemon.cancel()
-    import contextlib
-
     with contextlib.suppress(asyncio.CancelledError, Exception):
         await asyncio.wait_for(daemon, timeout=2.0)
 
@@ -578,6 +583,171 @@ async def test_exec_rejects_bad_arg_format(
 
 
 # ---------------------------------------------------------------------------
+# broker subcommand + default-mode shim auto-attach (P1 integration)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def short_secret() -> Iterator[Path]:
+    """A pre-seeded secret under a short /tmp dir. The broker's AF_UNIX socket
+    path is derived from the secret-file dir, and macOS caps `sun_path` at ~104
+    bytes — pytest's `tmp_path` is too long to bind a socket beside, so broker
+    tests need a short base dir of their own."""
+    import base64
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp(prefix="sp", dir="/tmp")  # noqa: S108 - short path for AF_UNIX
+    try:
+        path = Path(d) / "secret"
+        path.write_bytes(base64.b64encode(SECRET))
+        yield path
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+async def _wait_for_broker_socket(sock: Path, *, tries: int = 100) -> None:
+    """Poll until the broker's AF_UNIX socket both exists and accepts, so any
+    follower (a ClientSession or a shim) is guaranteed a live peer."""
+    for _ in range(tries):
+        if sock.exists():
+            try:
+                _r, w = await asyncio.open_unix_connection(str(sock))
+            except OSError:
+                pass
+            else:
+                w.close()
+                with contextlib.suppress(OSError):
+                    await w.wait_closed()
+                return
+        await asyncio.sleep(0.05)
+    raise RuntimeError("broker socket never came up")
+
+
+async def test_broker_subcommand_serves_mcp_over_socket(
+    capsys: pytest.CaptureFixture[str], short_secret: Path
+) -> None:
+    """`broker` mode binds the AF_UNIX socket and answers MCP — `status` needs no
+    extension — proving the subcommand wiring end to end: socket claim + accept
+    loop + clientId-threaded `Server.run` + clean shutdown on cancel."""
+    from mcp.client.session import ClientSession
+    from mcp.types import TextContent
+
+    from sallyport_daemon.broker import (
+        _dump_json,
+        _parse_json,
+        broker_socket_path,
+        mcp_socket_streams,
+    )
+    from sallyport_daemon.framing import read_frame, write_frame
+
+    port = _free_port()
+    sock = broker_socket_path(port, short_secret.parent)
+    ns = parse_args(["--secret-file", str(short_secret), "--port", str(port), "broker"])
+    daemon = asyncio.create_task(amain(ns))
+
+    try:
+        await _wait_for_broker_socket(sock)
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        signer = Signer(SECRET)
+        await write_frame(writer, _dump_json(signer.sign(Envelope(type="hello", body={}))))
+        ack = await asyncio.wait_for(read_frame(reader), timeout=5)
+        assert ack is not None
+        assert signer.verify(_parse_json(ack)).type == "hello_ack"
+        async with mcp_socket_streams(reader, writer, signer) as (crs, cws):
+            async with ClientSession(crs, cws) as session:
+                await asyncio.wait_for(session.initialize(), timeout=10)
+                result = await asyncio.wait_for(session.call_tool("status", {}), timeout=10)
+                block = result.content[0]
+                assert isinstance(block, TextContent)
+                assert '"connected": false' in block.text
+            await cws.aclose()
+            writer.close()
+    finally:
+        daemon.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(daemon, timeout=3.0)
+
+    err = capsys.readouterr().err
+    assert "broker mode" in err
+    # The broker unlinks its socket on clean shutdown.
+    assert not sock.exists()
+
+
+async def test_default_mode_attaches_to_running_broker_as_shim(
+    capsys: pytest.CaptureFixture[str], short_secret: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Headline path: with a broker already running, a plain `sallyport-daemon`
+    (no subcommand) detects the socket and runs as a thin stdio shim — binding no
+    port of its own — relaying MCP through the broker. We feed an `initialize`
+    on the shim's stdin and read the broker's answer back on its stdout."""
+    import os
+    import sys
+
+    from sallyport_daemon.broker import broker_socket_path
+
+    port = _free_port()
+    sock = broker_socket_path(port, short_secret.parent)
+
+    broker_ns = parse_args(["--secret-file", str(short_secret), "--port", str(port), "broker"])
+    broker = asyncio.create_task(amain(broker_ns))
+
+    cc_to_shim_r, cc_to_shim_w = os.pipe()  # test -> shim stdin (requests)
+    shim_to_cc_r, shim_to_cc_w = os.pipe()  # shim stdout -> test (responses)
+
+    class _FakeStd:
+        def __init__(self, f: object) -> None:
+            self.buffer = f
+
+    try:
+        await _wait_for_broker_socket(sock)
+
+        # Replace stdio so the shim's `_open_stdio_streams` binds our pipes.
+        monkeypatch.setattr(sys, "stdin", _FakeStd(os.fdopen(cc_to_shim_r, "rb", buffering=0)))
+        monkeypatch.setattr(sys, "stdout", _FakeStd(os.fdopen(shim_to_cc_w, "wb", buffering=0)))
+
+        shim_ns = parse_args(["--secret-file", str(short_secret), "--port", str(port)])
+        shim = asyncio.create_task(amain(shim_ns))
+
+        # Read the shim's relayed stdout via an asyncio reader on our end.
+        loop = asyncio.get_running_loop()
+        resp_reader = asyncio.StreamReader()
+        await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(resp_reader),
+            os.fdopen(shim_to_cc_r, "rb", buffering=0),
+        )
+
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "loop-test", "version": "0"},
+            },
+        }
+        os.write(cc_to_shim_w, (json.dumps(init_req) + "\n").encode())
+        line = await asyncio.wait_for(resp_reader.readline(), timeout=10)
+        resp = json.loads(line)
+        assert resp["id"] == 1
+        assert "result" in resp
+        assert resp["result"]["protocolVersion"]  # the broker answered initialize
+    finally:
+        # EOF the shim's stdin so its relay returns, then cancel both daemons.
+        with contextlib.suppress(OSError):
+            os.close(cc_to_shim_w)
+        for task in ("shim", "broker"):
+            t = locals().get(task)
+            if isinstance(t, asyncio.Task):
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(t, timeout=3.0)
+
+    assert "shim mode" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
 # zombie-daemon diagnostics: ps parsing, port-holder report, kill-stale,
 # parent watchdog
 # ---------------------------------------------------------------------------
@@ -628,6 +798,87 @@ def test_find_sallyport_processes_filters() -> None:
 def test_find_sallyport_processes_excludes_self() -> None:
     procs = find_sallyport_processes(PS_OUTPUT, own_pid=100)
     assert [p.pid for p in procs] == [200, 400]
+
+
+def test_is_broker_command() -> None:
+    from sallyport_daemon.__main__ import _is_broker_command
+
+    assert _is_broker_command("/opt/venv/bin/sallyport-daemon broker")
+    assert _is_broker_command("/opt/venv/bin/python -m sallyport_daemon broker --port 10086")
+    assert not _is_broker_command("/opt/venv/bin/sallyport-daemon serve")
+    assert not _is_broker_command("/opt/venv/bin/sallyport-daemon")
+    # A path component containing 'broker' must not trip it (token, not substring).
+    assert not _is_broker_command("/home/u/broker-tools/sallyport-daemon serve")
+
+
+def test_kill_stale_spares_orphaned_broker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A detached broker re-parents to PID 1 (looks orphaned) but is long-lived
+    by design — --kill-stale must report it and SIGTERM only the plain orphan."""
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(
+        m,
+        "_ps_snapshot",
+        lambda: (
+            "100 1 03:00:00 /opt/venv/bin/sallyport-daemon broker\n"
+            "200 1 01:00:00 /opt/venv/bin/sallyport-daemon\n"
+        ),
+    )
+    killed: list[int] = []
+    monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: False)
+    m._run_kill_stale()
+    out = capsys.readouterr().out
+    assert killed == [200]  # the plain orphan is reaped; the broker is spared
+    assert "broker" in out.lower()
+
+
+def test_terminate_stale_holder_spares_broker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ensure_port_available must NOT reclaim the port from an orphaned broker —
+    it is the intended long-lived holder, not a dead-session leftover."""
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [100])
+    monkeypatch.setattr(
+        m, "_ps_snapshot", lambda: "100 1 03:00:00 /opt/venv/bin/sallyport-daemon broker\n"
+    )
+    killed: list[int] = []
+    monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append(pid))
+    assert m._terminate_stale_holder(10086, Path("/nonexistent")) is False
+    assert killed == []
+
+
+def test_describe_port_holder_labels_broker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A broker holding the port is labelled as long-lived-by-design, NOT as a
+    stale orphan, and the kill-stale hint is suppressed for it."""
+    import time as _time
+
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [100])
+    monkeypatch.setattr(
+        m, "_ps_snapshot", lambda: "100 1 03:00:00 /opt/venv/bin/sallyport-daemon broker\n"
+    )
+    pidfile = tmp_path / "daemon-10086.pid"
+    pidfile.write_text(
+        json.dumps(
+            {
+                "pid": 100,
+                "port": 10086,
+                "version": "0.4.0",
+                "started_at": _time.time(),
+                "mode": "broker",
+            }
+        )
+    )
+    text = "\n".join(m._describe_port_holder(10086, tmp_path))
+    assert "broker" in text.lower()
+    assert "ORPHANED" not in text
+    assert "--kill-stale" not in text
 
 
 def test_describe_port_holder_names_pid_version_and_age(

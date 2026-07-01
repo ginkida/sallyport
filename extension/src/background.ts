@@ -17,6 +17,8 @@ import {
 } from './storage.js';
 import { badgeFromStatus } from './badge.js';
 import { extractHostname } from './format.js';
+import { dropEpoch, setBrokerMode } from './tools/ownership.js';
+import { loadEpochs, persistEpochs, reconcileWithLiveTabs } from './tools/ownership-store.js';
 
 async function updateBadge(snapshot: StatusSnapshot): Promise<void> {
   const { paused } = await getSettings();
@@ -61,6 +63,10 @@ const bridge = new BridgeConnection({
       // popup not open — fine.
     });
   },
+  // The daemon reports broker vs standalone in the hello_ack; the tool layer
+  // reads ownership.isBrokerMode() to gate owner-scoped list_tabs + focus
+  // mitigation. Re-signalled on every (re)connect, so it survives SW eviction.
+  onBrokerMode: (broker: boolean) => setBrokerMode(broker),
   runTool: async (name, args): Promise<ToolHandlerResult> => {
     try {
       const data = await runTool(name, args);
@@ -89,11 +95,24 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 async function bootBridge(): Promise<void> {
+  // Rehydrate tab-ownership epochs from session storage (survives SW eviction)
+  // and prune any whose tab is gone, BEFORE the connection can carry a tool
+  // call that relies on them. Best-effort; the daemon stays the authority.
+  await loadEpochs();
+  await reconcileWithLiveTabs();
   await bridge.start();
   // start() sets the initial state internally but only some paths call
   // pushStatus — make sure the toolbar badge is in sync on every wake-up.
   await updateBadge(bridge.status());
 }
+
+// A closed tab loses its ownership: drop its epoch so its id can't later be
+// confirmed against a recycled tab, and persist the smaller map. Only persist
+// when an owned tab actually went away — in standalone the map is always empty,
+// so this stays a no-op for the 100% of users who never run a broker.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (dropEpoch(tabId)) void persistEpochs();
+});
 
 chrome.runtime.onStartup.addListener(() => void bootBridge());
 chrome.runtime.onInstalled.addListener(() => void bootBridge());

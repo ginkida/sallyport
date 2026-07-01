@@ -60,10 +60,17 @@ class Bridge:
         request_timeout: float = 60.0,
         hello_timeout: float = 10.0,
         status_path: Path | None = None,
+        broker_mode: bool = False,
     ) -> None:
         self._signer = Signer(secret)
         self._host = host
         self._port = port
+        # Broker mode (one process, N MCP clients) is signalled to the extension
+        # in the hello_ack body so it can enable the broker-only behaviours the
+        # daemon gate can't reach: owner-scoping its own list_tabs to
+        # agent-created tabs, and the focus-theft mitigation (dedicated window /
+        # never foreground a created tab). Standalone leaves all of that off.
+        self._broker_mode = broker_mode
         self._request_timeout = request_timeout
         self._hello_timeout = hello_timeout
         self._client: ServerConnection | None = None
@@ -88,6 +95,16 @@ class Bridge:
         # so a loop can attribute "it just timed out" to a specific tool/code.
         self._last_calls: deque[dict[str, Any]] = deque(maxlen=LAST_CALLS_MAXLEN)
         self._last_error: dict[str, Any] | None = None
+        # Which broker client the latest failure belongs to, so `status` scopes
+        # lastError per-caller (invariants #13/#14). None in standalone.
+        self._last_error_client: str | None = None
+        # Per-client tab ownership (broker mode, invariant #13). Lazy import to
+        # avoid the bridge<->ownership cycle (ownership imports ToolError here).
+        # One registry on the shared Bridge serves all broker connections; in
+        # standalone mode (client_id=None on every call) it stays empty and inert.
+        from .ownership import OwnershipRegistry
+
+        self._ownership = OwnershipRegistry()
 
     @property
     def connected(self) -> bool:
@@ -195,7 +212,7 @@ class Bridge:
 
         log.info("ws: client attached from %s", ws.remote_address)
         try:
-            ack = self._signer.sign(Envelope(type="hello_ack", body={}))
+            ack = self._signer.sign(Envelope(type="hello_ack", body={"broker": self._broker_mode}))
             await self._send_raw(ws, ack)
             await self._read_loop(ws)
         except websockets.ConnectionClosed:
@@ -235,7 +252,9 @@ class Bridge:
             if env.type == "hello":
                 # The attach-time hello is consumed by _handle_client; this
                 # re-acks a (harmless) mid-session hello.
-                ack = self._signer.sign(Envelope(type="hello_ack", body={}))
+                ack = self._signer.sign(
+                    Envelope(type="hello_ack", body={"broker": self._broker_mode})
+                )
                 await self._send_raw(ws, ack)
             elif env.type == "ping":
                 # The extension pings on a fixed cadence to keep its MV3
@@ -283,11 +302,31 @@ class Bridge:
         async with self._send_lock:
             await ws.send(json.dumps(env, separators=(",", ":")))
 
-    def _status(self) -> dict[str, Any]:
+    def _status(self, client_id: str | None = None) -> dict[str, Any]:
         """Cheap health snapshot for loop preflight. Exposes no secret
-        material — connection state, version, port, queue depth, uptime."""
+        material — connection state, version, port, queue depth, uptime.
+
+        In broker mode (``client_id`` set) the diagnostic ring + lastError are
+        owner-scoped to the CALLING client: a session sees only its own recent
+        outcomes, never another client's tools, codes or server-minted clientId
+        (invariants #13/#14 — the shared ring must not become a cross-client
+        activity oracle). Standalone (``client_id is None``) returns the full
+        single-client view unchanged."""
         from .pidfile import daemon_version
 
+        if client_id is None:
+            last_calls = list(self._last_calls)
+            last_error = self._last_error
+        else:
+            # Strip the broker-internal ``client`` tag from the entries we return
+            # — the caller doesn't need its own id echoed, and others' must never
+            # leak. lastError rides through only when it belongs to this caller.
+            last_calls = [
+                {k: v for k, v in entry.items() if k != "client"}
+                for entry in self._last_calls
+                if entry.get("client") == client_id
+            ]
+            last_error = self._last_error if self._last_error_client == client_id else None
         return {
             "connected": self.connected,
             "version": daemon_version(),
@@ -297,8 +336,8 @@ class Bridge:
             # Recent tool-call outcomes (oldest→newest) + the latest failure, so
             # a loop can attribute a stall to a specific tool/code. Outcomes
             # only — never the args.
-            "lastCalls": list(self._last_calls),
-            "lastError": self._last_error,
+            "lastCalls": last_calls,
+            "lastError": last_error,
         }
 
     def set_status_path(self, path: Path | None) -> None:
@@ -335,19 +374,23 @@ class Bridge:
         self._last_handshake_error_at = time.time()
         self._write_status()
 
-    async def call_tool(self, name: str, args: dict[str, Any]) -> Any:
+    async def call_tool(self, name: str, args: dict[str, Any], client_id: str | None = None) -> Any:
+        # `client_id` identifies the MCP client in broker mode (per-connection,
+        # server-minted) and is the scope future tab-ownership/audit hang on.
+        # In single-client/standalone mode it is None and changes nothing.
         # Built-ins answer BEFORE the call lock on purpose: `status` exists
         # so a loop iteration can fail fast / report progress even while a
         # slow tool call (e.g. a 30 s embedded wait) holds the lock. It is also
         # deliberately NOT recorded in the last-call ring — it IS the
         # introspection, so logging it would be self-referential noise.
         if name == "status":
-            return self._status()
+            return self._status(client_id)
 
         # Local-only tools run in this process and don't need the extension.
         # Imported lazily to avoid a circular reference (local_tools imports
         # ToolError from this module).
         from .local_tools import LOCAL_TOOLS, PRE_CALL_VALIDATORS
+        from .ownership import ensure_owns, record_close, record_result, scope_list_tabs
 
         started = time.monotonic()
         try:
@@ -361,7 +404,19 @@ class Bridge:
                     validator = PRE_CALL_VALIDATORS.get(name)
                     if validator is not None:
                         validator(args)
+                    # Broker-mode ownership gate (invariant #13): a client may
+                    # only act on tabs it created. No-op in standalone
+                    # (client_id=None). May raise tab_required/tab_not_owned, and
+                    # injects the expected epoch for the extension to confirm.
+                    args = ensure_owns(self._ownership, client_id, name, args)
                     result = await self._call_tool_locked(name, args)
+                    # Record a freshly-created owned tab, evict a just-closed one,
+                    # then owner-scope a list_tabs result (fail-closed) before it
+                    # leaves the daemon.
+                    record_result(self._ownership, client_id, name, result, opened_at=time.time())
+                    record_close(self._ownership, client_id, name, args)
+                    if name == "list_tabs":
+                        result = scope_list_tabs(self._ownership, client_id, result)
         except Exception as exc:
             # CancelledError is a BaseException, so a cancelled call is NOT
             # recorded here — only genuinely completed (errored) calls are.
@@ -371,15 +426,39 @@ class Bridge:
                 ms=round((time.monotonic() - started) * 1000),
                 code=getattr(exc, "code", None),
                 error=str(exc),
+                client_id=client_id,
             )
             raise
         self._record_call(
-            name, ok=True, ms=round((time.monotonic() - started) * 1000), code=None, error=None
+            name,
+            ok=True,
+            ms=round((time.monotonic() - started) * 1000),
+            code=None,
+            error=None,
+            client_id=client_id,
         )
         return result
 
+    def release_client(self, client_id: str | None) -> None:
+        """Release a disconnected broker client's tab ownership (invariant #13).
+
+        Called by the broker when an MCP connection closes. v1 keeps the tabs
+        OPEN — they merely become unowned, so the human can use or close them —
+        rather than auto-closing work the agent left behind. No-op in standalone
+        (client_id=None), where there is no per-client ownership."""
+        if client_id is None:
+            return
+        self._ownership.release_client(client_id)
+
     def _record_call(
-        self, name: str, *, ok: bool, ms: int, code: str | None, error: str | None
+        self,
+        name: str,
+        *,
+        ok: bool,
+        ms: int,
+        code: str | None,
+        error: str | None,
+        client_id: str | None = None,
     ) -> None:
         """Append a tool-call OUTCOME to the diagnostic ring (and, on failure,
         set lastError). Records the tool name, ok, integer ms and — on failure —
@@ -387,6 +466,8 @@ class Bridge:
         carry credentials). The compact ring entry omits the error string; the
         full (capped) message lives only in lastError."""
         entry: dict[str, Any] = {"tool": name, "ok": ok, "ms": ms}
+        if client_id is not None:
+            entry["client"] = client_id
         if not ok and code:
             entry["code"] = code
         self._last_calls.append(entry)
@@ -396,6 +477,9 @@ class Bridge:
                 "code": code,
                 "error": (error or "")[:MAX_CALL_ERROR],
             }
+            # Remember which client owns this failure so `status` only surfaces it
+            # to that client in broker mode (None in standalone — full view).
+            self._last_error_client = client_id
 
     async def _call_tool_locked(self, name: str, args: dict[str, Any]) -> Any:
         if self._client is None:

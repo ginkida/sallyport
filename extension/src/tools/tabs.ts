@@ -5,7 +5,17 @@ import { attach } from './cdp.js';
 import { ensureAllowed, hostnameOf } from './gates.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { clearRefsForTab } from './refs.js';
+import { agentTabIds, filterTabsToOwned, getEpoch, isBrokerMode, mintEpoch } from './ownership.js';
+import { persistEpochs } from './ownership-store.js';
+import { createAgentTab } from './agent-window.js';
 import type { Tool } from './types.js';
+
+/** Open a fresh tab loading `url`. In broker mode it goes into the dedicated,
+ * non-focused agent window (no focus theft, kept out of the human's windows);
+ * standalone opens it active in the current window, as today. */
+async function openTab(url: string): Promise<chrome.tabs.Tab> {
+  return isBrokerMode() ? createAgentTab(url) : chrome.tabs.create({ url, active: true });
+}
 
 /** Resolve which tab a tool should operate on.
  *
@@ -52,16 +62,18 @@ export function waitForLoad(tabId: number, timeoutMs = 30000): Promise<void> {
 
 export const listTabs: Tool = async () => {
   const all = await chrome.tabs.query({});
+  const tabs = all.map((t) => ({
+    tabId: t.id,
+    url: t.url ?? '',
+    title: t.title ?? '',
+    active: t.active,
+    windowId: t.windowId,
+  }));
+  // Owner-scope in broker mode: only the agent-created tabs leave the browser,
+  // so the human's tab metadata never crosses the wire. The daemon scopes again
+  // per-client (fail-closed). Standalone returns the whole profile as before.
   return {
-    data: {
-      tabs: all.map((t) => ({
-        tabId: t.id,
-        url: t.url ?? '',
-        title: t.title ?? '',
-        active: t.active,
-        windowId: t.windowId,
-      })),
-    },
+    data: { tabs: isBrokerMode() ? filterTabsToOwned(tabs, agentTabIds()) : tabs },
   };
 };
 
@@ -88,16 +100,24 @@ export const navigate: Tool = async (args) => {
     throw new BridgeError('domain_not_allowed', `${hostnameOf(url)} is not in the allowlist`);
   }
   const newTab = !!args.newTab;
+  // Broker mode has no active-tab fallback (invariant #13): a navigate with no
+  // explicit tabId is a CREATE-OWN (a fresh owned tab), never a clobber of
+  // whatever tab the human happens to have focused. Standalone keeps today's
+  // resolveTab behaviour (explicit tabId, else active tab).
+  const createOwn = newTab || (isBrokerMode() && typeof args.tabId !== 'number');
   let tab: chrome.tabs.Tab;
-  if (newTab) {
-    tab = await chrome.tabs.create({ url, active: true });
+  let created = false;
+  if (createOwn) {
+    tab = await openTab(url);
+    created = true;
   } else {
     tab = await resolveTab(args);
     const current = tab.url ?? '';
     if (current.startsWith('chrome://') || current.startsWith('edge://')) {
       // Browser-internal page: can't navigate it in place, and there is no
       // user content to lose — open the target in a fresh tab instead.
-      tab = await chrome.tabs.create({ url, active: true });
+      tab = await openTab(url);
+      created = true;
     } else {
       // Reusing an existing tab DESTROYS whatever it currently holds. If that
       // page is real content that isn't itself allowlisted, refuse — otherwise
@@ -118,6 +138,14 @@ export const navigate: Tool = async (args) => {
   await waitForLoad(tab.id!);
   // Navigation invalidates any refs we held for this tab.
   clearRefsForTab(tab.id!);
+  // Ownership epoch (broker mode only): a created tab mints a fresh epoch (the
+  // daemon records ownership from it); an in-place navigate echoes the existing
+  // one. The daemon ignores `epoch` in standalone, so we don't mint there.
+  let epoch: string | undefined;
+  if (isBrokerMode()) {
+    epoch = created ? mintEpoch(tab.id!) : getEpoch(tab.id!);
+    if (created) await persistEpochs();
+  }
   let wait = null;
   if (waitSpec) {
     // "Loaded" (tab status complete) rarely means "rendered" on SPAs — the
@@ -127,7 +155,11 @@ export const navigate: Tool = async (args) => {
     await attach(tab.id!);
     wait = await runEmbeddedWait(tab.id!, waitSpec);
   }
-  return { tabId: tab.id, url, data: { tabId: tab.id, url, ...(wait ? { wait } : {}) } };
+  return {
+    tabId: tab.id,
+    url,
+    data: { tabId: tab.id, url, ...(epoch ? { epoch } : {}), ...(wait ? { wait } : {}) },
+  };
 };
 
 export const closeTab: Tool = async (args) => {

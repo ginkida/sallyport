@@ -91,6 +91,25 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "retryable=no; the result couldn't be serialised for the wire — narrow the "
             "request (scope a snapshot, lower maxChars) so the payload is smaller/plainer."
         ),
+        "tab_required": (
+            "retryable=yes; broker mode has no active-tab fallback — pass an explicit tabId "
+            "of a tab you created (navigate with newTab:true makes one; list_tabs shows the "
+            "tabs you own), then retry."
+        ),
+        "tab_not_owned": (
+            "retryable=no; you can only drive tabs you created — not another client's or the "
+            "human's; create one with navigate(newTab:true) or pick one from list_tabs "
+            "(which shows only your tabs)."
+        ),
+        "tab_gone": (
+            "retryable=no; a tab you owned has closed or its id was recycled — open a fresh "
+            "one with navigate(newTab:true); list_tabs shows the tabs you still own."
+        ),
+        "bringtofront_forbidden": (
+            "retryable=no; broker mode won't foreground a tab (it would steal the human's "
+            "focus) — snapshot/read_text need no visible tab; screenshot works only when the "
+            "tab is already the active one in its window."
+        ),
     }
 )
 

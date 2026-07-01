@@ -38,6 +38,11 @@ export type Deps = {
   /** Called whenever the connection state changes. Production pushes via
    * chrome.runtime.sendMessage; tests can subscribe directly. */
   onStatus(snapshot: StatusSnapshot): void;
+  /** Called when the daemon reports broker vs standalone mode in the hello_ack
+   * body. Production wires it to ownership.setBrokerMode so the tool layer can
+   * enable broker-only behaviours (owner-scoped list_tabs, focus mitigation);
+   * tests observe directly. Optional — single-client builds may omit it. */
+  onBrokerMode?: (broker: boolean) => void;
   /** Executes a tool against the page. Production wires to `runTool`. */
   runTool: ToolHandler;
   /** Extension version reported in the hello frame. */
@@ -344,31 +349,17 @@ export class BridgeConnection {
       }
     });
 
-    ws.addEventListener('message', async (evt: MessageEvent) => {
-      let raw: unknown;
-      try {
-        raw = JSON.parse(evt.data as string);
-      } catch {
-        return;
-      }
-      let env: SignedEnvelope;
-      try {
-        env = await this.signer.verify(raw);
-      } catch (e) {
-        this.lastError = 'mac/replay rejected: ' + (e as Error).message;
-        this.pushStatus();
-        return;
-      }
-      // `handleEnvelope` is async (it dispatches tools and signs the reply).
-      // Awaiting it inside this listener and catching keeps a failure in tool
-      // execution or signing from becoming an unhandled promise rejection —
-      // mirrors the try/catch the 'open' handler already uses.
-      try {
-        await this.handleEnvelope(env);
-      } catch (e) {
-        this.lastError = 'tool dispatch error: ' + (e as Error).message;
-        this.pushStatus();
-      }
+    // Process signed envelopes strictly in arrival order: chain each on the
+    // previous so the hello_ack's broker-mode signal is applied before any
+    // tool_call the daemon sent after it. The per-message `verify()` awaits can
+    // otherwise resolve out of order, dispatching a tool_call while brokerMode
+    // is still stale right after a service-worker wake — which would let a
+    // tabId-less navigate fall back to (and clobber) the human's active tab.
+    // `dispatchMessage` swallows its own errors, and the `.catch` is a belt so a
+    // single bad frame can never break the chain for later frames.
+    let inbound: Promise<void> = Promise.resolve();
+    ws.addEventListener('message', (evt: MessageEvent) => {
+      inbound = inbound.then(() => this.dispatchMessage(evt)).catch(() => {});
     });
 
     ws.addEventListener('close', () => {
@@ -449,6 +440,38 @@ export class BridgeConnection {
     this.deps.alarms.create(ALARM_RECONNECT, { delayInMinutes: alarmDelayMin });
   }
 
+  /** Verify and dispatch one inbound WS frame. Runs serialised through the
+   * connection's `inbound` chain (see the message listener), so completing
+   * fully — including the hello_ack's brokerMode update — before the next frame
+   * is what guarantees in-order envelope processing. Swallows its own errors so
+   * the chain is never broken by a bad frame or a failing tool dispatch. */
+  private async dispatchMessage(evt: MessageEvent): Promise<void> {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(evt.data as string);
+    } catch {
+      return;
+    }
+    let env: SignedEnvelope;
+    try {
+      env = await this.signer.verify(raw);
+    } catch (e) {
+      this.lastError = 'mac/replay rejected: ' + (e as Error).message;
+      this.pushStatus();
+      return;
+    }
+    // `handleEnvelope` is async (it dispatches tools and signs the reply).
+    // Awaiting it here and catching keeps a failure in tool execution or
+    // signing from becoming an unhandled promise rejection — mirrors the
+    // try/catch the 'open' handler already uses.
+    try {
+      await this.handleEnvelope(env);
+    } catch (e) {
+      this.lastError = 'tool dispatch error: ' + (e as Error).message;
+      this.pushStatus();
+    }
+  }
+
   private async handleEnvelope(env: SignedEnvelope): Promise<void> {
     switch (env.type) {
       case 'ping':
@@ -459,7 +482,9 @@ export class BridgeConnection {
         // worker's idle timer; nothing else to do.
         break;
       case 'hello_ack':
-        // Server confirmed pairing — nothing else to do.
+        // Server confirmed pairing. Its body reports broker vs standalone mode;
+        // surface it so the tool layer can enable broker-only behaviours.
+        this.deps.onBrokerMode?.(Boolean((env.body as { broker?: unknown } | null)?.broker));
         break;
       case 'tool_call':
         await this.handleToolCall(env);

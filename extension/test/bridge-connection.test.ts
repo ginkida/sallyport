@@ -875,3 +875,89 @@ describe('BridgeConnection — stale-guard races across awaits', () => {
     await until(() => bridge.status().state === 'connected');
   });
 });
+
+describe('broker-mode signal (hello_ack body)', () => {
+  it('forwards broker:true from the hello_ack to onBrokerMode', async () => {
+    const seen: boolean[] = [];
+    const { deps } = makeDeps({ onBrokerMode: (b) => seen.push(b) });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.simulateOpen();
+    await until(() => ws.sent.length === 1); // hello sent
+
+    ws.simulateMessage(JSON.stringify(signEnvelope('hello_ack', { broker: true })));
+    await until(() => seen.length === 1);
+    expect(seen).toEqual([true]);
+  });
+
+  it('reports broker:false when the daemon omits the flag (standalone)', async () => {
+    const seen: boolean[] = [];
+    const { deps } = makeDeps({ onBrokerMode: (b) => seen.push(b) });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.simulateOpen();
+    await until(() => ws.sent.length === 1);
+
+    ws.simulateMessage(JSON.stringify(signEnvelope('hello_ack', {})));
+    await until(() => seen.length === 1);
+    expect(seen).toEqual([false]);
+  });
+
+  it('a hello_ack without an onBrokerMode dep is harmless', async () => {
+    const { deps } = makeDeps(); // no onBrokerMode
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.simulateOpen();
+    await until(() => ws.sent.length === 1);
+
+    ws.simulateMessage(JSON.stringify(signEnvelope('hello_ack', { broker: true })));
+    await flush();
+    expect(bridge.status().state).toBe('connected'); // still fine
+  });
+
+  // Regression: envelopes must be applied in ARRIVAL order. After a service
+  // worker wake the daemon sends hello_ack (the broker signal) first, then a
+  // tool_call. Each message's verify() awaits independently, so without in-order
+  // processing the tool_call could verify first and run while brokerMode is still
+  // stale — letting a tabId-less navigate clobber the human's active tab.
+  it('applies hello_ack before a tool_call sent right after it, even if the tool_call verifies first', async () => {
+    const order: string[] = [];
+    const { deps } = makeDeps({
+      onBrokerMode: () => order.push('brokerMode'),
+      runTool: async () => {
+        order.push('runTool');
+        return { ok: true, data: {} };
+      },
+    });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.simulateOpen();
+    await until(() => ws.sent.length === 1); // hello signed by the real signer
+
+    // Swap in a signer that makes the hello_ack verify SLOWER than the
+    // tool_call's. Without in-order processing the tool_call wins the race and
+    // runs before brokerMode is set; with it, the chain guarantees the order.
+    (bridge as unknown as { signer: unknown }).signer = {
+      async verify(raw: { type: string }) {
+        if (raw.type === 'hello_ack') await new Promise((r) => setTimeout(r, 20));
+        return raw;
+      },
+      hasSecret: () => true,
+      async sign(type: string, body: unknown, id?: string) {
+        return { v: 1, ts: 0, nonce: 'n', type, body, id, mac: 'x' };
+      },
+    };
+
+    ws.simulateMessage(JSON.stringify({ type: 'hello_ack', body: { broker: true } }));
+    ws.simulateMessage(
+      JSON.stringify({ type: 'tool_call', id: 'r1', body: { name: 'snapshot', args: {} } }),
+    );
+
+    await until(() => order.includes('runTool'));
+    expect(order).toEqual(['brokerMode', 'runTool']);
+  });
+});

@@ -39,6 +39,16 @@ def test_write_read_roundtrip(tmp_path: Path) -> None:
     assert isinstance(info["version"], str)
     assert info["version"]
     assert isinstance(info["started_at"], float)
+    # No mode for an ordinary daemon — the pidfile shape is unchanged.
+    assert "mode" not in info
+
+
+def test_write_records_broker_mode(tmp_path: Path) -> None:
+    path = pidfile_path(tmp_path, 10086)
+    write_pidfile(path, 10086, mode="broker")
+    info = read_pidfile(path)
+    assert info is not None
+    assert info["mode"] == "broker"
 
 
 def test_write_creates_missing_parent_dir(tmp_path: Path) -> None:

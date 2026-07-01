@@ -7,6 +7,7 @@
 
 import { appendAudit, getSettings, redactAuditArgs, type AuditEntry } from './storage.js';
 import { BridgeError } from './tools/errors.js';
+import { confirmEpoch, EXPECTED_EPOCH_ARG, stripEpochArg } from './tools/ownership.js';
 import { evaluate } from './tools/evaluate.js';
 import { consoleTail } from './tools/console.js';
 import { click, fill, readText } from './tools/dom.js';
@@ -65,16 +66,27 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
   const tool = tools[name];
   if (!tool) throw new BridgeError('unknown_tool', `unknown tool: ${name}`);
 
+  // Broker-mode ownership confirmation (invariant #13, defence-in-depth). The
+  // daemon is the authoritative gate but injects the create-time epoch it
+  // recorded for the owned tab; we confirm it matches what we minted before
+  // acting, so a recycled Chrome tabId can't silently retarget us (tab_gone).
+  // Strip the broker-internal field so neither the tool nor the audit sees it.
+  const expectedEpoch = args[EXPECTED_EPOCH_ARG];
+  const callArgs = stripEpochArg(args);
+
   const audit: AuditEntry = {
     ts: Date.now(),
     tool: name,
-    args: redactAuditArgs(name, args),
+    args: redactAuditArgs(name, callArgs),
     ok: false,
   };
-  if (typeof args.tabId === 'number') audit.tabId = args.tabId;
+  if (typeof callArgs.tabId === 'number') audit.tabId = callArgs.tabId;
 
   try {
-    const result = await tool(args);
+    if (expectedEpoch !== undefined && typeof callArgs.tabId === 'number') {
+      confirmEpoch(callArgs.tabId, expectedEpoch);
+    }
+    const result = await tool(callArgs);
     audit.ok = true;
     if (result.tabId !== undefined) audit.tabId = result.tabId;
     if (result.url !== undefined) audit.url = result.url;
@@ -86,7 +98,7 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
     // attempted secret in args (the success path already redacts when
     // allowPassword=true). Redact it before it reaches the audit log.
     if (e instanceof BridgeError && e.code === 'password_field') {
-      audit.args = redactAuditArgs(name, args, { force: true });
+      audit.args = redactAuditArgs(name, callArgs, { force: true });
     }
     await appendAudit(audit);
     throw e;

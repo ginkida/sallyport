@@ -10,20 +10,28 @@
  */
 
 import { beforeEach, describe, expect, it } from 'vitest';
-import { isBlankTarget, navigate } from '../src/tools/tabs.js';
+import { isBlankTarget, listTabs, navigate } from '../src/tools/tabs.js';
 import { setAllowlist } from '../src/storage.js';
+import { clearAllEpochs, getEpoch, mintEpoch, setBrokerMode } from '../src/tools/ownership.js';
+import { resetAgentWindow } from '../src/tools/agent-window.js';
 
-type MockTab = { id: number; url: string; status?: string };
+type MockTab = { id: number; url: string; status?: string; windowId?: number };
 
 type Calls = {
   update: Array<{ tabId: number; url: string }>;
   create: Array<{ url: string }>;
+  // Broker-mode focus mitigation: dedicated agent window + windowed tab creates.
+  windowsCreate: Array<{ url: string; focused?: boolean }>;
+  tabCreate: Array<{ url: string; windowId?: number; active?: boolean }>;
 };
 
 function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls {
   const store = new Map<string, unknown>();
-  const calls: Calls = { update: [], create: [] };
+  const calls: Calls = { update: [], create: [], windowsCreate: [], tabCreate: [] };
   const byId = new Map<number, MockTab>();
+  const windows = new Set<number>();
+  let nextTabId = 999;
+  let nextWindowId = 5000;
   for (const t of opts.tabs ?? []) byId.set(t.id, t);
   if (opts.active) byId.set(opts.active.id, opts.active);
 
@@ -31,21 +39,31 @@ function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls 
     return byId.get(tabId) ?? { id: tabId, url: 'https://done.example/', status: 'complete' };
   }
 
+  const sessionStore = new Map<string, unknown>();
+  const localApi = {
+    async get(keys: string | string[]) {
+      const out: Record<string, unknown> = {};
+      for (const k of Array.isArray(keys) ? keys : [keys]) {
+        if (store.has(k)) out[k] = store.get(k);
+      }
+      return out;
+    },
+    async set(obj: Record<string, unknown>) {
+      for (const [k, v] of Object.entries(obj)) store.set(k, v);
+    },
+    async remove(keys: string | string[]) {
+      for (const k of Array.isArray(keys) ? keys : [keys]) store.delete(k);
+    },
+  };
   (globalThis as unknown as { chrome: unknown }).chrome = {
     storage: {
-      local: {
-        async get(keys: string | string[]) {
-          const out: Record<string, unknown> = {};
-          for (const k of Array.isArray(keys) ? keys : [keys]) {
-            if (store.has(k)) out[k] = store.get(k);
-          }
-          return out;
+      local: localApi,
+      session: {
+        async get(key: string) {
+          return sessionStore.has(key) ? { [key]: sessionStore.get(key) } : {};
         },
         async set(obj: Record<string, unknown>) {
-          for (const [k, v] of Object.entries(obj)) store.set(k, v);
-        },
-        async remove(keys: string | string[]) {
-          for (const k of Array.isArray(keys) ? keys : [keys]) store.delete(k);
+          for (const [k, v] of Object.entries(obj)) sessionStore.set(k, v);
         },
       },
     },
@@ -67,14 +85,36 @@ function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls 
         byId.set(tabId, next);
         return Promise.resolve(next);
       },
-      create(info: { url: string }) {
+      create(info: { url: string; windowId?: number; active?: boolean }) {
         calls.create.push({ url: info.url });
-        const next = { id: 999, url: info.url, status: 'complete' };
-        byId.set(999, next);
+        calls.tabCreate.push({ url: info.url, windowId: info.windowId, active: info.active });
+        const id = nextTabId++;
+        const next: MockTab = {
+          id,
+          url: info.url,
+          status: 'complete',
+          windowId: info.windowId,
+        };
+        byId.set(id, next);
         return Promise.resolve(next);
       },
       onUpdated: { addListener() {}, removeListener() {} },
       onRemoved: { addListener() {} },
+    },
+    windows: {
+      create(info: { url: string; focused?: boolean }) {
+        calls.windowsCreate.push({ url: info.url, focused: info.focused });
+        const winId = nextWindowId++;
+        windows.add(winId);
+        const id = nextTabId++;
+        const tab: MockTab = { id, url: info.url, status: 'complete', windowId: winId };
+        byId.set(id, tab);
+        return Promise.resolve({ id: winId, tabs: [tab] });
+      },
+      get(windowId: number) {
+        if (windows.has(windowId)) return Promise.resolve({ id: windowId });
+        return Promise.reject(new Error('no such window'));
+      },
     },
   };
   return calls;
@@ -84,6 +124,8 @@ const ALLOW = 'https://allowed.example/next';
 
 beforeEach(async () => {
   installChromeMock({});
+  clearAllEpochs(); // resets broker mode + epoch map between tests
+  resetAgentWindow(); // forget the dedicated agent window between tests
 });
 
 describe('navigate — clobber gate (invariant #12 parity with close_tab)', () => {
@@ -165,5 +207,94 @@ describe('isBlankTarget', () => {
     expect(isBlankTarget('https://example.com/')).toBe(false);
     expect(isBlankTarget('http://localhost:3000/')).toBe(false);
     expect(isBlankTarget('chrome://settings')).toBe(false);
+  });
+});
+
+describe('navigate — broker-mode create-own + epoch (invariant #13)', () => {
+  it('a tabId-less navigate opens an owned tab in a non-focused agent window', async () => {
+    const calls = installChromeMock({ active: { id: 3, url: 'https://bank.example/account' } });
+    resetAgentWindow();
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    setBrokerMode(true);
+    const res = await navigate({ url: ALLOW });
+    // A dedicated, non-focused window — never the human's focused bank tab.
+    expect(calls.windowsCreate).toEqual([{ url: ALLOW, focused: false }]);
+    expect(calls.create).toHaveLength(0); // window create makes the tab, not tabs.create
+    expect(calls.update).toHaveLength(0);
+    const data = res.data as { tabId?: number; epoch?: string };
+    expect(typeof data.epoch).toBe('string');
+    expect(getEpoch(999)).toBe(data.epoch); // first created tab id
+  });
+
+  it('reuses the agent window (non-active tab) for a second create-own', async () => {
+    const calls = installChromeMock({});
+    resetAgentWindow();
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    setBrokerMode(true);
+    await navigate({ url: ALLOW }); // creates the window (tab 999 in window 5000)
+    await navigate({ url: ALLOW }); // reuses it
+    expect(calls.windowsCreate).toHaveLength(1); // only one window ever created
+    expect(calls.tabCreate).toEqual([{ url: ALLOW, windowId: 5000, active: false }]);
+  });
+
+  it('an in-place navigate echoes the existing epoch and does not re-mint', async () => {
+    const calls = installChromeMock({ tabs: [{ id: 7, url: 'about:blank' }] });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    setBrokerMode(true);
+    const minted = mintEpoch(7);
+    const res = await navigate({ tabId: 7, url: ALLOW });
+    expect(calls.update).toEqual([{ tabId: 7, url: ALLOW }]);
+    expect((res.data as { epoch?: string }).epoch).toBe(minted);
+    expect(getEpoch(7)).toBe(minted); // unchanged by an in-place navigate
+  });
+
+  it('does not mint or echo an epoch in standalone mode', async () => {
+    const calls = installChromeMock({ active: { id: 3, url: 'about:blank' } });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    const res = await navigate({ url: ALLOW }); // brokerMode false (reset in beforeEach)
+    expect((res.data as { epoch?: string }).epoch).toBeUndefined();
+    // Standalone keeps the active-tab path: a tabId-less navigate updates it.
+    expect(calls.update).toEqual([{ tabId: 3, url: ALLOW }]);
+  });
+});
+
+describe('list_tabs — owner-scoped in broker mode (invariant #13)', () => {
+  function mockProfileTabs(tabs: Array<{ id: number; url: string }>): void {
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      tabs: {
+        async query() {
+          return tabs.map((t) => ({ ...t, title: '', active: false, windowId: 1 }));
+        },
+      },
+    };
+  }
+
+  it('returns the whole profile in standalone mode', async () => {
+    mockProfileTabs([
+      { id: 1, url: 'a' },
+      { id: 2, url: 'b' },
+    ]);
+    const res = await listTabs({});
+    expect((res.data as { tabs: unknown[] }).tabs).toHaveLength(2);
+  });
+
+  it('returns only agent-created tabs in broker mode', async () => {
+    mockProfileTabs([
+      { id: 1, url: 'human' },
+      { id: 2, url: 'agent' },
+      { id: 3, url: 'human2' },
+    ]);
+    setBrokerMode(true);
+    mintEpoch(2);
+    const res = await listTabs({});
+    const ids = (res.data as { tabs: Array<{ tabId: number }> }).tabs.map((t) => t.tabId);
+    expect(ids).toEqual([2]);
+  });
+
+  it('returns nothing when the agent owns no tabs (fail-closed)', async () => {
+    mockProfileTabs([{ id: 1, url: 'human' }]);
+    setBrokerMode(true);
+    const res = await listTabs({});
+    expect((res.data as { tabs: unknown[] }).tabs).toEqual([]);
   });
 });

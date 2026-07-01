@@ -59,7 +59,12 @@ _WAIT_FOR_SCHEMA: dict[str, Any] = {
 TOOLS: list[Tool] = [
     Tool(
         name="list_tabs",
-        description="List all open browser tabs (tabId, url, title, active, windowId).",
+        description=(
+            "List open browser tabs (tabId, url, title, active, windowId). In broker "
+            "mode (a shared broker daemon serving several sessions) this is owner-scoped: "
+            "it returns only the tabs THIS session created, never the human's or another "
+            "session's tabs."
+        ),
         inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
     ),
     Tool(
@@ -68,7 +73,10 @@ TOOLS: list[Tool] = [
             "Open a URL. The destination domain must be in the extension's allowlist "
             "or the call fails with domain_not_allowed. Set newTab=true to open a "
             "new tab; otherwise updates the tab passed in tabId, or the active tab "
-            "in the current window if tabId is omitted. waitFor polls after the "
+            "in the current window if tabId is omitted. In broker mode (a shared "
+            "broker daemon) there is no active-tab fallback: a navigate with no tabId "
+            "opens a NEW tab you own, and a tabId must reference a tab you created "
+            "(else tab_not_owned). waitFor polls after the "
             "load until a selector/text shows up — on SPAs 'loaded' rarely means "
             "'rendered', so prefer navigate+waitFor over navigate then wait_for. "
             "Returns {tabId, url, wait?}."
@@ -511,7 +519,10 @@ TOOLS: list[Tool] = [
             "(background tab, occluded window) cannot render a frame — the "
             "call fails fast with `tab_not_visible` instead of hanging; pass "
             "bringToFront=true to activate the tab first (it visibly steals "
-            "the user's tab/window focus, so only when intended). Prefer "
+            "the user's tab/window focus, so only when intended). In broker "
+            "mode bringToFront is refused (`bringtofront_forbidden`) and agent "
+            "tabs open in the background, so only an already-active agent tab is "
+            "captureable — use snapshot/read_text for any other tab. Prefer "
             "snapshot/read_text for understanding page structure."
         ),
         inputSchema={
@@ -861,7 +872,7 @@ TOOLS: list[Tool] = [
 
 
 async def _dispatch_call(
-    bridge: Bridge, name: str, arguments: dict[str, Any] | None
+    bridge: Bridge, name: str, arguments: dict[str, Any] | None, client_id: str | None = None
 ) -> list[TextContent | ImageContent]:
     """Run a tool through the bridge and wrap the outcome as MCP content.
 
@@ -869,7 +880,7 @@ async def _dispatch_call(
     tested directly without standing up an MCP stdio server.
     """
     try:
-        data = await bridge.call_tool(name, arguments or {})
+        data = await bridge.call_tool(name, arguments or {}, client_id)
     except ExtensionNotConnected as exc:
         return [TextContent(type="text", text=f"Error: {exc}")]
     except ToolError as exc:
@@ -914,7 +925,10 @@ def _as_image_content(name: str, data: Any) -> list[TextContent | ImageContent] 
     ]
 
 
-def build_server(bridge: Bridge) -> Server:
+def build_server(bridge: Bridge, client_id: str | None = None) -> Server:
+    """Build the MCP server. In broker mode `client_id` is the per-connection
+    identity threaded into every tool call (tab ownership / audit scope); the
+    stdio/standalone path leaves it None, unchanged."""
     server: Server = Server("sallyport")
 
     @server.list_tools()  # type: ignore[no-untyped-call]
@@ -923,7 +937,7 @@ def build_server(bridge: Bridge) -> Server:
 
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
-        return await _dispatch_call(bridge, name, arguments)
+        return await _dispatch_call(bridge, name, arguments, client_id)
 
     return server
 

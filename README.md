@@ -178,6 +178,49 @@ popup's **Allowlist** tab, add an entry like `example.com` or
 `*.github.com`. Tick **allow evaluate()** only if you actually need
 arbitrary JS on that host.
 
+## Running a shared broker (multiple sessions)
+
+By default each Claude Code session spawns its own daemon, and only one can own
+the browser at a time (they'd fight over `127.0.0.1:10086`). **Broker mode** lets
+several sessions — and you, working in the same browser — share one extension:
+
+```sh
+# Start one long-lived broker (owns the extension; stays up until Ctrl-C).
+sallyport-daemon broker
+```
+
+Now register and use Sallyport exactly as above (`claude mcp add sallyport
+sallyport-daemon`) from **as many project folders as you like**. Each plain
+`sallyport-daemon` session **auto-detects** the running broker and attaches to it
+as a thin relay over a `0600` Unix-domain socket (`broker-10086.sock`, next to
+the secret); with no broker running, a session falls back to standalone, exactly
+as before. Pair the extension once, against the broker.
+
+You can leave the broker running in the background (`sallyport-daemon broker &`,
+`nohup`, or your own service manager); it's meant to be long-lived. `doctor`
+recognises it as an intentional broker rather than a stale daemon, so
+`sallyport-daemon doctor --kill-stale` reports it and leaves it running — stop it
+explicitly with `kill <pid>` (or Ctrl-C) when you're done.
+
+What you get:
+
+- **Many sessions at once.** N agents drive the one browser concurrently; calls
+  are serialised so they never corrupt each other's state.
+- **Each agent stays in its own tabs.** An agent can only see and act on tabs it
+  created (`navigate` with no tab opens a fresh one); it cannot touch — or even
+  list — your tabs or another agent's. `list_tabs` shows a session only its own
+  tabs.
+- **It won't steal your focus.** Agent tabs open in a separate, un-focused window
+  and never foreground themselves, so you can keep working while agents do.
+- **You're logged in.** It's your real browser profile, so agents operate on the
+  sites you're already signed into — scoped, as always, to the allowlist.
+
+Broker mode is a *software partition* of one shared profile, not an OS-level
+sandbox: the security floor is still "any process running as you" (it can read
+the secret and drive the browser within the allowlist). See
+[`SECURITY.md`](SECURITY.md) for the full model, including the new tab-ownership
+and MCP-client-auth invariants.
+
 ## Tools
 
 | Name | Notes |

@@ -230,6 +230,27 @@ async def test_successful_local_tool_records_ok_outcome(tmp_path: Any) -> None:
         del os.environ["SALLYPORT_DOWNLOAD_DIR"]
 
 
+async def test_call_tool_stamps_client_in_ring(tmp_path: Any) -> None:
+    """A supplied client_id (broker mode) tags the outcome ring entry with a
+    `client` field for per-connection attribution; standalone (None) omits it."""
+    import os
+
+    from sallyport_daemon.bridge import Bridge
+
+    os.environ["SALLYPORT_DOWNLOAD_DIR"] = str(tmp_path)
+    try:
+        bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+        await bridge.call_tool(
+            "save_to_file", {"data": "aGk=", "filename": "n1.txt"}, client_id="client-xyz"
+        )
+        assert bridge._status()["lastCalls"][-1]["client"] == "client-xyz"  # noqa: SLF001
+        # A call with no client_id (standalone) leaves the field off entirely.
+        await bridge.call_tool("save_to_file", {"data": "aGk=", "filename": "n2.txt"})
+        assert "client" not in bridge._status()["lastCalls"][-1]  # noqa: SLF001
+    finally:
+        del os.environ["SALLYPORT_DOWNLOAD_DIR"]
+
+
 def test_status_connected_reflects_ws_state() -> None:
     """`connected` must mirror the WebSocket's real protocol state, not just a
     non-None client reference: a CLOSING/CLOSED socket lingering in the slot
@@ -303,9 +324,11 @@ class _FakeBridge:
         self._result = result
         self._raises = raises
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.client_ids: list[str | None] = []
 
-    async def call_tool(self, name: str, args: dict[str, Any]) -> Any:
+    async def call_tool(self, name: str, args: dict[str, Any], client_id: str | None = None) -> Any:
         self.calls.append((name, args))
+        self.client_ids.append(client_id)
         if self._raises is not None:
             raise self._raises
         return self._result
@@ -319,6 +342,16 @@ async def test_dispatch_call_happy_path_formats_result() -> None:
     assert out[0].type == "text"
     assert '"hello": "world"' in out[0].text
     assert bridge.calls == [("snapshot", {"tabId": 7})]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_call_threads_client_id() -> None:
+    """In broker mode the dispatcher forwards the per-connection client_id to
+    the bridge; single-client/standalone passes None (the default)."""
+    bridge: Any = _FakeBridge(result=None)
+    await _dispatch_call(bridge, "snapshot", {"tabId": 1}, "client-abc")
+    await _dispatch_call(bridge, "snapshot", {"tabId": 1})
+    assert bridge.client_ids == ["client-abc", None]
 
 
 @pytest.mark.asyncio

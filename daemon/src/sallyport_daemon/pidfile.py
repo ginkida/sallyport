@@ -35,14 +35,22 @@ def pidfile_path(config_dir: Path, port: int) -> Path:
     return config_dir / f"daemon-{port}.pid"
 
 
-def write_pidfile(path: Path, port: int) -> None:
-    """Best-effort — a daemon that cannot write its pidfile still runs."""
-    info = {
+def write_pidfile(path: Path, port: int, *, mode: str | None = None) -> None:
+    """Best-effort — a daemon that cannot write its pidfile still runs.
+
+    ``mode`` records the run kind ("broker"); it lets ``doctor`` and the
+    stale-reaper recognise an orphan-by-design broker (re-parented to PID 1 once
+    its launching shell exits) instead of mistaking it for a dead-session
+    leftover. Omitted for ordinary MCP/serve daemons, keeping their pidfile shape
+    unchanged."""
+    info: dict[str, Any] = {
         "pid": os.getpid(),
         "port": port,
         "version": daemon_version(),
         "started_at": time.time(),
     }
+    if mode is not None:
+        info["mode"] = mode
     with contextlib.suppress(OSError):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(info))
