@@ -53,7 +53,12 @@ const bridge = new BridgeConnection({
     setSettings: setSettingsForConnection,
   },
   alarms: {
-    create: (name, options) => chrome.alarms.create(name, options),
+    // The state machine's two call sites each pass exactly one of
+    // delayInMinutes/periodInMinutes, so `options` is always a valid
+    // AlarmCreateInfo; the cast bridges that to @types/chrome's discriminated
+    // union, which the deliberately-loose port type can't prove structurally.
+    // Wiring-shim adaptation only — no behaviour change to the reconnect logic.
+    create: (name, options) => chrome.alarms.create(name, options as chrome.alarms.AlarmCreateInfo),
     clear: (name) => {
       chrome.alarms.clear(name);
     },

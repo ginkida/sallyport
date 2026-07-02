@@ -61,7 +61,7 @@ export function waitForLoad(tabId: number, timeoutMs = 30000): Promise<void> {
     }, timeoutMs);
     const ready = (tab: chrome.tabs.Tab) =>
       tab.status === 'complete' && !!tab.url && tab.url !== 'about:blank';
-    const listener = (id: number, info: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) => {
+    const listener = (id: number, info: chrome.tabs.OnUpdatedInfo, tab: chrome.tabs.Tab) => {
       if (id === tabId && info.status === 'complete' && ready(tab)) {
         clearTimeout(t);
         chrome.tabs.onUpdated.removeListener(listener);

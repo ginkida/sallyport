@@ -13,6 +13,8 @@
  * Chrome-bound, so it sits outside the vitest coverage gate; it is exercised by
  * the navigate tests' chrome mock and by manual `sallyport-daemon exec`. */
 
+import { BridgeError } from './errors.js';
+
 const WIN_KEY = 'sallyport_agent_window';
 let agentWindowId: number | null = null;
 let loaded = false;
@@ -53,6 +55,12 @@ export async function createAgentTab(url: string): Promise<chrome.tabs.Tab> {
     }
   }
   const win = await chrome.windows.create({ url, focused: false });
+  if (!win) {
+    // @types/chrome now models windows.create as possibly resolving undefined.
+    // Presentation-only (invariant #13 keys on tabId, never windowId), so surface
+    // the rare failure explicitly instead of crashing on win.tabs/win.id below.
+    throw new BridgeError('window_create_failed', 'could not create the agent window');
+  }
   await rememberWindowId(win.id ?? null);
   const tab = win.tabs?.[0];
   if (tab) return tab;
