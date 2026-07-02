@@ -10,8 +10,7 @@ export type StatusSnapshot = {
 };
 
 export type ToolHandlerResult =
-  | { ok: true; data: unknown }
-  | { ok: false; error: string; code?: string; detail?: unknown };
+  { ok: true; data: unknown } | { ok: false; error: string; code?: string; detail?: unknown };
 export type ToolHandler = (
   name: string,
   args: Record<string, unknown>,

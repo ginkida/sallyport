@@ -16,8 +16,7 @@ export type ToolCallBody = {
 };
 
 export type ToolResultBody =
-  | { ok: true; data: unknown }
-  | { ok: false; error: string; code?: string };
+  { ok: true; data: unknown } | { ok: false; error: string; code?: string };
 
 export type HelloBody = {
   extensionVersion: string;

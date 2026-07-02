@@ -108,8 +108,7 @@ function parseCoord(raw: unknown, name: string, tool: string): number {
 }
 
 export type PointerTarget =
-  | { mode: 'coord'; x: number; y: number }
-  | { mode: 'selector'; selector: string };
+  { mode: 'coord'; x: number; y: number } | { mode: 'selector'; selector: string };
 
 /** Disambiguate a pointer tool's target: exactly one of a selector/@eN OR an
  * explicit viewport x+y (both coords required, non-negative, finite). Shared by
