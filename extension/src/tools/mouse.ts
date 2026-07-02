@@ -145,6 +145,7 @@ export function parsePointerTarget(args: Record<string, unknown>, tool: string):
 async function aimAtElement(
   tabId: number,
   objectId: string,
+  tool: string,
 ): Promise<{ point: Omit<ClickPoint, 'hitEl'>; hitTargetRef: string | null }> {
   const GROUP = 'sallyport_mouse';
   const probe = await cdp<{
@@ -156,7 +157,7 @@ async function aimAtElement(
     objectGroup: GROUP,
   });
   if (probe.exceptionDetails || !probe.result.objectId) {
-    throw new BridgeError('not_found', 'mouse_click: could not measure element');
+    throw new BridgeError('not_found', `${tool}: could not measure element`);
   }
   try {
     const infoRes = await cdp<{ result: { value?: Omit<ClickPoint, 'hitEl'> } }>(
@@ -172,7 +173,7 @@ async function aimAtElement(
       },
     );
     const point = infoRes.result.value;
-    if (!point) throw new BridgeError('not_found', 'mouse_click: could not measure element');
+    if (!point) throw new BridgeError('not_found', `${tool}: could not measure element`);
 
     let hitTargetRef: string | null = null;
     if (point.covered) {
@@ -291,7 +292,7 @@ export const mouseClick: Tool = async (args) => {
   }
 
   const objectId = await resolveSelectorOrRef(tab.id!, target.selector, 'mouse_click');
-  const { point, hitTargetRef } = await aimAtElement(tab.id!, objectId);
+  const { point, hitTargetRef } = await aimAtElement(tab.id!, objectId, 'mouse_click');
   if (!point.visible) {
     throw new BridgeError('not_visible', `mouse_click: element ${point.tag} has zero size`);
   }
@@ -361,7 +362,7 @@ export const hover: Tool = async (args) => {
   }
 
   const objectId = await resolveSelectorOrRef(tab.id!, target.selector, 'hover');
-  const { point, hitTargetRef } = await aimAtElement(tab.id!, objectId);
+  const { point, hitTargetRef } = await aimAtElement(tab.id!, objectId, 'hover');
   if (!point.visible) {
     throw new BridgeError('not_visible', `hover: element ${point.tag} has zero size`);
   }
