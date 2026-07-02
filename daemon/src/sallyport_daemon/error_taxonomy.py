@@ -116,6 +116,12 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "retryable=no; the tab you targeted has closed or its id was recycled — open a "
             "fresh one with navigate(newTab:true); list_tabs shows the tabs still available."
         ),
+        "window_create_failed": (
+            "retryable=maybe; the browser couldn't open the dedicated agent window (broker "
+            "mode opens agent tabs in their own non-focused window) — retry "
+            "navigate(newTab:true); if it persists the browser may be low on resources, so "
+            "check the Sallyport popup shows the extension attached."
+        ),
         "bringtofront_forbidden": (
             "retryable=no; broker mode won't foreground a tab (it would steal the human's "
             "focus) — snapshot/read_text need no visible tab; screenshot works only when the "
