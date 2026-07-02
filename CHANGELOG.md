@@ -17,12 +17,13 @@ uses [Semantic Versioning](https://semver.org/).
   the per-tab ring survives the auto-reconnect, re-wedges on every retry (and in
   broker mode tears down the WS shared by all sessions). The budget now accounts
   for the *entire* serialised entry (metadata + body), and every page/server-
-  controllable string field is clipped — the URL to `NETWORK_MAX_URL` (4 KiB,
-  `urlTruncated` flagged) and `method`/`contentType` to `NETWORK_MAX_META_FIELD`
-  (256 B) — with the `origin` still derived from the full URL so the fail-closed
-  allowlist filter (#3) is unaffected. Found by the internal security audit (round
-  3; the sibling `method`/`contentType` path was caught by the round-4
-  re-verification of this fix). +6 tests.
+  controllable string field is clipped in code — the URL and `origin` to
+  `NETWORK_MAX_URL` (4 KiB, `urlTruncated` flagged) and `method`/`contentType` to
+  `NETWORK_MAX_META_FIELD` (256 B). `origin` is still derived from the *full* URL
+  before its bound (a real origin is DNS-bounded far below the cap, so the
+  fail-closed allowlist filter (#3) is never affected). Found by the internal
+  security audit (round 3; the sibling `method`/`contentType` and `origin` paths
+  were caught by the round-4 re-verification of this fix). +9 tests.
 - **`fill`'s password gate now covers a `delegatesFocus` shadow-host target
   (invariant #5).** The 0.14.0 focus-landed probe reported
   `getRootNode().activeElement === this`, but for an open shadow host with

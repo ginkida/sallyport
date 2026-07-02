@@ -75,7 +75,7 @@ export const NETWORK_MAX_BODY = 256 * 1024;
 // 3 UTF-8 bytes), so a code-unit budget could pass a result that serialises past
 // the cap and 1009-closes the WS. Entries past the budget (oldest first) drop
 // their body to metadata (bodyOmitted); every controllable string field is
-// independently clipped (url to NETWORK_MAX_URL, method/contentType to
+// independently clipped (url + origin to NETWORK_MAX_URL, method/contentType to
 // NETWORK_MAX_META_FIELD) so even metadata-only entries stay small. 10 MiB leaves >=6 MiB
 // headroom under MAX_FRAME_BYTES for the envelope and HMAC framing. A same-origin
 // RPC report (e.g. Metrika's /i-proxy/ gateway with a signed per-session key)
@@ -175,7 +175,11 @@ export function clipBody(
  * origin extraction / body capping are unit-testable without chrome. */
 export function shapeNetworkEntry(meta: NetworkMeta, bodyText: string | null): NetworkEntry {
   // origin from the FULL url BEFORE clipping, so the fail-closed allowlist filter
-  // (invariant #3) is unaffected by url truncation.
+  // (invariant #3) is unaffected by url truncation — then length-bounded (like the
+  // other controllable string fields) so no returned field is uncapped IN CODE. A
+  // real allowlist-passing origin is DNS-bounded to <=267 chars, far below the cap,
+  // so the filter is never affected; the cap only bounds a pathological host string
+  // and removes reliance on the external DNS bound.
   const origin = originFromUrl(meta.url);
   const clippedUrl = clipUrl(meta.url);
   const entry: NetworkEntry = {
@@ -188,7 +192,7 @@ export function shapeNetworkEntry(meta: NetworkMeta, bodyText: string | null): N
     type: meta.type,
     contentType: meta.contentType.slice(0, NETWORK_MAX_META_FIELD),
     size: meta.size,
-    origin,
+    origin: origin === null ? null : origin.slice(0, NETWORK_MAX_URL),
   };
   if (clippedUrl.truncated) entry.urlTruncated = true;
   if (typeof bodyText === 'string') {

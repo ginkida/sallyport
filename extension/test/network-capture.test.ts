@@ -157,6 +157,21 @@ describe('shapeNetworkEntry', () => {
     expect(e.method).toBe('POST');
     expect(e.contentType).toBe('application/json');
   });
+
+  it('length-bounds origin in code but never truncates a real origin (allowlist intact)', () => {
+    // A real (allowlist-passing) origin is DNS-bounded well under the cap, so it is
+    // returned verbatim — the fail-closed allowlist filter matches on the full value.
+    const real = shapeNetworkEntry(meta({ url: 'https://api.example.com/x' }), '{}');
+    expect(real.origin).toBe('https://api.example.com');
+    // A pathological host string (only reachable in isolation, never a returned
+    // entry) is still bounded in code, not left to the external DNS limit.
+    const huge = shapeNetworkEntry(
+      meta({ url: 'https://' + 'a'.repeat(5000) + '.example.com/y' }),
+      null,
+    );
+    expect(huge.origin).not.toBeNull();
+    expect(huge.origin!.length).toBe(NETWORK_MAX_URL);
+  });
 });
 
 describe('clipUrl', () => {
