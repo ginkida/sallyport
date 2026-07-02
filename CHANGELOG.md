@@ -14,12 +14,16 @@ uses [Semantic Versioning](https://semver.org/).
   opt-out only stopped re-asserting it, so a tab already driven with keep-awake on
   kept reporting itself focused (presence / read-receipt leak on sites like
   Telegram) for the rest of the debugger session even after the user turned the
-  setting off. `attach` now tracks which tabs it emulated (`focusEmulated`) and,
-  on the next tool call after the opt-out, issues
-  `setFocusEmulationEnabled({enabled:false})` to undo it — decided by a pure,
-  unit-tested `keepAwakeAction` (enable / disable / none) so the disable command
-  is never sent to a tab that was never emulated (off-path CDP footprint stays
-  minimal). Found by the internal security audit (round 2). +3 tests.
+  setting off. `attach` now unconditionally issues
+  `setFocusEmulationEnabled({enabled:false})` on the off-path (decided by a pure,
+  unit-tested `keepAwakeAction`) to undo it. The revoke is deliberately *not*
+  gated on an in-memory "did we emulate this tab" marker: MV3 evicts the service
+  worker while the tab-level CDP override survives, so a gated revoke would
+  silently no-op after a routine SW restart and leave the leak in place — the
+  exact corner the round-2 audit caught. `enabled:false` is an idempotent no-op on
+  a never-emulated tab, and since keep-awake defaults on the off-path only runs
+  after a deliberate opt-out, so this adds no CDP footprint to the default path.
+  Found by the internal security audit (round 2). +2 tests.
 - **`status.pendingCalls` is now owner-scoped in broker mode (invariants
   #13/#14).** The field reported `len(self._pending)` globally, but the call lock
   serialises every client, so at most one call is ever pending — meaning a broker

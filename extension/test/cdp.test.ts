@@ -68,18 +68,15 @@ describe('classifyAttachError', () => {
 
 // Keep-awake must actually REVOKE focus emulation when the user turns the
 // setting off (not just stop re-asserting), so a tab stops reporting itself
-// focused. keepAwakeAction decides enable / disable / none per attach.
+// focused. keepAwakeAction decides enable / disable per attach — the off-path
+// is UNCONDITIONAL (no ephemeral "was emulated" gate) so it stays correct after
+// an MV3 service-worker restart wipes in-memory state.
 describe('keepAwakeAction', () => {
-  it('enables when the setting is on (idempotent re-assert)', () => {
-    expect(keepAwakeAction(true, false)).toBe('enable');
-    expect(keepAwakeAction(true, true)).toBe('enable');
+  it('enables when the setting is on', () => {
+    expect(keepAwakeAction(true)).toBe('enable');
   });
 
-  it('disables when the setting is off but the tab was previously emulated', () => {
-    expect(keepAwakeAction(false, true)).toBe('disable');
-  });
-
-  it('does nothing when off and never emulated (no CDP footprint on the off-path)', () => {
-    expect(keepAwakeAction(false, false)).toBe('none');
+  it('disables (revokes) unconditionally when the setting is off — the guarantee that survives an SW restart', () => {
+    expect(keepAwakeAction(false)).toBe('disable');
   });
 });

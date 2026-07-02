@@ -69,24 +69,23 @@ export function classifyAttachError(msg: string): BridgeError {
  * set stays accurate without polling. */
 const attached = new Set<number>();
 
-/** Tabs on which we've enabled focus emulation (keep-awake). Tracked so that
- * turning the setting OFF actively REVOKES emulation on the next tool call —
- * `setFocusEmulationEnabled({enabled:true})` is sticky, so without this the
- * documented opt-out would silently leave the tab believing it's focused
- * (Telegram-style presence / read receipts) until detach. */
-const focusEmulated = new Set<number>();
-
-/** Decide what keep-awake should do for a tab this attach: (re-)ENABLE when the
- * setting is on (the CDP calls are idempotent), DISABLE when it's off but we
- * previously emulated this tab (revoke the sticky focus emulation), else NONE —
- * so the disable command is never issued on a tab we never emulated (keeps the
- * off-path CDP footprint minimal). Pure / unit-tested. */
-export function keepAwakeAction(
-  keepAwake: boolean,
-  wasEmulated: boolean,
-): 'enable' | 'disable' | 'none' {
-  if (keepAwake) return 'enable';
-  return wasEmulated ? 'disable' : 'none';
+/** Decide what keep-awake should do for a tab on this attach: (re-)ENABLE the
+ * focus emulation + lifecycle keep-alive when the setting is on (both CDP calls
+ * are idempotent), or DISABLE (revoke) the focus emulation when it's off.
+ *
+ * The off-path fires UNCONDITIONALLY — deliberately NOT gated on "did we enable
+ * it on this tab earlier". That knowledge could only live in ephemeral module
+ * state, which an MV3 service-worker restart wipes while the tab-level CDP
+ * override survives (the debugger stays attached across a SW restart) — so a
+ * gated revoke would silently no-op and leave the tab reporting itself focused
+ * (presence / read-receipt leak) after the user opted out. `enabled:false` is an
+ * idempotent best-effort no-op on a tab that was never emulated, and since
+ * keep-awake DEFAULTS ON the off-path only runs after a deliberate opt-out, so
+ * this adds no CDP footprint to the default path. Pure / unit-tested — the test
+ * pins "off ⇒ disable" so a future ephemeral gate can't silently reintroduce the
+ * leak. */
+export function keepAwakeAction(keepAwake: boolean): 'enable' | 'disable' {
+  return keepAwake ? 'enable' : 'disable';
 }
 
 // The MV3 service worker always has the full chrome.*; vitest imports this
@@ -96,7 +95,6 @@ export function keepAwakeAction(
 if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
   chrome.tabs.onRemoved.addListener((tabId) => {
     attached.delete(tabId);
-    focusEmulated.delete(tabId);
     clearRefsForTab(tabId);
     clearConsole(tabId);
     clearNetwork(tabId);
@@ -107,7 +105,6 @@ if (typeof chrome !== 'undefined' && chrome.debugger?.onDetach) {
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId !== undefined) {
       attached.delete(source.tabId);
-      focusEmulated.delete(source.tabId);
       clearRefsForTab(source.tabId);
       clearConsole(source.tabId);
       clearNetwork(source.tabId);
@@ -134,14 +131,15 @@ export async function attach(tabId: number): Promise<void> {
   // capture is gated here so Runtime.enable is NEVER issued on the
   // unconditional attach path — only when the user turned the setting on.
   const settings = await getSettings();
-  switch (keepAwakeAction(settings.keepAwake, focusEmulated.has(tabId))) {
+  switch (keepAwakeAction(settings.keepAwake)) {
     case 'enable':
       await keepAwake(tabId);
       break;
     case 'disable':
-      // The user turned keep-awake OFF — revoke the sticky focus emulation we
-      // applied, so the tab stops believing it is focused (invariant: the
-      // documented opt-out must actually take effect, not just stop re-asserting).
+      // Keep-awake is OFF — revoke the sticky focus emulation so the tab stops
+      // believing it is focused (the documented opt-out must actually take
+      // effect, not just stop re-asserting). Unconditional + idempotent, so it
+      // is correct even after an MV3 SW restart wiped any in-memory marker.
       await releaseKeepAwake(tabId);
       break;
   }
@@ -177,7 +175,6 @@ async function keepAwake(tabId: number): Promise<void> {
   }
   try {
     await cdp(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: true });
-    focusEmulated.add(tabId);
   } catch {
     // older Chrome / command unavailable — proceed without
   }
@@ -193,7 +190,6 @@ async function releaseKeepAwake(tabId: number): Promise<void> {
   } catch {
     // older Chrome / command unavailable — nothing to revoke
   }
-  focusEmulated.delete(tabId);
 }
 
 export async function cdp<T = unknown>(
