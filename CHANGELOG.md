@@ -8,6 +8,15 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **`status.pendingCalls` is now owner-scoped in broker mode (invariants
+  #13/#14).** The field reported `len(self._pending)` globally, but the call lock
+  serialises every client, so at most one call is ever pending — meaning a broker
+  client that merely polled `status` in a loop saw `pendingCalls:1` exactly when
+  another session was mid-call, a 0/1 cross-client activity oracle (start time,
+  duration, cadence) that the ring/`lastError` owner-scoping was meant to prevent.
+  Pending calls are now tagged with their originating client, and `_status`
+  counts only the caller's own in broker mode; standalone keeps the full count.
+  Found by the internal security audit (round 2). +1 test.
 - **`fill`'s password gate now covers the actual insertText target (invariant
   #5).** The gate checked the resolved node for `type=password`, but the
   `method:insertText` path (and the value→insertText fallback) types via CDP

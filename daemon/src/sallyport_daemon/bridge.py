@@ -84,6 +84,10 @@ class Bridge:
         self._client: ServerConnection | None = None
         self._client_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        # req_id -> originating client_id, so `status.pendingCalls` can be
+        # owner-scoped in broker mode (a client must not learn another client's
+        # in-flight call as an activity oracle). None entries = standalone.
+        self._pending_clients: dict[str, str | None] = {}
         self._send_lock = asyncio.Lock()
         # Serialise MCP-side tool calls. The extension's tools share per-tab
         # state (CDP attachments, accessibility refs), so two concurrent
@@ -275,6 +279,7 @@ class Bridge:
                 if not fut.done():
                     fut.set_exception(ExtensionNotConnected("extension disconnected mid-request"))
             self._pending.clear()
+            self._pending_clients.clear()
 
     async def _read_loop(self, ws: ServerConnection) -> None:
         async for raw in ws:
@@ -380,7 +385,16 @@ class Bridge:
             "mode": "broker" if self._broker_mode else "standalone",
             "version": daemon_version(),
             "port": self._port,
-            "pendingCalls": len(self._pending),
+            # Owner-scoped in broker mode: a client sees only its OWN in-flight
+            # calls, never another client's (which — since the call lock
+            # serialises everything, so at most one pending call exists globally
+            # — would otherwise be a 0/1 cross-client activity oracle). Standalone
+            # (client_id is None) reports the full count.
+            "pendingCalls": (
+                len(self._pending)
+                if client_id is None
+                else sum(1 for c in self._pending_clients.values() if c == client_id)
+            ),
             "uptimeS": round(time.monotonic() - self._started_monotonic, 1),
             # Recent tool-call outcomes (oldest→newest) + the latest failure, so
             # a loop can attribute a stall to a specific tool/code. Outcomes
@@ -465,7 +479,7 @@ class Bridge:
                     # (client_id=None). May raise tab_required/tab_not_owned, and
                     # injects the expected epoch for the extension to confirm.
                     args = ensure_owns(self._ownership, client_id, name, args)
-                    result = await self._call_tool_locked(name, args)
+                    result = await self._call_tool_locked(name, args, client_id)
                     # Record a freshly-created owned tab, evict a just-closed one,
                     # then owner-scope a list_tabs result (fail-closed) before it
                     # leaves the daemon.
@@ -537,7 +551,9 @@ class Bridge:
             # to that client in broker mode (None in standalone — full view).
             self._last_error_client = client_id
 
-    async def _call_tool_locked(self, name: str, args: dict[str, Any]) -> Any:
+    async def _call_tool_locked(
+        self, name: str, args: dict[str, Any], client_id: str | None = None
+    ) -> Any:
         if self._client is None:
             raise ExtensionNotConnected(
                 "extension is not connected — open Chrome and check the Sallyport popup",
@@ -557,6 +573,7 @@ class Bridge:
             ) from exc
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
+        self._pending_clients[req_id] = client_id
         try:
             await self._send_raw(self._client, env)
             try:
@@ -567,6 +584,7 @@ class Bridge:
                 ) from exc
         finally:
             self._pending.pop(req_id, None)
+            self._pending_clients.pop(req_id, None)
 
         if not isinstance(result, dict):
             # A verified-but-malformed tool_result body (truthy non-dict —

@@ -270,6 +270,27 @@ async def test_call_tool_stamps_client_in_ring(tmp_path: Any) -> None:
         del os.environ["SALLYPORT_DOWNLOAD_DIR"]
 
 
+def test_status_pending_calls_owner_scoped_in_broker_mode() -> None:
+    """status.pendingCalls must not leak another client's in-flight call. The
+    call lock serialises all clients, so at most one pending entry exists
+    globally — a broker client must see only its OWN pending count (else it's a
+    0/1 cross-client activity oracle), while standalone sees the full count
+    (invariants #13/#14)."""
+    from sallyport_daemon.bridge import Bridge
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+    # Client "A" has a call in flight (as if mid-_call_tool_locked).
+    bridge._pending["r1"] = None  # type: ignore[assignment]  # noqa: SLF001
+    bridge._pending_clients["r1"] = "A"  # noqa: SLF001
+
+    # Client "B" polling status must NOT see A's activity...
+    assert bridge._status(client_id="B")["pendingCalls"] == 0  # noqa: SLF001
+    # ...A sees its own...
+    assert bridge._status(client_id="A")["pendingCalls"] == 1  # noqa: SLF001
+    # ...and standalone (no client_id) keeps the full global count.
+    assert bridge._status()["pendingCalls"] == 1  # noqa: SLF001
+
+
 def test_status_connected_reflects_ws_state() -> None:
     """`connected` must mirror the WebSocket's real protocol state, not just a
     non-None client reference: a CLOSING/CLOSED socket lingering in the slot

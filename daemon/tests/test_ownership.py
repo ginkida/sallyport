@@ -282,7 +282,9 @@ class _StubBridge(Bridge):
         self.seen: list[tuple[str, dict[str, Any]]] = []
         self.responses: dict[str, Any] = {}
 
-    async def _call_tool_locked(self, name: str, args: dict[str, Any]) -> Any:
+    async def _call_tool_locked(
+        self, name: str, args: dict[str, Any], client_id: str | None = None
+    ) -> Any:
         self.seen.append((name, dict(args)))
         return self.responses.get(name, {})
 
