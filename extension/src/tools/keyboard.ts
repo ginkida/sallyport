@@ -24,36 +24,6 @@ const SPECIAL: Record<string, { key: string; code: string; vkc: number; text?: s
   pagedown: { key: 'PageDown', code: 'PageDown', vkc: 34 },
 };
 
-// Keys whose default action can move focus to another element (Tab between form
-// controls; arrows/Home/End/PageUp/Down within composite widgets; Enter can
-// submit/advance). After a segment ending in one of these, focus may have landed
-// on a field the one-shot password probe never saw — so the gate is re-checked
-// before the NEXT segment is dispatched (invariant #5, see dispatchKeys).
-const FOCUS_MOVING_KEYS = new Set([
-  'tab',
-  'enter',
-  'return',
-  'arrowup',
-  'arrowdown',
-  'arrowleft',
-  'arrowright',
-  'home',
-  'end',
-  'pageup',
-  'pagedown',
-]);
-
-/** True when a keystroke segment's terminal key can move focus (so the password
- * gate must be re-asserted before the following segment). Pure / tested. */
-export function isFocusMovingKey(seg: string): boolean {
-  const parts = seg
-    .split('+')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  if (parts.length === 0) return false;
-  return FOCUS_MOVING_KEYS.has(parts[parts.length - 1]);
-}
-
 const MODIFIERS: Record<string, { bit: number; key: string; code: string; vkc: number }> = {
   alt: { bit: 1, key: 'Alt', code: 'AltLeft', vkc: 18 },
   ctrl: { bit: 2, key: 'Control', code: 'ControlLeft', vkc: 17 },
@@ -90,18 +60,48 @@ function resolveKey(k: string): { key: string; code: string; vkc: number; text?:
   throw new BridgeError('bad_key', `send_keys: unknown key "${k}"`);
 }
 
+/** True when a keystroke segment actually TYPES a character into the focused
+ * field: a bare key that resolves to `text` (letter/digit/space/enter) with no
+ * non-shift modifier — a chord like `mod+a`/`ctrl+c` is a command, not text.
+ * Pure / tested.
+ *
+ * This drives the focus-boundary password re-probe (see dispatchKeys). Rather
+ * than enumerate the keys that CAN move focus — an open-ended set: Tab has a
+ * default action, Space/Enter ACTIVATE the focused control, and a site keydown
+ * handler can call `.focus()` on ANY key — we re-probe before every segment that
+ * would deposit a character. Whatever moved focus, the credential can't land in a
+ * password field the up-front probe never saw. */
+export function segmentTypesText(seg: string): boolean {
+  const parts = seg
+    .split('+')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return false;
+  // A non-shift modifier makes this a command chord (mod+a, ctrl+c), not text.
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (parts[i].toLowerCase() !== 'shift') return false;
+  }
+  try {
+    return resolveKey(parts[parts.length - 1]).text !== undefined;
+  } catch {
+    return false;
+  }
+}
+
 async function dispatchKeys(tabId: number, keysStr: string, allowPassword: boolean): Promise<void> {
   const os = await getOs();
   const modKey = os === 'mac' ? MODIFIERS.cmd : MODIFIERS.ctrl;
   const segments = keysStr.trim().split(/\s+/);
   for (let s = 0; s < segments.length; s++) {
     const seg = segments[s];
-    // Re-assert the password gate at a focus boundary: if the PREVIOUS segment
-    // could have moved focus (Tab/arrows/Enter/…), re-probe before dispatching
-    // this one — otherwise `tab secret` would deposit the credential into a
-    // password field the single up-front probe never saw, and (returning ok)
-    // even log it unredacted. Throwing here fires the force-redaction path too.
-    if (s > 0 && isFocusMovingKey(segments[s - 1])) {
+    // Re-assert the password gate before every character-typing segment (after
+    // the first — the up-front probe covers that). Focus can move mid-sequence in
+    // ways no key list captures: Tab's default action, Space/Enter ACTIVATING the
+    // focused control, or a site keydown handler calling `.focus()` on any key.
+    // So instead of enumerating focus-movers, we re-probe before depositing each
+    // character — `<mover> secret` can never land the credential in a password
+    // field the up-front probe never saw, and the throw fires force-redaction.
+    if (s > 0 && segmentTypesText(seg)) {
       await ensureNotPasswordField(tabId, allowPassword, 'send_keys');
     }
     const parts = seg

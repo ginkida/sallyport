@@ -1,48 +1,58 @@
 import { describe, expect, it } from 'vitest';
 
-import { isFocusMovingKey } from '../src/tools/keyboard.js';
+import { segmentTypesText } from '../src/tools/keyboard.js';
 
-// The password gate on send_keys must re-probe after any segment that can move
-// focus, so a `tab secret` sequence can't land the credential in a password
-// field the one-shot up-front probe never saw (invariant #5). isFocusMovingKey
-// decides where those focus boundaries are.
-describe('isFocusMovingKey', () => {
-  it('flags focus-moving keys (bare and modified)', () => {
+// The password gate on send_keys re-probes before every character-typing segment
+// (after the first), so a `<focus-mover> secret` sequence can't land the
+// credential in a password field the one-shot up-front probe never saw
+// (invariant #5). segmentTypesText decides which segments deposit a character —
+// deliberately NOT an enumeration of focus-movers, because Space/Enter activate
+// the focused control and site JS can .focus() on any key.
+describe('segmentTypesText', () => {
+  it('is true for keys that deposit a character', () => {
+    // letters, digits, space, enter/return all resolve to `text`.
+    for (const k of ['s', 'A', '5', 'space', 'Space', 'enter', 'return', 'shift+a', 'shift+5']) {
+      expect(segmentTypesText(k)).toBe(true);
+    }
+  });
+
+  it('is false for navigation/edit keys that move focus or edit but type no char', () => {
     for (const k of [
       'tab',
       'Tab',
-      'enter',
-      'return',
-      'ArrowUp',
-      'arrowdown',
-      'arrowleft',
-      'ArrowRight',
+      'shift+tab',
+      'escape',
+      'esc',
+      'backspace',
+      'delete',
+      'arrowup',
+      'ArrowDown',
       'home',
-      'End',
+      'end',
       'pageup',
       'pagedown',
-      'shift+tab', // Shift+Tab still moves focus (backwards)
+      'f5',
     ]) {
-      expect(isFocusMovingKey(k)).toBe(true);
+      expect(segmentTypesText(k)).toBe(false);
     }
   });
 
-  it('does not flag text/character or shortcut segments', () => {
-    for (const k of ['s', 'A', '5', 'space', 'escape', 'backspace', 'delete', 'mod+a', 'ctrl+c']) {
-      expect(isFocusMovingKey(k)).toBe(false);
+  it('is false for command chords (a non-shift modifier is a command, not text)', () => {
+    for (const k of ['mod+a', 'ctrl+c', 'cmd+v', 'alt+a', 'ctrl+shift+tab', 'ctrl+shift+a']) {
+      expect(segmentTypesText(k)).toBe(false);
     }
   });
 
-  it('keys on the TERMINAL key of a chord, not a modifier', () => {
-    // The last '+'-part is the key; modifiers before it don't count.
-    expect(isFocusMovingKey('ctrl+shift+tab')).toBe(true);
-    expect(isFocusMovingKey('ctrl+tab')).toBe(true);
-    expect(isFocusMovingKey('tab+a')).toBe(false); // terminal key is 'a'
+  it('resolves on the TERMINAL key of a chord', () => {
+    expect(segmentTypesText('shift+a')).toBe(true); // shift is allowed; 'a' types
+    expect(segmentTypesText('tab+a')).toBe(false); // 'tab' in a modifier slot => command
   });
 
-  it('is empty/whitespace-safe', () => {
-    expect(isFocusMovingKey('')).toBe(false);
-    expect(isFocusMovingKey('+')).toBe(false);
-    expect(isFocusMovingKey('  tab  ')).toBe(true);
+  it('is empty/whitespace/unknown-key safe (fails closed to false)', () => {
+    expect(segmentTypesText('')).toBe(false);
+    expect(segmentTypesText('+')).toBe(false);
+    expect(segmentTypesText('  s  ')).toBe(true);
+    expect(segmentTypesText('  tab  ')).toBe(false);
+    expect(segmentTypesText('notarealkey')).toBe(false); // resolveKey throws -> false
   });
 });

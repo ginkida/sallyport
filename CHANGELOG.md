@@ -6,6 +6,21 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **`send_keys` re-probes the password gate before every character-typing
+  segment, not just after an enumerated focus-moving key (invariant #5).** The
+  0.14.0 focus-boundary re-probe keyed off a `FOCUS_MOVING_KEYS` set that omitted
+  Space — but Space *activates* a focused control exactly like the Enter the set
+  included, so `send_keys keys="space p a s s"` could activate a "Next" button, let
+  the site reveal+focus a password field, and type the secret straight into it
+  (and, returning `ok`, log it to the audit trail unredacted). No finite key set
+  can enumerate the ways focus moves (a site keydown handler can `.focus()` on any
+  key), so the gate no longer tries: it re-probes the live focused field before
+  depositing *any* character (after the first, which the up-front probe covers),
+  decided by a pure, unit-tested `segmentTypesText`. Found by the internal
+  security audit (round 3, re-audit of the 0.14.0 fixes). Net -0 tests.
+
 ## [0.14.0] — 2026-07-02
 
 ### Security

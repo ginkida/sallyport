@@ -156,12 +156,14 @@ by walking `document.activeElement` down through **open** shadow roots
 (`fill` resolves a specific node by selector/ref and reads its `type`
 attribute via CDP `DOM.getAttributes`, so it is immune to the in-page
 getter trick below). Within a `send_keys` sequence the gate is
-**re-asserted after any focus-moving key** (Tab/Shift+Tab, arrows,
-Enter, Home/End/PageUp/Down), so a `tab <secret>` sequence can't tab
-focus into a password field and type the secret past a single up-front
-probe — it fails with `password_field` before the credential segment,
-which also triggers the audit-log redaction path. Two cases the
-keystroke gate still cannot reach:
+**re-asserted before every character-typing segment** (not merely after
+an enumerated focus-moving key), so however focus moved mid-sequence —
+Tab's default action, Space/Enter *activating* the focused control, or a
+site keydown handler calling `.focus()` on any key — a `<mover> <secret>`
+sequence can't deposit the credential into a password field the single
+up-front probe never saw. It fails with `password_field` before the
+credential character, which also triggers the audit-log redaction path.
+Two cases the keystroke gate still cannot reach:
 
 - **Closed shadow roots.** `element.shadowRoot` is `null` to page
   script for `attachShadow({mode:'closed'})`, so a focused
