@@ -6,6 +6,27 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `network_tail`'s MCP description now documents the always-present `origin` and
+  the `urlTruncated?` field (added in 0.14.1), and warns not to re-fetch a clipped
+  url — the description is the schema Claude reads, so the drift mattered.
+- Recovery hints added for `bad_key` (`send_keys`, unrecognised key/modifier) and
+  `filesystem_error` (`save_to_file`, mkdir/write failure), so an agent gets
+  retryable guidance instead of a bare `Error [code]`.
+- `hover` failures are no longer mislabeled `mouse_click:` — the shared
+  `aimAtElement` now names the calling tool in its "could not measure" errors.
+- `navigate`/`reload` fail fast with `tab_gone` when the target tab vanishes
+  mid-load, instead of hanging for the full 30 s load timeout and reporting a
+  misleading `timeout`.
+
+### Security
+
+- Bumped esbuild 0.28.0 → 0.28.1 (GHSA-g7r4-m6w7-qqqr, low: arbitrary file read
+  via esbuild's dev server on Windows). Build-time devDependency only — not in the
+  shipped extension or daemon, and this project never runs esbuild's dev server —
+  so exposure was near-zero; the bump clears the Dependabot alert.
+
 ## [0.14.1] — 2026-07-02
 
 ### Security
