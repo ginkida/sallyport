@@ -66,6 +66,11 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "on a custom combobox) — open it with click/mouse_click and pick the option "
             "with click (find/reveal locate it)."
         ),
+        "not_focusable": (
+            "retryable=maybe; the fill target couldn't take focus (a wrapper div, a "
+            "disabled/detached node) so insertText would type elsewhere — target the actual "
+            "input/textarea/contenteditable (snapshot/find it), or use method:value."
+        ),
         "unsafe_path": (
             "retryable=no; the path is outside the sandbox — place the file under "
             "~/Downloads/sallyport/ (or SALLYPORT_DOWNLOAD_DIR) and retry; save_to_file "

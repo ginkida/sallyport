@@ -8,6 +8,19 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **`fill`'s password gate now covers the actual insertText target (invariant
+  #5).** The gate checked the resolved node for `type=password`, but the
+  `method:insertText` path (and the value→insertText fallback) types via CDP
+  `Input.insertText`, which writes to `document.activeElement` — not the resolved
+  node. Filling a non-focusable target (a wrapper `<div>`, a disabled/detached
+  node) left focus on whatever was already focused, so an agent-chosen value
+  could be typed into a focused `<input type=password>` the gate never inspected,
+  and (no `password_field` throw) logged to the audit trail unredacted. `fill`
+  now refuses (`not_focusable`) unless focus actually landed on the gate-checked
+  node before the insertText, so the write can't be routed elsewhere; the
+  `method:value` path (writes the node directly, not activeElement) is unchanged.
+  The sibling of the `send_keys` fix above. Found by the internal security audit
+  (round 2). +2 tests.
 - **The WebSocket accept path now caps concurrent pre-auth handshakes
   (invariant #8).** Only one extension client is ever legitimately connected, but
   the WS leg — unlike the broker socket, which has `MAX_PENDING_HANDSHAKES` — put

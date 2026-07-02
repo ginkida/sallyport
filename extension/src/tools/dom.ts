@@ -8,6 +8,23 @@ import type { Tool } from './types.js';
 
 export { READ_TEXT_FN } from './poll.js';
 
+/** Guard for fill's insertText paths. CDP `Input.insertText` has no node
+ * argument — it writes to `document.activeElement` — so a write is only safe
+ * when `focus()` actually landed on the gate-checked node. `focused` is reported
+ * by FILL_CLEAR_FN (`activeElement === this` in the node's own root). Fail closed
+ * so text can never be routed to an element the password gate never inspected
+ * (invariant #5), and so a fill never silently types into the wrong element.
+ * Pure / unit-tested. */
+export function ensureFocusLanded(focused: boolean | undefined): void {
+  if (focused !== true) {
+    throw new BridgeError(
+      'not_focusable',
+      'fill: the target did not take focus, so typing would land in a different element — ' +
+        'target a focusable field (input/textarea/contenteditable), or use method:value',
+    );
+  }
+}
+
 export async function resolveSelectorOrRef(
   tabId: number,
   selector: string,
@@ -116,6 +133,11 @@ export const click: Tool = async (args) => {
 // the subsequent CDP Input.insertText lands in an empty field. Falls back to
 // the native value setter if execCommand is refused. FIXED literal — the
 // value itself never enters this function; it goes through Input.insertText.
+// Also reports `focused`: whether this node is the active element in its own
+// root AFTER focus(). Input.insertText has no node argument and writes to
+// document.activeElement, so if focus() did not land here (non-focusable div,
+// disabled/detached node) the caller MUST refuse — otherwise the text would be
+// typed into whatever else is focused, e.g. a password field the gate never saw.
 const FILL_CLEAR_FN = `function() {
   this.focus();
   const doc = this.ownerDocument;
@@ -139,7 +161,7 @@ const FILL_CLEAR_FN = `function() {
     if (d && d.set) d.set.call(this, ''); else this.value = '';
     this.dispatchEvent(new Event('input', { bubbles: true }));
   }
-  return { tag: this.tagName };
+  return { tag: this.tagName, focused: this.getRootNode().activeElement === this };
 }`;
 
 export const fill: Tool = async (args) => {
@@ -172,11 +194,16 @@ export const fill: Tool = async (args) => {
     // sees the same composition of events a real keyboard/IME produces,
     // which frameworks that ignore programmatic .value (Telegram, Slack,
     // draft.js editors) do react to.
-    const prep = await cdp<{ result: { value?: { tag: string } } }>(
+    const prep = await cdp<{ result: { value?: { tag: string; focused?: boolean } } }>(
       tab.id!,
       'Runtime.callFunctionOn',
       { objectId, functionDeclaration: FILL_CLEAR_FN, returnByValue: true },
     );
+    // Input.insertText writes to document.activeElement, not this node. If focus
+    // did not land here, refuse — otherwise the text goes to whatever else is
+    // focused (e.g. a password field the gate above never inspected), and the
+    // unredacted value would be logged. Fail closed (invariant #5).
+    ensureFocusLanded(prep.result.value?.focused);
     if (value !== '') {
       await cdp(tab.id!, 'Input.insertText', { text: value });
     }
@@ -243,11 +270,14 @@ export const fill: Tool = async (args) => {
   // passed above, so the fallback can't slip text into a password field.
   const stuck = res.applied === value || (value !== '' && res.applied.includes(value));
   if (!stuck) {
-    await cdp(tab.id!, 'Runtime.callFunctionOn', {
-      objectId,
-      functionDeclaration: FILL_CLEAR_FN,
-      returnByValue: true,
-    });
+    const fbPrep = await cdp<{ result: { value?: { tag: string; focused?: boolean } } }>(
+      tab.id!,
+      'Runtime.callFunctionOn',
+      { objectId, functionDeclaration: FILL_CLEAR_FN, returnByValue: true },
+    );
+    // Same guard as the method:insertText path: the fallback also types via
+    // Input.insertText (document.activeElement), so refuse if focus didn't land.
+    ensureFocusLanded(fbPrep.result.value?.focused);
     if (value !== '') await cdp(tab.id!, 'Input.insertText', { text: value });
     const fbWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
     return {

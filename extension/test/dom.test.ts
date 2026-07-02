@@ -15,13 +15,14 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 
 let attributesIndicatePassword: (attrs: readonly string[] | null | undefined) => boolean;
+let ensureFocusLanded: (focused: boolean | undefined) => void;
 
 beforeAll(async () => {
   (globalThis as unknown as { chrome: unknown }).chrome = {
     tabs: { onRemoved: { addListener() {} } },
     debugger: { onDetach: { addListener() {} } },
   };
-  ({ attributesIndicatePassword } = await import('../src/tools/dom.js'));
+  ({ attributesIndicatePassword, ensureFocusLanded } = await import('../src/tools/dom.js'));
 });
 
 describe('attributesIndicatePassword', () => {
@@ -57,5 +58,30 @@ describe('attributesIndicatePassword', () => {
     // A malformed odd-length list must not throw; the trailing name is skipped.
     expect(attributesIndicatePassword(['type'])).toBe(false);
     expect(attributesIndicatePassword(['id', 'x', 'type'])).toBe(false);
+  });
+});
+
+// fill's insertText paths type via CDP Input.insertText, which writes to
+// document.activeElement — NOT the resolved, gate-checked node. ensureFocusLanded
+// fails closed when focus() didn't land on the gate-checked node, so text can't
+// be routed into a focused password field the gate never inspected (invariant #5).
+describe('ensureFocusLanded', () => {
+  it('passes when focus landed on the gate-checked node', () => {
+    expect(() => ensureFocusLanded(true)).not.toThrow();
+  });
+
+  it('throws not_focusable when focus did not land (false or undefined)', () => {
+    for (const v of [false, undefined]) {
+      let code: string | undefined;
+      let message = '';
+      try {
+        ensureFocusLanded(v);
+      } catch (e) {
+        code = (e as { code?: string }).code;
+        message = (e as Error).message;
+      }
+      expect(code).toBe('not_focusable');
+      expect(message).toMatch(/did not take focus/);
+    }
   });
 });
