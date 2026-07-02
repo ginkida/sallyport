@@ -16,10 +16,13 @@ uses [Semantic Versioning](https://semver.org/).
   ~18 MB of URL strings alone, past the 16 MiB frame cap → a 1009 close that, since
   the per-tab ring survives the auto-reconnect, re-wedges on every retry (and in
   broker mode tears down the WS shared by all sessions). The budget now accounts
-  for the *entire* serialised entry (metadata + body), and each URL is clipped to
-  `NETWORK_MAX_URL` (4 KiB, `urlTruncated` flagged) with the `origin` still derived
-  from the full URL so the fail-closed allowlist filter (#3) is unaffected. Found
-  by the internal security audit (round 3). +4 tests.
+  for the *entire* serialised entry (metadata + body), and every page/server-
+  controllable string field is clipped — the URL to `NETWORK_MAX_URL` (4 KiB,
+  `urlTruncated` flagged) and `method`/`contentType` to `NETWORK_MAX_META_FIELD`
+  (256 B) — with the `origin` still derived from the full URL so the fail-closed
+  allowlist filter (#3) is unaffected. Found by the internal security audit (round
+  3; the sibling `method`/`contentType` path was caught by the round-4
+  re-verification of this fix). +6 tests.
 - **`fill`'s password gate now covers a `delegatesFocus` shadow-host target
   (invariant #5).** The 0.14.0 focus-landed probe reported
   `getRootNode().activeElement === this`, but for an open shadow host with

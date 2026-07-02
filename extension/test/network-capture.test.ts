@@ -10,6 +10,7 @@ import {
   isDataContentType,
   NETWORK_MAX_BODY,
   NETWORK_MAX_ENTRIES,
+  NETWORK_MAX_META_FIELD,
   NETWORK_MAX_URL,
   NETWORK_RESPONSE_BUDGET,
   originFromUrl,
@@ -134,6 +135,27 @@ describe('shapeNetworkEntry', () => {
     const e = shapeNetworkEntry(meta(), '{}');
     expect(e.urlTruncated).toBeUndefined();
     expect(e.url).toBe('https://api.example.com/stat?id=1');
+  });
+
+  it('caps the sibling controllable metadata fields method + contentType (round-4)', () => {
+    // A pathological fetch(url,{method:'X'.repeat(...)}) or a server emitting a
+    // giant Content-Type must not blow the frame cap via the metadata path the
+    // url cap doesn't cover.
+    const e = shapeNetworkEntry(
+      meta({
+        method: 'M'.repeat(200_000),
+        contentType: 'application/json' + ';x='.repeat(100_000),
+      }),
+      null,
+    );
+    expect(e.method.length).toBe(NETWORK_MAX_META_FIELD);
+    expect(e.contentType.length).toBe(NETWORK_MAX_META_FIELD);
+  });
+
+  it('leaves normal method + contentType untouched (never truncates real values)', () => {
+    const e = shapeNetworkEntry(meta({ method: 'POST', contentType: 'application/json' }), '{}');
+    expect(e.method).toBe('POST');
+    expect(e.contentType).toBe('application/json');
   });
 });
 

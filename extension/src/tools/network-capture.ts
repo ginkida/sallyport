@@ -74,8 +74,9 @@ export const NETWORK_MAX_BODY = 256 * 1024;
 // undercounts badly (a control char escapes to `\uXXXX` = 6 bytes, a CJK unit is
 // 3 UTF-8 bytes), so a code-unit budget could pass a result that serialises past
 // the cap and 1009-closes the WS. Entries past the budget (oldest first) drop
-// their body to metadata (bodyOmitted); urls are independently clipped to
-// NETWORK_MAX_URL so even metadata-only entries stay small. 10 MiB leaves >=6 MiB
+// their body to metadata (bodyOmitted); every controllable string field is
+// independently clipped (url to NETWORK_MAX_URL, method/contentType to
+// NETWORK_MAX_META_FIELD) so even metadata-only entries stay small. 10 MiB leaves >=6 MiB
 // headroom under MAX_FRAME_BYTES for the envelope and HMAC framing. A same-origin
 // RPC report (e.g. Metrika's /i-proxy/ gateway with a signed per-session key)
 // often can't be replayed with fetch_in_page, so the per-body cap is generous and
@@ -84,6 +85,13 @@ export const NETWORK_RESPONSE_BUDGET = 10 * 1024 * 1024;
 // Per-entry URL cap. Real API urls are well under this; it exists only so a
 // pathological giant query string can't dominate a result's wire size.
 export const NETWORK_MAX_URL = 4 * 1024;
+// Cap for the other page/server-controllable string fields (`method`,
+// `contentType`). Real HTTP methods are a handful of chars and a Content-Type
+// essence is short, so this never truncates a legitimate value — it exists only
+// so a pathological `fetch(url,{method:'X'.repeat(...)})` or a server emitting a
+// giant Content-Type can't blow the 16 MiB frame cap on the sibling path the url
+// cap doesn't cover (round-4 caught this: url alone wasn't enough).
+export const NETWORK_MAX_META_FIELD = 256;
 
 const WIRE_ENCODER = new TextEncoder();
 
@@ -172,11 +180,13 @@ export function shapeNetworkEntry(meta: NetworkMeta, bodyText: string | null): N
   const clippedUrl = clipUrl(meta.url);
   const entry: NetworkEntry = {
     ts: meta.ts,
-    method: meta.method,
+    // method/contentType are page/server-controllable too; cap them so no single
+    // metadata field can dominate the result's wire size (see NETWORK_MAX_META_FIELD).
+    method: meta.method.slice(0, NETWORK_MAX_META_FIELD),
     url: clippedUrl.url,
     status: meta.status,
     type: meta.type,
-    contentType: meta.contentType,
+    contentType: meta.contentType.slice(0, NETWORK_MAX_META_FIELD),
     size: meta.size,
     origin,
   };
