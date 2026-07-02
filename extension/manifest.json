@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Sallyport",
   "description": "Secure bridge between a local MCP daemon and Chrome. Authenticated via HMAC, scoped by domain allowlist, audited.",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "icons": {
     "16": "icons/16.png",
     "48": "icons/48.png",
