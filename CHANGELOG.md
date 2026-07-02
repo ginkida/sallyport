@@ -8,6 +8,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **`fill`'s password gate now covers a `delegatesFocus` shadow-host target
+  (invariant #5).** The 0.14.0 focus-landed probe reported
+  `getRootNode().activeElement === this`, but for an open shadow host with
+  `delegatesFocus:true`, `focus()` delegates to an inner control while
+  `document.activeElement` *retargets* back to the host — so the probe saw
+  `=== this`, passed, and `Input.insertText` then typed into the inner
+  `<input type=password>` the resolved-node gate never inspected (and logged the
+  value unredacted). `fill` now re-applies the password gate to the deepest
+  focused leaf (descending open shadow roots) via CDP ground truth before the
+  insertText on both insertText paths, so the write can't be routed into an
+  unvetted password field. `method:value` (writes the resolved node directly) was
+  never affected. Found by the internal security audit (round 3).
 - **`send_keys` re-probes the password gate before every character-typing
   segment, not just after an enumerated focus-moving key (invariant #5).** The
   0.14.0 focus-boundary re-probe keyed off a `FOCUS_MOVING_KEYS` set that omitted

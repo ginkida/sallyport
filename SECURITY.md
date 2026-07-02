@@ -155,7 +155,11 @@ The keystroke gate (`key_type` / `send_keys`) finds the focused element
 by walking `document.activeElement` down through **open** shadow roots
 (`fill` resolves a specific node by selector/ref and reads its `type`
 attribute via CDP `DOM.getAttributes`, so it is immune to the in-page
-getter trick below). Within a `send_keys` sequence the gate is
+getter trick below; for its `insertText` paths `fill` then re-checks the
+deepest focused leaf after `focus()`, so a `delegatesFocus` shadow host —
+whose `focus()` delegates to an inner control while `document.activeElement`
+retargets back to the host — cannot route a value into an inner password
+field the resolved-node gate never inspected). Within a `send_keys` sequence the gate is
 **re-asserted before every character-typing segment** (not merely after
 an enumerated focus-moving key), so however focus moved mid-sequence —
 Tab's default action, Space/Enter *activating* the focused control, or a

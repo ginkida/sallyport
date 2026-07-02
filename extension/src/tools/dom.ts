@@ -10,11 +10,13 @@ export { READ_TEXT_FN } from './poll.js';
 
 /** Guard for fill's insertText paths. CDP `Input.insertText` has no node
  * argument — it writes to `document.activeElement` — so a write is only safe
- * when `focus()` actually landed on the gate-checked node. `focused` is reported
- * by FILL_CLEAR_FN (`activeElement === this` in the node's own root). Fail closed
- * so text can never be routed to an element the password gate never inspected
- * (invariant #5), and so a fill never silently types into the wrong element.
- * Pure / unit-tested. */
+ * when `focus()` actually landed. `focused` is reported by FILL_CLEAR_FN
+ * (`activeElement === this` in the node's own root). Fail closed so a fill never
+ * silently types into the wrong element (invariant #5). Companion check:
+ * `ensureFocusedLeafNotPassword` then re-applies the password gate to the DEEPEST
+ * focused leaf — this check alone is fooled by a `delegatesFocus` shadow host
+ * (activeElement retargets to the host, so `=== this` holds) that delegates focus
+ * to an inner password input. Pure / unit-tested. */
 export function ensureFocusLanded(focused: boolean | undefined): void {
   if (focused !== true) {
     throw new BridgeError(
@@ -99,6 +101,45 @@ async function targetIsPasswordField(tabId: number, objectId: string): Promise<b
     nodeId: node.nodeId,
   });
   return attributesIndicatePassword(res.attributes);
+}
+
+// Walk document.activeElement down through OPEN shadow roots to the element that
+// ACTUALLY holds focus. CDP Input.insertText writes to this leaf, which is not
+// always the resolved node: a shadow host with `delegatesFocus:true` delegates
+// `focus()` to an inner control, yet `document.activeElement` (retargeted to the
+// document) still reports the HOST — so the up-front gate, which inspects the
+// resolved host, sees no password field while the write lands on the inner one.
+// FIXED literal, no agent interpolation (invariant #4). The descent runs in page
+// JS, so a hostile allowlisted page could hide a closed root or lie — the same
+// stronger-adversary residual documented for the keystroke probe (SECURITY.md);
+// against an honest page + agent mis-driving (the invariant #5 threat) it
+// resolves the true write target.
+const DEEPEST_ACTIVE_ELEMENT_EXPR =
+  '(() => { let a = document.activeElement;' +
+  ' while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;' +
+  ' return a; })()';
+
+/** After `focus()` has run, re-apply the password gate to the element that will
+ * ACTUALLY receive the CDP `Input.insertText` — the deepest focused leaf, which
+ * for a `delegatesFocus` shadow host is an inner node the up-front gate (checking
+ * the resolved host) never inspected. Reads the leaf's `type` via CDP ground
+ * truth (`targetIsPasswordField`), so a value can't be routed into an
+ * `<input type=password>` (invariant #5). No-op when `allowPassword`, or when
+ * nothing is focused (`ensureFocusLanded` handles the no-focus case). */
+async function ensureFocusedLeafNotPassword(tabId: number, allowPassword: boolean): Promise<void> {
+  if (allowPassword) return;
+  const active = await cdp<{ result: { objectId?: string } }>(tabId, 'Runtime.evaluate', {
+    expression: DEEPEST_ACTIVE_ELEMENT_EXPR,
+  });
+  const objectId = active.result.objectId;
+  if (!objectId) return;
+  if (await targetIsPasswordField(tabId, objectId)) {
+    throw new BridgeError(
+      'password_field',
+      'fill: focus resolved to <input type=password> (e.g. a delegatesFocus shadow host); ' +
+        'pass allowPassword=true to override',
+    );
+  }
 }
 
 export const click: Tool = async (args) => {
@@ -202,8 +243,12 @@ export const fill: Tool = async (args) => {
     // Input.insertText writes to document.activeElement, not this node. If focus
     // did not land here, refuse — otherwise the text goes to whatever else is
     // focused (e.g. a password field the gate above never inspected), and the
-    // unredacted value would be logged. Fail closed (invariant #5).
+    // unredacted value would be logged. Fail closed (invariant #5). Then re-check
+    // the ACTUAL focused leaf: a delegatesFocus shadow host passes ensureFocusLanded
+    // (activeElement retargets to the host === this) yet delegates focus to an
+    // inner <input type=password> the resolved-node gate never saw.
     ensureFocusLanded(prep.result.value?.focused);
+    await ensureFocusedLeafNotPassword(tab.id!, args.allowPassword === true);
     if (value !== '') {
       await cdp(tab.id!, 'Input.insertText', { text: value });
     }
@@ -276,8 +321,10 @@ export const fill: Tool = async (args) => {
       { objectId, functionDeclaration: FILL_CLEAR_FN, returnByValue: true },
     );
     // Same guard as the method:insertText path: the fallback also types via
-    // Input.insertText (document.activeElement), so refuse if focus didn't land.
+    // Input.insertText (document.activeElement), so refuse if focus didn't land
+    // and re-check the actual focused leaf for a delegatesFocus password bypass.
     ensureFocusLanded(fbPrep.result.value?.focused);
+    await ensureFocusedLeafNotPassword(tab.id!, args.allowPassword === true);
     if (value !== '') await cdp(tab.id!, 'Input.insertText', { text: value });
     const fbWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
     return {
