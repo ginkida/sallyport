@@ -69,6 +69,26 @@ export function classifyAttachError(msg: string): BridgeError {
  * set stays accurate without polling. */
 const attached = new Set<number>();
 
+/** Tabs on which we've enabled focus emulation (keep-awake). Tracked so that
+ * turning the setting OFF actively REVOKES emulation on the next tool call —
+ * `setFocusEmulationEnabled({enabled:true})` is sticky, so without this the
+ * documented opt-out would silently leave the tab believing it's focused
+ * (Telegram-style presence / read receipts) until detach. */
+const focusEmulated = new Set<number>();
+
+/** Decide what keep-awake should do for a tab this attach: (re-)ENABLE when the
+ * setting is on (the CDP calls are idempotent), DISABLE when it's off but we
+ * previously emulated this tab (revoke the sticky focus emulation), else NONE —
+ * so the disable command is never issued on a tab we never emulated (keeps the
+ * off-path CDP footprint minimal). Pure / unit-tested. */
+export function keepAwakeAction(
+  keepAwake: boolean,
+  wasEmulated: boolean,
+): 'enable' | 'disable' | 'none' {
+  if (keepAwake) return 'enable';
+  return wasEmulated ? 'disable' : 'none';
+}
+
 // The MV3 service worker always has the full chrome.*; vitest imports this
 // module transitively (tabs.ts/poll.ts pull pure helpers) where it doesn't
 // exist at load time — guard the top-level registrations so importing never
@@ -76,6 +96,7 @@ const attached = new Set<number>();
 if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
   chrome.tabs.onRemoved.addListener((tabId) => {
     attached.delete(tabId);
+    focusEmulated.delete(tabId);
     clearRefsForTab(tabId);
     clearConsole(tabId);
     clearNetwork(tabId);
@@ -86,6 +107,7 @@ if (typeof chrome !== 'undefined' && chrome.debugger?.onDetach) {
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId !== undefined) {
       attached.delete(source.tabId);
+      focusEmulated.delete(source.tabId);
       clearRefsForTab(source.tabId);
       clearConsole(source.tabId);
       clearNetwork(source.tabId);
@@ -112,7 +134,17 @@ export async function attach(tabId: number): Promise<void> {
   // capture is gated here so Runtime.enable is NEVER issued on the
   // unconditional attach path — only when the user turned the setting on.
   const settings = await getSettings();
-  if (settings.keepAwake) await keepAwake(tabId);
+  switch (keepAwakeAction(settings.keepAwake, focusEmulated.has(tabId))) {
+    case 'enable':
+      await keepAwake(tabId);
+      break;
+    case 'disable':
+      // The user turned keep-awake OFF — revoke the sticky focus emulation we
+      // applied, so the tab stops believing it is focused (invariant: the
+      // documented opt-out must actually take effect, not just stop re-asserting).
+      await releaseKeepAwake(tabId);
+      break;
+  }
   if (settings.captureConsole) await ensureConsoleCapture(tabId);
   if (settings.captureNetwork) await ensureNetworkCapture(tabId);
 }
@@ -134,7 +166,9 @@ export async function attach(tabId: number): Promise<void> {
  * (`tab_not_visible` / bringToFront). Side effect worth knowing: a page
  * that believes it is active behaves like one (Telegram sends read
  * receipts / presence) — the popup setting "Keep automated tabs awake"
- * turns this off (gated by the caller in `attach`). */
+ * turns this off, and the next tool call then actively DISABLES the focus
+ * emulation on the driven tab (see `releaseKeepAwake`), not merely stops
+ * re-asserting it. */
 async function keepAwake(tabId: number): Promise<void> {
   try {
     await cdp(tabId, 'Page.setWebLifecycleState', { state: 'active' });
@@ -143,9 +177,23 @@ async function keepAwake(tabId: number): Promise<void> {
   }
   try {
     await cdp(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+    focusEmulated.add(tabId);
   } catch {
     // older Chrome / command unavailable — proceed without
   }
+}
+
+/** Undo `keepAwake`'s focus emulation when the user turns the setting off, so
+ * the tab stops reporting itself focused (presence/read-receipt leak). Best
+ * effort. `Page.setWebLifecycleState` has no clean inverse, but focus emulation
+ * is the presence-relevant override, so disabling it is what stops the leak. */
+async function releaseKeepAwake(tabId: number): Promise<void> {
+  try {
+    await cdp(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: false });
+  } catch {
+    // older Chrome / command unavailable — nothing to revoke
+  }
+  focusEmulated.delete(tabId);
 }
 
 export async function cdp<T = unknown>(

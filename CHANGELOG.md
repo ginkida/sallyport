@@ -8,6 +8,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **Turning off "Keep automated tabs awake" now actively revokes focus
+  emulation.** `keepAwake` issues `Emulation.setFocusEmulationEnabled({enabled:
+  true})`, which is *sticky* — it persists on the tab until detach. The documented
+  opt-out only stopped re-asserting it, so a tab already driven with keep-awake on
+  kept reporting itself focused (presence / read-receipt leak on sites like
+  Telegram) for the rest of the debugger session even after the user turned the
+  setting off. `attach` now tracks which tabs it emulated (`focusEmulated`) and,
+  on the next tool call after the opt-out, issues
+  `setFocusEmulationEnabled({enabled:false})` to undo it — decided by a pure,
+  unit-tested `keepAwakeAction` (enable / disable / none) so the disable command
+  is never sent to a tab that was never emulated (off-path CDP footprint stays
+  minimal). Found by the internal security audit (round 2). +3 tests.
 - **`status.pendingCalls` is now owner-scoped in broker mode (invariants
   #13/#14).** The field reported `len(self._pending)` globally, but the call lock
   serialises every client, so at most one call is ever pending — meaning a broker

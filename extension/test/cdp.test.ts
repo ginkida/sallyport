@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { classifyAttachError } from '../src/tools/cdp.js';
+import { classifyAttachError, keepAwakeAction } from '../src/tools/cdp.js';
 import { BridgeError } from '../src/tools/errors.js';
 
 describe('classifyAttachError', () => {
@@ -63,5 +63,23 @@ describe('classifyAttachError', () => {
 
   it('is case-insensitive', () => {
     expect(classifyAttachError('NO TAB WITH GIVEN ID: 5.').code).toBe('attach_target_closed');
+  });
+});
+
+// Keep-awake must actually REVOKE focus emulation when the user turns the
+// setting off (not just stop re-asserting), so a tab stops reporting itself
+// focused. keepAwakeAction decides enable / disable / none per attach.
+describe('keepAwakeAction', () => {
+  it('enables when the setting is on (idempotent re-assert)', () => {
+    expect(keepAwakeAction(true, false)).toBe('enable');
+    expect(keepAwakeAction(true, true)).toBe('enable');
+  });
+
+  it('disables when the setting is off but the tab was previously emulated', () => {
+    expect(keepAwakeAction(false, true)).toBe('disable');
+  });
+
+  it('does nothing when off and never emulated (no CDP footprint on the off-path)', () => {
+    expect(keepAwakeAction(false, false)).toBe('none');
   });
 });
