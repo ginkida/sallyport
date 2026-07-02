@@ -6,6 +6,31 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.14.3] — 2026-07-02
+
+Maintenance + robustness patch. No wire change (`PROTOCOL_VERSION` stays `1`),
+drop-in over 0.14.2; the daemon is unchanged apart from the new recovery hint.
+
+### Added
+
+- **`window_create_failed` error code + recovery hint.** In broker mode an agent
+  tab opens in a dedicated non-focused window; if the browser fails to create it
+  (`chrome.windows.create` resolving no window), `navigate` now fails fast with
+  `window_create_failed` (retryable=maybe) instead of crashing on an undefined
+  window. The taxonomy hint tells a looping agent to retry `navigate(newTab:true)`
+  and to check the extension is attached.
+
+### Changed
+
+- Adopted **@types/chrome 0.2.2** (from the long-pinned 0.0.270) and adapted the
+  three Chrome type-shape changes it tightened — `chrome.windows.create`
+  nullability, the `chrome.tabs.TabChangeInfo` → `OnUpdatedInfo` rename, and the
+  `AlarmCreateInfo` discriminated union — with no runtime-behaviour change beyond
+  the guard above. Refreshed dev-tooling (prettier, typescript-eslint,
+  `@vitest/coverage-v8`) and the SHA-pinned CI actions (setup-python,
+  codeql-action). Dev/CI only — the shipped daemon and extension are otherwise
+  unchanged.
+
 ## [0.14.2] — 2026-07-02
 
 ### Fixed
@@ -1480,7 +1505,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.14.2...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.14.3...HEAD
+[0.14.3]: https://github.com/ginkida/sallyport/compare/v0.14.2...v0.14.3
 [0.14.2]: https://github.com/ginkida/sallyport/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/ginkida/sallyport/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/ginkida/sallyport/compare/v0.13.0...v0.14.0
