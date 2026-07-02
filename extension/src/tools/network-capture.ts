@@ -44,6 +44,9 @@ export interface NetworkEntry {
   ts: number;
   method: string;
   url: string;
+  /** Set when `url` was clipped to NETWORK_MAX_URL (a page put a huge query
+   * string on it). `origin` is still derived from the FULL url (invariant #3). */
+  urlTruncated?: boolean;
   status: number;
   /** Resource type, lowercased — always 'xhr' or 'fetch' (nothing else is kept). */
   type: string;
@@ -63,26 +66,46 @@ export interface NetworkEntry {
 
 export const NETWORK_MAX_ENTRIES = 100;
 export const NETWORK_MAX_BODY = 256 * 1024;
-// Total response-body WIRE BYTES returned in ONE network_tail result. Measured
-// as the UTF-8 length of each body's JSON-serialised form (see bodyWireBytes) —
-// NOT its `.length` in UTF-16 code units, which undercounts badly: a control
-// char escapes to `\uXXXX` (6 bytes) and a CJK unit is 3 UTF-8 bytes, so a
-// code-unit budget could pass a result that serialises past the 16 MiB frame cap
-// and 1009-closes the WS. Bodies past the budget (oldest first) drop to metadata
-// (bodyOmitted). 10 MiB leaves >=6 MiB headroom under MAX_FRAME_BYTES for the
-// envelope, per-entry metadata, and HMAC framing. A same-origin RPC report (e.g.
-// Metrika's /i-proxy/ gateway with a signed per-session key) often can't be
-// replayed with fetch_in_page, so the per-body cap is generous and it is the
-// aggregate wire size that is bounded.
+// Total WIRE BYTES returned in ONE network_tail result — counted over the WHOLE
+// serialised entry (metadata + body), not just the body: a page can put a
+// multi-hundred-KB query string on a same-origin XHR, so N entries' urls alone
+// can blow the 16 MiB frame cap with no bodies at all. Measured as UTF-8 length
+// of the JSON-serialised form (see entryWireBytes) — NOT UTF-16 `.length`, which
+// undercounts badly (a control char escapes to `\uXXXX` = 6 bytes, a CJK unit is
+// 3 UTF-8 bytes), so a code-unit budget could pass a result that serialises past
+// the cap and 1009-closes the WS. Entries past the budget (oldest first) drop
+// their body to metadata (bodyOmitted); urls are independently clipped to
+// NETWORK_MAX_URL so even metadata-only entries stay small. 10 MiB leaves >=6 MiB
+// headroom under MAX_FRAME_BYTES for the envelope and HMAC framing. A same-origin
+// RPC report (e.g. Metrika's /i-proxy/ gateway with a signed per-session key)
+// often can't be replayed with fetch_in_page, so the per-body cap is generous and
+// it is the aggregate wire size that is bounded.
 export const NETWORK_RESPONSE_BUDGET = 10 * 1024 * 1024;
+// Per-entry URL cap. Real API urls are well under this; it exists only so a
+// pathological giant query string can't dominate a result's wire size.
+export const NETWORK_MAX_URL = 4 * 1024;
 
 const WIRE_ENCODER = new TextEncoder();
 
 /** Wire cost of a captured body: the UTF-8 byte length of its JSON-serialised
- * form — exactly what counts against the 16 MiB frame cap once the tool result
- * is stringified and sent. Pure. */
+ * form. Pure. */
 export function bodyWireBytes(body: string): number {
   return WIRE_ENCODER.encode(JSON.stringify(body)).length;
+}
+
+/** Wire cost of a WHOLE serialised entry (metadata + body) — exactly what counts
+ * against the 16 MiB frame cap once the tool result is stringified and sent.
+ * Pure. */
+export function entryWireBytes(entry: NetworkEntry): number {
+  return WIRE_ENCODER.encode(JSON.stringify(entry)).length;
+}
+
+/** Clip a captured URL to NETWORK_MAX_URL, flagging truncation. Callers must take
+ * `origin` from the UNCAPPED url first (invariant #3) — only the stored/filterable
+ * url is trimmed. Pure. */
+export function clipUrl(url: string, max = NETWORK_MAX_URL): { url: string; truncated: boolean } {
+  if (url.length <= max) return { url, truncated: false };
+  return { url: url.slice(0, max), truncated: true };
 }
 const DEFAULT_NETWORK_LIMIT = 20;
 const NETWORK_MAX_PENDING = 512;
@@ -143,16 +166,21 @@ export function clipBody(
  * (already known to be textual data; null when unavailable/binary). Pure, so
  * origin extraction / body capping are unit-testable without chrome. */
 export function shapeNetworkEntry(meta: NetworkMeta, bodyText: string | null): NetworkEntry {
+  // origin from the FULL url BEFORE clipping, so the fail-closed allowlist filter
+  // (invariant #3) is unaffected by url truncation.
+  const origin = originFromUrl(meta.url);
+  const clippedUrl = clipUrl(meta.url);
   const entry: NetworkEntry = {
     ts: meta.ts,
     method: meta.method,
-    url: meta.url,
+    url: clippedUrl.url,
     status: meta.status,
     type: meta.type,
     contentType: meta.contentType,
     size: meta.size,
-    origin: originFromUrl(meta.url),
+    origin,
   };
+  if (clippedUrl.truncated) entry.urlTruncated = true;
   if (typeof bodyText === 'string') {
     const { body, truncated } = clipBody(bodyText);
     entry.body = body;
@@ -178,13 +206,16 @@ export function filterNetworkEntries(
   return { entries: out.slice(-opts.limit), total: out.length };
 }
 
-/** Keep response bodies for the NEWEST entries within a total WIRE-BYTE budget;
- * older bodies beyond it are dropped (metadata + `size` kept, `bodyOmitted` set)
- * so one result never exceeds the 16 MiB WS frame cap regardless of the requested
- * `limit`. The budget is measured in serialised wire bytes (bodyWireBytes), not
- * UTF-16 `.length`, so JSON-escape/UTF-8 expansion can't sneak the frame over the
- * cap. Clones the entries it strips — never mutates the ring buffer. `entries`
- * arrive oldest→newest. Pure. */
+/** Keep the NEWEST entries whole within a total WIRE-BYTE budget measured over the
+ * ENTIRE serialised entry (metadata + body), not just the body — so one result
+ * never exceeds the 16 MiB WS frame cap regardless of the requested `limit` OR of
+ * how large the per-entry metadata (notably `url`) grew. An entry that doesn't fit
+ * with its body drops the body (metadata + `size` kept, `bodyOmitted` set); its
+ * clipped metadata still counts, so the running total tracks the real payload.
+ * Measured in serialised wire bytes (entryWireBytes), not UTF-16 `.length`, so
+ * JSON-escape/UTF-8 expansion can't sneak the frame over the cap. Clones the
+ * entries it strips — never mutates the ring buffer. `entries` arrive
+ * oldest→newest. Pure. */
 export function applyResponseBudget(
   entries: NetworkEntry[],
   budget = NETWORK_RESPONSE_BUDGET,
@@ -194,13 +225,15 @@ export function applyResponseBudget(
   let omitted = 0;
   for (let i = out.length - 1; i >= 0; i--) {
     const e = out[i];
-    if (typeof e.body !== 'string') continue;
-    const cost = bodyWireBytes(e.body);
-    if (used + cost <= budget) {
-      used += cost;
-    } else {
-      // Clone without the body so the ring buffer's entry is untouched.
-      out[i] = {
+    const full = entryWireBytes(e);
+    if (used + full <= budget) {
+      used += full;
+      continue;
+    }
+    if (typeof e.body === 'string') {
+      // Doesn't fit with its body — clone without it (ring buffer untouched). The
+      // stripped, url-capped metadata is small; count it so `used` stays honest.
+      const stripped: NetworkEntry = {
         ts: e.ts,
         method: e.method,
         url: e.url,
@@ -211,7 +244,13 @@ export function applyResponseBudget(
         origin: e.origin,
         bodyOmitted: true,
       };
+      if (e.urlTruncated) stripped.urlTruncated = true;
+      out[i] = stripped;
+      used += entryWireBytes(stripped);
       omitted++;
+    } else {
+      // Already metadata-only (url-capped, small) — keep it and count it.
+      used += full;
     }
   }
   return { entries: out, omitted };

@@ -8,6 +8,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **`network_tail` bounds a result by whole-entry wire bytes and caps the stored
+  URL, closing a metadata-path frame-cap wedge (invariant #6).** The 0.14.0
+  wire-byte budget counted only response *body* bytes, and the `url` was stored
+  uncapped — so an allowlisted page issuing a handful of same-origin XHRs each with
+  a ~900 KB query string (empty bodies) could produce a `network_tail` result of
+  ~18 MB of URL strings alone, past the 16 MiB frame cap → a 1009 close that, since
+  the per-tab ring survives the auto-reconnect, re-wedges on every retry (and in
+  broker mode tears down the WS shared by all sessions). The budget now accounts
+  for the *entire* serialised entry (metadata + body), and each URL is clipped to
+  `NETWORK_MAX_URL` (4 KiB, `urlTruncated` flagged) with the `origin` still derived
+  from the full URL so the fail-closed allowlist filter (#3) is unaffected. Found
+  by the internal security audit (round 3). +4 tests.
 - **`fill`'s password gate now covers a `delegatesFocus` shadow-host target
   (invariant #5).** The 0.14.0 focus-landed probe reported
   `getRootNode().activeElement === this`, but for an open shadow host with

@@ -4,10 +4,13 @@ import {
   applyResponseBudget,
   bodyWireBytes,
   clipBody,
+  clipUrl,
+  entryWireBytes,
   filterNetworkEntries,
   isDataContentType,
   NETWORK_MAX_BODY,
   NETWORK_MAX_ENTRIES,
+  NETWORK_MAX_URL,
   NETWORK_RESPONSE_BUDGET,
   originFromUrl,
   parseNetworkArgs,
@@ -117,6 +120,35 @@ describe('shapeNetworkEntry', () => {
     const e = shapeNetworkEntry(meta({ url: 'data:application/json,{}' }), '{}');
     expect(e.origin).toBeNull();
   });
+
+  it('clips a pathologically long url but keeps origin from the FULL url (#3, Finding 2)', () => {
+    const longUrl = 'https://api.example.com/x?q=' + 'a'.repeat(900_000);
+    const e = shapeNetworkEntry(meta({ url: longUrl }), null);
+    expect(e.url.length).toBe(NETWORK_MAX_URL);
+    expect(e.urlTruncated).toBe(true);
+    // origin taken before clipping, so the fail-closed allowlist filter is intact.
+    expect(e.origin).toBe('https://api.example.com');
+  });
+
+  it('leaves a normal url untruncated', () => {
+    const e = shapeNetworkEntry(meta(), '{}');
+    expect(e.urlTruncated).toBeUndefined();
+    expect(e.url).toBe('https://api.example.com/stat?id=1');
+  });
+});
+
+describe('clipUrl', () => {
+  it('leaves a normal url untouched', () => {
+    const { url, truncated } = clipUrl('https://api.example.com/stat?id=1');
+    expect(truncated).toBe(false);
+    expect(url).toBe('https://api.example.com/stat?id=1');
+  });
+
+  it('clips an oversized url to NETWORK_MAX_URL and flags truncation', () => {
+    const { url, truncated } = clipUrl('https://x/' + 'a'.repeat(NETWORK_MAX_URL));
+    expect(truncated).toBe(true);
+    expect(url.length).toBe(NETWORK_MAX_URL);
+  });
 });
 
 describe('filterNetworkEntries', () => {
@@ -210,19 +242,34 @@ describe('applyResponseBudget', () => {
     expect(entries.some((e) => e.bodyOmitted)).toBe(false);
   });
 
-  it('keeps the NEWEST bodies within budget and drops older ones to metadata', () => {
-    // oldest→newest. Each 100-char ASCII body serialises to 102 wire bytes
-    // (100 + 2 quotes), so a 210-byte budget fits the last two, not the third.
-    const { entries, omitted } = applyResponseBudget(
-      [withBody(1, 100), withBody(2, 100), withBody(3, 100)],
-      210,
-    );
+  it('keeps the NEWEST entries whole within budget and drops older bodies to metadata', () => {
+    // oldest→newest. Budget = room for the two newest WHOLE entries (metadata +
+    // body) but not the third's body — computed from entryWireBytes so the test
+    // tracks the real accounting, not a hand-counted body-only figure.
+    const e1 = withBody(1, 100);
+    const e2 = withBody(2, 100);
+    const e3 = withBody(3, 100);
+    const budget = entryWireBytes(e2) + entryWireBytes(e3) + 5;
+    const { entries, omitted } = applyResponseBudget([e1, e2, e3], budget);
     expect(omitted).toBe(1);
     expect(entries[0].body).toBeUndefined();
     expect(entries[0].bodyOmitted).toBe(true);
     expect(entries[0].size).toBe(100); // metadata retained
     expect(entries[1].body?.length).toBe(100);
     expect(entries[2].body?.length).toBe(100);
+  });
+
+  it('counts per-entry METADATA, not just the body, against the budget (Finding 2)', () => {
+    // An entry whose body alone fits the budget but whose WHOLE serialised form
+    // (metadata + body) does not. Body-only accounting kept it — and an uncapped
+    // url could then blow the 16 MiB frame cap; whole-entry accounting drops it.
+    const e = withBody(1, 100);
+    const bodyOnly = bodyWireBytes(e.body!);
+    expect(entryWireBytes(e)).toBeGreaterThan(bodyOnly + 50); // metadata is significant
+    const { entries, omitted } = applyResponseBudget([e], bodyOnly + 10);
+    expect(omitted).toBe(1);
+    expect(entries[0].body).toBeUndefined();
+    expect(entries[0].bodyOmitted).toBe(true);
   });
 
   it('counts WIRE bytes not code units — a control-char body that fits by .length is omitted', () => {
