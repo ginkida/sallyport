@@ -28,15 +28,18 @@ updates:
     ignore:
       - dependency-name: '*'
         update-types: ['version-update:semver-major']
-      # @types/chrome ships on a 0.x line where a Dependabot-"minor" bump
-      # (0.0.x -> 0.2.x) is a breaking API change under caret semantics and
-      # needs code adaptation (chrome.alarms.create signature,
-      # chrome.windows.create nullability, chrome.tabs.TabChangeInfo removal).
-      # The global semver-major ignore doesn't catch it (major stays 0), so
-      # hold minor here too — adopt @types/chrome breaks deliberately, not as
-      # a weekly auto-PR that fails typecheck.
+      # @types/chrome ships on a 0.x line where even a Dependabot-"patch"
+      # bump breaks typecheck: 0.0.270 -> 0.0.332 already drops
+      # chrome.tabs.TabChangeInfo and marks chrome.windows.create's result
+      # nullable (src/tools/tabs.ts, src/tools/agent-window.ts), and the
+      # 0.2.x minor adds a chrome.alarms.create signature change on top.
+      # None of the global major/minor rules catch a 0.0.x patch, so freeze
+      # @types/chrome outright — its breaks touch invariant-#13 code and are
+      # adopted deliberately with matching source edits, never as a weekly
+      # auto-PR that fails CI.
       - dependency-name: '@types/chrome'
-        update-types: ['version-update:semver-minor']
+        update-types:
+          ['version-update:semver-minor', 'version-update:semver-patch']
 
   # Keeps the SHA-pinned actions in .github/workflows/ current (Dependabot
   # bumps both the pinned SHA and the # vX.Y.Z comment). Major bumps are
