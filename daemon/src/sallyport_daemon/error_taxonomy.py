@@ -76,6 +76,12 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "~/Downloads/sallyport/ (or SALLYPORT_DOWNLOAD_DIR) and retry; save_to_file "
             "writes there."
         ),
+        "filesystem_error": (
+            "retryable=maybe; save_to_file couldn't create the download dir or write the "
+            "file (permission denied, read-only volume, or disk full — the message says "
+            "which) — free or fix ~/Downloads/sallyport/ (or set SALLYPORT_DOWNLOAD_DIR to a "
+            "writable dir), then retry."
+        ),
         "attach_debugger_conflict": (
             "retryable=yes; another client holds the tab (DevTools open / another extension "
             "/ a tab mid-drag) — close DevTools or retry shortly."
@@ -124,6 +130,12 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
         "bad_args": (
             "retryable=no; the arguments don't match the tool's schema (the message says which "
             "field) — fix the call before retrying; an identical retry fails the same way."
+        ),
+        "bad_key": (
+            "retryable=no; send_keys got an unrecognised key or modifier (the message names "
+            "it) — keys are single letters/digits, Enter/Escape/Tab/Backspace/Delete/Space, "
+            "arrows, Home/End/PageUp/PageDown or F1-F12; modifiers are mod/ctrl/cmd/shift/alt; "
+            "fix the spec, an identical retry fails the same way."
         ),
         "paused": (
             "retryable=no while paused; the user paused Sallyport from the popup — ask them to "
