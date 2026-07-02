@@ -69,6 +69,23 @@ export function waitForLoad(tabId: number, timeoutMs = 30000): Promise<void> {
       }
     };
     chrome.tabs.get(tabId, (tab) => {
+      // A tab closed/recycled in the gap between create/update and this get makes
+      // Chrome call back with `tab === undefined` + runtime.lastError (reading it
+      // clears the "Unchecked runtime.lastError" warning). Without this guard
+      // `ready(undefined)` throws inside the callback, Chrome swallows it, the
+      // promise never settles, and the call hangs to the full timeout with a
+      // misleading code:'timeout'. Fail fast with the same tab_gone getTabOrGone uses.
+      if (chrome.runtime?.lastError || !tab) {
+        clearTimeout(t);
+        reject(
+          new BridgeError(
+            'tab_gone',
+            `tab ${tabId} is gone (closed, or its id was recycled) — ` +
+              `open a fresh one with navigate(newTab:true)`,
+          ),
+        );
+        return;
+      }
       if (ready(tab)) {
         clearTimeout(t);
         resolve();

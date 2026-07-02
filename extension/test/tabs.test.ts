@@ -10,7 +10,14 @@
  */
 
 import { beforeEach, describe, expect, it } from 'vitest';
-import { closeTab, isBlankTarget, listTabs, navigate, resolveTab } from '../src/tools/tabs.js';
+import {
+  closeTab,
+  isBlankTarget,
+  listTabs,
+  navigate,
+  resolveTab,
+  waitForLoad,
+} from '../src/tools/tabs.js';
 import { setAllowlist } from '../src/storage.js';
 import { clearAllEpochs, getEpoch, mintEpoch, setBrokerMode } from '../src/tools/ownership.js';
 import { resetAgentWindow } from '../src/tools/agent-window.js';
@@ -126,6 +133,21 @@ beforeEach(async () => {
   installChromeMock({});
   clearAllEpochs(); // resets broker mode + epoch map between tests
   resetAgentWindow(); // forget the dedicated agent window between tests
+});
+
+describe('waitForLoad — vanished tab', () => {
+  it('fails fast with tab_gone (not a 30s timeout) when the tab is gone', async () => {
+    installChromeMock({});
+    // Chrome invokes the get callback with no tab (closed/recycled) instead of
+    // throwing; without the guard, ready(undefined) throws inside the callback,
+    // is swallowed, and the promise hangs to the timeout with code:'timeout'.
+    (
+      globalThis as unknown as {
+        chrome: { tabs: { get: (id: number, cb: (t?: unknown) => void) => void } };
+      }
+    ).chrome.tabs.get = (_id, cb) => cb(undefined);
+    await expect(waitForLoad(999, 5000)).rejects.toMatchObject({ code: 'tab_gone' });
+  });
 });
 
 describe('navigate — clobber gate (invariant #12 parity with close_tab)', () => {
