@@ -16,7 +16,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
-    "@types/chrome": "^0.0.270",
+    "@types/chrome": "^0.0.332",
     "@vitest/coverage-v8": "^4.1.9",
     "esbuild": "^0.28.1",
     "eslint": "^9.0.0",
