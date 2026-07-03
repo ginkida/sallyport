@@ -6,6 +6,68 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **The keystroke password gate (`key_type`/`send_keys`) now fails closed when
+  its focus probe throws or returns no value.** A page defining a throwing
+  getter for `type`/`shadowRoot` previously made the probe throw, the result
+  read as `undefined`, and the gate silently passed — documented in
+  SECURITY.md as the "hostile in-page getters" blind spot. `classifyPasswordProbe`
+  (`extension/src/tools/focus.ts`) now checks the CDP response's
+  `exceptionDetails` and blocks with a new `focus_probe_failed` code
+  (deliberately distinct from `password_field`, since we don't actually know
+  it IS a password field — the hint doesn't suggest `allowPassword=true`).
+  `fill` was never affected (reads the DOM attribute via `DOM.getAttributes`,
+  which a page can't shadow).
+- **The audit log's per-string truncation now also bounds array/object
+  fan-out**, closing the "pathological agent spams huge structured args"
+  gap SECURITY.md's audit-log-persistence limitation flagged. `truncateAuditValue`
+  shares one running item budget (`MAX_AUDIT_ITEMS`=16) across the WHOLE
+  logged value — including a tool call's own top-level args keys, not just
+  what's nested under each one — so a wide-or-deep args object collapses
+  to a `…N more`/`…N more keys` marker instead of growing unbounded.
+- **`doctor --kill-stale` and the automatic startup port-eviction now
+  re-verify a process right before signalling it**, closing a TOCTOU window:
+  both built their kill list from one `ps` snapshot, then looped
+  `os.kill(pid, SIGTERM)` with no re-check — if the real orphaned daemon
+  exited on its own and the OS recycled its exact pid for an unrelated
+  process in that window, the old code would have signalled the wrong
+  process. `_reverify_stale_orphan` re-checks (still a sallyport-daemon,
+  still orphaned, still not a broker) immediately before each `os.kill`;
+  a pid that no longer matches is skipped and reported, never signalled.
+  The automatic startup path (`ensure_port_available`, not just the
+  diagnostic command) is the higher-stakes one — it runs on every daemon
+  launch.
+
+### Fixed
+
+- `error_taxonomy.py` now has recovery hints for two previously-unmapped but
+  real thrown codes: `timeout` (navigate's page-load watchdog — the anti-rot
+  test used to forbid this key, conflating it with `wait_for`/`settle`'s
+  unrelated non-error `reason:'timeout'` field) and `error` (the extension's
+  generic catch-all for a non-`BridgeError` throw). `tab_not_visible`'s hint
+  no longer tells a broker-mode agent to retry with `bringToFront` — that's
+  `bringtofront_forbidden` in broker mode — and now points at snapshot/read_text
+  directly.
+- **`navigate`'s result in broker mode no longer leaks the internal
+  ownership `epoch` field.** `record_result` (invariant #13 bookkeeping)
+  read `epoch` off the tool result but never removed it before the result
+  reached the agent, so every broker-mode create-own `navigate` call
+  returned an opaque, undocumented UUID string alongside `tabId`/`url`.
+  `Bridge.call_tool` now strips it after recording — a field with no
+  actionable meaning to the caller shouldn't need explaining in the MCP
+  schema.
+- `README.md`'s Tools table was missing `find`/`reveal`/`settle` (shipped
+  since 0.8.0), its test counts were stale (439/594 → 458/646), and its
+  permissions list omitted `contextMenus` (added for the popup-pin
+  context-menu entry).
+
+### Changed
+
+- Added `timeout-minutes` to every CI/CodeQL/publish job — a hung runner (a
+  stuck test or CDP wait) now fails fast instead of burning GitHub's default
+  360-minute ceiling.
+
 ## [0.14.3] — 2026-07-02
 
 Maintenance + robustness patch. No wire change (`PROTOCOL_VERSION` stays `1`),

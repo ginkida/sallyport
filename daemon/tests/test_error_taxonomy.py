@@ -63,10 +63,14 @@ def test_every_taxonomy_key_is_a_real_thrown_code() -> None:
 
 
 def test_no_hint_for_success_not_error_conditions() -> None:
-    """wait_for/settle return found:false / settled:false as SUCCESS, never a
-    ToolError — those must not masquerade as recoverable errors."""
+    """wait_for/settle return settled:false / found:false (with a
+    reason:'timeout' string) as SUCCESS, never a ToolError — those must not
+    masquerade as recoverable errors. Note "timeout" itself IS a real thrown
+    BridgeError code (navigate's page-load watchdog, tabs.ts) distinct from
+    wait_for/settle's non-error `reason` field of the same name, so it
+    legitimately has a hint — only "settled"/"found" are checked here."""
     keys = known_codes()
-    for not_an_error in ("timeout", "settled", "found"):
+    for not_an_error in ("settled", "found"):
         assert not_an_error not in keys
 
 

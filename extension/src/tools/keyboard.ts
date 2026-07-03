@@ -1,6 +1,6 @@
 import { attach, cdp } from './cdp.js';
 import { BridgeError } from './errors.js';
-import { findActiveField } from './focus.js';
+import { classifyPasswordProbe, findActiveField } from './focus.js';
 import { ensureAllowed } from './gates.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
@@ -182,33 +182,31 @@ const ACTIVE_FIELD_PROBE = '(' + findActiveField.toString() + ')(document)';
  * happily type into it, bypassing `fill`'s `password_field` check.
  *
  * Coverage: the top frame, including OPEN shadow roots (the common case —
- * `attachShadow({mode:'open'})` is the default). Two residual blind spots,
- * both documented in SECURITY.md: (1) CLOSED shadow roots, whose
- * `.shadowRoot` is null to page script, so the focused node can't be
- * reached; (2) cross-origin iframes, whose inner activeElement the top
- * frame can't see. Both require an allowlisted page the user already
- * trusted. We probe rather than ship a partial frame traversal that would
- * lie about its coverage. */
+ * `attachShadow({mode:'open'})` is the default). A probe exception (a page
+ * with a throwing getter for `type`/`shadowRoot`) fails CLOSED via
+ * `classifyPasswordProbe` — `focus_probe_failed` — rather than silently
+ * passing. Two residual blind spots remain, both documented in SECURITY.md:
+ * (1) CLOSED shadow roots, whose `.shadowRoot` is null to page script, so the
+ * focused node can't be reached; (2) cross-origin iframes, whose inner
+ * activeElement the top frame can't see. Both require an allowlisted page
+ * the user already trusted. We probe rather than ship a partial frame
+ * traversal that would lie about its coverage. */
 async function ensureNotPasswordField(
   tabId: number,
   allowPassword: boolean,
   tool: string,
 ): Promise<void> {
   if (allowPassword) return;
-  const probe = await cdp<{ result: { value?: { tag: string; type: string } } }>(
-    tabId,
-    'Runtime.evaluate',
-    {
-      expression: ACTIVE_FIELD_PROBE,
-      returnByValue: true,
-    },
-  );
-  const v = probe.result.value;
-  if (v && v.tag === 'INPUT' && v.type === 'password') {
-    throw new BridgeError(
-      'password_field',
-      `${tool}: focus is on <input type=password>; pass allowPassword=true to override`,
-    );
+  const probe = await cdp<{
+    result: { value?: { tag: string; type: string } };
+    exceptionDetails?: { text: string; exception?: { description?: string } };
+  }>(tabId, 'Runtime.evaluate', {
+    expression: ACTIVE_FIELD_PROBE,
+    returnByValue: true,
+  });
+  const outcome = classifyPasswordProbe(probe.result, probe.exceptionDetails !== undefined);
+  if (outcome.blocked) {
+    throw new BridgeError(outcome.code, `${tool}: ${outcome.reason}`);
   }
 }
 

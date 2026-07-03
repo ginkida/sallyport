@@ -45,6 +45,16 @@ export const AUDIT_LIMIT = 500;
  * silently. 1 KiB keeps args readable for debugging without ever
  * approaching the limit. */
 export const MAX_AUDIT_STRING = 1024;
+/** Total array-elements + object-keys a single audit value may expand while
+ * being truncated — one running budget shared across the WHOLE nested
+ * structure, not a per-level cap (an independent width/depth pair still
+ * multiplies out: e.g. width 50 at depth 4 is 6M+ leaves). `MAX_AUDIT_STRING`
+ * alone doesn't bound fan-out — an args object with many array elements (or
+ * deeply nested ones) can still serialise past the 10 MiB quota even with
+ * every leaf string capped. 16 is far more than any real tool call's args
+ * ever use; worst case (every visited item a max-length string) is
+ * ~16 KiB/entry, so `AUDIT_LIMIT` entries stay well inside the quota. */
+export const MAX_AUDIT_ITEMS = 16;
 
 const K = {
   secret: 'sallyport_secret_b64',
@@ -134,25 +144,56 @@ export function truncateAuditString(s: string): string {
   return s.slice(0, MAX_AUDIT_STRING) + `…<truncated, ${s.length} chars total>`;
 }
 
-/** Recursively trim every string inside an audit value. Other primitives
- * pass through. Pure / tested. */
-export function truncateAuditValue(v: unknown): unknown {
+/** Recursively trim every string inside an audit value, AND bound total
+ * array-elements/object-keys visited to `MAX_AUDIT_ITEMS` (shared across the
+ * whole call via `budget`) so a wide-or-deep args object can't fan out past
+ * the storage quota regardless of shape. Other primitives pass through.
+ * Pure / tested. */
+function truncateAuditValueBudgeted(v: unknown, budget: { left: number }): unknown {
   if (typeof v === 'string') return truncateAuditString(v);
-  if (Array.isArray(v)) return v.map(truncateAuditValue);
+  if (Array.isArray(v)) {
+    const out: unknown[] = [];
+    for (const item of v) {
+      if (budget.left <= 0) {
+        out.push(`…<${v.length - out.length} more>`);
+        break;
+      }
+      budget.left--;
+      out.push(truncateAuditValueBudgeted(item, budget));
+    }
+    return out;
+  }
   if (v && typeof v === 'object') {
+    const entries = Object.entries(v);
     const out: Record<string, unknown> = {};
-    for (const [k, val] of Object.entries(v)) out[k] = truncateAuditValue(val);
+    let shown = 0;
+    for (const [k, val] of entries) {
+      if (budget.left <= 0) {
+        out['…'] = `${entries.length - shown} more keys`;
+        break;
+      }
+      budget.left--;
+      shown++;
+      out[k] = truncateAuditValueBudgeted(val, budget);
+    }
     return out;
   }
   return v;
 }
 
+export function truncateAuditValue(v: unknown): unknown {
+  return truncateAuditValueBudgeted(v, { left: MAX_AUDIT_ITEMS });
+}
+
 export async function appendAudit(entry: AuditEntry): Promise<void> {
   const safe: AuditEntry = {
     ...entry,
-    args: Object.fromEntries(
-      Object.entries(entry.args).map(([k, v]) => [k, truncateAuditValue(v)]),
-    ),
+    // Pass the WHOLE args object through the budgeted truncator (not a
+    // per-key map) so the top-level key count shares the same budget as
+    // everything nested under it — mapping per-key would give each value
+    // its own fresh MAX_AUDIT_ITEMS budget, leaving the number of top-level
+    // keys itself unbounded (a wide, flat args object would still fan out).
+    args: truncateAuditValue(entry.args) as Record<string, unknown>,
   };
   if (entry.error !== undefined) safe.error = truncateAuditString(entry.error);
 

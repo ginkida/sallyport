@@ -15,8 +15,8 @@ Claude Code ── MCP/stdio ──▶ daemon ── WS+HMAC ──▶ extension
 
 | Status | Number |
 |---|---|
-| Daemon tests (pytest) | 439 |
-| Extension tests (vitest) | 594 |
+| Daemon tests (pytest) | 458 |
+| Extension tests (vitest) | 646 |
 | Lint / typecheck (ruff, mypy, eslint, prettier, tsc) | all green |
 
 ## What's in the box
@@ -60,8 +60,8 @@ everything. Sallyport changes the default in five places:
 Other deliberate choices:
 
 - No content-script injection, no `<all_urls>` content scripts. Permissions
-  are only what the debugger API needs (`tabs`, `activeTab`, `debugger`,
-  `storage`, `alarms`).
+  are only what the debugger API (and a popup-pin context-menu entry) need
+  (`tabs`, `activeTab`, `debugger`, `storage`, `alarms`, `contextMenus`).
 - Per-tab accessibility refs (`@e1`, `@e2`). Snapshotting tab A cannot
   invalidate refs for tab B, and a ref scoped to A cannot resolve to a node
   in B.
@@ -253,6 +253,9 @@ and MCP-client-auth invariants.
 | `send_keys` | `Mod+A`, `Shift+Tab`, etc. `Mod` = `Cmd` on macOS, `Ctrl` elsewhere. Same password-field gate as `key_type`. |
 | `screenshot` | PNG/JPEG as a native MCP image block. `maxWidth` downscales, `region={x,y,width,height}` crops (viewport-relative CSS px). Hidden tabs fail fast with `tab_not_visible`; `bringToFront=true` activates the tab first (steals focus). |
 | `wait_for` | Poll (250 ms) until a selector/`@eN` ref is visible and/or page text contains a substring; `absent=true` waits until it is GONE. `timeoutMs` ≤ 30 s; timeout returns `{found:false}`, not an error. Replaces blind sleeps. Prefer the embedded `waitFor` on the preceding action when there is one. |
+| `settle` | Wait for the DOM to stop changing (element count + page size steady for `stableMs`, default 500 ms) — for "the page just did *something*" moments with no single element to `wait_for`. Poll (250 ms), ≤ 30 s; a never-settling page returns `{settled:false}`, not an error. |
+| `find` | Semantic element locator — match by `role`/`name`/`nameExact`/`value` over the accessibility tree instead of a CSS selector, ranked exact-match-first (`limit`, ≤ 50). No `evaluate`, no probe. |
+| `reveal` | Scroll a virtualized list/container and re-`snapshot` until an element matching `find`'s predicate appears — for infinite-scroll feeds and lazy-rendered tables. Stops on found/stall/`maxSteps` (≤ 40)/timeout. |
 | `scroll` | Deterministic scrolling — the predicate-less companion to `reveal`. `selector` → `scrollIntoView`; or scroll the page (or a `selector` container) by `dx`/`dy` (negatives = up/left) or `to='top'\|'bottom'`. Returns `{x, y, scrollHeight, atBottom}` so a lazy-load loop knows when to stop. Fixed scroll probe, no `evaluate`. |
 | `evaluate` | Per-domain opt-in. Returns `{type, value}`. |
 | `fetch_in_page` | `fetch()` with page cookies/auth. Returns `{status, contentType, headers, mode, data}`. Allowlist-gated. |

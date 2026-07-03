@@ -44,9 +44,10 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "mis-target."
         ),
         "tab_not_visible": (
-            "retryable=yes; a hidden tab can't render a frame — activate it first "
-            "(screenshot bringToFront=true, or switch to it) then retry, or use "
-            "snapshot/read_text which don't need a visible tab."
+            "retryable=yes; a hidden tab can't render a frame — in standalone mode "
+            "activate it first (screenshot bringToFront=true, or switch to it) then "
+            "retry; in broker mode bringToFront is forbidden (bringtofront_forbidden), "
+            "so use snapshot/read_text instead, which don't need a visible tab."
         ),
         "not_visible": (
             "retryable=yes; the target has zero size / isn't laid out yet — wait_for (or "
@@ -170,6 +171,22 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
         "unknown_tool": (
             "retryable=no; no tool by that name is registered — check the advertised tool list; "
             "a retry with the same name won't succeed."
+        ),
+        "timeout": (
+            "retryable=maybe; navigate's page-load watchdog fired (30s) without the tab reaching "
+            "'complete' — the page may just be slow/heavy, or stuck loading; wait_for/settle on a "
+            "concrete selector instead of relying on full page load, or retry navigate."
+        ),
+        "focus_probe_failed": (
+            "retryable=no; key_type/send_keys couldn't verify the focused field is safe to type "
+            "into (the page's type/shadowRoot accessor threw or returned nothing) — use fill "
+            "instead (reads the DOM attribute directly, unaffected by in-page getters), or inspect "
+            "the field first with snapshot/get_state."
+        ),
+        "error": (
+            "retryable=maybe; an unclassified tool failure (the message carries whatever detail "
+            "is available) — re-check the call's arguments and target tab/element before retrying; "
+            "if it recurs identically, treat it as non-retryable."
         ),
     }
 )

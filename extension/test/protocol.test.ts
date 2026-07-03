@@ -145,6 +145,25 @@ describe('canonicalJson — key ordering and strings', () => {
     expect(canonicalJson({ k: '😀' })).toBe('{"k":"😀"}');
   });
 
+  it('advances past a shared BMP prefix before comparing the differing char', () => {
+    // Every existing key-order test differs at position 0, so the
+    // code-point-index advance (compareCodePoints' `i += ca > 0xffff ? 2 : 1`)
+    // never actually runs. A shared single-code-unit prefix forces it to.
+    expect(canonicalJson({ ab: 1, ac: 2 })).toBe('{"ab":1,"ac":2}');
+  });
+
+  it('advances past a shared ASTRAL prefix (surrogate pair, +2) before comparing', () => {
+    // Same as above but the shared prefix itself is astral, so the advance
+    // takes the +2 branch on both operands, not just +1.
+    expect(canonicalJson({ '\u{1F600}a': 1, '\u{1F600}b': 2 })).toBe(
+      '{"\u{1F600}a":1,"\u{1F600}b":2}',
+    );
+  });
+
+  it('a key that is a strict prefix of another sorts first (length-difference tail)', () => {
+    expect(canonicalJson({ abc: 2, ab: 1 })).toBe('{"ab":1,"abc":2}');
+  });
+
   it('rejects unsupported types', () => {
     expect(() => canonicalJson({ k: 10n })).toThrow(/unsupported type/);
     expect(() => canonicalJson(undefined)).toThrow(/unsupported type/);

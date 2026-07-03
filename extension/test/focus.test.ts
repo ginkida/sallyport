@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { findActiveField, type FocusNode } from '../src/tools/focus.js';
+import { classifyPasswordProbe, findActiveField, type FocusNode } from '../src/tools/focus.js';
 
 function input(type: string): FocusNode {
   return { tagName: 'INPUT', type };
@@ -61,5 +61,39 @@ describe('findActiveField — keystroke password-gate focus traversal', () => {
 
   it('lowercases the type so the gate comparison is case-insensitive', () => {
     expect(findActiveField({ activeElement: input('PASSWORD') }).type).toBe('password');
+  });
+});
+
+describe('classifyPasswordProbe — fail-closed decision for the CDP probe result', () => {
+  it('lets a clean non-password result through', () => {
+    expect(classifyPasswordProbe({ value: { tag: 'INPUT', type: 'text' } }, false)).toEqual({
+      blocked: false,
+    });
+    expect(classifyPasswordProbe({ value: { tag: '', type: '' } }, false)).toEqual({
+      blocked: false,
+    });
+  });
+
+  it('blocks with password_field on an actual password input', () => {
+    const out = classifyPasswordProbe({ value: { tag: 'INPUT', type: 'password' } }, false);
+    expect(out).toMatchObject({ blocked: true, code: 'password_field' });
+  });
+
+  it('fails closed with focus_probe_failed when the probe threw (hostile getter)', () => {
+    // Runtime.evaluate reports exceptionDetails; returnByValue yields no `value`.
+    const out = classifyPasswordProbe({ value: undefined }, true);
+    expect(out).toMatchObject({ blocked: true, code: 'focus_probe_failed' });
+  });
+
+  it('fails closed with focus_probe_failed on a missing value even without an exception', () => {
+    // Belt-and-braces: an unreadable/undefined value must never read as "safe".
+    const out = classifyPasswordProbe({ value: undefined }, false);
+    expect(out).toMatchObject({ blocked: true, code: 'focus_probe_failed' });
+  });
+
+  it('never suggests allowPassword for a probe failure (that would be misleading)', () => {
+    const out = classifyPasswordProbe({ value: undefined }, true);
+    expect(out).toMatchObject({ blocked: true });
+    if (out.blocked) expect(out.reason.toLowerCase()).not.toContain('allowpassword');
   });
 });

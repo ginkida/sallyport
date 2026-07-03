@@ -148,6 +148,19 @@ describe('matchAllowlist — malformed stored pattern', () => {
     expect(matchAllowlist('https://example.com/', [entry('https://')]).matched).toBe(false);
     expect(matchAllowlist('https://example.com/', [entry('http://[')]).matched).toBe(false);
   });
+
+  it('returns no match when a stored pattern is empty/whitespace-only after trim', () => {
+    expect(matchAllowlist('https://example.com/', [entry('')]).matched).toBe(false);
+    expect(matchAllowlist('https://example.com/', [entry('   ')]).matched).toBe(false);
+  });
+
+  it('URL pattern with matching protocol but a DIFFERENT host does not match', () => {
+    // Same protocol/path as the requested URL, but pu.hostname != host — the
+    // protocol check alone must not be enough to match.
+    expect(
+      matchAllowlist('https://evil.com/path/foo', [entry('https://good.com/path/*')]).matched,
+    ).toBe(false);
+  });
 });
 
 describe('matchAllowlist — port handling', () => {

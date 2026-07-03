@@ -296,6 +296,37 @@ def _listening_pids(port: int) -> list[int]:
     return [int(tok) for tok in res.stdout.split() if tok.isdigit()]
 
 
+def _reverify_stale_orphan(pid: int) -> bool:
+    """Re-check, immediately before signalling, that ``pid`` STILL is an
+    orphaned sallyport-daemon (not a broker).
+
+    Both kill paths below build their target list from an earlier `ps`
+    snapshot. If the real orphan exits on its own and the OS recycles its
+    exact pid for an unrelated process before we get to `os.kill`, trusting
+    that stale snapshot would SIGTERM the wrong process. This isn't fully
+    atomic (no portable pidfd-equivalent across macOS/Linux without an extra
+    dependency), but it narrows the race from "however long since the batch
+    snapshot" down to "one more `ps` round-trip, immediately before the
+    kill" — cheap, and only ever run on the already-rare stale-process path.
+    """
+    try:
+        res = subprocess.run(  # noqa: S603 - fixed argv, no user input
+            ["ps", "-p", str(pid), "-o", "pid=,ppid=,etime=,command="],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in res.stdout.splitlines():
+        info = parse_ps_line(line)
+        if info is None or info.pid != pid:
+            continue
+        is_sallyport = "sallyport-daemon" in info.command or "sallyport_daemon" in info.command
+        return is_sallyport and info.orphaned and not _is_broker_command(info.command)
+    return False
+
+
 def _pid_is_broker(pid: int, command: str | None, recorded: dict[str, Any] | None) -> bool:
     """True if this pid is a POSITIVELY-IDENTIFIED broker — its argv carries the
     ``broker`` token, or the port pidfile records ``mode==broker`` for this pid.
@@ -429,14 +460,22 @@ def _run_kill_stale() -> None:
     if not stale:
         print("  --kill-stale: no orphaned sallyport-daemon processes found")
         return
+    signalled: list[int] = []
     for p in stale:
+        if not _reverify_stale_orphan(p.pid):
+            print(
+                f"  SKIP  PID {p.pid}: no longer matches the orphaned daemon seen a "
+                "moment ago (exited, or its pid was recycled) — not signalling"
+            )
+            continue
         try:
             os.kill(p.pid, signal.SIGTERM)
             print(f"  KILL  PID {p.pid} (orphaned, up {p.etime}) — sent SIGTERM")
+            signalled.append(p.pid)
         except OSError as exc:
             print(f"  FAIL  PID {p.pid}: {exc}")
     deadline = time.monotonic() + 3.0
-    remaining = [p.pid for p in stale]
+    remaining = signalled
     while remaining and time.monotonic() < deadline:
         time.sleep(0.1)
         remaining = [pid for pid in remaining if _pid_alive(pid)]
@@ -478,7 +517,15 @@ def _terminate_stale_holder(port: int, config_dir: Path) -> bool:
     ]
     if not stale:
         return False
+    signalled: list[int] = []
     for pid in stale:
+        if not _reverify_stale_orphan(pid):
+            print(
+                f"Sallyport: PID {pid} no longer matches the orphaned daemon seen a "
+                "moment ago (exited, or its pid was recycled) — not signalling.",
+                file=sys.stderr,
+            )
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
             print(
@@ -486,14 +533,19 @@ def _terminate_stale_holder(port: int, config_dir: Path) -> bool:
                 "(its session is gone) — sent SIGTERM, reclaiming the port.",
                 file=sys.stderr,
             )
+            signalled.append(pid)
         except OSError as exc:
             print(f"Sallyport: could not signal stale PID {pid}: {exc}", file=sys.stderr)
     deadline = time.monotonic() + 3.0
-    remaining = list(stale)
+    remaining = list(signalled)
     while remaining and time.monotonic() < deadline:
         time.sleep(0.1)
         remaining = [pid for pid in remaining if _pid_alive(pid)]
-    return True
+    # True only if something was ACTUALLY signalled — every stale candidate
+    # can lose the _reverify_stale_orphan race (exited/recycled between the
+    # snapshot and here), in which case nothing changed and the caller's
+    # re-probe would just waste a round-trip before falling through anyway.
+    return bool(signalled)
 
 
 def ensure_port_available(host: str, port: int, config_dir: Path) -> None:

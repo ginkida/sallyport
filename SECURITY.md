@@ -179,20 +179,28 @@ Two cases the keystroke gate still cannot reach:
   returns the `<iframe>` element, not the focused element inside it.
   Typing into a password field inside *any* iframe — same-origin or
   cross-origin — isn't caught.
-- **Hostile in-page getters (keystroke gate only).** The keystroke probe
-  reads the focused element's `type` / `shadowRoot` via `Runtime.evaluate`.
-  A page that defines a throwing getter for one of those makes the probe
-  throw; the result then reads as `undefined` and the keystroke gate
-  passes. `fill` is **not** affected: it reads the `type` attribute from
-  the browser's DOM via CDP `DOM.getAttributes`, which a page cannot
-  shadow with a throwing or lying JS accessor, and fails closed if the
-  node can't be read.
 
-**Exploitability:** the agent must (a) drive focus into the closed root
-/ iframe and (b) the page (or iframe) must be on an allowlisted domain —
-a site the user already trusted. Real but narrow blind spots, and only
-for `key_type` / `send_keys`; `fill` into the same field reads the DOM
-attribute directly and is caught regardless of in-page getters.
+**Fixed: hostile in-page getters (keystroke gate only).** The keystroke
+probe reads the focused element's `type` / `shadowRoot` via
+`Runtime.evaluate`. A page that defines a throwing getter for one of those
+makes the probe throw; previously the result then read as `undefined` and
+the keystroke gate silently passed. `classifyPasswordProbe` (`focus.ts`)
+now checks the CDP response's `exceptionDetails` (and an `undefined` value
+with no exception, belt-and-braces) and fails **closed** with
+`focus_probe_failed` instead of treating an unreadable probe as "no
+field" — we don't actually know it IS a password field, just that we
+couldn't rule it out, so the code is deliberately distinct from
+`password_field` (whose recovery hint suggests `allowPassword=true`,
+which would be misleading here). `fill` was never affected: it reads the
+`type` attribute from the browser's DOM via CDP `DOM.getAttributes`, which
+a page cannot shadow with a throwing or lying JS accessor.
+
+**Exploitability (residual — closed shadow roots / iframes):** the agent
+must (a) drive focus into the closed root / iframe and (b) the page (or
+iframe) must be on an allowlisted domain — a site the user already
+trusted. Real but narrow blind spots, and only for `key_type` /
+`send_keys`; `fill` into the same field reads the DOM attribute directly
+and is caught regardless.
 
 **Possible fix:** resolve the focused node at the CDP `DOM` level (which
 can pierce closed roots) and walk frames via `Target.getTargets` — the

@@ -188,6 +188,7 @@ describe('audit log', () => {
 });
 
 import {
+  MAX_AUDIT_ITEMS,
   MAX_AUDIT_STRING,
   redactAuditArgs,
   truncateAuditString,
@@ -290,6 +291,37 @@ describe('audit truncation — pure helpers', () => {
     expect(list[1] as string).toContain('chars total');
     expect((list[2] as { inner: string }).inner).toContain('chars total');
   });
+
+  it('truncateAuditValue: caps a wide array at MAX_AUDIT_ITEMS with a "more" marker', () => {
+    const wide = Array.from({ length: MAX_AUDIT_ITEMS + 10 }, (_, i) => `item${i}`);
+    const out = truncateAuditValue(wide) as unknown[];
+    expect(out.length).toBe(MAX_AUDIT_ITEMS + 1); // capped items + one marker
+    expect(out[MAX_AUDIT_ITEMS]).toBe('…<10 more>');
+    expect(out.slice(0, MAX_AUDIT_ITEMS)).toEqual(wide.slice(0, MAX_AUDIT_ITEMS));
+  });
+
+  it('truncateAuditValue: caps a wide object at MAX_AUDIT_ITEMS keys with a "more" marker', () => {
+    const wide: Record<string, string> = {};
+    for (let i = 0; i < MAX_AUDIT_ITEMS + 5; i++) wide[`k${i}`] = `v${i}`;
+    const out = truncateAuditValue(wide) as Record<string, unknown>;
+    expect(Object.keys(out)).toHaveLength(MAX_AUDIT_ITEMS + 1); // capped keys + one marker
+    expect(out['…']).toBe('5 more keys');
+  });
+
+  it('truncateAuditValue: a deeply-nested/wide structure still terminates within the shared budget', () => {
+    // Adversarial shape: nesting AND width both far exceed the budget — the
+    // shared running counter (not independent per-level caps) must still
+    // bound the total work/output regardless of how it's distributed.
+    let pathological: unknown = 'leaf';
+    for (let level = 0; level < 20; level++) {
+      pathological = Array.from({ length: 20 }, () => pathological);
+    }
+    const out = truncateAuditValue(pathological);
+    // Must not throw/hang, and must not silently accept unbounded expansion —
+    // a cheap proxy for "bounded total size" is a small serialised length.
+    expect(() => JSON.stringify(out)).not.toThrow();
+    expect(JSON.stringify(out).length).toBeLessThan(2000);
+  });
 });
 
 describe('appendAudit — truncates entries before storage', () => {
@@ -330,5 +362,21 @@ describe('appendAudit — truncates entries before storage', () => {
     await appendAudit(small);
     const log = await getAudit();
     expect(log[0]).toEqual(small);
+  });
+
+  it('bounds a wide FLAT args object by TOP-LEVEL key count too, not just per-value', async () => {
+    // Regression: mapping truncateAuditValue over each top-level key
+    // individually gives every value its own fresh MAX_AUDIT_ITEMS budget,
+    // leaving the number of top-level keys itself unbounded — a wide flat
+    // args object (many short values, none individually over any cap)
+    // would still serialise unbounded. The whole args object must share
+    // ONE budget with everything nested under it.
+    const wideArgs: Record<string, string> = {};
+    for (let i = 0; i < MAX_AUDIT_ITEMS + 50; i++) wideArgs[`k${i}`] = `v${i}`;
+    await appendAudit({ ts: 1, tool: 'click', args: wideArgs, ok: true });
+    const log = await getAudit();
+    const keys = Object.keys(log[0].args);
+    expect(keys.length).toBeLessThanOrEqual(MAX_AUDIT_ITEMS + 1); // capped keys + one marker
+    expect(log[0].args['…']).toBe('50 more keys');
   });
 });
