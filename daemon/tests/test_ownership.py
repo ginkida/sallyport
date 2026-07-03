@@ -313,6 +313,19 @@ async def test_call_tool_records_create_then_gates_subsequent_calls() -> None:
     assert b.seen[-1] == ("snapshot", {"tabId": 5, EPOCH_ARG: "e1"})
 
 
+async def test_call_tool_strips_epoch_from_the_agent_facing_result() -> None:
+    """`epoch` is internal ownership-registry bookkeeping (invariant #13) —
+    record_result consumes it, but the agent (and the MCP schema) should
+    never see it in the tool result."""
+    b = _StubBridge()
+    b.responses["navigate"] = {"tabId": 5, "epoch": "e1", "url": "https://x"}
+    out = await b.call_tool("navigate", {"url": "https://x"}, client_id="A")
+    assert out == {"tabId": 5, "url": "https://x"}
+    assert "epoch" not in out
+    # The registry still recorded it correctly despite the stripped result.
+    assert b._ownership.epoch_for("A", 5) == "e1"
+
+
 async def test_call_tool_unowned_tab_is_rejected_before_roundtrip() -> None:
     b = _StubBridge()
     with pytest.raises(ToolError) as exc:

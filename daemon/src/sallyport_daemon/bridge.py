@@ -484,6 +484,14 @@ class Bridge:
                     # then owner-scope a list_tabs result (fail-closed) before it
                     # leaves the daemon.
                     record_result(self._ownership, client_id, name, result, opened_at=time.time())
+                    if isinstance(result, dict) and "epoch" in result:
+                        # `epoch` is internal ownership-registry bookkeeping
+                        # (invariant #13, confirmed extension-side in
+                        # tools.ts:runTool) — record_result just consumed it
+                        # above. Strip it so the agent-facing result (and its
+                        # MCP schema) doesn't have to explain a field with no
+                        # actionable meaning to the caller.
+                        result = {k: v for k, v in result.items() if k != "epoch"}
                     record_close(self._ownership, client_id, name, args)
                     if name == "list_tabs":
                         result = scope_list_tabs(self._ownership, client_id, result)
