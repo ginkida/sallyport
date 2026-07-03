@@ -6,6 +6,44 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **The keystroke password gate (`key_type`/`send_keys`) now fails closed when
+  its focus probe throws or returns no value.** A page defining a throwing
+  getter for `type`/`shadowRoot` previously made the probe throw, the result
+  read as `undefined`, and the gate silently passed — documented in
+  SECURITY.md as the "hostile in-page getters" blind spot. `classifyPasswordProbe`
+  (`extension/src/tools/focus.ts`) now checks the CDP response's
+  `exceptionDetails` and blocks with a new `focus_probe_failed` code
+  (deliberately distinct from `password_field`, since we don't actually know
+  it IS a password field — the hint doesn't suggest `allowPassword=true`).
+  `fill` was never affected (reads the DOM attribute via `DOM.getAttributes`,
+  which a page can't shadow).
+- **The audit log's per-string truncation now also bounds array/object
+  fan-out**, closing the "pathological agent spams huge structured args"
+  gap SECURITY.md's audit-log-persistence limitation flagged. `truncateAuditValue`
+  now shares one running item budget (`MAX_AUDIT_ITEMS`=16) across the whole
+  nested structure — not an independent per-level width/depth pair, which
+  still multiplies out — so a wide-or-deep args object collapses to a
+  `…N more`/`…N more keys` marker instead of growing unbounded.
+
+### Fixed
+
+- `error_taxonomy.py` now has recovery hints for two previously-unmapped but
+  real thrown codes: `timeout` (navigate's page-load watchdog — the anti-rot
+  test used to forbid this key, conflating it with `wait_for`/`settle`'s
+  unrelated non-error `reason:'timeout'` field) and `error` (the extension's
+  generic catch-all for a non-`BridgeError` throw). `tab_not_visible`'s hint
+  no longer tells a broker-mode agent to retry with `bringToFront` — that's
+  `bringtofront_forbidden` in broker mode — and now points at snapshot/read_text
+  directly.
+
+### Changed
+
+- Added `timeout-minutes` to every CI/CodeQL/publish job — a hung runner (a
+  stuck test or CDP wait) now fails fast instead of burning GitHub's default
+  360-minute ceiling.
+
 ## [0.14.3] — 2026-07-02
 
 Maintenance + robustness patch. No wire change (`PROTOCOL_VERSION` stays `1`),
