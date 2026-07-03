@@ -35,3 +35,41 @@ export function findActiveField(root: { activeElement?: FocusNode }): {
     type: el && el.type ? String(el.type).toLowerCase() : '',
   };
 }
+
+/** Decide what `ensureNotPasswordField` (keyboard.ts) should do with a
+ * `Runtime.evaluate` probe result. Pure/chrome-free so the decision is
+ * unit-testable, mirroring `classifyAttachError`/`classifyWaitError`.
+ *
+ * SECURITY.md documents a blind spot: a page with a throwing getter for
+ * `type`/`shadowRoot` makes the `findActiveField` probe throw, so
+ * `result.value` never arrives — treating that as "not a password field"
+ * would silently let the gate pass. Fail closed instead: a probe exception
+ * or a missing value blocks the keystroke with a distinct code from
+ * `password_field` (we don't actually know it IS a password field, just
+ * that we couldn't rule it out), so the recovery hint can't misleadingly
+ * suggest `allowPassword=true`. */
+export function classifyPasswordProbe(
+  result: { value?: { tag: string; type: string } },
+  hadException: boolean,
+):
+  | { blocked: false }
+  | { blocked: true; code: 'password_field' | 'focus_probe_failed'; reason: string } {
+  if (hadException || result.value === undefined) {
+    return {
+      blocked: true,
+      code: 'focus_probe_failed',
+      reason:
+        "could not verify the focused field is safe to type into (the page's type/shadowRoot " +
+        'accessor threw or returned nothing) — use fill instead (reads the DOM attribute ' +
+        'directly, unaffected by in-page getters), or inspect the field with snapshot/get_state',
+    };
+  }
+  if (result.value.tag === 'INPUT' && result.value.type === 'password') {
+    return {
+      blocked: true,
+      code: 'password_field',
+      reason: 'focus is on <input type=password>; pass allowPassword=true to override',
+    };
+  }
+  return { blocked: false };
+}
