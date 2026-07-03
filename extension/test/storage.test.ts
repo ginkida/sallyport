@@ -363,4 +363,20 @@ describe('appendAudit — truncates entries before storage', () => {
     const log = await getAudit();
     expect(log[0]).toEqual(small);
   });
+
+  it('bounds a wide FLAT args object by TOP-LEVEL key count too, not just per-value', async () => {
+    // Regression: mapping truncateAuditValue over each top-level key
+    // individually gives every value its own fresh MAX_AUDIT_ITEMS budget,
+    // leaving the number of top-level keys itself unbounded — a wide flat
+    // args object (many short values, none individually over any cap)
+    // would still serialise unbounded. The whole args object must share
+    // ONE budget with everything nested under it.
+    const wideArgs: Record<string, string> = {};
+    for (let i = 0; i < MAX_AUDIT_ITEMS + 50; i++) wideArgs[`k${i}`] = `v${i}`;
+    await appendAudit({ ts: 1, tool: 'click', args: wideArgs, ok: true });
+    const log = await getAudit();
+    const keys = Object.keys(log[0].args);
+    expect(keys.length).toBeLessThanOrEqual(MAX_AUDIT_ITEMS + 1); // capped keys + one marker
+    expect(log[0].args['…']).toBe('50 more keys');
+  });
 });

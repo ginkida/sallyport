@@ -188,9 +188,12 @@ export function truncateAuditValue(v: unknown): unknown {
 export async function appendAudit(entry: AuditEntry): Promise<void> {
   const safe: AuditEntry = {
     ...entry,
-    args: Object.fromEntries(
-      Object.entries(entry.args).map(([k, v]) => [k, truncateAuditValue(v)]),
-    ),
+    // Pass the WHOLE args object through the budgeted truncator (not a
+    // per-key map) so the top-level key count shares the same budget as
+    // everything nested under it — mapping per-key would give each value
+    // its own fresh MAX_AUDIT_ITEMS budget, leaving the number of top-level
+    // keys itself unbounded (a wide, flat args object would still fan out).
+    args: truncateAuditValue(entry.args) as Record<string, unknown>,
   };
   if (entry.error !== undefined) safe.error = truncateAuditString(entry.error);
 
