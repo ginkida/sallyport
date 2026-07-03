@@ -112,6 +112,16 @@ def test_drop_tab_and_release_client() -> None:
     assert reg.release_client("A") == {}  # idempotent
 
 
+def test_drop_tab_for_a_client_with_no_owned_tabs_at_all() -> None:
+    """A client_id that never created a tab has no entry in `_owned` at all
+    (as opposed to an empty/emptied dict) — the `owned is not None` guard's
+    False arm, distinct from the "tab id absent within an existing client"
+    case covered above."""
+    reg = OwnershipRegistry()
+    reg.drop_tab("never-seen-client", 5)  # no error, no entry ever created
+    assert reg.owned_tab_ids("never-seen-client") == set()
+
+
 # --- ensure_owns gate ------------------------------------------------------
 
 
