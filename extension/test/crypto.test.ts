@@ -42,6 +42,26 @@ describe('decodeSecret', () => {
   });
 });
 
+describe('Signer with no secret set', () => {
+  it('sign() throws before any secret has been set', async () => {
+    const s = new Signer();
+    await expect(s.sign('ping', {})).rejects.toThrow(/no secret/);
+  });
+
+  it('verify() throws before any secret has been set', async () => {
+    const s = new Signer();
+    await expect(
+      s.verify({ v: 1, ts: 0, nonce: 'n', type: 'ping', body: {}, mac: 'x' }),
+    ).rejects.toThrow(/no secret/);
+  });
+
+  it('sign()/verify() throw again after clear()', async () => {
+    const s = await makeSigner(SECRET_BYTES);
+    s.clear();
+    await expect(s.sign('ping', {})).rejects.toThrow(/no secret/);
+  });
+});
+
 describe('Signer.sign / verify roundtrip', () => {
   it('signs and verifies a simple envelope', async () => {
     const s = await makeSigner(SECRET_BYTES);
@@ -160,6 +180,36 @@ describe('Signer.verify field validation', () => {
     const signed = await s.sign('ping', {});
     signed.mac = '!!!not base64!!!';
     await expect(s.verify(signed)).rejects.toThrow();
+  });
+
+  it('rejects empty/missing nonce (bad nonce, distinct from mac issues)', async () => {
+    const s = await makeSigner(SECRET_BYTES);
+    const signed = await s.sign('ping', {});
+    signed.nonce = '';
+    await expect(s.verify(signed)).rejects.toThrow(/bad nonce/);
+    const signed2 = await s.sign('ping', {});
+    delete (signed2 as Record<string, unknown>).nonce;
+    await expect(s.verify(signed2)).rejects.toThrow(/bad nonce/);
+  });
+
+  it('rejects a missing/non-string mac (type check, before base64 decode)', async () => {
+    const s = await makeSigner(SECRET_BYTES);
+    const signed = await s.sign('ping', {});
+    delete (signed as Record<string, unknown>).mac;
+    await expect(s.verify(signed)).rejects.toThrow(/bad mac/);
+    const signed2 = await s.sign('ping', {});
+    (signed2 as Record<string, unknown>).mac = 12345;
+    await expect(s.verify(signed2)).rejects.toThrow(/bad mac/);
+  });
+
+  it('rejects a valid-base64 mac of the wrong byte length (constant-time compare short-circuit)', async () => {
+    // constantTimeEq's length check must reject before ever comparing bytes —
+    // a shorter-but-valid-base64 mac must not accidentally verify as a
+    // truncated prefix match.
+    const s = await makeSigner(SECRET_BYTES);
+    const signed = await s.sign('ping', {});
+    signed.mac = Buffer.from(signed.mac, 'base64').subarray(0, 10).toString('base64');
+    await expect(s.verify(signed)).rejects.toThrow(/mac mismatch/);
   });
 
   it('rejects non-string id', async () => {
