@@ -1403,8 +1403,10 @@ def test_terminate_stale_holder_skips_a_pid_that_no_longer_re_verifies(
     monkeypatch.setattr(m, "_ps_snapshot", lambda: "100 1 03:00:00 sallyport-daemon\n")
     monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append(pid))
     monkeypatch.setattr(m, "_reverify_stale_orphan", lambda pid: False)
-    # Even though a stale holder was found, nothing gets signalled.
-    assert m._terminate_stale_holder(10086, Path("/nonexistent")) is True
+    # Nothing was actually signalled, so the return value must say so too —
+    # the caller (ensure_port_available) uses it to decide whether a re-probe
+    # is worth trying at all.
+    assert m._terminate_stale_holder(10086, Path("/nonexistent")) is False
     assert killed == []
 
 

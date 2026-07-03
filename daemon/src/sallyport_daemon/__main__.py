@@ -541,7 +541,11 @@ def _terminate_stale_holder(port: int, config_dir: Path) -> bool:
     while remaining and time.monotonic() < deadline:
         time.sleep(0.1)
         remaining = [pid for pid in remaining if _pid_alive(pid)]
-    return True
+    # True only if something was ACTUALLY signalled — every stale candidate
+    # can lose the _reverify_stale_orphan race (exited/recycled between the
+    # snapshot and here), in which case nothing changed and the caller's
+    # re-probe would just waste a round-trip before falling through anyway.
+    return bool(signalled)
 
 
 def ensure_port_available(host: str, port: int, config_dir: Path) -> None:

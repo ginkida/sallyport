@@ -460,7 +460,13 @@ class Bridge:
         # Imported lazily to avoid a circular reference (local_tools imports
         # ToolError from this module).
         from .local_tools import LOCAL_TOOLS, PRE_CALL_VALIDATORS
-        from .ownership import ensure_owns, record_close, record_result, scope_list_tabs
+        from .ownership import (
+            CREATE_CAPABLE,
+            ensure_owns,
+            record_close,
+            record_result,
+            scope_list_tabs,
+        )
 
         started = time.monotonic()
         try:
@@ -484,13 +490,16 @@ class Bridge:
                     # then owner-scope a list_tabs result (fail-closed) before it
                     # leaves the daemon.
                     record_result(self._ownership, client_id, name, result, opened_at=time.time())
-                    if isinstance(result, dict) and "epoch" in result:
+                    if name in CREATE_CAPABLE and isinstance(result, dict) and "epoch" in result:
                         # `epoch` is internal ownership-registry bookkeeping
                         # (invariant #13, confirmed extension-side in
                         # tools.ts:runTool) — record_result just consumed it
                         # above. Strip it so the agent-facing result (and its
                         # MCP schema) doesn't have to explain a field with no
-                        # actionable meaning to the caller.
+                        # actionable meaning to the caller. Gated on the same
+                        # CREATE_CAPABLE set record_result reads from, so an
+                        # unrelated future tool that happens to return a field
+                        # literally named "epoch" isn't silently stripped too.
                         result = {k: v for k, v in result.items() if k != "epoch"}
                     record_close(self._ownership, client_id, name, args)
                     if name == "list_tabs":
