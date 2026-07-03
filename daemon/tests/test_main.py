@@ -890,6 +890,78 @@ def test_find_sallyport_processes_excludes_self() -> None:
     assert [p.pid for p in procs] == [200, 400]
 
 
+class _FakeRun:
+    """Minimal stand-in for subprocess.run's return value — only `.stdout` is
+    read by `_reverify_stale_orphan`."""
+
+    def __init__(self, stdout: str) -> None:
+        self.stdout = stdout
+
+
+def test_reverify_stale_orphan_still_matches(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(
+        m.subprocess, "run", lambda *a, **k: _FakeRun("100 1 03:00:05 sallyport-daemon\n")
+    )
+    assert m._reverify_stale_orphan(100) is True
+
+
+def test_reverify_stale_orphan_pid_exited(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`ps -p <gone>` prints nothing (or just a header, filtered by parse_ps_line
+    returning None) once the process no longer exists."""
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _FakeRun(""))
+    assert m._reverify_stale_orphan(100) is False
+
+
+def test_reverify_stale_orphan_pid_recycled_to_unrelated_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact TOCTOU scenario this guards against: the orphan exited and the
+    OS handed its pid to some other, unrelated process."""
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(
+        m.subprocess, "run", lambda *a, **k: _FakeRun("100 1 00:00:01 /usr/bin/some-other-tool\n")
+    )
+    assert m._reverify_stale_orphan(100) is False
+
+
+def test_reverify_stale_orphan_pid_recycled_to_a_live_sallyport_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recycled to ANOTHER sallyport-daemon, but one with a live parent — not
+    orphaned, so still must not be signalled."""
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(
+        m.subprocess, "run", lambda *a, **k: _FakeRun("100 555 00:00:01 sallyport-daemon\n")
+    )
+    assert m._reverify_stale_orphan(100) is False
+
+
+def test_reverify_stale_orphan_pid_recycled_to_a_broker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A broker is orphan-by-design and must never be reverified as killable."""
+    import sallyport_daemon.__main__ as m
+
+    monkeypatch.setattr(
+        m.subprocess, "run", lambda *a, **k: _FakeRun("100 1 03:00:05 sallyport-daemon broker\n")
+    )
+    assert m._reverify_stale_orphan(100) is False
+
+
+def test_reverify_stale_orphan_ps_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sallyport_daemon.__main__ as m
+
+    def _raise(*a: object, **k: object) -> None:
+        raise OSError("ps not found")
+
+    monkeypatch.setattr(m.subprocess, "run", _raise)
+    assert m._reverify_stale_orphan(100) is False
+
+
 def test_is_broker_command() -> None:
     from sallyport_daemon.__main__ import _is_broker_command
 
@@ -919,6 +991,7 @@ def test_kill_stale_spares_orphaned_broker(
     killed: list[int] = []
     monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append(pid))
     monkeypatch.setattr(m, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(m, "_reverify_stale_orphan", lambda pid: True)
     m._run_kill_stale()
     out = capsys.readouterr().out
     assert killed == [200]  # the plain orphan is reaped; the broker is spared
@@ -1172,6 +1245,7 @@ def test_kill_stale_terminates_only_orphans(
     monkeypatch.setattr(m.os, "getpid", lambda: 400)
     monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     monkeypatch.setattr(m, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(m, "_reverify_stale_orphan", lambda pid: True)
     m._run_kill_stale()
     out = capsys.readouterr().out
     assert killed == [(100, _signal.SIGTERM)]
@@ -1190,9 +1264,30 @@ def test_kill_stale_reports_survivors(
     monkeypatch.setattr(m.os, "kill", lambda pid, sig: None)
     monkeypatch.setattr(m, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(m.time, "monotonic", _FakeMonotonic())
+    monkeypatch.setattr(m, "_reverify_stale_orphan", lambda pid: True)
     m._run_kill_stale()
     out = capsys.readouterr().out
     assert "WARN  PID 100 ignored SIGTERM" in out
+
+
+def test_kill_stale_skips_a_pid_that_no_longer_re_verifies(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """TOCTOU guard: if the pid no longer re-verifies as the same orphaned
+    daemon right before the kill (exited + recycled between the batch ps
+    snapshot and now), --kill-stale must skip it, not blindly SIGTERM
+    whatever now has that pid."""
+    import sallyport_daemon.__main__ as m
+
+    killed: list[int] = []
+    monkeypatch.setattr(m, "_ps_snapshot", lambda: "100 1 03:00:00 sallyport-daemon\n")
+    monkeypatch.setattr(m.os, "getpid", lambda: 400)
+    monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(m, "_reverify_stale_orphan", lambda pid: False)
+    m._run_kill_stale()
+    out = capsys.readouterr().out
+    assert killed == []
+    assert "SKIP  PID 100" in out
 
 
 class _FakeMonotonic:
@@ -1288,10 +1383,29 @@ def test_ensure_port_available_evicts_stale_orphan(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     monkeypatch.setattr(m, "_pid_alive", lambda pid: False)
     monkeypatch.setattr(m.time, "sleep", lambda *a: None)
+    monkeypatch.setattr(m, "_reverify_stale_orphan", lambda pid: True)
 
     m.ensure_port_available("127.0.0.1", 10086, Path("/nonexistent"))
     assert killed == [(100, _signal.SIGTERM)]
     assert probes["n"] == 2  # re-probed after the eviction
+
+
+def test_terminate_stale_holder_skips_a_pid_that_no_longer_re_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same TOCTOU guard as --kill-stale, on the automatic startup eviction
+    path — this one runs on every daemon launch, not just a diagnostic
+    command, so the stakes for signalling the wrong pid are higher."""
+    import sallyport_daemon.__main__ as m
+
+    killed: list[int] = []
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [100])
+    monkeypatch.setattr(m, "_ps_snapshot", lambda: "100 1 03:00:00 sallyport-daemon\n")
+    monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(m, "_reverify_stale_orphan", lambda pid: False)
+    # Even though a stale holder was found, nothing gets signalled.
+    assert m._terminate_stale_holder(10086, Path("/nonexistent")) is True
+    assert killed == []
 
 
 def test_ensure_port_available_refuses_live_holder(
