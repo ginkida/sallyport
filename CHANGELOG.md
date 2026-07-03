@@ -26,6 +26,18 @@ uses [Semantic Versioning](https://semver.org/).
   nested structure — not an independent per-level width/depth pair, which
   still multiplies out — so a wide-or-deep args object collapses to a
   `…N more`/`…N more keys` marker instead of growing unbounded.
+- **`doctor --kill-stale` and the automatic startup port-eviction now
+  re-verify a process right before signalling it**, closing a TOCTOU window:
+  both built their kill list from one `ps` snapshot, then looped
+  `os.kill(pid, SIGTERM)` with no re-check — if the real orphaned daemon
+  exited on its own and the OS recycled its exact pid for an unrelated
+  process in that window, the old code would have signalled the wrong
+  process. `_reverify_stale_orphan` re-checks (still a sallyport-daemon,
+  still orphaned, still not a broker) immediately before each `os.kill`;
+  a pid that no longer matches is skipped and reported, never signalled.
+  The automatic startup path (`ensure_port_available`, not just the
+  diagnostic command) is the higher-stakes one — it runs on every daemon
+  launch.
 
 ### Fixed
 
@@ -37,6 +49,18 @@ uses [Semantic Versioning](https://semver.org/).
   no longer tells a broker-mode agent to retry with `bringToFront` — that's
   `bringtofront_forbidden` in broker mode — and now points at snapshot/read_text
   directly.
+- **`navigate`'s result in broker mode no longer leaks the internal
+  ownership `epoch` field.** `record_result` (invariant #13 bookkeeping)
+  read `epoch` off the tool result but never removed it before the result
+  reached the agent, so every broker-mode create-own `navigate` call
+  returned an opaque, undocumented UUID string alongside `tabId`/`url`.
+  `Bridge.call_tool` now strips it after recording — a field with no
+  actionable meaning to the caller shouldn't need explaining in the MCP
+  schema.
+- `README.md`'s Tools table was missing `find`/`reveal`/`settle` (shipped
+  since 0.8.0), its test counts were stale (439/594 → 458/646), and its
+  permissions list omitted `contextMenus` (added for the popup-pin
+  context-menu entry).
 
 ### Changed
 
