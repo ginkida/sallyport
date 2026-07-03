@@ -22,10 +22,10 @@ uses [Semantic Versioning](https://semver.org/).
 - **The audit log's per-string truncation now also bounds array/object
   fan-out**, closing the "pathological agent spams huge structured args"
   gap SECURITY.md's audit-log-persistence limitation flagged. `truncateAuditValue`
-  now shares one running item budget (`MAX_AUDIT_ITEMS`=16) across the whole
-  nested structure — not an independent per-level width/depth pair, which
-  still multiplies out — so a wide-or-deep args object collapses to a
-  `…N more`/`…N more keys` marker instead of growing unbounded.
+  shares one running item budget (`MAX_AUDIT_ITEMS`=16) across the WHOLE
+  logged value — including a tool call's own top-level args keys, not just
+  what's nested under each one — so a wide-or-deep args object collapses
+  to a `…N more`/`…N more keys` marker instead of growing unbounded.
 - **`doctor --kill-stale` and the automatic startup port-eviction now
   re-verify a process right before signalling it**, closing a TOCTOU window:
   both built their kill list from one `ps` snapshot, then looped
