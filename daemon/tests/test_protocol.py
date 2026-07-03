@@ -347,6 +347,38 @@ def test_verify_rejects_empty_type() -> None:
         s.verify(raw)
 
 
+def test_verify_rejects_empty_nonce() -> None:
+    s = Signer(SECRET)
+    raw = s.sign(Envelope(type="ping", body={}))
+    raw["nonce"] = ""
+    with pytest.raises(ProtocolError, match="bad nonce"):
+        s.verify(raw)
+
+
+def test_verify_rejects_non_string_nonce() -> None:
+    s = Signer(SECRET)
+    raw = s.sign(Envelope(type="ping", body={}))
+    raw["nonce"] = 12345
+    with pytest.raises(ProtocolError, match="bad nonce"):
+        s.verify(raw)
+
+
+def test_verify_rejects_missing_mac() -> None:
+    s = Signer(SECRET)
+    raw = s.sign(Envelope(type="ping", body={}))
+    del raw["mac"]
+    with pytest.raises(ProtocolError, match="bad mac"):
+        s.verify(raw)
+
+
+def test_verify_rejects_non_string_mac() -> None:
+    s = Signer(SECRET)
+    raw = s.sign(Envelope(type="ping", body={}))
+    raw["mac"] = 12345
+    with pytest.raises(ProtocolError, match="bad mac"):
+        s.verify(raw)
+
+
 def test_verify_rejects_non_base64_mac() -> None:
     s = Signer(SECRET)
     raw = s.sign(Envelope(type="ping", body={}))
