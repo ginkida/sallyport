@@ -1,6 +1,6 @@
 [project]
 name = "sallyport"
-version = "0.14.3"
+version = "0.14.4"
 description = "MCP server bridging Claude Code to a browser extension over WS+HMAC"
 readme = "README.md"
 license = "MIT"

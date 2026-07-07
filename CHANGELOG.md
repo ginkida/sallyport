@@ -6,6 +6,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.14.4] — 2026-07-07
+
+Security-hardening + coverage patch. No wire change (`PROTOCOL_VERSION` stays
+`1`), drop-in over 0.14.3.
+
 ### Security
 
 - **The keystroke password gate (`key_type`/`send_keys`) now fails closed when
@@ -58,7 +63,7 @@ uses [Semantic Versioning](https://semver.org/).
   actionable meaning to the caller shouldn't need explaining in the MCP
   schema.
 - `README.md`'s Tools table was missing `find`/`reveal`/`settle` (shipped
-  since 0.8.0), its test counts were stale (439/594 → 458/646), and its
+  since 0.8.0), its test counts were stale (439/594 → 458/647), and its
   permissions list omitted `contextMenus` (added for the popup-pin
   context-menu entry).
 
@@ -1567,7 +1572,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.14.3...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.14.4...HEAD
+[0.14.4]: https://github.com/ginkida/sallyport/compare/v0.14.3...v0.14.4
 [0.14.3]: https://github.com/ginkida/sallyport/compare/v0.14.2...v0.14.3
 [0.14.2]: https://github.com/ginkida/sallyport/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/ginkida/sallyport/compare/v0.14.0...v0.14.1
