@@ -66,12 +66,23 @@ def test_no_hint_for_success_not_error_conditions() -> None:
     """wait_for/settle return settled:false / found:false (with a
     reason:'timeout' string) as SUCCESS, never a ToolError — those must not
     masquerade as recoverable errors. Note "timeout" itself IS a real thrown
-    BridgeError code (navigate's page-load watchdog, tabs.ts) distinct from
-    wait_for/settle's non-error `reason` field of the same name, so it
-    legitimately has a hint — only "settled"/"found" are checked here."""
+    BridgeError code (the shared page-load watchdog in tabs.ts, thrown by
+    both navigate and reload) distinct from wait_for/settle's non-error
+    `reason` field of the same name, so it legitimately has a hint — only
+    "settled"/"found" are checked here."""
     keys = known_codes()
     for not_an_error in ("settled", "found"):
         assert not_an_error not in keys
+
+
+def test_timeout_hint_attributes_the_shared_watchdog_to_both_callers() -> None:
+    """Regression: the "timeout" code is thrown by a single shared watchdog
+    (tabs.ts:waitForLoad) used by BOTH navigate and reload — a hint that only
+    mentions navigate misdirects an agent whose reload call timed out towards
+    retrying the wrong tool (and one that needs a URL it may not have)."""
+    hint = format_error_hint("timeout") or ""
+    assert "navigate" in hint.lower()
+    assert "reload" in hint.lower()
 
 
 def test_no_hint_advertises_a_gate_relaxing_flag() -> None:

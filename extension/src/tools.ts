@@ -99,7 +99,16 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
     // A typing call rejected by the password gate still carries the
     // attempted secret in args (the success path already redacts when
     // allowPassword=true). Redact it before it reaches the audit log.
-    if (e instanceof BridgeError && e.code === 'password_field') {
+    // `focus_probe_failed` (classifyPasswordProbe's fail-closed branch,
+    // focus.ts) is included too: it fires precisely when we couldn't rule
+    // OUT a password field, so the same "might be a credential" reasoning
+    // applies — not redacting here would leak the attempted secret into the
+    // persisted, popup-exportable audit log even though the keystroke itself
+    // was correctly blocked from reaching the page.
+    if (
+      e instanceof BridgeError &&
+      (e.code === 'password_field' || e.code === 'focus_probe_failed')
+    ) {
       audit.args = redactAuditArgs(name, callArgs, { force: true });
     }
     await appendAudit(audit);

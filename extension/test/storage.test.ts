@@ -305,7 +305,46 @@ describe('audit truncation — pure helpers', () => {
     for (let i = 0; i < MAX_AUDIT_ITEMS + 5; i++) wide[`k${i}`] = `v${i}`;
     const out = truncateAuditValue(wide) as Record<string, unknown>;
     expect(Object.keys(out)).toHaveLength(MAX_AUDIT_ITEMS + 1); // capped keys + one marker
-    expect(out['…']).toBe('5 more keys');
+    // No exact remaining-count here (unlike the array marker): computing one
+    // would require a full pass over the object, which is exactly the
+    // unbounded-enumeration-cost gap this behavior closes.
+    expect(out['…']).toBe('<more keys omitted, audit budget exhausted>');
+  });
+
+  it('truncateAuditValue: skips inherited (non-own) enumerable properties', () => {
+    // for...in walks the prototype chain; only own keys should survive.
+    const proto = { inherited: 'from-proto' };
+    const obj = Object.create(proto) as Record<string, string>;
+    obj.own = 'mine';
+    const out = truncateAuditValue(obj) as Record<string, unknown>;
+    expect(out).toEqual({ own: 'mine' });
+  });
+
+  it('truncateAuditValue: truncates an oversized object KEY, not just its value', () => {
+    const hugeKey = 'k'.repeat(MAX_AUDIT_STRING + 500);
+    const out = truncateAuditValue({ [hugeKey]: 'short value' }) as Record<string, unknown>;
+    const keys = Object.keys(out);
+    expect(keys).toHaveLength(1);
+    expect(keys[0].length).toBeLessThan(hugeKey.length);
+    expect(keys[0]).toContain(`${hugeKey.length} chars total`);
+  });
+
+  it('truncateAuditValue: a very wide object never recurses/allocates past the budget', () => {
+    // NOTE: enumerating a plain object's own keys is inherently O(width) in
+    // a JS engine (there's no lazy/partial enumeration API), so this is a
+    // regression guard against reintroducing the WORSE eager pattern
+    // (Object.entries() materialising a full array of every key/value pair,
+    // then recursing into values before checking the budget) — not a claim
+    // that this stays fast at arbitrary width. The bound is generous on
+    // purpose to avoid CI flakiness while still catching a return to
+    // quadratic-ish behavior (e.g. recursing/copying past the budget).
+    const veryWide: Record<string, string> = {};
+    for (let i = 0; i < 200_000; i++) veryWide[`k${i}`] = 'v';
+    const start = performance.now();
+    const out = truncateAuditValue(veryWide) as Record<string, unknown>;
+    const elapsedMs = performance.now() - start;
+    expect(Object.keys(out)).toHaveLength(MAX_AUDIT_ITEMS + 1);
+    expect(elapsedMs).toBeLessThan(500);
   });
 
   it('truncateAuditValue: a deeply-nested/wide structure still terminates within the shared budget', () => {
@@ -377,6 +416,6 @@ describe('appendAudit — truncates entries before storage', () => {
     const log = await getAudit();
     const keys = Object.keys(log[0].args);
     expect(keys.length).toBeLessThanOrEqual(MAX_AUDIT_ITEMS + 1); // capped keys + one marker
-    expect(log[0].args['…']).toBe('50 more keys');
+    expect(log[0].args['…']).toBe('<more keys omitted, audit budget exhausted>');
   });
 });

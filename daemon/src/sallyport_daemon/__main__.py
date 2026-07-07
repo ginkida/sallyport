@@ -497,9 +497,13 @@ def _pid_alive(pid: int) -> bool:
 def _terminate_stale_holder(port: int, config_dir: Path) -> bool:
     """If ``port`` is held by an ORPHANED sallyport daemon (parent died — a dead
     session's leftover), SIGTERM it and wait briefly for it to release the
-    socket. Returns True if such a holder was found and signalled (caller should
-    re-probe the bind), False if there is nothing safe to evict — port free, held
-    by a *live* session (parent alive), or by a non-sallyport process.
+    socket. Returns True if the caller's re-probe is worth trying — either we
+    signalled a holder, or a candidate turned out to have already exited on its
+    own (which releases anything it held just as surely as a SIGTERM would).
+    Returns False only when there is nothing safe to evict AND nothing changed —
+    port free, held by a *live* session (parent alive), by a non-sallyport
+    process, or by something that's still alive as a DIFFERENT process at that
+    pid (recycled).
 
     Mirrors ``_run_kill_stale``'s policy: only orphans are touched; a daemon with
     a live parent is someone's working bridge and is never killed automatically.
@@ -518,13 +522,31 @@ def _terminate_stale_holder(port: int, config_dir: Path) -> bool:
     if not stale:
         return False
     signalled: list[int] = []
+    reprobe_worthy = False
     for pid in stale:
         if not _reverify_stale_orphan(pid):
-            print(
-                f"Sallyport: PID {pid} no longer matches the orphaned daemon seen a "
-                "moment ago (exited, or its pid was recycled) — not signalling.",
-                file=sys.stderr,
-            )
+            if _pid_alive(pid):
+                print(
+                    f"Sallyport: PID {pid} no longer matches the orphaned daemon seen a "
+                    "moment ago (its pid was recycled by a different, live process) — "
+                    "not signalling.",
+                    file=sys.stderr,
+                )
+            else:
+                # It exited on its own in the window between the snapshot and
+                # this re-check — exactly the race _reverify_stale_orphan
+                # narrows, not closes. Nothing to signal, but a process that
+                # has genuinely exited has already released anything it
+                # held, including this port, so the caller's re-probe is
+                # still worth trying — returning False here (as if nothing
+                # had changed) would refuse to start over a port that is, in
+                # all likelihood, already free.
+                print(
+                    f"Sallyport: PID {pid} already exited on its own since the snapshot "
+                    "— not signalling, but the port may already be free.",
+                    file=sys.stderr,
+                )
+                reprobe_worthy = True
             continue
         try:
             os.kill(pid, signal.SIGTERM)
@@ -541,11 +563,7 @@ def _terminate_stale_holder(port: int, config_dir: Path) -> bool:
     while remaining and time.monotonic() < deadline:
         time.sleep(0.1)
         remaining = [pid for pid in remaining if _pid_alive(pid)]
-    # True only if something was ACTUALLY signalled — every stale candidate
-    # can lose the _reverify_stale_orphan race (exited/recycled between the
-    # snapshot and here), in which case nothing changed and the caller's
-    # re-probe would just waste a round-trip before falling through anyway.
-    return bool(signalled)
+    return bool(signalled) or reprobe_worthy
 
 
 def ensure_port_available(host: str, port: int, config_dir: Path) -> None:

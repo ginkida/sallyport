@@ -6,6 +6,55 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.14.5] — 2026-07-07
+
+Follow-up security patch closing gaps surfaced by an independent review of
+0.14.4's hardening pass. No wire change (`PROTOCOL_VERSION` stays `1`),
+drop-in over 0.14.4.
+
+### Security
+
+- **The fail-closed `focus_probe_failed` path (0.14.4) now redacts the audit
+  log too.** `key_type`/`send_keys` correctly blocked the keystroke when the
+  password probe couldn't rule out a password field, but the attempted text
+  still reached the persisted, popup-exportable audit log — only the
+  confirmed `password_field` code triggered the existing force-redaction.
+  `runTool`'s catch block now force-redacts on either code.
+- **Audit-log object keys are now truncated, not just values.** An object
+  whose property NAME was itself huge (e.g. an attacker-controlled HTTP
+  header name via `fetch_in_page`) bypassed `MAX_AUDIT_STRING` entirely,
+  since only values were ever passed through `truncateAuditString`.
+- **Audit-log truncation of wide objects no longer eagerly materializes the
+  whole object before applying its budget.** The object branch used
+  `Object.entries(v)`, which builds an array of every own key/value pair
+  before a single one is checked against `MAX_AUDIT_ITEMS` — costing CPU
+  proportional to the object's width even when the stored result was
+  already correctly capped. It now walks keys via `for...in` and stops the
+  moment the budget is exhausted (SECURITY.md notes the residual, accepted
+  gap: enumerating a plain object's own keys is inherently a full-width pass
+  in the JS runtime, so this reduces the cost, it doesn't make it O(1)).
+- **The automatic startup port-eviction (0.14.4's TOCTOU fix) could refuse
+  to start over a port that had actually just become free.**
+  `_terminate_stale_holder` returned `False` — "nothing to re-probe for" —
+  whenever no pid was signalled, including the case where the stale pid
+  simply exited on its own between the `ps` snapshot and the re-verify
+  check (exactly the race the fix narrows). Since a process that has
+  genuinely exited releases anything it held, including the port, that case
+  is now distinguished from "still alive as something else" and still
+  triggers the caller's re-probe.
+
+### Fixed
+
+- `error_taxonomy.py`'s `timeout` hint attributed the code exclusively to
+  `navigate`, but `reload` throws the identical code and message via the
+  same shared page-load watchdog (`tabs.ts:waitForLoad`) — a timed-out
+  `reload` call got a hint pointing at the wrong tool. The hint now
+  mentions both.
+- SECURITY.md's audit-log-persistence section hadn't been updated for
+  0.14.4's `MAX_AUDIT_ITEMS` fan-out bound, so it still read as if that gap
+  were open. Rewritten to describe the current, more thoroughly bounded
+  state (including this release's key-truncation and redaction fixes).
+
 ## [0.14.4] — 2026-07-07
 
 Security-hardening + coverage patch. No wire change (`PROTOCOL_VERSION` stays
@@ -1572,7 +1621,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.14.4...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.14.5...HEAD
+[0.14.5]: https://github.com/ginkida/sallyport/compare/v0.14.4...v0.14.5
 [0.14.4]: https://github.com/ginkida/sallyport/compare/v0.14.3...v0.14.4
 [0.14.3]: https://github.com/ginkida/sallyport/compare/v0.14.2...v0.14.3
 [0.14.2]: https://github.com/ginkida/sallyport/compare/v0.14.1...v0.14.2

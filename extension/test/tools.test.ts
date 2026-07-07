@@ -27,15 +27,23 @@ vi.mock('../src/tools/dom.js', () => ({
   readText: vi.fn(),
 }));
 
-import { runTool } from '../src/tools.js';
-import { appendAudit } from '../src/storage.js';
+vi.mock('../src/tools/keyboard.js', () => ({
+  keyType: vi.fn(),
+  sendKeys: vi.fn(),
+}));
+
+import { runTool, BridgeError } from '../src/tools.js';
+import { appendAudit, redactAuditArgs } from '../src/storage.js';
 import { clearAllEpochs, mintEpoch } from '../src/tools/ownership.js';
+import { keyType } from '../src/tools/keyboard.js';
 
 beforeEach(() => {
   clearAllEpochs();
   clickStub.mockReset();
   clickStub.mockResolvedValue({ data: { ok: true } });
   vi.mocked(appendAudit).mockClear();
+  vi.mocked(redactAuditArgs).mockClear();
+  vi.mocked(keyType).mockReset();
 });
 
 describe('runTool epoch chokepoint', () => {
@@ -83,5 +91,49 @@ describe('runTool epoch chokepoint', () => {
     await runTool('click', { tabId: 5 });
     expect(clickStub).toHaveBeenCalledOnce();
     expect(clickStub.mock.calls[0][0]).toEqual({ tabId: 5 });
+  });
+});
+
+describe('runTool — force-redacts attempted secrets on password-probe failures', () => {
+  it('force-redacts key_type.text when the tool throws password_field', async () => {
+    vi.mocked(keyType).mockRejectedValueOnce(
+      new BridgeError('password_field', 'key_type: focus is on <input type=password>'),
+    );
+    await expect(runTool('key_type', { tabId: 5, text: 'hunter2' })).rejects.toMatchObject({
+      code: 'password_field',
+    });
+    const forceCall = vi
+      .mocked(redactAuditArgs)
+      .mock.calls.find(([, , opts]) => opts?.force === true);
+    expect(forceCall).toBeDefined();
+    expect(forceCall![0]).toBe('key_type');
+  });
+
+  it('force-redacts key_type.text when the probe fails closed with focus_probe_failed', async () => {
+    // classifyPasswordProbe's fail-closed branch (focus.ts): we couldn't rule
+    // OUT a password field, so the attempted text must not reach the audit
+    // log any less than the confirmed password_field case does.
+    vi.mocked(keyType).mockRejectedValueOnce(
+      new BridgeError('focus_probe_failed', 'key_type: could not verify the focused field'),
+    );
+    await expect(runTool('key_type', { tabId: 5, text: 'hunter2' })).rejects.toMatchObject({
+      code: 'focus_probe_failed',
+    });
+    const forceCall = vi
+      .mocked(redactAuditArgs)
+      .mock.calls.find(([, , opts]) => opts?.force === true);
+    expect(forceCall).toBeDefined();
+    expect(forceCall![0]).toBe('key_type');
+  });
+
+  it('does NOT force-redact on unrelated tool failures', async () => {
+    vi.mocked(keyType).mockRejectedValueOnce(new BridgeError('bad_args', 'key_type: missing text'));
+    await expect(runTool('key_type', { tabId: 5, text: 'hunter2' })).rejects.toMatchObject({
+      code: 'bad_args',
+    });
+    const forceCall = vi
+      .mocked(redactAuditArgs)
+      .mock.calls.find(([, , opts]) => opts?.force === true);
+    expect(forceCall).toBeUndefined();
   });
 });

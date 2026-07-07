@@ -210,20 +210,36 @@ for a narrow, already-trusted-origin case.
 
 ### Audit log persistence depends on `chrome.storage.local` quota
 
-Even with per-entry truncation (`MAX_AUDIT_STRING = 1024`), 500 entries
-× ~5 KB headroom = ~2.5 MB, well inside the 10 MiB quota. A pathological
-agent that spams huge structured arg objects could in principle still
-push it. The truncation walks objects/arrays recursively, so unusual
-shapes don't slip through unbounded.
+Per-entry truncation (`MAX_AUDIT_STRING = 1024` per string, including
+object keys) plus a shared fan-out budget (`MAX_AUDIT_ITEMS = 16`
+array-elements-or-object-keys, one running counter across the WHOLE
+nested structure — not a per-level cap) keep 500 entries well inside the
+10 MiB quota regardless of shape: a pathological agent that spams huge,
+wide, or deeply-nested structured arg objects — or objects with
+huge/attacker-controlled property names (e.g. HTTP header names via
+`fetch_in_page`) — can't fan out the *stored* size past that bound.
+**Residual, accepted gap:** enumerating a plain JS object's own keys is
+inherently a pass over its full width in the extension's runtime (there
+is no lazy/partial enumeration API), so an extremely wide single object
+still costs CPU roughly proportional to its width before the bound kicks
+in — a possible brief (sub-second at realistic sizes) main-thread stall
+on the single-threaded MV3 service worker, not a storage or memory
+blowout, and not exploitable beyond that.
 
-**Typed credentials are redacted.** When `fill` / `key_type` /
-`send_keys` run with `allowPassword=true` (the only way text reaches a
-password field), the typed value is replaced with a length placeholder
-before it is written to the audit log, so passwords are not retained at
-rest or surfaced by the popup's Export. Values typed into non-password
-fields are kept verbatim — that is the point of a visible audit trail —
-so treat the exported log as containing whatever the agent typed into
-ordinary inputs.
+**Typed credentials are redacted — both when typed AND when refused.**
+When `fill` / `key_type` / `send_keys` run with `allowPassword=true` (the
+only way text reaches a password field), the typed value is replaced
+with a length placeholder before it is written to the audit log, so
+passwords are not retained at rest or surfaced by the popup's Export.
+The same redaction applies when a typing call is REJECTED for touching
+(or possibly touching) a password field — both the confirmed
+`password_field` case and the fail-closed `focus_probe_failed` case (the
+page's `type`/`shadowRoot` accessor threw or returned nothing, so the
+field couldn't be ruled out) — so an attempted credential doesn't leak
+into the audit log just because the keystroke itself was correctly
+blocked. Values typed into non-password fields are kept verbatim — that
+is the point of a visible audit trail — so treat the exported log as
+containing whatever the agent typed into ordinary inputs.
 
 ### Allowlist matches any port unless a port is pinned
 

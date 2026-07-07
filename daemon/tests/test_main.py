@@ -1390,12 +1390,45 @@ def test_ensure_port_available_evicts_stale_orphan(monkeypatch: pytest.MonkeyPat
     assert probes["n"] == 2  # re-probed after the eviction
 
 
-def test_terminate_stale_holder_skips_a_pid_that_no_longer_re_verifies(
+def test_ensure_port_available_reprobes_when_stale_holder_already_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end regression for the return-value fix: the stale pid exits on
+    its own right before `_reverify_stale_orphan`'s re-check (nothing gets
+    signalled), but startup must still re-probe and succeed rather than
+    refuse over a port that's actually free by then."""
+    import sallyport_daemon.__main__ as m
+
+    probes = {"n": 0}
+
+    def fake_probe(host: str, port: int) -> tuple[bool, str]:
+        probes["n"] += 1
+        return (probes["n"] > 1, "")  # busy first, free on the re-probe
+
+    killed: list[int] = []
+    monkeypatch.setattr(m, "_probe_bind", fake_probe)
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [100])
+    monkeypatch.setattr(m, "_ps_snapshot", lambda: "100 1 03:00:00 sallyport-daemon\n")
+    monkeypatch.setattr(m.os, "getpid", lambda: 999)
+    monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(m, "_reverify_stale_orphan", lambda pid: False)
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: False)  # gone by re-check time
+
+    m.ensure_port_available("127.0.0.1", 10086, Path("/nonexistent"))
+    assert killed == []  # nothing to signal — it already exited on its own
+    assert probes["n"] == 2  # still re-probed, and startup proceeds
+
+
+def test_terminate_stale_holder_skips_a_pid_recycled_to_a_live_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Same TOCTOU guard as --kill-stale, on the automatic startup eviction
     path — this one runs on every daemon launch, not just a diagnostic
-    command, so the stakes for signalling the wrong pid are higher."""
+    command, so the stakes for signalling the wrong pid are higher.
+
+    Here the pid still belongs to SOME live process (just not our orphan
+    target anymore) — nothing was signalled AND nothing plausibly changed
+    about the port, so the caller should not bother re-probing."""
     import sallyport_daemon.__main__ as m
 
     killed: list[int] = []
@@ -1403,10 +1436,30 @@ def test_terminate_stale_holder_skips_a_pid_that_no_longer_re_verifies(
     monkeypatch.setattr(m, "_ps_snapshot", lambda: "100 1 03:00:00 sallyport-daemon\n")
     monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append(pid))
     monkeypatch.setattr(m, "_reverify_stale_orphan", lambda pid: False)
-    # Nothing was actually signalled, so the return value must say so too —
-    # the caller (ensure_port_available) uses it to decide whether a re-probe
-    # is worth trying at all.
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: True)
     assert m._terminate_stale_holder(10086, Path("/nonexistent")) is False
+    assert killed == []
+
+
+def test_terminate_stale_holder_reprobes_when_a_candidate_already_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: if the stale pid exits on its own in the window between the
+    initial `ps` snapshot and `_reverify_stale_orphan`'s re-check (the exact
+    race this whole mechanism narrows), nothing gets signalled — but the port
+    is nearly certainly free the instant that process exited. The old
+    `return bool(signalled)` treated this identically to "nothing safe to
+    evict" and skipped the caller's re-probe entirely, refusing to start over
+    a port that had, in all likelihood, just become free."""
+    import sallyport_daemon.__main__ as m
+
+    killed: list[int] = []
+    monkeypatch.setattr(m, "_listening_pids", lambda port: [100])
+    monkeypatch.setattr(m, "_ps_snapshot", lambda: "100 1 03:00:00 sallyport-daemon\n")
+    monkeypatch.setattr(m.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(m, "_reverify_stale_orphan", lambda pid: False)
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: False)  # gone by the time we re-check
+    assert m._terminate_stale_holder(10086, Path("/nonexistent")) is True
     assert killed == []
 
 
