@@ -238,6 +238,7 @@ and MCP-client-auth invariants.
 | `list_tabs` | No allowlist check — listing is free. |
 | `navigate` | Checks the *destination* URL against allowlist. `waitFor={selector?,text?,absent?,timeoutMs?}` polls after the load until the page is actually usable (SPAs render long after "loaded"). |
 | `reload` | Hard reload via `bypassCache=true`. Allowlist-gated; refs invalidate. |
+| `history_go` | Back/forward through the tab's session history — return to the previous page without knowing its URL. `direction='back'\|'forward'`, `steps` hops several entries in one jump (intermediate pages never load). The **landing** entry is allowlist-checked *before* anything moves (`Page.getNavigationHistory` → `Page.navigateToHistoryEntry`, no `evaluate`); too far → `no_history` with how far it does reach. Refs invalidate; optional `waitFor`. |
 | `close_tab` | `tabId` required — no implicit fallback (closing the wrong tab loses work). |
 | `snapshot` | Accessibility tree with stable `@eN` refs (per-tab), pruned of layout noise. Cross-checks against a DOM walk (same refs) when the a11y tree looks suspiciously sparse — Telegram Web K and similar SPAs. `mode=auto\|a11y\|dom`; `compact=true` → flat list of actionable elements only; `selector` scopes to one subtree. |
 | `read_text` | Whole-page or by ref. No raw JS. Capped at 20 000 chars by default (`maxChars` overrides; cut results carry `truncated`/`totalChars`). |

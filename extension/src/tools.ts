@@ -14,6 +14,7 @@ import { handleDialog } from './tools/dialog.js';
 import { click, fill, readText } from './tools/dom.js';
 import { fetchInPage } from './tools/fetch.js';
 import { find } from './tools/find.js';
+import { historyGo } from './tools/history.js';
 import { keyType, sendKeys } from './tools/keyboard.js';
 import { hover, mouseClick } from './tools/mouse.js';
 import { networkTail } from './tools/network.js';
@@ -35,6 +36,7 @@ const tools: Record<string, Tool> = {
   list_tabs: listTabs,
   navigate,
   reload,
+  history_go: historyGo,
   close_tab: closeTab,
   snapshot,
   read_text: readText,

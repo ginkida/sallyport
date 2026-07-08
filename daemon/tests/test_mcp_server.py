@@ -49,6 +49,7 @@ def test_tools_catalogue_covers_extension() -> None:
         "list_tabs",
         "navigate",
         "reload",
+        "history_go",
         "close_tab",
         "snapshot",
         "read_text",

@@ -8,6 +8,21 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`history_go` tool — the browser's back/forward buttons.** After following
+  a link an agent often has no way back: the previous page's URL is gone from
+  its context, so it re-derives it or gets stuck — while the browser remembers
+  the whole trail. `history_go` walks it: `direction: back|forward`, `steps`
+  hops several entries in one jump (intermediate pages never load), embedded
+  `waitFor` covers the SPA render gap, refs invalidate like `navigate`.
+  Structured CDP only: `Page.getNavigationHistory` names the LANDING entry's
+  URL before anything moves, so the destination is allowlist-gated exactly
+  like an explicit `navigate` (going "back" can't become a side door to a
+  non-allowlisted page sitting in the history → `domain_not_allowed` naming
+  the host), and the page being left is gated like `reload`. History that
+  doesn't reach that far → `no_history` with how far it does reach; the
+  shared page-load watchdog's `timeout` hint now names all three tools that
+  throw it.
+
 - **`handle_dialog` tool + opt-in JS-dialog auto-handling.** A native JS
   dialog (`alert`/`confirm`/`prompt`/`beforeunload`) freezes the page's JS —
   every subsequent wait/click times out — and the dialog itself is browser UI

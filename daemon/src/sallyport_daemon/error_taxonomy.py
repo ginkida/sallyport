@@ -174,10 +174,16 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
         ),
         "timeout": (
             "retryable=maybe; the page-load watchdog fired (30s) without the tab reaching "
-            "'complete' — thrown by navigate AND by reload (bypassCache or not), both share the "
+            "'complete' — thrown by navigate, reload (bypassCache or not) and history_go, "
+            "which all share the "
             "same watchdog. The page may just be slow/heavy, or stuck loading; wait_for/settle on "
             "a concrete selector instead of relying on full page load, or retry the SAME tool "
-            "that failed (navigate needs a URL; reload just needs the tabId)."
+            "that failed (navigate needs a URL; reload/history_go just need the tabId)."
+        ),
+        "no_history": (
+            "retryable=no; the tab's session history doesn't reach that far in that direction "
+            "(the message says how far it does) — reduce steps, flip direction, or navigate to "
+            "an explicit URL instead; an identical retry fails the same way."
         ),
         "focus_probe_failed": (
             "retryable=no; key_type/send_keys couldn't verify the focused field is safe to type "

@@ -145,6 +145,46 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="history_go",
+        description=(
+            "Go back or forward through a tab's own session history — the "
+            "browser's back/forward buttons. Use it to return to the previous "
+            "page after following a link, when you no longer have that page's "
+            "URL to re-navigate to. direction:'back'|'forward'; steps hops "
+            "several entries in ONE jump (default 1; intermediate pages never "
+            "load). The LANDING entry is allowlist-checked before anything "
+            "moves — going back can't reach a non-allowlisted page that "
+            "happens to sit in the history (you get domain_not_allowed "
+            "naming the host). History that doesn't reach that far → "
+            "no_history (the message says how far it does reach); a "
+            "same-document hop (SPA pushState) may not fire a load at all. "
+            "Refs from the previous snapshot are invalidated — re-snapshot "
+            "after. waitFor polls for the landing page's element/text in the "
+            "same call (SPAs render long after 'loaded'). Structured CDP "
+            "only — no JS eval. Domain must be in allowlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "enum": ["back", "forward"],
+                    "description": "Which way to move through the tab's history",
+                },
+                "steps": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1,
+                    "description": "How many history entries to hop in one jump",
+                },
+                "tabId": _TAB_ID_SCHEMA,
+                "waitFor": _WAIT_FOR_SCHEMA,
+            },
+            "required": ["direction"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="snapshot",
         description=(
             "Return the accessibility tree of the current/target tab. Interactive "
