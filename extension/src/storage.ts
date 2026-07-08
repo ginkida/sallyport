@@ -35,6 +35,13 @@ export type Settings = {
    * Default OFF — it lazily enables CDP `Network.enable` and reads response
    * bodies (widening the observable CDP footprint), so it is opt-in. */
   captureNetwork: boolean;
+  /** Auto-answer native JS dialogs (alert/confirm/prompt/beforeunload) on
+   * driven tabs (dialog-capture.ts) — an open dialog freezes the page's JS
+   * and no tool can click it — steerable via the `handle_dialog` tool.
+   * Default OFF — it lazily enables CDP `Page.enable` (widening the
+   * observable CDP footprint) and answers dialogs the human might have
+   * wanted to see, so it is opt-in. */
+  handleDialogs: boolean;
 };
 
 export const DEFAULT_SERVER_URL = 'ws://127.0.0.1:10086/ws';
@@ -103,6 +110,7 @@ export async function getSettings(): Promise<Settings> {
     keepAwake: v?.keepAwake !== false, // default on
     captureConsole: !!v?.captureConsole, // default off (opt-in)
     captureNetwork: !!v?.captureNetwork, // default off (opt-in)
+    handleDialogs: !!v?.handleDialogs, // default off (opt-in)
   };
 }
 

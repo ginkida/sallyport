@@ -6,6 +6,26 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`handle_dialog` tool + opt-in JS-dialog auto-handling.** A native JS
+  dialog (`alert`/`confirm`/`prompt`/`beforeunload`) freezes the page's JS —
+  every subsequent wait/click times out — and the dialog itself is browser UI
+  no CDP input event can click (in broker mode it pops in the non-focused
+  agent window where nobody is looking). New popup setting "auto-handle JS
+  dialogs" (off by default; the third `chrome.debugger.onEvent` surface,
+  lazy `Page.enable` per the SECURITY.md checklist) answers every dialog the
+  moment it opens — alert → OK, everything else → the safe cancel — and
+  records it to a per-tab ring (≤20 entries, message capped at 512 chars,
+  origin-tagged, cleared on tab close/detach). The new allowlist-gated
+  `handle_dialog` tool reads the ring (origin-filtered to the allowlist,
+  fail-closed) and can ARM a one-shot `accept`/`dismiss` (+`promptText` for
+  `prompt()`) for the tab's **next** dialog: arm accept, then click the
+  button that opens `confirm('Delete?')`, or let a `beforeunload`-blocked
+  navigation proceed. Escalation is per-dialog and never sticky; `promptText`
+  travels as a structured CDP argument (no interpolation), and in broker mode
+  the tool is owner-gated like every tab-touching call.
+
 ## [0.14.5] — 2026-07-07
 
 Follow-up security patch closing gaps surfaced by an independent review of

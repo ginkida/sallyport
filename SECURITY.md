@@ -337,8 +337,10 @@ For *security-relevant* additions, also check:
    automatically via `truncateAuditValue`; safe.
 7. **Does it subscribe to CDP events** (`chrome.debugger.onEvent`, e.g.
    `console_tail` / `console-capture.ts`, `network_tail` /
-   `network-capture.ts`)? Keep it opt-in behind a popup setting (default off)
-   and enable the underlying domain (`Runtime.enable`, `Network.enable`, …)
+   `network-capture.ts`, `handle_dialog` / `dialog-capture.ts`)? Keep it
+   opt-in behind a popup setting (default off)
+   and enable the underlying domain (`Runtime.enable`, `Network.enable`,
+   `Page.enable`, …)
    lazily — never on the unconditional `attach()` path, so the observable
    CDP footprint only widens for users who asked for it. Buffer with a hard
    per-tab cap, clear on `tabs.onRemoved` / `debugger.onDetach`, and tag each
@@ -350,6 +352,11 @@ For *security-relevant* additions, also check:
    never capture request/response headers (no `Authorization`/`Cookie`
    exfiltration). Response bodies can still carry sensitive same-origin data,
    so the opt-in default-off + allowlist origin filter are load-bearing.
+   If the subscription also **acts** on the page (`handle_dialog` answers
+   dialogs), keep the automatic action to the safest default (alert → OK,
+   everything else → cancel) and route any escalation through the
+   allowlist-gated tool as a per-event one-shot — never a sticky policy an
+   agent sets once and keeps.
 
 ## Reporting
 

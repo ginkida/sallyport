@@ -95,6 +95,10 @@
           <input type="checkbox" id="capture-network"> capture API responses (canvas dashboards)
         </label>
         <div class="muted small hint">Records XHR/fetch JSON responses on driven tabs, readable via the network_tail tool — the data behind canvas charts (e.g. Metrika) without screenshots. Off by default — it reads response bodies and widens the debugger's CDP footprint.</div>
+        <label class="checkbox">
+          <input type="checkbox" id="handle-dialogs"> auto-handle JS dialogs (alert/confirm)
+        </label>
+        <div class="muted small hint">Answers alert/confirm/prompt/beforeunload dialogs on driven tabs automatically (alert → OK, everything else → cancel; steerable via the handle_dialog tool) — an open dialog otherwise freezes the page and stalls automation. Off by default — it widens the debugger's CDP footprint and answers dialogs you might have wanted to see.</div>
       </details>
 
       <details id="status-advanced" class="disclosure">

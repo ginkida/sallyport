@@ -1,5 +1,6 @@
 import { getSettings } from '../storage.js';
 import { clearConsole, ensureConsoleCapture } from './console-capture.js';
+import { clearDialogs, ensureDialogCapture } from './dialog-capture.js';
 import { BridgeError } from './errors.js';
 import { clearNetwork, ensureNetworkCapture } from './network-capture.js';
 import { clearRefsForTab } from './refs.js';
@@ -98,6 +99,7 @@ if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
     clearRefsForTab(tabId);
     clearConsole(tabId);
     clearNetwork(tabId);
+    clearDialogs(tabId);
   });
 }
 
@@ -108,6 +110,7 @@ if (typeof chrome !== 'undefined' && chrome.debugger?.onDetach) {
       clearRefsForTab(source.tabId);
       clearConsole(source.tabId);
       clearNetwork(source.tabId);
+      clearDialogs(source.tabId);
     }
   });
 }
@@ -145,6 +148,7 @@ export async function attach(tabId: number): Promise<void> {
   }
   if (settings.captureConsole) await ensureConsoleCapture(tabId);
   if (settings.captureNetwork) await ensureNetworkCapture(tabId);
+  if (settings.handleDialogs) await ensureDialogCapture(tabId);
 }
 
 /** Chrome freezes background tabs and (on macOS) fully-occluded windows:

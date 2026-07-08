@@ -10,6 +10,7 @@ import { BridgeError } from './tools/errors.js';
 import { confirmEpoch, EXPECTED_EPOCH_ARG, stripEpochArg } from './tools/ownership.js';
 import { evaluate } from './tools/evaluate.js';
 import { consoleTail } from './tools/console.js';
+import { handleDialog } from './tools/dialog.js';
 import { click, fill, readText } from './tools/dom.js';
 import { fetchInPage } from './tools/fetch.js';
 import { find } from './tools/find.js';
@@ -40,6 +41,7 @@ const tools: Record<string, Tool> = {
   get_state: getState,
   console_tail: consoleTail,
   network_tail: networkTail,
+  handle_dialog: handleDialog,
   click,
   mouse_click: mouseClick,
   hover,

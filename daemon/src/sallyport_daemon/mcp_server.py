@@ -343,6 +343,58 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="handle_dialog",
+        description=(
+            "See and steer native JS dialogs (alert/confirm/prompt/"
+            "beforeunload) on a tab. An open dialog FREEZES the page's JS — "
+            "clicks and waits then time out — and the dialog is native browser "
+            "UI no other tool can see or click. With handling enabled every "
+            "dialog is answered automatically the moment it opens (alert → OK, "
+            "confirm/prompt/beforeunload → cancel) and recorded. Call with no "
+            "action to read what happened: {enabled, armed, recent:[{ts, type, "
+            "message, origin, response:{accept, promptText?}, armed}]} "
+            "(oldest→newest). Pass action:'accept'|'dismiss' (+promptText to "
+            "answer a prompt()) to ARM the response for the NEXT dialog on the "
+            "tab — a one-shot, consumed by the first dialog, replaced by "
+            "re-arming: e.g. arm accept, THEN click the button that opens "
+            "confirm('Delete?'); arm accept before a navigation blocked by a "
+            "beforeunload handler. OPT-IN: handling must be turned on in the "
+            "extension popup ('auto-handle JS dialogs', off by default) — when "
+            "it's off you get {enabled:false}, NOT an error, and dialogs "
+            "behave natively (the page stays frozen until a human clicks "
+            "them). Handling begins at the first bridge attach with the "
+            "setting on — a dialog already open before then is NOT answered. "
+            "Recorded entries are origin-filtered to the allowlist. Structured "
+            "CDP only — no JS eval. Domain must be in allowlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["accept", "dismiss"],
+                    "description": ("Arm this answer for the tab's NEXT dialog (one-shot)"),
+                },
+                "promptText": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "description": (
+                        "Text a prompt() receives when accepted (requires action:'accept')"
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "default": 20,
+                    "description": "Max recent entries to return",
+                },
+                "tabId": _TAB_ID_SCHEMA,
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="click",
         description=(
             "Click an element via DOM .click(). selector can be a CSS selector or a "

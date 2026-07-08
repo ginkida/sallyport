@@ -408,6 +408,7 @@ $('#status-settings').addEventListener('toggle', async () => {
   ($('#keep-awake') as HTMLInputElement).checked = s.keepAwake;
   ($('#capture-console') as HTMLInputElement).checked = s.captureConsole;
   ($('#capture-network') as HTMLInputElement).checked = s.captureNetwork;
+  ($('#handle-dialogs') as HTMLInputElement).checked = s.handleDialogs;
 });
 
 $('#status-advanced').addEventListener('toggle', async () => {
@@ -447,6 +448,12 @@ $('#capture-network').addEventListener('change', async () => {
   // Takes effect on the next tool call — captureNetwork is re-read per attach,
   // which lazily issues Network.enable for the driven tab when on.
   await setSettings({ captureNetwork: ($('#capture-network') as HTMLInputElement).checked });
+});
+
+$('#handle-dialogs').addEventListener('change', async () => {
+  // Takes effect on the next tool call — handleDialogs is re-read per attach,
+  // which lazily issues Page.enable for the driven tab when on.
+  await setSettings({ handleDialogs: ($('#handle-dialogs') as HTMLInputElement).checked });
 });
 
 $('#settings-save').addEventListener('click', async () => {

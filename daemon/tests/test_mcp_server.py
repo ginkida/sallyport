@@ -55,6 +55,7 @@ def test_tools_catalogue_covers_extension() -> None:
         "get_state",
         "console_tail",
         "network_tail",
+        "handle_dialog",
         "click",
         "mouse_click",
         "hover",
