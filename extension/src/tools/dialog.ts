@@ -5,20 +5,22 @@
  *
  * Allowlist-gated like every page-touching tool, and additionally
  * ORIGIN-FILTERED at read time: only entries whose frame origin is in the
- * allowlist are returned (fail-closed on an unknown origin). Handling is
+ * allowlist are returned (fail-closed on an unknown origin). An arm is itself
+ * bound to the origin it was just allowlist-checked against here — it cannot
+ * be hijacked by a dialog from a different origin (invariant #3). Handling is
  * opt-in: when the popup setting is off the tool returns {enabled:false} so
  * "no dialogs recorded" isn't misread as "no dialogs happened" — with the
- * setting off, dialogs behave natively and block automation until a human
- * clicks them.
+ * setting off (including turned off mid-session), dialogs behave natively and
+ * block automation until a human clicks them.
  */
 
 import { matchAllowlist } from '../allowlist.js';
 import { getAllowlist, getSettings } from '../storage.js';
 import { attach } from './cdp.js';
+import { filterByAllowedOrigins, originFromStackUrl } from './console-capture.js';
 import {
   armDialog,
   describeArmed,
-  filterDialogEntries,
   getArmedDialog,
   parseDialogArgs,
   readDialogs,
@@ -42,18 +44,28 @@ export const handleDialog: Tool = async (args) => {
   }
 
   if (action !== undefined) {
-    armDialog(tab.id!, {
-      accept: action === 'accept',
-      ...(promptText !== undefined ? { promptText } : {}),
-    });
+    // Bind the arm to the origin it was just allowlist-checked against
+    // (tab.url, above) — decideDialogResponse refuses to apply it to a
+    // dialog from any other origin (invariant #3).
+    armDialog(
+      tab.id!,
+      { accept: action === 'accept', ...(promptText !== undefined ? { promptText } : {}) },
+      originFromStackUrl(tab.url),
+    );
   }
 
   const list = await getAllowlist();
   const isAllowed = (origin: string): boolean => matchAllowlist(origin, list).matched;
-  const recent = filterDialogEntries(readDialogs(tab.id!), isAllowed).slice(-limit);
+  const allowed = filterByAllowedOrigins(readDialogs(tab.id!), isAllowed);
+  const recent = allowed.slice(-limit);
   return {
     tabId: tab.id,
     url: tab.url,
-    data: { enabled: true, armed: describeArmed(getArmedDialog(tab.id!)), recent },
+    data: {
+      enabled: true,
+      armed: describeArmed(getArmedDialog(tab.id!)),
+      recent,
+      ...(allowed.length > recent.length ? { truncated: true } : {}),
+    },
   };
 };

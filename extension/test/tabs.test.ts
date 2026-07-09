@@ -146,7 +146,24 @@ describe('waitForLoad — vanished tab', () => {
         chrome: { tabs: { get: (id: number, cb: (t?: unknown) => void) => void } };
       }
     ).chrome.tabs.get = (_id, cb) => cb(undefined);
-    await expect(waitForLoad(999, 5000)).rejects.toMatchObject({ code: 'tab_gone' });
+    await expect(waitForLoad(999, 'navigate', 5000)).rejects.toMatchObject({ code: 'tab_gone' });
+  });
+});
+
+describe('waitForLoad — timeout message names the calling tool', () => {
+  it('embeds the passed toolName, not a hardcoded "navigate"', async () => {
+    installChromeMock({});
+    // A tab that never reaches 'complete' and no onUpdated event ever fires
+    // (the mock's addListener is a no-op) — the watchdog is the only way out.
+    (
+      globalThis as unknown as {
+        chrome: { tabs: { get: (id: number, cb: (t?: unknown) => void) => void } };
+      }
+    ).chrome.tabs.get = (_id, cb) => cb({ status: 'loading', url: 'https://x.example/' });
+    await expect(waitForLoad(1, 'history_go', 5)).rejects.toMatchObject({
+      code: 'timeout',
+      message: 'history_go: page load timeout',
+    });
   });
 });
 

@@ -7,12 +7,13 @@ import {
   DIALOG_MAX_ENTRIES,
   DIALOG_MAX_MESSAGE,
   DIALOG_MAX_PROMPT_TEXT,
-  filterDialogEntries,
   parseDialogArgs,
   shapeDialogEntry,
-  type DialogEntry,
 } from '../src/tools/dialog-capture.js';
 import { BridgeError } from '../src/tools/errors.js';
+
+const ORIGIN = 'https://app.example.com';
+const OTHER_ORIGIN = 'https://evil.example';
 
 describe('defaultDialogResponse', () => {
   it('accepts only alert — OK is its sole button', () => {
@@ -33,50 +34,87 @@ describe('defaultDialogResponse', () => {
 
 describe('decideDialogResponse', () => {
   it('falls back to the default policy when nothing is armed', () => {
-    expect(decideDialogResponse(undefined, 'confirm')).toEqual({
+    expect(decideDialogResponse(undefined, 'confirm', ORIGIN)).toEqual({
       response: { accept: false },
       armed: false,
     });
-    expect(decideDialogResponse(undefined, 'alert')).toEqual({
+    expect(decideDialogResponse(undefined, 'alert', ORIGIN)).toEqual({
       response: { accept: true },
       armed: false,
     });
   });
 
-  it('an armed accept/dismiss overrides the default', () => {
-    expect(decideDialogResponse({ accept: true }, 'confirm')).toEqual({
-      response: { accept: true },
-      armed: true,
-    });
-    expect(decideDialogResponse({ accept: true }, 'beforeunload')).toEqual({
-      response: { accept: true },
-      armed: true,
-    });
+  it('an armed accept/dismiss overrides the default when the origin matches', () => {
+    expect(
+      decideDialogResponse({ response: { accept: true }, origin: ORIGIN }, 'confirm', ORIGIN),
+    ).toEqual({ response: { accept: true }, armed: true });
+    expect(
+      decideDialogResponse({ response: { accept: true }, origin: ORIGIN }, 'beforeunload', ORIGIN),
+    ).toEqual({ response: { accept: true }, armed: true });
   });
 
-  it('honours promptText only on an ACCEPTED prompt()', () => {
-    expect(decideDialogResponse({ accept: true, promptText: 'hi' }, 'prompt')).toEqual({
-      response: { accept: true, promptText: 'hi' },
-      armed: true,
-    });
+  it('honours promptText only on an ACCEPTED prompt() from the armed origin', () => {
+    expect(
+      decideDialogResponse(
+        { response: { accept: true, promptText: 'hi' }, origin: ORIGIN },
+        'prompt',
+        ORIGIN,
+      ),
+    ).toEqual({ response: { accept: true, promptText: 'hi' }, armed: true });
   });
 
   it('drops promptText on non-prompt types and on a dismiss', () => {
-    expect(decideDialogResponse({ accept: true, promptText: 'hi' }, 'confirm')).toEqual({
-      response: { accept: true },
-      armed: true,
-    });
-    expect(decideDialogResponse({ accept: false, promptText: 'hi' }, 'prompt')).toEqual({
-      response: { accept: false },
-      armed: true,
-    });
+    expect(
+      decideDialogResponse(
+        { response: { accept: true, promptText: 'hi' }, origin: ORIGIN },
+        'confirm',
+        ORIGIN,
+      ),
+    ).toEqual({ response: { accept: true }, armed: true });
+    expect(
+      decideDialogResponse(
+        { response: { accept: false, promptText: 'hi' }, origin: ORIGIN },
+        'prompt',
+        ORIGIN,
+      ),
+    ).toEqual({ response: { accept: false }, armed: true });
   });
 
-  it('forces accept on an alert even when a dismiss is armed', () => {
-    expect(decideDialogResponse({ accept: false }, 'alert')).toEqual({
-      response: { accept: true },
-      armed: true,
-    });
+  it('forces accept on an alert from the armed origin even when a dismiss is armed', () => {
+    expect(
+      decideDialogResponse({ response: { accept: false }, origin: ORIGIN }, 'alert', ORIGIN),
+    ).toEqual({ response: { accept: true }, armed: true });
+  });
+
+  it('SECURITY: an origin mismatch falls through to the default and does NOT consume the arm', () => {
+    // A dialog from a DIFFERENT origin than the one the arm was checked
+    // against (e.g. a cross-origin iframe, or the tab having navigated
+    // elsewhere) must not receive the escalated response.
+    expect(
+      decideDialogResponse(
+        { response: { accept: true, promptText: 'secret' }, origin: ORIGIN },
+        'prompt',
+        OTHER_ORIGIN,
+      ),
+    ).toEqual({ response: { accept: false }, armed: false });
+  });
+
+  it('SECURITY: fail-closed — an unresolvable dialog origin never matches, even an unresolvable armed origin', () => {
+    expect(
+      decideDialogResponse({ response: { accept: true }, origin: ORIGIN }, 'confirm', null),
+    ).toEqual({ response: { accept: false }, armed: false });
+    expect(
+      decideDialogResponse({ response: { accept: true }, origin: null }, 'confirm', null),
+    ).toEqual({ response: { accept: false }, armed: false });
+  });
+
+  it('an alert from a mismatched origin still resolves to accept via the DEFAULT policy, not the arm', () => {
+    const result = decideDialogResponse(
+      { response: { accept: false }, origin: ORIGIN },
+      'alert',
+      OTHER_ORIGIN,
+    );
+    expect(result).toEqual({ response: { accept: true }, armed: false });
   });
 });
 
@@ -119,30 +157,6 @@ describe('shapeDialogEntry', () => {
       armed: true,
     });
     expect(shapeDialogEntry({ url: 'about:blank' }, { accept: false }, false, 7).origin).toBeNull();
-  });
-});
-
-describe('filterDialogEntries', () => {
-  const mk = (origin: string | null): DialogEntry => ({
-    ts: 1,
-    type: 'confirm',
-    message: 'm',
-    origin,
-    response: { accept: false },
-    armed: false,
-  });
-
-  it('keeps allowed origins, drops others', () => {
-    const out = filterDialogEntries(
-      [mk('https://ok.example'), mk('https://evil.example')],
-      (o) => o === 'https://ok.example',
-    );
-    expect(out).toHaveLength(1);
-    expect(out[0].origin).toBe('https://ok.example');
-  });
-
-  it('fail-closed: a null origin is dropped even if the check would pass', () => {
-    expect(filterDialogEntries([mk(null)], () => true)).toEqual([]);
   });
 });
 

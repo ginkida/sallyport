@@ -356,7 +356,15 @@ For *security-relevant* additions, also check:
    dialogs), keep the automatic action to the safest default (alert → OK,
    everything else → cancel) and route any escalation through the
    allowlist-gated tool as a per-event one-shot — never a sticky policy an
-   agent sets once and keeps.
+   agent sets once and keeps. Bind that one-shot to the origin it was
+   allowlist-checked against when armed, and refuse to apply it to anything
+   else (fail-closed if either origin can't be determined) — an armed
+   escalation is scoped to intent for ONE page, not a standing grant any
+   frame or later navigation on the tab can trigger. And because acting
+   (unlike passive observation) means the human may want their control back,
+   the setting's OFF path must actively revoke the underlying CDP enable
+   (`Page.disable`, not just stop future recording) — see `cdp.ts`'s
+   `releaseKeepAwake`/`releaseDialogCapture` for the shape.
 
 ## Reporting
 

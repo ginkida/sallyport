@@ -23,6 +23,24 @@
  *    dismiss (confirm() sees cancel, prompt() sees null, beforeunload stays on
  *    the page). Escalation — accepting a confirm/beforeunload — is a per-dialog
  *    one-shot armed through the allowlist-gated tool, never sticky.
+ *  - ORIGIN-BOUND ARMING: the one-shot is tagged with the origin `handle_dialog`
+ *    was allowlist-checked against when it armed. It only fires for a dialog
+ *    from that SAME origin (fail-closed on an unresolvable dialog origin) — a
+ *    cross-origin iframe (ad, embed) on the same tab can't consume an escalated
+ *    accept/promptText meant for a different page. A non-matching dialog gets
+ *    the safe default and leaves the arm untouched for the dialog it was
+ *    actually meant for. Origin-binding alone doesn't cover an arm that never
+ *    met ITS dialog and the tab later returns to the SAME origin for unrelated
+ *    work — `clearArmedDialog` (called from navigate/reload/history_go
+ *    alongside ref invalidation) additionally drops a pending arm on any
+ *    navigation, so it can't outlive the page it was set on.
+ *  - LIVE OFF-SWITCH: unchecking the popup setting actively revokes handling
+ *    (`Page.disable` + drops any pending arm) on every already-enabled tab —
+ *    UNCONDITIONALLY, the same shape as keep-awake's `releaseKeepAwake`, so an
+ *    MV3 service-worker restart (which wipes the ephemeral `enabledTabs` this
+ *    module tracks, while the underlying `chrome.debugger` session survives)
+ *    can't silently defeat the off-switch. The acting surface must not stay
+ *    live after the human opts back into answering dialogs themselves.
  *  - BOUNDED: per-tab ring of ≤20 entries × ≤512-char message (#6 fine);
  *  - PER-TAB + CLEARED on `tabs.onRemoved`/`debugger.onDetach` (#7 untouched);
  *  - ORIGIN-TAGGED: each entry records the dialog's frame origin and
@@ -47,6 +65,14 @@ export const DIALOG_MAX_PROMPT_TEXT = 2048;
 export interface DialogResponse {
   accept: boolean;
   promptText?: string;
+}
+
+/** An armed one-shot: the response plus the origin it was allowlist-checked
+ * against at arm time — the binding `decideDialogResponse` enforces before
+ * ever applying it to an opening dialog. */
+export interface ArmedDialog {
+  response: DialogResponse;
+  origin: string | null;
 }
 
 export interface DialogEntry {
@@ -74,20 +100,30 @@ export function defaultDialogResponse(type: string): DialogResponse {
 }
 
 /** Resolve the response for an opening dialog from an (optional) armed
- * one-shot. Alerts are always accepted — accept is their only meaningful
- * answer, so an armed dismiss must not wedge into a nonsensical reply.
- * `promptText` is honoured only on an accepted prompt(); on any other type it
- * is dropped rather than sent (the protocol ignores it there, and recording
- * it would misdescribe what happened). Pure. */
+ * one-shot. ORIGIN-BOUND (invariant #3): the arm only applies when the
+ * dialog's origin matches the origin it was allowlist-checked against at arm
+ * time — fail-closed when either origin is unresolvable (`null` never
+ * matches `null`), so a cross-origin iframe or a tab that has since navigated
+ * elsewhere can't hijack an escalated accept/promptText meant for a different
+ * page. A non-matching dialog falls through to the safe default AND does not
+ * consume the arm, leaving it live for the dialog it was actually meant for.
+ * Alerts are always accepted when the arm DOES apply — accept is their only
+ * meaningful answer, so an armed dismiss must not wedge into a nonsensical
+ * reply. `promptText` is honoured only on an accepted prompt(); on any other
+ * type it is dropped rather than sent (the protocol ignores it there, and
+ * recording it would misdescribe what happened). Pure. */
 export function decideDialogResponse(
-  armed: DialogResponse | undefined,
+  armed: ArmedDialog | undefined,
   type: string,
+  dialogOrigin: string | null,
 ): { response: DialogResponse; armed: boolean } {
-  if (!armed) return { response: defaultDialogResponse(type), armed: false };
+  if (!armed || dialogOrigin === null || armed.origin !== dialogOrigin) {
+    return { response: defaultDialogResponse(type), armed: false };
+  }
   if (type === 'alert') return { response: { accept: true }, armed: true };
-  const response: DialogResponse = { accept: armed.accept };
-  if (type === 'prompt' && armed.accept && armed.promptText !== undefined) {
-    response.promptText = armed.promptText;
+  const response: DialogResponse = { accept: armed.response.accept };
+  if (type === 'prompt' && armed.response.accept && armed.response.promptText !== undefined) {
+    response.promptText = armed.response.promptText;
   }
   return { response, armed: true };
 }
@@ -116,16 +152,6 @@ export function shapeDialogEntry(
     response,
     armed,
   };
-}
-
-/** Keep only entries from an allowed origin. Fail-closed: an entry whose
- * origin is null (couldn't be determined) is DROPPED, never returned. Pure
- * (the allowlist check is injected). */
-export function filterDialogEntries(
-  entries: DialogEntry[],
-  isAllowed: (origin: string) => boolean,
-): DialogEntry[] {
-  return entries.filter((e) => e.origin !== null && isAllowed(e.origin));
 }
 
 export interface DialogArgs {
@@ -191,7 +217,7 @@ export function describeArmed(
 
 const buffers = new Map<number, DialogEntry[]>();
 const enabledTabs = new Set<number>();
-const armedByTab = new Map<number, DialogResponse>();
+const armedByTab = new Map<number, ArmedDialog>();
 
 async function onDebuggerEvent(
   source: { tabId?: number },
@@ -200,10 +226,14 @@ async function onDebuggerEvent(
 ): Promise<void> {
   if (source.tabId === undefined || method !== 'Page.javascriptDialogOpening') return;
   const tabId = source.tabId;
-  const oneShot = armedByTab.get(tabId);
-  armedByTab.delete(tabId); // consumed by the FIRST dialog after arming
   const p = (params ?? {}) as DialogEventParams;
-  const { response, armed } = decideDialogResponse(oneShot, String(p.type ?? ''));
+  const oneShot = armedByTab.get(tabId);
+  const dialogOrigin = originFromStackUrl(p.url);
+  const { response, armed } = decideDialogResponse(oneShot, String(p.type ?? ''), dialogOrigin);
+  // Only consume the arm when it actually applied — an origin mismatch (a
+  // decoy dialog from another frame) must leave it live for the dialog it was
+  // meant for.
+  if (armed) armedByTab.delete(tabId);
   // Answer FIRST — the page's JS is frozen until the dialog is handled.
   try {
     await chrome.debugger.sendCommand({ tabId }, 'Page.handleJavaScriptDialog', {
@@ -245,6 +275,36 @@ export async function ensureDialogCapture(tabId: number): Promise<void> {
   }
 }
 
+/** Turn dialog handling back OFF for a tab — the `handleDialogs` off-switch
+ * (mirrors `cdp.ts:releaseKeepAwake`'s shape). Runs every `attach()` call when
+ * the setting is off.
+ *
+ * UNCONDITIONAL, deliberately NOT gated on "does `enabledTabs` still remember
+ * this tab" — exactly like `releaseKeepAwake`. `enabledTabs` is ephemeral
+ * module state that an MV3 service-worker restart wipes, while the
+ * `chrome.debugger` session (and whatever CDP domains it enabled) survives
+ * that restart — `attach()`'s own "already attached" catch exists BECAUSE of
+ * this. A gated revoke would silently no-op after a restart: the user
+ * unchecks the setting, `enabledTabs.has(tabId)` reads false on the fresh
+ * Set, `Page.disable` never fires, and dialogs keep getting auto-answered
+ * forever — exactly the bug this function exists to prevent, just deferred to
+ * the next SW restart instead of never happening. `Page.disable` is
+ * idempotent (a harmless no-op on a tab where it was never enabled), so the
+ * unconditional call costs nothing on the common path. Actively stops
+ * `javascriptDialogOpening` from firing at all — dialogs go back to native,
+ * human-clickable behaviour — and drops any pending arm: an escalated
+ * one-shot must not survive the human opting back into answering dialogs
+ * themselves. */
+export async function releaseDialogCapture(tabId: number): Promise<void> {
+  enabledTabs.delete(tabId);
+  armedByTab.delete(tabId);
+  try {
+    await chrome.debugger.sendCommand({ tabId }, 'Page.disable');
+  } catch {
+    // tab gone, or already disabled — nothing to revoke
+  }
+}
+
 /** Drop a tab's buffer + enabled flag + armed one-shot — wired into
  * tabs.onRemoved / debugger.onDetach (cdp.ts) so state never outlives the
  * tab. */
@@ -254,15 +314,29 @@ export function clearDialogs(tabId: number): void {
   armedByTab.delete(tabId);
 }
 
-/** Arm a one-shot response for the tab's next dialog (replacing any pending
- * one). Only reachable through the allowlist-gated `handle_dialog` tool. */
-export function armDialog(tabId: number, response: DialogResponse): void {
-  armedByTab.set(tabId, response);
+/** Drop ONLY a tab's pending arm (buffer/capture state untouched) — wired
+ * into navigate/reload/history_go (tabs.ts / history.ts) alongside
+ * `clearRefsForTab`. Origin-binding alone stops a CROSS-origin dialog from
+ * hijacking an arm, but an arm that never met the dialog it was meant for
+ * would otherwise sit live indefinitely and could silently fire on a later,
+ * unrelated SAME-origin dialog once the tab happens to return there — an arm
+ * is scoped to intent for the page it was set on, not a standing grant that
+ * survives the agent moving on to other work. */
+export function clearArmedDialog(tabId: number): void {
+  armedByTab.delete(tabId);
 }
 
-/** The currently armed one-shot, if any. */
+/** Arm a one-shot response for the tab's next dialog (replacing any pending
+ * one), bound to `origin` — the origin `handle_dialog` allowlist-checked at
+ * arm time. Only reachable through the allowlist-gated `handle_dialog` tool. */
+export function armDialog(tabId: number, response: DialogResponse, origin: string | null): void {
+  armedByTab.set(tabId, { response, origin });
+}
+
+/** The currently armed one-shot's response, if any (origin stripped — callers
+ * outside this module only need what it will answer with). */
 export function getArmedDialog(tabId: number): DialogResponse | undefined {
-  return armedByTab.get(tabId);
+  return armedByTab.get(tabId)?.response;
 }
 
 /** Snapshot a tab's captured entries (a copy, oldest→newest). */

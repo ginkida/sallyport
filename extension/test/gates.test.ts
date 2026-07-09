@@ -93,6 +93,22 @@ describe('ensureAllowed', () => {
     expect(caught).toBeInstanceOf(BridgeError);
     expect((caught as BridgeError).code).toBe('domain_not_allowed');
   });
+
+  it('accepts a pre-fetched list instead of re-fetching (a caller with a second check to make against the same list, e.g. history_go, can avoid a double storage round-trip)', async () => {
+    // Deliberately do NOT setAllowlist a matching entry — if the passed list
+    // were ignored and a fresh (empty) fetch happened instead, this would
+    // reject with domain_not_allowed.
+    const list = [{ pattern: 'example.com', allowEvaluate: false, addedAt: 0 }];
+    await expect(ensureAllowed('https://example.com/page', list)).resolves.toBeUndefined();
+  });
+
+  it('an empty/mismatched pre-fetched list still rejects domain_not_allowed', async () => {
+    await setAllowlist([{ pattern: 'example.com', allowEvaluate: false, addedAt: 0 }]);
+    // Even though the STORED allowlist would match, the passed list wins.
+    await expect(ensureAllowed('https://example.com/page', [])).rejects.toMatchObject({
+      code: 'domain_not_allowed',
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

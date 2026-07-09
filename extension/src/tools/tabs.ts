@@ -2,6 +2,7 @@ import { BridgeError } from './errors.js';
 import { matchAllowlist } from '../allowlist.js';
 import { getAllowlist } from '../storage.js';
 import { attach } from './cdp.js';
+import { clearArmedDialog } from './dialog-capture.js';
 import { ensureAllowed, hostnameOf } from './gates.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { clearRefsForTab } from './refs.js';
@@ -53,11 +54,15 @@ export async function resolveTab(args: Record<string, unknown>): Promise<chrome.
   return active;
 }
 
-export function waitForLoad(tabId: number, timeoutMs = 30000): Promise<void> {
+/** `toolName` names the message on a watchdog timeout — navigate/reload/
+ * history_go all share this watchdog, and the error text must name whichever
+ * one the agent actually called so a loop keying on the message (not just the
+ * `timeout` code) retries the right tool. */
+export function waitForLoad(tabId: number, toolName: string, timeoutMs = 30000): Promise<void> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
-      reject(new BridgeError('timeout', 'navigate: page load timeout'));
+      reject(new BridgeError('timeout', `${toolName}: page load timeout`));
     }, timeoutMs);
     const ready = (tab: chrome.tabs.Tab) =>
       tab.status === 'complete' && !!tab.url && tab.url !== 'about:blank';
@@ -171,9 +176,12 @@ export const navigate: Tool = async (args) => {
       await chrome.tabs.update(tab.id!, { url });
     }
   }
-  await waitForLoad(tab.id!);
-  // Navigation invalidates any refs we held for this tab.
+  await waitForLoad(tab.id!, 'navigate');
+  // Navigation invalidates any refs we held for this tab, and any pending
+  // dialog arm — a one-shot is scoped to the page it was set on, not a
+  // standing grant that should still apply once the tab has moved on.
   clearRefsForTab(tab.id!);
+  clearArmedDialog(tab.id!);
   // Ownership epoch (broker mode only): a created tab mints a fresh epoch (the
   // daemon records ownership from it); an in-place navigate echoes the existing
   // one. The daemon ignores `epoch` in standalone, so we don't mint there.
@@ -220,9 +228,11 @@ export const reload: Tool = async (args) => {
   await ensureAllowed(tab.url);
   const bypassCache = args.bypassCache === true;
   await chrome.tabs.reload(tab.id!, { bypassCache });
-  await waitForLoad(tab.id!);
-  // A reload invalidates any refs we may have built for this tab.
+  await waitForLoad(tab.id!, 'reload');
+  // A reload invalidates any refs we may have built for this tab, and any
+  // pending dialog arm (see the identical note in navigate).
   clearRefsForTab(tab.id!);
+  clearArmedDialog(tab.id!);
   return {
     tabId: tab.id,
     url: tab.url,

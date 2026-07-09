@@ -1,6 +1,6 @@
 import { getSettings } from '../storage.js';
 import { clearConsole, ensureConsoleCapture } from './console-capture.js';
-import { clearDialogs, ensureDialogCapture } from './dialog-capture.js';
+import { clearDialogs, ensureDialogCapture, releaseDialogCapture } from './dialog-capture.js';
 import { BridgeError } from './errors.js';
 import { clearNetwork, ensureNetworkCapture } from './network-capture.js';
 import { clearRefsForTab } from './refs.js';
@@ -130,9 +130,10 @@ export async function attach(tabId: number): Promise<void> {
       attached.add(tabId);
     }
   }
-  // Read settings once and drive the two opt-in, best-effort features. Console
-  // capture is gated here so Runtime.enable is NEVER issued on the
-  // unconditional attach path — only when the user turned the setting on.
+  // Read settings once and drive the opt-in, best-effort features below.
+  // Capture is gated here so Runtime.enable/Network.enable/Page.enable are
+  // NEVER issued on the unconditional attach path — only when the user
+  // turned the setting on.
   const settings = await getSettings();
   switch (keepAwakeAction(settings.keepAwake)) {
     case 'enable':
@@ -148,7 +149,14 @@ export async function attach(tabId: number): Promise<void> {
   }
   if (settings.captureConsole) await ensureConsoleCapture(tabId);
   if (settings.captureNetwork) await ensureNetworkCapture(tabId);
-  if (settings.handleDialogs) await ensureDialogCapture(tabId);
+  // Dialog handling ACTS on the page (unlike console/network, which only
+  // observe), so unlike those two, turning it off must actively stop it —
+  // same off-path shape as keep-awake's releaseKeepAwake below.
+  if (settings.handleDialogs) {
+    await ensureDialogCapture(tabId);
+  } else {
+    await releaseDialogCapture(tabId);
+  }
 }
 
 /** Chrome freezes background tabs and (on macOS) fully-occluded windows:

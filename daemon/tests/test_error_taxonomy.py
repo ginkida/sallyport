@@ -85,6 +85,22 @@ def test_timeout_hint_attributes_the_shared_watchdog_to_both_callers() -> None:
     assert "reload" in hint.lower()
 
 
+def test_timeout_hint_warns_history_go_is_not_safe_to_blindly_retry() -> None:
+    """Regression: history_go ALSO shares tabs.ts:waitForLoad's watchdog, but
+    unlike navigate/reload a blind retry isn't safe — Page.navigateToHistoryEntry
+    can complete (the hop already landed) before the watchdog fires, so retrying
+    the same call would move further than intended. The hint must name
+    history_go AND carry guidance distinct from the "just retry" advice given
+    for navigate/reload, or a future edit could silently drop this warning and
+    reintroduce the over-navigation risk with the full suite still green."""
+    hint = format_error_hint("timeout") or ""
+    low = hint.lower()
+    assert "history_go" in low
+    assert "not" in low  # the non-retryable caveat, not just a mention
+    assert "retry" in low
+    assert "snapshot" in low or "read_text" in low  # how to check where it landed instead
+
+
 def test_no_hint_advertises_a_gate_relaxing_flag() -> None:
     """Invariant #4/#5: a recovery hint must never tell the agent to flip
     allowPassword/allowEvaluate — those are user decisions, not auto-retries."""

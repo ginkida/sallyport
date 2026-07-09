@@ -174,11 +174,15 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
         ),
         "timeout": (
             "retryable=maybe; the page-load watchdog fired (30s) without the tab reaching "
-            "'complete' — thrown by navigate, reload (bypassCache or not) and history_go, "
-            "which all share the "
-            "same watchdog. The page may just be slow/heavy, or stuck loading; wait_for/settle on "
-            "a concrete selector instead of relying on full page load, or retry the SAME tool "
-            "that failed (navigate needs a URL; reload/history_go just need the tabId)."
+            "'complete' — thrown by navigate, reload (bypassCache or not) and history_go, which "
+            "all share the same watchdog. The page may just be slow/heavy, or stuck loading; "
+            "wait_for/settle on a concrete selector instead of relying on full page load. For "
+            "navigate/reload it's safe to retry the SAME tool (navigate needs a URL; reload just "
+            "needs the tabId) — both are idempotent. For history_go, do NOT blindly retry: "
+            "Page.navigateToHistoryEntry fires and can complete BEFORE this watchdog does, so a "
+            "timeout likely means the hop already landed and only 'reached complete' timed out — "
+            "retrying would move further than intended. Instead read_text/snapshot the tab to see "
+            "where it actually landed, or wait_for/settle a concrete selector."
         ),
         "no_history": (
             "retryable=no; the tab's session history doesn't reach that far in that direction "

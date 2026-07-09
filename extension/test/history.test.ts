@@ -85,13 +85,49 @@ describe('planHistoryHop', () => {
       expect.unreachable();
     } catch (e) {
       expect((e as BridgeError).code).toBe('domain_not_allowed');
-      expect((e as BridgeError).message).toContain('b.example');
     }
     expect(planHistoryHop(entries, 3, 'back', 2, allowAExample).id).toBe(11);
+  });
+
+  it('SECURITY: the domain_not_allowed message does NOT echo the blocked hostname', () => {
+    // history_go's tabId-less standalone fallback can target the human's
+    // active tab; naming the blocked entry's host would let an agent probe
+    // `steps` to enumerate hostnames from the human's browsing history that
+    // the allowlist forbids touching (the same oracle tab_not_owned avoids
+    // for tab identity).
+    try {
+      planHistoryHop(entries, 3, 'back', 1, allowAExample);
+      expect.unreachable();
+    } catch (e) {
+      expect((e as BridgeError).message).not.toContain('b.example');
+      expect((e as BridgeError).message).not.toContain('example.com');
+    }
   });
 
   it('intermediate non-allowlisted entries do not block a jump over them', () => {
     // 0 → forward 3 hops OVER b.example (index 2) and lands on a.example.
     expect(planHistoryHop(entries, 0, 'forward', 3, allowAExample).id).toBe(13);
+  });
+
+  it('SECURITY: a malformed currentIndex fails with a classified error instead of crashing', () => {
+    // Page.getNavigationHistory is an external CDP response; a malformed one
+    // (e.g. entries:[] from the caller's Array.isArray fallback) must not
+    // silently index past the array and throw an unclassified TypeError.
+    for (const bad of [-1, 4, 4.5, NaN, Infinity]) {
+      try {
+        planHistoryHop(entries, bad, 'back', 1, () => true);
+        expect.unreachable();
+      } catch (e) {
+        expect((e as BridgeError).code).toBe('error');
+      }
+    }
+    // The specific case the fallback produces: entries=[] (CDP gave nothing
+    // sane) paired with whatever currentIndex the response carried.
+    try {
+      planHistoryHop([], 0, 'back', 1, () => true);
+      expect.unreachable();
+    } catch (e) {
+      expect((e as BridgeError).code).toBe('error');
+    }
   });
 });

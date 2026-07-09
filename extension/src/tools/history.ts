@@ -11,7 +11,15 @@
  * non-allowlisted page that happens to sit in the tab's history. The jump is
  * `Page.navigateToHistoryEntry` (a fixed protocol command, no `evaluate`),
  * intermediate entries never load, and the current page is gated too (like
- * `reload`) since an in-place navigation destroys it.
+ * `reload`, via the shared `ensureAllowed`) since an in-place navigation
+ * destroys it.
+ *
+ * The `domain_not_allowed`/`no_history` failures deliberately do NOT echo the
+ * blocked entry's hostname: `history_go`'s `tabId`-less standalone fallback
+ * (`resolveTab`) can target the human's active tab, and naming a
+ * non-allowlisted history entry would turn a probe over `steps` into a
+ * hostname oracle over the human's browsing history — the same
+ * oracle-avoidance stance `tab_not_owned` already takes for tab identity.
  *
  * The planning (bounds + destination gate) is pure (`planHistoryHop`) so
  * vitest drives it directly; the thin CDP wiring follows `navigate`'s shape —
@@ -21,8 +29,9 @@
 import { matchAllowlist } from '../allowlist.js';
 import { getAllowlist } from '../storage.js';
 import { attach, cdp } from './cdp.js';
+import { clearArmedDialog } from './dialog-capture.js';
 import { BridgeError } from './errors.js';
-import { hostnameOf } from './gates.js';
+import { ensureAllowed } from './gates.js';
 import { getEpoch, isBrokerMode } from './ownership.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { clearRefsForTab } from './refs.js';
@@ -57,11 +66,17 @@ export function parseHistorySteps(raw: unknown): number {
 }
 
 /** Pick the target history entry for a hop, or fail with a stable code:
+ *  - `error`               `Page.getNavigationHistory` returned something
+ *                          this tab can't sensibly index (a malformed/empty
+ *                          response) — a boundary check on an external CDP
+ *                          answer, not a scenario our own code can produce
  *  - `no_history`          the tab's history doesn't reach that far in that
  *                          direction (how far it DOES reach is in the message)
  *  - `domain_not_allowed`  the target entry's URL isn't allowlisted — the
  *                          destination gate `navigate` applies, applied to
- *                          where "back"/"forward" actually lands
+ *                          where "back"/"forward" actually lands. The
+ *                          hostname is deliberately NOT echoed (see the
+ *                          module doc's oracle-avoidance note).
  * Only the LANDING entry is checked: `Page.navigateToHistoryEntry` jumps
  * straight to it, intermediate entries never load. Pure (the allowlist check
  * is injected). */
@@ -72,6 +87,9 @@ export function planHistoryHop(
   steps: number,
   isAllowed: (url: string) => boolean,
 ): HistoryEntry {
+  if (!Number.isInteger(currentIndex) || currentIndex < 0 || currentIndex >= entries.length) {
+    throw new BridgeError('error', "history_go: couldn't read the tab's navigation history");
+  }
   const available = direction === 'back' ? currentIndex : entries.length - 1 - currentIndex;
   if (steps > available) {
     throw new BridgeError(
@@ -86,8 +104,7 @@ export function planHistoryHop(
   if (!isAllowed(target.url)) {
     throw new BridgeError(
       'domain_not_allowed',
-      `history_go: ${direction} ${steps} lands on ${hostnameOf(target.url)}, ` +
-        `which is not in the allowlist`,
+      `history_go: ${direction} ${steps} lands on a page whose domain is not in the allowlist`,
     );
   }
   return target;
@@ -98,21 +115,54 @@ interface NavigationHistory {
   entries: Array<{ id: number; url: string }>;
 }
 
+/** Close the CDP/tabs-API race after `Page.navigateToHistoryEntry`: unlike
+ * `chrome.tabs.update` (whose call commits into the tabs API before its own
+ * callback fires), a CDP-issued navigation's completion isn't synchronized
+ * with the tabs API's `Tab` object — the very next `chrome.tabs.get` can still
+ * read the OLD url/status, which would make `waitForLoad`'s fast path resolve
+ * immediately against the page we just left. Poll (briefly) until the tab's
+ * url changes or its status leaves 'complete', whichever comes first. A
+ * same-document hop (SPA `pushState`-style history) may never flip status at
+ * all — the url check alone still catches it. If NEITHER changes within the
+ * short bound, the navigation had already caught up before we started polling
+ * (e.g. hopping to the entry the tab is already showing) — proceed either
+ * way, `waitForLoad` still runs its own check afterward. */
+function waitForHistoryTransition(
+  tabId: number,
+  beforeUrl: string,
+  timeoutMs = 2000,
+): Promise<void> {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = (): void => {
+      chrome.tabs.get(tabId, (tab) => {
+        if (chrome.runtime?.lastError || !tab) {
+          resolve(); // vanished — let waitForLoad's own tab_gone guard handle it
+          return;
+        }
+        if (tab.url !== beforeUrl || tab.status !== 'complete' || Date.now() >= deadline) {
+          resolve();
+          return;
+        }
+        setTimeout(poll, 50);
+      });
+    };
+    poll();
+  });
+}
+
 export const historyGo: Tool = async (args) => {
   const direction = parseHistoryDirection(args.direction);
   const steps = parseHistorySteps(args.steps);
   const waitSpec = parseWaitFor(args.waitFor, 'history_go');
   const tab = await resolveTab(args);
-  // Gate the page being LEFT like reload/navigate do: an in-place navigation
+  // One allowlist fetch, reused for both the leaving-page gate and the
+  // destination check below (matching navigate's single-fetch shape).
+  const list = await getAllowlist();
+  // Gate the page being LEFT like reload does: an in-place navigation
   // destroys the current page, so a non-allowlisted one is refused. The
   // destination gate lives in planHistoryHop.
-  const list = await getAllowlist();
-  if (!matchAllowlist(tab.url ?? '', list).matched) {
-    throw new BridgeError(
-      'domain_not_allowed',
-      `${hostnameOf(tab.url ?? '')} is not in the allowlist`,
-    );
-  }
+  await ensureAllowed(tab.url, list);
   await attach(tab.id!);
   const hist = await cdp<NavigationHistory>(tab.id!, 'Page.getNavigationHistory');
   const isAllowed = (url: string): boolean => matchAllowlist(url, list).matched;
@@ -123,10 +173,14 @@ export const historyGo: Tool = async (args) => {
     steps,
     isAllowed,
   );
+  const beforeUrl = tab.url ?? '';
   await cdp(tab.id!, 'Page.navigateToHistoryEntry', { entryId: target.id });
-  await waitForLoad(tab.id!);
-  // Navigation invalidates any refs we held for this tab.
+  await waitForHistoryTransition(tab.id!, beforeUrl);
+  await waitForLoad(tab.id!, 'history_go');
+  // Navigation invalidates any refs we held for this tab, and any pending
+  // dialog arm (see the identical note in navigate).
   clearRefsForTab(tab.id!);
+  clearArmedDialog(tab.id!);
   // Broker epoch: an in-place move on an existing owned tab — echo, never mint
   // (mirrors navigate's non-created branch).
   const epoch = isBrokerMode() ? getEpoch(tab.id!) : undefined;

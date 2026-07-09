@@ -17,11 +17,19 @@ uses [Semantic Versioning](https://semver.org/).
   Structured CDP only: `Page.getNavigationHistory` names the LANDING entry's
   URL before anything moves, so the destination is allowlist-gated exactly
   like an explicit `navigate` (going "back" can't become a side door to a
-  non-allowlisted page sitting in the history → `domain_not_allowed` naming
-  the host), and the page being left is gated like `reload`. History that
-  doesn't reach that far → `no_history` with how far it does reach; the
-  shared page-load watchdog's `timeout` hint now names all three tools that
-  throw it.
+  non-allowlisted page sitting in the history), and the page being left is
+  gated like `reload`. Neither `domain_not_allowed` nor `no_history` echoes
+  the blocked entry's hostname — `history_go`'s `tabId`-less standalone
+  fallback can target the human's active tab, and naming a blocked history
+  entry would turn a `steps` sweep into a hostname oracle over the human's
+  non-allowlisted browsing history (the same avoidance `tab_not_owned` takes
+  for tab identity). A malformed `Page.getNavigationHistory` response fails
+  with a classified `error` instead of crashing, and a short bounded poll
+  closes the race where a CDP-issued hop can complete before the shared
+  page-load watchdog's own `chrome.tabs.get` check catches up. That
+  watchdog's `timeout` hint now names all three tools that throw it, and
+  warns that — unlike `navigate`/`reload` — `history_go` isn't safe to
+  blindly retry on a timeout: the hop can already have landed.
 
 - **`handle_dialog` tool + opt-in JS-dialog auto-handling.** A native JS
   dialog (`alert`/`confirm`/`prompt`/`beforeunload`) freezes the page's JS —
@@ -32,14 +40,31 @@ uses [Semantic Versioning](https://semver.org/).
   lazy `Page.enable` per the SECURITY.md checklist) answers every dialog the
   moment it opens — alert → OK, everything else → the safe cancel — and
   records it to a per-tab ring (≤20 entries, message capped at 512 chars,
-  origin-tagged, cleared on tab close/detach). The new allowlist-gated
-  `handle_dialog` tool reads the ring (origin-filtered to the allowlist,
-  fail-closed) and can ARM a one-shot `accept`/`dismiss` (+`promptText` for
-  `prompt()`) for the tab's **next** dialog: arm accept, then click the
-  button that opens `confirm('Delete?')`, or let a `beforeunload`-blocked
-  navigation proceed. Escalation is per-dialog and never sticky; `promptText`
-  travels as a structured CDP argument (no interpolation), and in broker mode
-  the tool is owner-gated like every tab-touching call.
+  origin-tagged, cleared on tab close/detach). Unlike the console/network
+  capture settings, which only stop future recording, unchecking this one
+  mid-session actively `Page.disable`s and drops any pending arm on every
+  enabled tab — since this feature acts on the page, off has to mean off. That
+  revoke is UNCONDITIONAL (the same shape as keep-awake's `releaseKeepAwake`),
+  not gated on ephemeral in-memory state: an MV3 service-worker restart wipes
+  that state while the underlying `chrome.debugger` session survives it, so a
+  gated revoke would silently leave dialogs auto-answered forever after a
+  restart even though the user unchecked the setting.
+  The new allowlist-gated `handle_dialog` tool reads the ring (origin-filtered
+  to the allowlist, fail-closed, `truncated` flag on a filtered/limited read)
+  and can ARM a one-shot `accept`/`dismiss` (+`promptText` for `prompt()`) for
+  the tab's **next** dialog: arm accept, then click the button that opens
+  `confirm('Delete?')`, or let a `beforeunload`-blocked navigation proceed.
+  The arm is bound to the origin it was allowlist-checked against when armed
+  and refuses to fire for a dialog from any other origin (fail-closed if
+  either is unresolvable) — a cross-origin iframe on the same tab can't
+  hijack an escalated accept or `promptText`; a non-matching dialog gets the
+  safe default and leaves the arm live for the one it was actually meant for.
+  `navigate`/`reload`/`history_go` additionally clear a pending arm on any
+  navigation (same-origin included), so one that never met its intended
+  dialog can't sit live indefinitely and fire on a later, unrelated dialog
+  once the tab happens to return to the same origin. `promptText` travels as
+  a structured CDP argument (no interpolation), and in broker mode the tool
+  is owner-gated like every tab-touching call.
 
 ## [0.14.5] — 2026-07-07
 

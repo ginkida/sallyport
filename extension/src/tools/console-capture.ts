@@ -136,12 +136,14 @@ export function pushCapped<T>(buf: T[], entry: T, max: number): T[] {
 }
 
 /** Keep only entries from an allowed origin. Fail-closed: an entry whose origin
- * is null (couldn't be determined) is DROPPED, never returned. Pure (the
- * allowlist check is injected). */
-export function filterByAllowedOrigins(
-  entries: ConsoleEntry[],
+ * is null (couldn't be determined) is DROPPED, never returned. Generic over any
+ * entry shape that carries an `origin` — shared by every capture module
+ * (console/network/dialog) rather than forked per module. Pure (the allowlist
+ * check is injected). */
+export function filterByAllowedOrigins<T extends { origin: string | null }>(
+  entries: T[],
   isAllowed: (origin: string) => boolean,
-): ConsoleEntry[] {
+): T[] {
   return entries.filter((e) => e.origin !== null && isAllowed(e.origin));
 }
 
