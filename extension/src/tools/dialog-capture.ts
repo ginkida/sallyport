@@ -16,9 +16,10 @@
  *  - OPT-IN: only runs when the popup setting `handleDialogs` is on (default
  *    off); `ensureDialogCapture` is called from `attach()` ONLY then, so the
  *    unconditional attach hot-path never widens the CDP footprint. Structured
- *    CDP only (`Page.enable` + `Page.handleJavaScriptDialog`) — no JS eval,
- *    no interpolation (#4): an armed `promptText` travels as a structured
- *    protocol argument.
+ *    CDP only (`Page.enable` + `Page.handleJavaScriptDialog` +
+ *    `Page.frameNavigated`, read-only, for arm invalidation below) — no JS
+ *    eval, no interpolation (#4): an armed `promptText` travels as a
+ *    structured protocol argument.
  *  - SAFE DEFAULTS: alert → accept (OK is its only button), everything else →
  *    dismiss (confirm() sees cancel, prompt() sees null, beforeunload stays on
  *    the page). Escalation — accepting a confirm/beforeunload — is a per-dialog
@@ -30,10 +31,21 @@
  *    accept/promptText meant for a different page. A non-matching dialog gets
  *    the safe default and leaves the arm untouched for the dialog it was
  *    actually meant for. Origin-binding alone doesn't cover an arm that never
- *    met ITS dialog and the tab later returns to the SAME origin for unrelated
- *    work — `clearArmedDialog` (called from navigate/reload/history_go
- *    alongside ref invalidation) additionally drops a pending arm on any
- *    navigation, so it can't outlive the page it was set on.
+ *    met ITS dialog and the tab later moves on to a new page — the top-level
+ *    frame committing to a NEW document (`Page.frameNavigated`, main-frame
+ *    only) drops any pending arm, INSIDE this module: this is a CDP event, not
+ *    a tools.ts call site, so it uniformly covers navigate/reload/history_go
+ *    AND any navigation a tool never told us about (a `click()` on a link or
+ *    form-submit button, a page's own JS redirect) — an arm can't outlive the
+ *    page it was set on regardless of how the tab left it. It also closes the
+ *    timing gap a call-site-only clear would have: `frameNavigated` fires the
+ *    moment the new document is committed, necessarily before that page's own
+ *    scripts can run and open a dialog, so a same-origin dialog on the FRESH
+ *    page can never race an arm meant for the page just left. `navigate`/
+ *    `reload`/`history_go` additionally call `clearArmedDialog` themselves
+ *    (belt-and-suspenders, redundant once `frameNavigated` fires, but cheap
+ *    and it also covers cases where dialog handling — hence `Page.enable` —
+ *    was off at the exact moment of the hop).
  *  - LIVE OFF-SWITCH: unchecking the popup setting actively revokes handling
  *    (`Page.disable` + drops any pending arm) on every already-enabled tab —
  *    UNCONDITIONALLY, the same shape as keep-awake's `releaseKeepAwake`, so an
@@ -134,6 +146,18 @@ export interface DialogEventParams {
   url?: string;
 }
 
+export interface FrameNavigatedParams {
+  frame?: { parentId?: string };
+}
+
+/** True when a `Page.frameNavigated` event is for the MAIN frame (no
+ * `parentId`) — the only case that should drop a pending dialog arm; a
+ * sub-frame (iframe) navigating doesn't invalidate an arm meant for the
+ * top-level page. Pure. */
+export function isMainFrameNavigation(params: FrameNavigatedParams | undefined): boolean {
+  return params?.frame !== undefined && params.frame.parentId === undefined;
+}
+
 /** Shape a `Page.javascriptDialogOpening` event + the response we gave into a
  * ring entry. Message capped, origin extracted from the frame URL (null on
  * anything opaque — dropped at read time). Pure. */
@@ -224,8 +248,15 @@ async function onDebuggerEvent(
   method: string,
   params?: unknown,
 ): Promise<void> {
-  if (source.tabId === undefined || method !== 'Page.javascriptDialogOpening') return;
+  if (source.tabId === undefined) return;
   const tabId = source.tabId;
+  if (method === 'Page.frameNavigated') {
+    if (isMainFrameNavigation(params as FrameNavigatedParams | undefined)) {
+      armedByTab.delete(tabId);
+    }
+    return;
+  }
+  if (method !== 'Page.javascriptDialogOpening') return;
   const p = (params ?? {}) as DialogEventParams;
   const oneShot = armedByTab.get(tabId);
   const dialogOrigin = originFromStackUrl(p.url);
@@ -252,7 +283,10 @@ async function onDebuggerEvent(
 // Registered once. Guarded so importing this module in vitest (no chrome) just
 // loads the pure helpers without demanding the API. A third onEvent listener
 // alongside console-capture's and network-capture's — each filters by method,
-// so they coexist without routing.
+// so they coexist without routing. Handles both Page.javascriptDialogOpening
+// (answer + record) and Page.frameNavigated (arm invalidation) — both are
+// Page-domain events, so one listener covers both without a second
+// registration.
 if (typeof chrome !== 'undefined' && chrome.debugger?.onEvent) {
   chrome.debugger.onEvent.addListener((source, method, params) => {
     void onDebuggerEvent(source, method, params);

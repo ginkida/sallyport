@@ -70,6 +70,14 @@ export function classifyAttachError(msg: string): BridgeError {
  * set stays accurate without polling. */
 const attached = new Set<number>();
 
+/** Reset in-memory attach state (test hook — vitest reuses this module across
+ * every `it()` in a file, so a mock tabId that collides with one attached in
+ * an earlier test would otherwise silently skip `chrome.debugger.attach` here
+ * and desync from the mock's own call log). */
+export function resetAttachedTabs(): void {
+  attached.clear();
+}
+
 /** Decide what keep-awake should do for a tab on this attach: (re-)ENABLE the
  * focus emulation + lifecycle keep-alive when the setting is on (both CDP calls
  * are idempotent), or DISABLE (revoke) the focus emulation when it's off.

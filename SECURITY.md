@@ -360,11 +360,32 @@ For *security-relevant* additions, also check:
    allowlist-checked against when armed, and refuse to apply it to anything
    else (fail-closed if either origin can't be determined) — an armed
    escalation is scoped to intent for ONE page, not a standing grant any
-   frame or later navigation on the tab can trigger. And because acting
-   (unlike passive observation) means the human may want their control back,
-   the setting's OFF path must actively revoke the underlying CDP enable
-   (`Page.disable`, not just stop future recording) — see `cdp.ts`'s
-   `releaseKeepAwake`/`releaseDialogCapture` for the shape.
+   frame or later navigation on the tab can trigger. Origin-binding alone
+   only stops a CROSS-origin hijack; an arm that never met its intended event
+   still sits live until something clears it, so also invalidate it on
+   navigation. Prefer a CDP-level signal (`dialog-capture.ts` listens for
+   `Page.frameNavigated`, main-frame only) over hooking every tools.ts call
+   site that might navigate — a call-site-only clear both MISSES navigations
+   the tool layer doesn't know about (a plain `click()` on a link or
+   form-submit button never routes through `navigate`/`reload`/`history_go`)
+   and RACES the page it just landed on (clearing after `waitForLoad` is too
+   late to beat a dialog the fresh page pops on its own load); a CDP event
+   fires the instant the new document commits, before that page's scripts can
+   run. And because acting (unlike passive observation) means the human may
+   want their control back, the setting's OFF path must actively revoke the
+   underlying CDP enable (`Page.disable`, not just stop future recording) —
+   see `cdp.ts`'s `releaseKeepAwake`/`releaseDialogCapture` for the shape, and
+   make that revoke UNCONDITIONAL (never gated on in-memory bookkeeping an
+   MV3 service-worker restart can wipe while the debugger session itself
+   survives).
+8. **Does the tool report an outcome that depends on an action actually
+   having taken effect** (a navigation, a hop through history)? Don't infer
+   success from a watchdog merely resolving — a beforeunload prompt (or
+   anything else) can silently cancel the underlying action while every
+   "did it finish" check still reads as done (status back to `'complete'`,
+   no error thrown). Verify the tangible outcome directly when there's a
+   cheap, reliable way to (`history_go` compares the tab's landed URL against
+   the known-good target history entry) rather than trusting timing alone.
 
 ## Reporting
 

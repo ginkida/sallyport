@@ -7,6 +7,7 @@ import {
   DIALOG_MAX_ENTRIES,
   DIALOG_MAX_MESSAGE,
   DIALOG_MAX_PROMPT_TEXT,
+  isMainFrameNavigation,
   parseDialogArgs,
   shapeDialogEntry,
 } from '../src/tools/dialog-capture.js';
@@ -211,5 +212,21 @@ describe('describeArmed', () => {
       action: 'accept',
       promptText: 't',
     });
+  });
+});
+
+describe('isMainFrameNavigation', () => {
+  it('SECURITY: true for the main frame (no parentId) — this is what invalidates an armed dialog', () => {
+    expect(isMainFrameNavigation({ frame: { parentId: undefined } })).toBe(true);
+    expect(isMainFrameNavigation({ frame: {} })).toBe(true);
+  });
+
+  it('false for a sub-frame (has a parentId) — an iframe navigating must not drop an arm meant for the top-level page', () => {
+    expect(isMainFrameNavigation({ frame: { parentId: 'F1' } })).toBe(false);
+  });
+
+  it('false for a malformed/missing event — never mistakes garbage for a main-frame nav', () => {
+    expect(isMainFrameNavigation(undefined)).toBe(false);
+    expect(isMainFrameNavigation({})).toBe(false);
   });
 });

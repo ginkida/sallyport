@@ -1,12 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 
+import { resetAttachedTabs } from '../src/tools/cdp.js';
 import { BridgeError } from '../src/tools/errors.js';
 import {
+  historyGo,
   parseHistoryDirection,
   parseHistorySteps,
   planHistoryHop,
   type HistoryEntry,
 } from '../src/tools/history.js';
+import { setAllowlist } from '../src/storage.js';
 
 const entries: HistoryEntry[] = [
   { id: 10, url: 'https://a.example/start' },
@@ -129,5 +132,149 @@ describe('planHistoryHop', () => {
     } catch (e) {
       expect((e as BridgeError).code).toBe('error');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// historyGo — chrome-bound integration: does the hop actually land where it
+// claims to?
+// ---------------------------------------------------------------------------
+
+type MockTab = { id: number; url: string; status?: string };
+
+/** Minimal chrome mock for historyGo: allowlist storage, a single tab whose
+ * url/status the test controls, and the two CDP commands historyGo issues.
+ * `hopSucceeds: false` simulates a beforeunload prompt cancelling the hop —
+ * Page.navigateToHistoryEntry "succeeds" (resolves) but the tab never
+ * actually leaves its current page, exactly like a dismissed beforeunload. */
+function installHistoryChromeMock(opts: {
+  tab: MockTab;
+  navHistory: { currentIndex: number; entries: Array<{ id: number; url: string }> };
+  hopSucceeds: boolean;
+}): void {
+  const store = new Map<string, unknown>();
+  let currentTab: MockTab = { ...opts.tab, status: opts.tab.status ?? 'complete' };
+  // A cancelled hop: the browser transiently reports 'loading' (it DID start)
+  // before settling back to 'complete' on the SAME url once beforeunload
+  // dismisses it — this lets waitForHistoryTransition's poll resolve on its
+  // very first tick (status changed) instead of running its full 2s timeout,
+  // while still exercising the real "landed url mismatch" code path.
+  let cancelledHopPending = false;
+  let getCallsSinceCancel = 0;
+
+  function currentSnapshot(): MockTab {
+    if (!cancelledHopPending) return currentTab;
+    getCallsSinceCancel++;
+    if (getCallsSinceCancel === 1) return { ...currentTab, status: 'loading' };
+    cancelledHopPending = false;
+    return currentTab; // settled back on the ORIGINAL url — the hop never landed
+  }
+
+  (globalThis as unknown as { chrome: unknown }).chrome = {
+    storage: {
+      local: {
+        async get(keys: string | string[]) {
+          const out: Record<string, unknown> = {};
+          for (const k of Array.isArray(keys) ? keys : [keys]) {
+            if (store.has(k)) out[k] = store.get(k);
+          }
+          return out;
+        },
+        async set(obj: Record<string, unknown>) {
+          for (const [k, v] of Object.entries(obj)) store.set(k, v);
+        },
+        async remove(keys: string | string[]) {
+          for (const k of Array.isArray(keys) ? keys : [keys]) store.delete(k);
+        },
+      },
+      session: {
+        async get() {
+          return {};
+        },
+        async set() {},
+      },
+    },
+    tabs: {
+      async query() {
+        return [currentTab];
+      },
+      get(tabId: number, cb?: (t: MockTab) => void) {
+        const tab = currentSnapshot();
+        if (cb) {
+          cb(tab);
+          return;
+        }
+        return Promise.resolve(tab);
+      },
+      onUpdated: { addListener() {}, removeListener() {} },
+    },
+    debugger: {
+      attach() {
+        return Promise.resolve();
+      },
+      sendCommand(_target: { tabId: number }, method: string, params?: { entryId?: number }) {
+        if (method === 'Page.getNavigationHistory') {
+          return Promise.resolve(opts.navHistory);
+        }
+        if (method === 'Page.navigateToHistoryEntry') {
+          if (opts.hopSucceeds) {
+            const entry = opts.navHistory.entries.find((e) => e.id === params?.entryId);
+            if (entry) currentTab = { id: currentTab.id, url: entry.url, status: 'complete' };
+          } else {
+            cancelledHopPending = true;
+            getCallsSinceCancel = 0;
+          }
+          return Promise.resolve({});
+        }
+        return Promise.resolve({});
+      },
+      onEvent: { addListener() {} },
+      onDetach: { addListener() {} },
+    },
+  };
+}
+
+describe('historyGo — verifies the hop actually landed', () => {
+  const navHistory = {
+    currentIndex: 1,
+    entries: [
+      { id: 10, url: 'https://allowed.example/start' },
+      { id: 11, url: 'https://allowed.example/current' },
+    ],
+  };
+
+  beforeEach(() => {
+    resetAttachedTabs();
+  });
+
+  it('reports the target url when the hop actually lands', async () => {
+    installHistoryChromeMock({
+      tab: { id: 1, url: 'https://allowed.example/current' },
+      navHistory,
+      hopSucceeds: true,
+    });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    const result = (await historyGo({ tabId: 1, direction: 'back' })) as {
+      data: { url: string };
+    };
+    expect(result.data.url).toBe('https://allowed.example/start');
+  });
+
+  it('SECURITY/CORRECTNESS: does NOT report success when a beforeunload prompt cancels the hop', async () => {
+    installHistoryChromeMock({
+      tab: { id: 1, url: 'https://allowed.example/current' },
+      navHistory,
+      hopSucceeds: false,
+    });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    let caught: unknown;
+    try {
+      await historyGo({ tabId: 1, direction: 'back' });
+      expect.unreachable();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(BridgeError);
+    expect((caught as BridgeError).code).toBe('navigation_cancelled');
   });
 });

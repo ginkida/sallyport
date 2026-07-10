@@ -29,7 +29,12 @@ uses [Semantic Versioning](https://semver.org/).
   page-load watchdog's own `chrome.tabs.get` check catches up. That
   watchdog's `timeout` hint now names all three tools that throw it, and
   warns that — unlike `navigate`/`reload` — `history_go` isn't safe to
-  blindly retry on a timeout: the hop can already have landed.
+  blindly retry on a timeout: the hop can already have landed. Conversely, a
+  `beforeunload` prompt dismissed mid-hop (the default policy, unless
+  `handle_dialog` was armed to accept it) leaves the tab exactly where it
+  started with every timing check still reading as success — `history_go`
+  verifies the tab actually reached the target history entry's URL before
+  reporting success, failing with `navigation_cancelled` instead.
 
 - **`handle_dialog` tool + opt-in JS-dialog auto-handling.** A native JS
   dialog (`alert`/`confirm`/`prompt`/`beforeunload`) freezes the page's JS —
@@ -59,10 +64,16 @@ uses [Semantic Versioning](https://semver.org/).
   either is unresolvable) — a cross-origin iframe on the same tab can't
   hijack an escalated accept or `promptText`; a non-matching dialog gets the
   safe default and leaves the arm live for the one it was actually meant for.
-  `navigate`/`reload`/`history_go` additionally clear a pending arm on any
-  navigation (same-origin included), so one that never met its intended
-  dialog can't sit live indefinitely and fire on a later, unrelated dialog
-  once the tab happens to return to the same origin. `promptText` travels as
+  An arm is also invalidated the instant the tab's top-level frame commits to
+  a new document — `dialog-capture.ts` listens for CDP's own
+  `Page.frameNavigated` rather than only hooking `navigate`/`reload`/
+  `history_go`, so it uniformly covers every way a tab can move on (a plain
+  link click, a form submit, a page's own JS redirect) and can't race a
+  same-origin dialog on the FRESH page the way clearing after the fact would.
+  `navigate`/`reload` now also `attach()` unconditionally (previously only
+  when a `waitFor` was given, and only after the load finished) so a dialog
+  the destination page opens immediately on its OWN load is caught too, not
+  just from whatever tool call happens to come next. `promptText` travels as
   a structured CDP argument (no interpolation), and in broker mode the tool
   is owner-gated like every tab-touching call.
 

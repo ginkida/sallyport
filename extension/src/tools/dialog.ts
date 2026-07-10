@@ -32,7 +32,10 @@ import type { Tool } from './types.js';
 export const handleDialog: Tool = async (args) => {
   const { action, promptText, limit } = parseDialogArgs(args);
   const tab = await resolveTab(args);
-  await ensureAllowed(tab.url);
+  // One allowlist fetch, reused for the current-page gate and the read-time
+  // origin filter below (matching history_go's single-fetch shape).
+  const list = await getAllowlist();
+  await ensureAllowed(tab.url, list);
   // attach() lazily issues Page.enable when the setting is on, so the first
   // call also starts handling going forward (no retroactive handling of a
   // dialog that is already open).
@@ -54,7 +57,6 @@ export const handleDialog: Tool = async (args) => {
     );
   }
 
-  const list = await getAllowlist();
   const isAllowed = (origin: string): boolean => matchAllowlist(origin, list).matched;
   const allowed = filterByAllowedOrigins(readDialogs(tab.id!), isAllowed);
   const recent = allowed.slice(-limit);

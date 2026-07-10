@@ -189,6 +189,13 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "(the message says how far it does) — reduce steps, flip direction, or navigate to "
             "an explicit URL instead; an identical retry fails the same way."
         ),
+        "navigation_cancelled": (
+            "retryable=maybe; history_go's hop did not actually happen — the tab is still on "
+            "its previous page, most likely because a beforeunload prompt was dismissed (by "
+            "handle_dialog's default policy, or a human). Check where you actually are with "
+            "read_text/snapshot before deciding whether to retry; if you need to leave the page "
+            "regardless, arm handle_dialog to accept the NEXT beforeunload first."
+        ),
         "focus_probe_failed": (
             "retryable=no; key_type/send_keys couldn't verify the focused field is safe to type "
             "into (the page's type/shadowRoot accessor threw or returned nothing) — use fill "

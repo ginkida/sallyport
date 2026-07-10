@@ -151,6 +151,14 @@ export const navigate: Tool = async (args) => {
   if (createOwn) {
     tab = await openTab(url);
     created = true;
+    // Attach right away so any capture opted into (console/network/dialog)
+    // is live for the page's OWN load, not just from the next tool call —
+    // matters most for dialog handling: a dialog on first load would
+    // otherwise freeze the page with no one listening. Inherent race for a
+    // brand-new tab (it starts loading `url` at creation, before this
+    // resolves) — best effort, strictly better than not attaching until
+    // whatever tool call happens to come next.
+    await attach(tab.id!);
   } else {
     tab = await resolveTab(args);
     const current = tab.url ?? '';
@@ -159,6 +167,7 @@ export const navigate: Tool = async (args) => {
       // user content to lose — open the target in a fresh tab instead.
       tab = await openTab(url);
       created = true;
+      await attach(tab.id!);
     } else {
       // Reusing an existing tab DESTROYS whatever it currently holds. If that
       // page is real content that isn't itself allowlisted, refuse — otherwise
@@ -173,6 +182,11 @@ export const navigate: Tool = async (args) => {
             `pass newTab=true to open ${hostnameOf(url)} in a new tab instead`,
         );
       }
+      // Attach BEFORE issuing the navigation (not after) — an EXISTING tab
+      // lets us close the race entirely: Page.enable lands before the new
+      // document can start executing scripts, so a dialog on load is never
+      // missed.
+      await attach(tab.id!);
       await chrome.tabs.update(tab.id!, { url });
     }
   }
@@ -180,6 +194,8 @@ export const navigate: Tool = async (args) => {
   // Navigation invalidates any refs we held for this tab, and any pending
   // dialog arm — a one-shot is scoped to the page it was set on, not a
   // standing grant that should still apply once the tab has moved on.
+  // (dialog-capture.ts's own Page.frameNavigated listener already clears it
+  // the moment the new document commits; this is belt-and-suspenders.)
   clearRefsForTab(tab.id!);
   clearArmedDialog(tab.id!);
   // Ownership epoch (broker mode only): a created tab mints a fresh epoch (the
@@ -194,8 +210,8 @@ export const navigate: Tool = async (args) => {
   if (waitSpec) {
     // "Loaded" (tab status complete) rarely means "rendered" on SPAs — the
     // embedded wait covers the gap to the element/text actually appearing,
-    // saving the follow-up wait_for round-trip. Needs CDP, so attach here
-    // (navigate alone doesn't).
+    // saving the follow-up wait_for round-trip. attach() already ran above
+    // (idempotent, so no cost re-asserting it here).
     await attach(tab.id!);
     wait = await runEmbeddedWait(tab.id!, waitSpec);
   }
@@ -227,6 +243,10 @@ export const reload: Tool = async (args) => {
   // subsequent tools, so apply the same domain check as snapshot/read_text.
   await ensureAllowed(tab.url);
   const bypassCache = args.bypassCache === true;
+  // Attach BEFORE reloading (not lazily on some later call) so any opted-in
+  // capture — dialog handling above all, since an unhandled dialog freezes
+  // the reloaded page — is live before the reloaded page's scripts run.
+  await attach(tab.id!);
   await chrome.tabs.reload(tab.id!, { bypassCache });
   await waitForLoad(tab.id!, 'reload');
   // A reload invalidates any refs we may have built for this tab, and any

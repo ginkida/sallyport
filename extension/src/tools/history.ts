@@ -177,6 +177,25 @@ export const historyGo: Tool = async (args) => {
   await cdp(tab.id!, 'Page.navigateToHistoryEntry', { entryId: target.id });
   await waitForHistoryTransition(tab.id!, beforeUrl);
   await waitForLoad(tab.id!, 'history_go');
+  // The hop can be CANCELLED without either of the above noticing: a
+  // beforeunload prompt that gets dismissed (handle_dialog's own default
+  // policy, or a human clicking Cancel) leaves the tab exactly where it
+  // started — url/status never change, so waitForHistoryTransition's
+  // "nothing moved ⇒ already there" fast path and waitForLoad's "already
+  // complete" fast path both read as success. Page.navigateToHistoryEntry
+  // jumps straight to a KNOWN prior history entry (no redirect chain the way
+  // an explicit navigate() could hit), so an exact URL match is a reliable
+  // "did this actually happen" check — verify it before reporting success
+  // with a URL the tab was never shown.
+  const landed = await chrome.tabs.get(tab.id!);
+  if (landed.url !== target.url) {
+    throw new BridgeError(
+      'navigation_cancelled',
+      `history_go: the ${direction} ${steps} hop did not complete — the tab is ` +
+        `still on its previous page (a beforeunload prompt may have kept it there); ` +
+        `check with read_text/snapshot before retrying`,
+    );
+  }
   // Navigation invalidates any refs we held for this tab, and any pending
   // dialog arm (see the identical note in navigate).
   clearRefsForTab(tab.id!);

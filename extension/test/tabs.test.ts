@@ -15,12 +15,14 @@ import {
   isBlankTarget,
   listTabs,
   navigate,
+  reload,
   resolveTab,
   waitForLoad,
 } from '../src/tools/tabs.js';
 import { setAllowlist } from '../src/storage.js';
 import { clearAllEpochs, getEpoch, mintEpoch, setBrokerMode } from '../src/tools/ownership.js';
 import { resetAgentWindow } from '../src/tools/agent-window.js';
+import { resetAttachedTabs } from '../src/tools/cdp.js';
 
 type MockTab = { id: number; url: string; status?: string; windowId?: number };
 
@@ -30,11 +32,21 @@ type Calls = {
   // Broker-mode focus mitigation: dedicated agent window + windowed tab creates.
   windowsCreate: Array<{ url: string; focused?: boolean }>;
   tabCreate: Array<{ url: string; windowId?: number; active?: boolean }>;
+  // Which tabs got a chrome.debugger.attach — navigate/reload now attach
+  // unconditionally (not just when a waitFor is given) so opted-in capture
+  // (dialog handling above all) is live for the page's own load.
+  debuggerAttach: number[];
 };
 
 function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls {
   const store = new Map<string, unknown>();
-  const calls: Calls = { update: [], create: [], windowsCreate: [], tabCreate: [] };
+  const calls: Calls = {
+    update: [],
+    create: [],
+    windowsCreate: [],
+    tabCreate: [],
+    debuggerAttach: [],
+  };
   const byId = new Map<number, MockTab>();
   const windows = new Set<number>();
   let nextTabId = 999;
@@ -92,6 +104,13 @@ function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls 
         byId.set(tabId, next);
         return Promise.resolve(next);
       },
+      reload(tabId: number, _info?: { bypassCache?: boolean }) {
+        // Real Chrome flips status to 'loading' then back to 'complete'; the
+        // mock only needs the end state so waitForLoad's fast path resolves.
+        const cur = getTab(tabId);
+        byId.set(tabId, { ...cur, status: 'complete' });
+        return Promise.resolve();
+      },
       create(info: { url: string; windowId?: number; active?: boolean }) {
         calls.create.push({ url: info.url });
         calls.tabCreate.push({ url: info.url, windowId: info.windowId, active: info.active });
@@ -107,6 +126,17 @@ function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls 
       },
       onUpdated: { addListener() {}, removeListener() {} },
       onRemoved: { addListener() {} },
+    },
+    debugger: {
+      attach(target: { tabId: number }) {
+        calls.debuggerAttach.push(target.tabId);
+        return Promise.resolve();
+      },
+      sendCommand() {
+        return Promise.resolve({});
+      },
+      onEvent: { addListener() {} },
+      onDetach: { addListener() {} },
     },
     windows: {
       create(info: { url: string; focused?: boolean }) {
@@ -133,6 +163,7 @@ beforeEach(async () => {
   installChromeMock({});
   clearAllEpochs(); // resets broker mode + epoch map between tests
   resetAgentWindow(); // forget the dedicated agent window between tests
+  resetAttachedTabs(); // forget which tabIds were CDP-attached between tests
 });
 
 describe('waitForLoad — vanished tab', () => {
@@ -231,6 +262,33 @@ describe('navigate — clobber gate (invariant #12 parity with close_tab)', () =
     });
     expect(calls.update).toHaveLength(0);
     expect(calls.create).toHaveLength(0);
+  });
+});
+
+describe('navigate/reload — attach unconditionally (dialogs on the FRESH page must be caught)', () => {
+  // An unhandled dialog on load freezes the page; attach() is what lazily
+  // turns on capture (console/network/dialog). Before this fix it only ran
+  // when a waitFor was passed, so a plain navigate/reload never caught a
+  // dialog that opened immediately — this pins that it now always does.
+  it('navigate attaches even with no waitFor, for an in-place update', async () => {
+    const calls = installChromeMock({ tabs: [{ id: 7, url: 'https://allowed.example/old' }] });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    await navigate({ tabId: 7, url: ALLOW });
+    expect(calls.debuggerAttach).toContain(7);
+  });
+
+  it('navigate attaches even with no waitFor, for a newly created tab', async () => {
+    const calls = installChromeMock({ active: { id: 3, url: 'https://allowed.example/old' } });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    await navigate({ url: ALLOW, newTab: true });
+    expect(calls.debuggerAttach.length).toBeGreaterThan(0);
+  });
+
+  it('reload attaches even with no explicit trigger for it', async () => {
+    const calls = installChromeMock({ tabs: [{ id: 7, url: 'https://allowed.example/old' }] });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    await reload({ tabId: 7 });
+    expect(calls.debuggerAttach).toContain(7);
   });
 });
 
