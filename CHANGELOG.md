@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-07-10
+
 ### Added
 
 - **`history_go` tool — the browser's back/forward buttons.** After following
@@ -1704,7 +1706,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.14.5...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/ginkida/sallyport/compare/v0.14.5...v0.15.0
 [0.14.5]: https://github.com/ginkida/sallyport/compare/v0.14.4...v0.14.5
 [0.14.4]: https://github.com/ginkida/sallyport/compare/v0.14.3...v0.14.4
 [0.14.3]: https://github.com/ginkida/sallyport/compare/v0.14.2...v0.14.3
