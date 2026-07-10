@@ -377,15 +377,31 @@ For *security-relevant* additions, also check:
    see `cdp.ts`'s `releaseKeepAwake`/`releaseDialogCapture` for the shape, and
    make that revoke UNCONDITIONAL (never gated on in-memory bookkeeping an
    MV3 service-worker restart can wipe while the debugger session itself
-   survives).
+   survives). If enabling this CAPTURE from a tool that didn't need CDP
+   before (`navigate`/`reload` calling `attach()` so dialog handling is live
+   for the destination page's own load) turns a previously CDP-independent
+   tool into one that hard-depends on `chrome.debugger.attach` succeeding,
+   make that attach BEST-EFFORT (`tabs.ts:bestEffortAttach`) — a debugger
+   conflict (DevTools already open on that tab, routine given this project's
+   own usage model) must not break a call that used to work fine without
+   CDP. If the same call site also has to mint state on success (broker
+   ownership epoch), make sure the best-effort attach can't abort the
+   function before that mint runs, or a swallowed failure still orphans
+   whatever the call was supposed to create.
 8. **Does the tool report an outcome that depends on an action actually
    having taken effect** (a navigation, a hop through history)? Don't infer
    success from a watchdog merely resolving — a beforeunload prompt (or
    anything else) can silently cancel the underlying action while every
    "did it finish" check still reads as done (status back to `'complete'`,
    no error thrown). Verify the tangible outcome directly when there's a
-   cheap, reliable way to (`history_go` compares the tab's landed URL against
-   the known-good target history entry) rather than trusting timing alone.
+   cheap, reliable way to, but pick the RIGHT comparison: `history_go`
+   compares the tab's landed URL against where it STARTED (`beforeUrl`), not
+   an exact match against the assumed destination — attaching CDP disables
+   the back/forward cache, so the "did it finish" question always resolves
+   against a live navigation that can legitimately redirect, and an
+   exact-match check would misreport a real redirect as a cancelled action.
+   Report what actually happened (the observed landed URL), not the
+   requested one.
 
 ## Reporting
 

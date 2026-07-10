@@ -151,6 +151,11 @@ function installHistoryChromeMock(opts: {
   tab: MockTab;
   navHistory: { currentIndex: number; entries: Array<{ id: number; url: string }> };
   hopSucceeds: boolean;
+  /** Simulates a legitimate server-side redirect: the hop succeeds but the
+   * tab lands on THIS url instead of the target entry's recorded url —
+   * attaching CDP disables the back/forward cache, so a real redirect is a
+   * live possibility, not an edge case. */
+  redirectTo?: string;
 }): void {
   const store = new Map<string, unknown>();
   let currentTab: MockTab = { ...opts.tab, status: opts.tab.status ?? 'complete' };
@@ -219,7 +224,8 @@ function installHistoryChromeMock(opts: {
         if (method === 'Page.navigateToHistoryEntry') {
           if (opts.hopSucceeds) {
             const entry = opts.navHistory.entries.find((e) => e.id === params?.entryId);
-            if (entry) currentTab = { id: currentTab.id, url: entry.url, status: 'complete' };
+            const landedUrl = opts.redirectTo ?? entry?.url;
+            if (landedUrl) currentTab = { id: currentTab.id, url: landedUrl, status: 'complete' };
           } else {
             cancelledHopPending = true;
             getCallsSinceCancel = 0;
@@ -276,5 +282,24 @@ describe('historyGo — verifies the hop actually landed', () => {
     }
     expect(caught).toBeInstanceOf(BridgeError);
     expect((caught as BridgeError).code).toBe('navigation_cancelled');
+  });
+
+  it('CORRECTNESS: a legitimate server-side redirect during the hop is NOT reported as cancelled', async () => {
+    // Attaching CDP disables the back/forward cache, so a history hop is
+    // always a live navigation and can redirect (session expiry -> /login,
+    // http->https normalization, ...). The old exact-match-to-target check
+    // would misfire here; verifying against beforeUrl must not.
+    installHistoryChromeMock({
+      tab: { id: 1, url: 'https://allowed.example/current' },
+      navHistory,
+      hopSucceeds: true,
+      redirectTo: 'https://allowed.example/login',
+    });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    const result = (await historyGo({ tabId: 1, direction: 'back' })) as {
+      data: { url: string };
+    };
+    // Reports where the tab ACTUALLY landed, not the (now-inaccurate) target.
+    expect(result.data.url).toBe('https://allowed.example/login');
   });
 });

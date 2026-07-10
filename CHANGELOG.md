@@ -33,8 +33,15 @@ uses [Semantic Versioning](https://semver.org/).
   `beforeunload` prompt dismissed mid-hop (the default policy, unless
   `handle_dialog` was armed to accept it) leaves the tab exactly where it
   started with every timing check still reading as success — `history_go`
-  verifies the tab actually reached the target history entry's URL before
-  reporting success, failing with `navigation_cancelled` instead.
+  verifies the tab actually LEFT its starting page before reporting success,
+  failing with `navigation_cancelled` instead. That check compares the
+  landed URL against where the tab STARTED, not an exact match against the
+  target history entry's URL: attaching CDP disables the back/forward cache,
+  so a hop is always a live navigation that can legitimately redirect (a
+  session-gated page bouncing to `/login`, an http→https or
+  www-normalizing redirect) — an exact-match check would misreport a
+  perfectly successful hop as cancelled. A successful call reports the URL
+  the tab actually landed on, not the assumed target.
 
 - **`handle_dialog` tool + opt-in JS-dialog auto-handling.** A native JS
   dialog (`alert`/`confirm`/`prompt`/`beforeunload`) freezes the page's JS —
@@ -73,9 +80,14 @@ uses [Semantic Versioning](https://semver.org/).
   `navigate`/`reload` now also `attach()` unconditionally (previously only
   when a `waitFor` was given, and only after the load finished) so a dialog
   the destination page opens immediately on its OWN load is caught too, not
-  just from whatever tool call happens to come next. `promptText` travels as
-  a structured CDP argument (no interpolation), and in broker mode the tool
-  is owner-gated like every tab-touching call.
+  just from whatever tool call happens to come next — but BEST-EFFORT: a
+  failed attach (most commonly `attach_debugger_conflict`, from DevTools
+  already open on that exact tab — routine, since this project's whole model
+  is an agent driving the user's own live Chrome profile) is swallowed
+  rather than blocking the navigation, so a plain navigate/reload that needs
+  no CDP at all keeps working exactly as before. `promptText` travels as a
+  structured CDP argument (no interpolation), and in broker mode the tool is
+  owner-gated like every tab-touching call.
 
 ## [0.14.5] — 2026-07-07
 

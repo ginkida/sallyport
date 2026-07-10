@@ -292,6 +292,62 @@ describe('navigate/reload — attach unconditionally (dialogs on the FRESH page 
   });
 });
 
+describe('navigate/reload — attach is BEST-EFFORT (a debugger conflict must not block the navigation)', () => {
+  // Regression: making attach() unconditional must not make navigate/reload
+  // hard-depend on chrome.debugger.attach succeeding — a human with DevTools
+  // open on the very tab being automated (a routine situation given this
+  // project's own usage model: driving the user's own live Chrome profile)
+  // would otherwise turn every navigate/reload into a hard failure, where
+  // before this feature existed they worked fine without CDP at all.
+  function failDebuggerAttach(): void {
+    (
+      globalThis as unknown as {
+        chrome: { debugger: { attach: () => Promise<void> } };
+      }
+    ).chrome.debugger.attach = () =>
+      Promise.reject(new Error('Another debugger is already attached to the tab'));
+  }
+
+  it('navigate still succeeds (in-place update) when chrome.debugger.attach fails', async () => {
+    const calls = installChromeMock({ tabs: [{ id: 7, url: 'https://allowed.example/old' }] });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    failDebuggerAttach();
+    const result = await navigate({ tabId: 7, url: ALLOW });
+    expect(result.data).toMatchObject({ url: ALLOW });
+    expect(calls.update).toEqual([{ tabId: 7, url: ALLOW }]);
+  });
+
+  it('navigate still succeeds (new tab) when chrome.debugger.attach fails', async () => {
+    const calls = installChromeMock({ active: { id: 3, url: 'https://allowed.example/old' } });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    failDebuggerAttach();
+    const result = await navigate({ url: ALLOW, newTab: true });
+    expect(result.data).toMatchObject({ url: ALLOW });
+    expect(calls.create).toEqual([{ url: ALLOW }]);
+  });
+
+  it('reload still succeeds when chrome.debugger.attach fails', async () => {
+    const calls = installChromeMock({ tabs: [{ id: 7, url: 'https://allowed.example/old' }] });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    failDebuggerAttach();
+    const result = await reload({ tabId: 7 });
+    expect(result.data).toMatchObject({ tabId: 7 });
+    expect(calls.update).toHaveLength(0); // reload doesn't call tabs.update
+  });
+
+  it('broker mode: a new tab is still owned (epoch minted) even when attach fails', async () => {
+    setBrokerMode(true);
+    installChromeMock({ active: { id: 3, url: 'https://allowed.example/old' } });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    failDebuggerAttach();
+    const result = (await navigate({ url: ALLOW, newTab: true })) as { data: { epoch?: string } };
+    // The whole point: attach() throwing must not abort the call before
+    // mintEpoch/persistEpochs run — otherwise the created tab is orphaned
+    // (open, but unowned on both extension and daemon sides).
+    expect(result.data.epoch).toBeTruthy();
+  });
+});
+
 describe('isBlankTarget', () => {
   it('treats blank/new-tab/empty as content-free', () => {
     expect(isBlankTarget('about:blank')).toBe(true);

@@ -24,8 +24,10 @@ async function openTab(url: string): Promise<chrome.tabs.Tab> {
  * would reach the daemon as an opaque code:'error' the agent can't act on.
  * Broker mode already catches a vanished OWNED tab via the epoch confirm
  * (tools.ts:runTool); this closes the standalone path and any explicit tabId
- * that raced a tab close. */
-async function getTabOrGone(tabId: number): Promise<chrome.tabs.Tab> {
+ * that raced a tab close. Exported for history.ts's own post-hop tab lookup —
+ * any `chrome.tabs.get` call on a tabId we don't already trust as live should
+ * go through this, not the raw API. */
+export async function getTabOrGone(tabId: number): Promise<chrome.tabs.Tab> {
   try {
     return await chrome.tabs.get(tabId);
   } catch {
@@ -34,6 +36,25 @@ async function getTabOrGone(tabId: number): Promise<chrome.tabs.Tab> {
       `tab ${tabId} is gone (closed, or its id was recycled) — ` +
         `open a fresh one with navigate(newTab:true)`,
     );
+  }
+}
+
+/** `attach()`, but a failure (most commonly `attach_debugger_conflict` — the
+ * human has DevTools open on this exact tab) never propagates. Capture
+ * (dialog/console/network) and keep-awake are a CONVENIENCE layered on top of
+ * the navigation, not a requirement for it — `chrome.tabs.update`/`.create`/
+ * `.reload` work with or without a debugger attached, and navigate/reload
+ * must keep working even when CDP can't get a foothold on the tab (a routine
+ * situation given this project's own usage model: an agent driving the
+ * user's own live Chrome profile, where the user may have DevTools open on
+ * the very tab being automated). */
+async function bestEffortAttach(tabId: number): Promise<void> {
+  try {
+    await attach(tabId);
+  } catch {
+    // best-effort — see doc comment. A tool that genuinely NEEDS CDP (e.g.
+    // an embedded waitFor's polling) will surface its own error from the
+    // debugger calls it makes, same as if attach() were never called at all.
   }
 }
 
@@ -157,8 +178,10 @@ export const navigate: Tool = async (args) => {
     // otherwise freeze the page with no one listening. Inherent race for a
     // brand-new tab (it starts loading `url` at creation, before this
     // resolves) — best effort, strictly better than not attaching until
-    // whatever tool call happens to come next.
-    await attach(tab.id!);
+    // whatever tool call happens to come next. Best-effort so an attach
+    // failure can't abort the call before the epoch mint below runs (which
+    // would otherwise orphan the just-created tab: created but unowned).
+    await bestEffortAttach(tab.id!);
   } else {
     tab = await resolveTab(args);
     const current = tab.url ?? '';
@@ -167,7 +190,7 @@ export const navigate: Tool = async (args) => {
       // user content to lose — open the target in a fresh tab instead.
       tab = await openTab(url);
       created = true;
-      await attach(tab.id!);
+      await bestEffortAttach(tab.id!);
     } else {
       // Reusing an existing tab DESTROYS whatever it currently holds. If that
       // page is real content that isn't itself allowlisted, refuse — otherwise
@@ -185,8 +208,9 @@ export const navigate: Tool = async (args) => {
       // Attach BEFORE issuing the navigation (not after) — an EXISTING tab
       // lets us close the race entirely: Page.enable lands before the new
       // document can start executing scripts, so a dialog on load is never
-      // missed.
-      await attach(tab.id!);
+      // missed. Best-effort: a failed attach (e.g. DevTools already open on
+      // this tab) must not block the navigate the agent actually asked for.
+      await bestEffortAttach(tab.id!);
       await chrome.tabs.update(tab.id!, { url });
     }
   }
@@ -211,8 +235,9 @@ export const navigate: Tool = async (args) => {
     // "Loaded" (tab status complete) rarely means "rendered" on SPAs — the
     // embedded wait covers the gap to the element/text actually appearing,
     // saving the follow-up wait_for round-trip. attach() already ran above
-    // (idempotent, so no cost re-asserting it here).
-    await attach(tab.id!);
+    // (best-effort) — no need to call it again: if it succeeded this is a
+    // no-op either way, and if it failed, runEmbeddedWait's own CDP calls
+    // will surface that on their own (same as if attach() had never run).
     wait = await runEmbeddedWait(tab.id!, waitSpec);
   }
   return {
@@ -246,7 +271,9 @@ export const reload: Tool = async (args) => {
   // Attach BEFORE reloading (not lazily on some later call) so any opted-in
   // capture — dialog handling above all, since an unhandled dialog freezes
   // the reloaded page — is live before the reloaded page's scripts run.
-  await attach(tab.id!);
+  // Best-effort: a failed attach (e.g. DevTools already open on this tab)
+  // must not block the reload the agent actually asked for.
+  await bestEffortAttach(tab.id!);
   await chrome.tabs.reload(tab.id!, { bypassCache });
   await waitForLoad(tab.id!, 'reload');
   // A reload invalidates any refs we may have built for this tab, and any

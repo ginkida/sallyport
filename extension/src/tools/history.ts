@@ -35,7 +35,7 @@ import { ensureAllowed } from './gates.js';
 import { getEpoch, isBrokerMode } from './ownership.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { clearRefsForTab } from './refs.js';
-import { resolveTab, waitForLoad } from './tabs.js';
+import { getTabOrGone, resolveTab, waitForLoad } from './tabs.js';
 import type { Tool } from './types.js';
 
 export type HistoryDirection = 'back' | 'forward';
@@ -182,13 +182,17 @@ export const historyGo: Tool = async (args) => {
   // policy, or a human clicking Cancel) leaves the tab exactly where it
   // started — url/status never change, so waitForHistoryTransition's
   // "nothing moved ⇒ already there" fast path and waitForLoad's "already
-  // complete" fast path both read as success. Page.navigateToHistoryEntry
-  // jumps straight to a KNOWN prior history entry (no redirect chain the way
-  // an explicit navigate() could hit), so an exact URL match is a reliable
-  // "did this actually happen" check — verify it before reporting success
-  // with a URL the tab was never shown.
-  const landed = await chrome.tabs.get(tab.id!);
-  if (landed.url !== target.url) {
+  // complete" fast path both read as success. Verify against `beforeUrl`
+  // (did we leave AT ALL), not an exact match to `target.url` — attaching
+  // CDP disables the back/forward cache, so a hop here is always a live
+  // network navigation and CAN legitimately redirect (session-gated pages
+  // bouncing to /login, http→https or www-normalizing redirects, …); an
+  // exact-match check would misreport a genuinely successful hop as
+  // cancelled. If the tab moved at all, trust it and report where it
+  // ACTUALLY landed (getTabOrGone: the tab could vanish in this exact
+  // window, e.g. a same-origin bounce that closes itself).
+  const landed = await getTabOrGone(tab.id!);
+  if (landed.url === beforeUrl) {
     throw new BridgeError(
       'navigation_cancelled',
       `history_go: the ${direction} ${steps} hop did not complete — the tab is ` +
@@ -196,6 +200,7 @@ export const historyGo: Tool = async (args) => {
         `check with read_text/snapshot before retrying`,
     );
   }
+  const landedUrl = landed.url ?? target.url;
   // Navigation invalidates any refs we held for this tab, and any pending
   // dialog arm (see the identical note in navigate).
   clearRefsForTab(tab.id!);
@@ -209,10 +214,10 @@ export const historyGo: Tool = async (args) => {
   }
   return {
     tabId: tab.id,
-    url: target.url,
+    url: landedUrl,
     data: {
       tabId: tab.id,
-      url: target.url,
+      url: landedUrl,
       direction,
       steps,
       ...(epoch ? { epoch } : {}),
