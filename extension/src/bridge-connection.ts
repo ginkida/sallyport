@@ -1,4 +1,4 @@
-import { decodeSecret, Signer } from './crypto.js';
+import { decodeSecret, Signer, type ReplayCacheStore } from './crypto.js';
 import { type SignedEnvelope } from './protocol.js';
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'no_secret';
@@ -26,6 +26,7 @@ export type StorageBackend = {
 
 export type Deps = {
   storage: StorageBackend;
+  replayCache?: ReplayCacheStore;
   /** Persist transient WS-related state via the same shape as chrome.alarms.
    * Tests pass no-op implementations; production wires real chrome.alarms.
    * `periodInMinutes` drives the recurring keep-alive wake-up; `delayInMinutes`
@@ -80,7 +81,7 @@ const DEFAULT_SERVER_URL = 'ws://127.0.0.1:10086/ws';
 
 export class BridgeConnection {
   private ws: WebSocket | null = null;
-  private signer = new Signer();
+  private signer: Signer;
   private state: ConnectionState = 'disconnected';
   private currentUrl = '';
   private shouldReconnect = false;
@@ -102,7 +103,9 @@ export class BridgeConnection {
    * to every state check that spans an await. */
   private epoch = 0;
 
-  constructor(private deps: Deps) {}
+  constructor(private deps: Deps) {
+    this.signer = new Signer(deps.replayCache);
+  }
 
   status(): StatusSnapshot {
     return {
@@ -148,7 +151,7 @@ export class BridgeConnection {
 
   async unpair(): Promise<void> {
     await this.deps.storage.clearSecret();
-    this.signer.clear();
+    await this.signer.clear();
     await this.disconnect();
     this.state = 'no_secret';
     this.lastError = null;

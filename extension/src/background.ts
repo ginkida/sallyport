@@ -52,6 +52,18 @@ const bridge = new BridgeConnection({
     getSettings: getSettingsForConnection,
     setSettings: setSettingsForConnection,
   },
+  replayCache: {
+    async load(): Promise<unknown> {
+      const key = 'sallyport_seen_nonces';
+      return (await chrome.storage.session.get(key))[key];
+    },
+    async save(snapshot): Promise<void> {
+      await chrome.storage.session.set({ sallyport_seen_nonces: snapshot });
+    },
+    async clear(): Promise<void> {
+      await chrome.storage.session.remove('sallyport_seen_nonces');
+    },
+  },
   alarms: {
     // The state machine's two call sites each pass exactly one of
     // delayInMinutes/periodInMinutes, so `options` is always a valid

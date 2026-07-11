@@ -1,99 +1,80 @@
-/**
- * Focus traversal behind the keystroke password gate (key_type / send_keys).
- *
- * `findActiveField` is the source of the in-page probe string in
- * `keyboard.ts` (serialised via toString). keyboard.ts is chrome-bound and
- * can't load under vitest, so the security-relevant logic — "descend OPEN
- * shadow roots to the real focused field" — is tested here against mock DOM
- * shapes. A regression in the traversal would otherwise ship silently.
- */
+/** Pure response parsing behind the CDP-level keystroke password gate. */
 
 import { describe, expect, it } from 'vitest';
-import { classifyPasswordProbe, findActiveField, type FocusNode } from '../src/tools/focus.js';
+import { collectFrameIds, domNodeIsPassword, focusedBackendNodeIds } from '../src/tools/focus.js';
 
-function input(type: string): FocusNode {
-  return { tagName: 'INPUT', type };
-}
+const focused = (backendDOMNodeId?: number): Record<string, unknown> => ({
+  ...(backendDOMNodeId === undefined ? {} : { backendDOMNodeId }),
+  properties: [{ name: 'focused', value: { type: 'boolean', value: true } }],
+});
 
-describe('findActiveField — keystroke password-gate focus traversal', () => {
-  it('reads a plain focused input (no shadow DOM)', () => {
-    expect(findActiveField({ activeElement: input('password') })).toEqual({
-      tag: 'INPUT',
-      type: 'password',
-    });
-    expect(findActiveField({ activeElement: input('text') })).toEqual({
-      tag: 'INPUT',
-      type: 'text',
-    });
+describe('collectFrameIds', () => {
+  it('walks nested same-origin and cross-origin frame descriptors', () => {
+    expect(
+      collectFrameIds({
+        frame: { id: 'top' },
+        childFrames: [
+          { frame: { id: 'a' } },
+          { frame: { id: 'b' }, childFrames: [{ frame: { id: 'b-child' } }] },
+        ],
+      }),
+    ).toEqual(['top', 'a', 'b', 'b-child']);
   });
 
-  it('descends a single OPEN shadow root to the real field (the bypass fix)', () => {
-    // document.activeElement is the host; the inner password must still be seen.
-    const host: FocusNode = {
-      tagName: 'MY-LOGIN',
-      shadowRoot: { activeElement: input('password') },
-    };
-    expect(findActiveField({ activeElement: host })).toEqual({ tag: 'INPUT', type: 'password' });
-  });
-
-  it('descends NESTED open shadow roots to the deepest field', () => {
-    const inner: FocusNode = { tagName: 'INNER', shadowRoot: { activeElement: input('password') } };
-    const outer: FocusNode = { tagName: 'OUTER', shadowRoot: { activeElement: inner } };
-    expect(findActiveField({ activeElement: outer })).toEqual({ tag: 'INPUT', type: 'password' });
-  });
-
-  it('stops at a CLOSED root (shadowRoot null) — the documented blind spot', () => {
-    // Page script sees shadowRoot === null for mode:'closed'; the probe can
-    // only report the host, which is not an INPUT, so the gate would pass.
-    const closedHost: FocusNode = { tagName: 'MY-CLOSED', shadowRoot: null };
-    expect(findActiveField({ activeElement: closedHost })).toEqual({ tag: 'MY-CLOSED', type: '' });
-  });
-
-  it('reports an open host with nothing focused inside as the host', () => {
-    const host: FocusNode = { tagName: 'MY-EMPTY', shadowRoot: { activeElement: null } };
-    expect(findActiveField({ activeElement: host })).toEqual({ tag: 'MY-EMPTY', type: '' });
-  });
-
-  it('handles no focus / nothing focused', () => {
-    expect(findActiveField({})).toEqual({ tag: '', type: '' });
-    expect(findActiveField({ activeElement: null })).toEqual({ tag: '', type: '' });
-  });
-
-  it('lowercases the type so the gate comparison is case-insensitive', () => {
-    expect(findActiveField({ activeElement: input('PASSWORD') }).type).toBe('password');
+  it('fails closed on a missing id or malformed children collection', () => {
+    expect(collectFrameIds({ frame: {} })).toBeNull();
+    expect(collectFrameIds({ frame: { id: 'top' }, childFrames: {} })).toBeNull();
+    expect(
+      collectFrameIds({ frame: { id: 'top' }, childFrames: [{ frame: { id: 7 } }] }),
+    ).toBeNull();
   });
 });
 
-describe('classifyPasswordProbe — fail-closed decision for the CDP probe result', () => {
-  it('lets a clean non-password result through', () => {
-    expect(classifyPasswordProbe({ value: { tag: 'INPUT', type: 'text' } }, false)).toEqual({
-      blocked: false,
-    });
-    expect(classifyPasswordProbe({ value: { tag: '', type: '' } }, false)).toEqual({
-      blocked: false,
-    });
+describe('focusedBackendNodeIds', () => {
+  it('extracts and de-duplicates focused backend nodes', () => {
+    expect(
+      focusedBackendNodeIds([{ backendDOMNodeId: 1, properties: [] }, focused(42), focused(42)]),
+    ).toEqual([42]);
   });
 
-  it('blocks with password_field on an actual password input', () => {
-    const out = classifyPasswordProbe({ value: { tag: 'INPUT', type: 'password' } }, false);
-    expect(out).toMatchObject({ blocked: true, code: 'password_field' });
+  it('returns an empty list for a valid frame that does not own focus', () => {
+    expect(focusedBackendNodeIds([{ backendDOMNodeId: 1, properties: [] }])).toEqual([]);
   });
 
-  it('fails closed with focus_probe_failed when the probe threw (hostile getter)', () => {
-    // Runtime.evaluate reports exceptionDetails; returnByValue yields no `value`.
-    const out = classifyPasswordProbe({ value: undefined }, true);
-    expect(out).toMatchObject({ blocked: true, code: 'focus_probe_failed' });
+  it('fails closed when a focused AX node has no usable backend id', () => {
+    expect(focusedBackendNodeIds([focused()])).toBeNull();
+    expect(focusedBackendNodeIds([focused(-1)])).toBeNull();
+    expect(focusedBackendNodeIds([focused(1.5)])).toBeNull();
   });
 
-  it('fails closed with focus_probe_failed on a missing value even without an exception', () => {
-    // Belt-and-braces: an unreadable/undefined value must never read as "safe".
-    const out = classifyPasswordProbe({ value: undefined }, false);
-    expect(out).toMatchObject({ blocked: true, code: 'focus_probe_failed' });
+  it('fails closed on malformed AX payloads', () => {
+    expect(focusedBackendNodeIds(undefined)).toBeNull();
+    expect(focusedBackendNodeIds([null])).toBeNull();
+    expect(focusedBackendNodeIds([{ properties: {} }])).toBeNull();
+    expect(focusedBackendNodeIds([{ properties: [null] }])).toBeNull();
+    expect(focusedBackendNodeIds([{ properties: [{ name: 'focused' }] }])).toBeNull();
+  });
+});
+
+describe('domNodeIsPassword', () => {
+  it('recognises password inputs case-insensitively from browser attributes', () => {
+    expect(domNodeIsPassword({ nodeName: 'INPUT', attributes: ['type', 'password'] })).toBe(true);
+    expect(domNodeIsPassword({ nodeName: 'input', attributes: ['TYPE', ' PASSWORD '] })).toBe(true);
   });
 
-  it('never suggests allowPassword for a probe failure (that would be misleading)', () => {
-    const out = classifyPasswordProbe({ value: undefined }, true);
-    expect(out).toMatchObject({ blocked: true });
-    if (out.blocked) expect(out.reason.toLowerCase()).not.toContain('allowpassword');
+  it('allows well-formed ordinary inputs and non-input nodes', () => {
+    expect(domNodeIsPassword({ nodeName: 'INPUT', attributes: ['type', 'email'] })).toBe(false);
+    expect(domNodeIsPassword({ nodeName: 'INPUT', attributes: [] })).toBe(false);
+    expect(domNodeIsPassword({ nodeName: '#document' })).toBe(false);
+    expect(domNodeIsPassword({ nodeName: 'IFRAME', attributes: ['src', 'https://x.test'] })).toBe(
+      false,
+    );
+  });
+
+  it('fails closed on malformed or unreadable DOM descriptions', () => {
+    expect(domNodeIsPassword(undefined)).toBeNull();
+    expect(domNodeIsPassword({ nodeName: 7, attributes: [] })).toBeNull();
+    expect(domNodeIsPassword({ nodeName: 'INPUT' })).toBeNull();
+    expect(domNodeIsPassword({ nodeName: 'INPUT', attributes: ['type', 7] })).toBeNull();
   });
 });

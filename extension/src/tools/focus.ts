@@ -1,75 +1,90 @@
-/** Pure focus-traversal for the keystroke password gate.
+/** Pure response parsing for the CDP-level keystroke password gate.
  *
- * `keyboard.ts` serialises `findActiveField` into a page probe via
- * `Function.prototype.toString` (it runs inside the page through
- * `Runtime.evaluate`). It lives here, free of any `chrome.*` import, so it
- * can be unit-tested directly — `keyboard.ts` itself pulls in `cdp.ts`,
- * which registers chrome listeners at import time and can't load under
- * vitest.
- *
- * The function descends `document.activeElement` through OPEN shadow roots
- * to the deepest focused node — `document.activeElement` otherwise retargets
- * to the shadow *host*, hiding a focused `<input type=password>` inside a
- * custom element. CLOSED shadow roots (`shadowRoot === null` to page script)
- * and iframes are unreachable from here and are documented blind spots in
- * SECURITY.md.
- *
- * MUST stay self-contained — no imports, no closure references — so
- * `toString()` serialisation yields a runnable standalone page expression. */
-export type FocusNode = {
-  tagName?: string;
-  type?: unknown;
-  shadowRoot?: { activeElement?: FocusNode | null } | null;
-} | null;
+ * keyboard.ts asks Page.getFrameTree for every document, then
+ * Accessibility.getFullAXTree for the focused node in each frame. AX nodes
+ * expose a backendDOMNodeId even through closed shadow roots; DOM.describeNode
+ * then supplies the browser-owned tag name and attributes without invoking
+ * page JavaScript. Keeping the parsers here chrome-free makes every
+ * fail-closed decision unit-testable. */
 
-export function findActiveField(root: { activeElement?: FocusNode }): {
-  tag: string;
-  type: string;
-} {
-  let el: FocusNode = root.activeElement || null;
-  while (el && el.shadowRoot && el.shadowRoot.activeElement) {
-    el = el.shadowRoot.activeElement;
-  }
-  return {
-    tag: el && el.tagName ? el.tagName : '',
-    type: el && el.type ? String(el.type).toLowerCase() : '',
+export type FrameTree = {
+  frame?: { id?: unknown };
+  childFrames?: unknown;
+};
+
+export type AXNode = {
+  backendDOMNodeId?: unknown;
+  properties?: unknown;
+};
+
+export type DOMNode = {
+  nodeName?: unknown;
+  attributes?: unknown;
+};
+
+/** Return all frame ids, or null when the tree is malformed. A partial list
+ * would falsely claim coverage while silently skipping a child frame. */
+export function collectFrameIds(root: unknown): string[] | null {
+  const ids: string[] = [];
+  const visit = (raw: unknown): boolean => {
+    if (!raw || typeof raw !== 'object') return false;
+    const tree = raw as FrameTree;
+    if (!tree.frame || typeof tree.frame.id !== 'string' || !tree.frame.id) return false;
+    ids.push(tree.frame.id);
+    if (tree.childFrames === undefined) return true;
+    if (!Array.isArray(tree.childFrames)) return false;
+    return tree.childFrames.every(visit);
   };
+  return visit(root) ? ids : null;
 }
 
-/** Decide what `ensureNotPasswordField` (keyboard.ts) should do with a
- * `Runtime.evaluate` probe result. Pure/chrome-free so the decision is
- * unit-testable, mirroring `classifyAttachError`/`classifyWaitError`.
- *
- * SECURITY.md documents a blind spot: a page with a throwing getter for
- * `type`/`shadowRoot` makes the `findActiveField` probe throw, so
- * `result.value` never arrives — treating that as "not a password field"
- * would silently let the gate pass. Fail closed instead: a probe exception
- * or a missing value blocks the keystroke with a distinct code from
- * `password_field` (we don't actually know it IS a password field, just
- * that we couldn't rule it out), so the recovery hint can't misleadingly
- * suggest `allowPassword=true`. */
-export function classifyPasswordProbe(
-  result: { value?: { tag: string; type: string } },
-  hadException: boolean,
-):
-  | { blocked: false }
-  | { blocked: true; code: 'password_field' | 'focus_probe_failed'; reason: string } {
-  if (hadException || result.value === undefined) {
-    return {
-      blocked: true,
-      code: 'focus_probe_failed',
-      reason:
-        "could not verify the focused field is safe to type into (the page's type/shadowRoot " +
-        'accessor threw or returned nothing) — use fill instead (reads the DOM attribute ' +
-        'directly, unaffected by in-page getters), or inspect the field with snapshot/get_state',
-    };
+/** Extract backend ids for every AX node explicitly marked focused. An empty
+ * array is a well-formed frame that does not own focus; null is malformed or
+ * contains a focused node without a backend id. */
+export function focusedBackendNodeIds(rawNodes: unknown): number[] | null {
+  if (!Array.isArray(rawNodes)) return null;
+  const ids: number[] = [];
+  for (const raw of rawNodes) {
+    if (!raw || typeof raw !== 'object') return null;
+    const node = raw as AXNode;
+    if (node.properties !== undefined && !Array.isArray(node.properties)) return null;
+    let focused = false;
+    for (const rawProperty of node.properties ?? []) {
+      if (!rawProperty || typeof rawProperty !== 'object') return null;
+      const property = rawProperty as { name?: unknown; value?: { value?: unknown } };
+      if (typeof property.name !== 'string') return null;
+      if (property.name === 'focused') {
+        if (!property.value || typeof property.value.value !== 'boolean') return null;
+        if (property.value.value) focused = true;
+      }
+    }
+    if (!focused) continue;
+    if (
+      typeof node.backendDOMNodeId !== 'number' ||
+      !Number.isInteger(node.backendDOMNodeId) ||
+      node.backendDOMNodeId <= 0
+    ) {
+      return null;
+    }
+    ids.push(node.backendDOMNodeId);
   }
-  if (result.value.tag === 'INPUT' && result.value.type === 'password') {
-    return {
-      blocked: true,
-      code: 'password_field',
-      reason: 'focus is on <input type=password>; pass allowPassword=true to override',
-    };
+  return [...new Set(ids)];
+}
+
+/** Browser-DOM password classification. null means the node could not be
+ * classified safely; false is a well-formed non-password node. */
+export function domNodeIsPassword(raw: unknown): boolean | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const node = raw as DOMNode;
+  if (typeof node.nodeName !== 'string') return null;
+  if (node.attributes !== undefined && !Array.isArray(node.attributes)) return null;
+  if (node.nodeName.toUpperCase() !== 'INPUT') return false;
+  if (!Array.isArray(node.attributes)) return null;
+  for (let i = 0; i + 1 < node.attributes.length; i += 2) {
+    const name = node.attributes[i];
+    const value = node.attributes[i + 1];
+    if (typeof name !== 'string' || typeof value !== 'string') return null;
+    if (name.toLowerCase() === 'type') return value.trim().toLowerCase() === 'password';
   }
-  return { blocked: false };
+  return false;
 }

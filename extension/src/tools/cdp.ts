@@ -219,3 +219,15 @@ export async function cdp<T = unknown>(
 ): Promise<T> {
   return (await chrome.debugger.sendCommand({ tabId }, method, params)) as unknown as T;
 }
+
+/** Send a command to a flat child protocol session (notably an OOPIF target)
+ * while retaining the root tab as the debuggee. Chrome exposes sessionId on
+ * DebuggerSession for exactly this routing. */
+export async function cdpSession<T = unknown>(
+  tabId: number,
+  sessionId: string,
+  method: string,
+  params?: Record<string, unknown>,
+): Promise<T> {
+  return (await chrome.debugger.sendCommand({ tabId, sessionId }, method, params)) as unknown as T;
+}

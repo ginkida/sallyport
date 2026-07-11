@@ -15,8 +15,8 @@ Claude Code ── MCP/stdio ──▶ daemon ── WS+HMAC ──▶ extension
 
 | Status | Number |
 |---|---|
-| Daemon tests (pytest) | 458 |
-| Extension tests (vitest) | 647 |
+| Daemon tests (pytest) | 462 |
+| Extension tests (vitest) | 712 |
 | Lint / typecheck (ruff, mypy, eslint, prettier, tsc) | all green |
 
 ## What's in the box
@@ -39,7 +39,8 @@ everything. Sallyport changes the default in five places:
 1. **HMAC-SHA256 on every frame.** A 32-byte random secret lives in
    `~/.config/sallyport/secret` (chmod 600) and is generated on first run. Both
    sides sign every WS frame and verify timestamp drift (≤ 30 s) and nonce
-   freshness (rolling cache of 4096 nonces — replay-protected). A
+   freshness (rolling cache of 4096 nonces — replay-protected and persisted
+   across extension service-worker eviction). A
    cross-language test pin in pytest + vitest guarantees the canonical-JSON
    and MAC bytes stay byte-for-byte compatible.
 2. **Domain allowlist enforced in the extension.** Tools refuse to run on any

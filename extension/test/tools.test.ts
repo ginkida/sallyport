@@ -110,7 +110,7 @@ describe('runTool — force-redacts attempted secrets on password-probe failures
   });
 
   it('force-redacts key_type.text when the probe fails closed with focus_probe_failed', async () => {
-    // classifyPasswordProbe's fail-closed branch (focus.ts): we couldn't rule
+    // The CDP focus walk's fail-closed branch (keyboard.ts/focus.ts): we couldn't rule
     // OUT a password field, so the attempted text must not reach the audit
     // log any less than the confirmed password_field case does.
     vi.mocked(keyType).mockRejectedValueOnce(

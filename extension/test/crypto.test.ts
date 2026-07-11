@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { createHmac } from 'node:crypto';
-import { Signer, decodeSecret } from '../src/crypto.js';
+import {
+  Signer,
+  decodeSecret,
+  type ReplayCacheSnapshot,
+  type ReplayCacheStore,
+} from '../src/crypto.js';
 import { canonicalJson, MAX_CLOCK_SKEW_S, NONCE_CACHE_SIZE } from '../src/protocol.js';
 
 const SECRET_BYTES = new Uint8Array(32);
@@ -16,6 +21,21 @@ async function makeSigner(secret: Uint8Array): Promise<Signer> {
   const s = new Signer();
   await s.setSecret(secret);
   return s;
+}
+
+function makeReplayStore(): ReplayCacheStore & { snapshot?: ReplayCacheSnapshot } {
+  return {
+    snapshot: undefined,
+    async load() {
+      return this.snapshot;
+    },
+    async save(snapshot) {
+      this.snapshot = structuredClone(snapshot);
+    },
+    async clear() {
+      this.snapshot = undefined;
+    },
+  };
 }
 
 describe('decodeSecret', () => {
@@ -57,7 +77,7 @@ describe('Signer with no secret set', () => {
 
   it('sign()/verify() throw again after clear()', async () => {
     const s = await makeSigner(SECRET_BYTES);
-    s.clear();
+    await s.clear();
     await expect(s.sign('ping', {})).rejects.toThrow(/no secret/);
   });
 });
@@ -253,6 +273,20 @@ describe('Signer.verify replay protection', () => {
     await expect(v.verify(signed)).rejects.toThrow(/replay/);
   });
 
+  it('accepts only one of two concurrent copies of the same frame', async () => {
+    // WebCrypto verification yields. Without serialization both calls can
+    // pass the seenSet check before either records the nonce.
+    const peer = await makeSigner(SECRET_BYTES);
+    const verifier = await makeSigner(SECRET_BYTES);
+    const frame = await peer.sign('ping', {});
+
+    const results = await Promise.allSettled([verifier.verify(frame), verifier.verify(frame)]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((result) => result.status === 'rejected');
+    expect(rejected).toBeDefined();
+    expect((rejected as PromiseRejectedResult).reason).toMatchObject({ message: 'nonce replay' });
+  });
+
   it('evicts the oldest nonce once the cache overflows (replay allowed after eviction)', async () => {
     const v = await makeSigner(SECRET_BYTES);
     const ping = (nonce: string) =>
@@ -293,6 +327,91 @@ describe('Signer.setSecret nonce-cache lifecycle', () => {
     // The old frame is no longer a replay (cache cleared); it now fails the
     // MAC check under the new key — proving both the clear and the key swap.
     await expect(s.verify(frame)).rejects.toThrow(/mac mismatch/);
+  });
+});
+
+describe('Signer persisted nonce-cache lifecycle', () => {
+  it('rejects a replay after the signer is recreated (MV3 worker eviction)', async () => {
+    const store = makeReplayStore();
+    const peer = await makeSigner(SECRET_BYTES);
+    const frame = await peer.sign('ping', {});
+    const firstWorker = new Signer(store);
+    await firstWorker.setSecret(SECRET_BYTES);
+    await firstWorker.verify(frame);
+
+    const restartedWorker = new Signer(store);
+    await restartedWorker.setSecret(SECRET_BYTES);
+    await expect(restartedWorker.verify(frame)).rejects.toThrow(/replay/);
+  });
+
+  it('does not restore nonces saved for a different secret', async () => {
+    const store = makeReplayStore();
+    const oldPeer = await makeSigner(SECRET_BYTES);
+    const oldFrame = await oldPeer.sign('ping', {});
+    const oldWorker = new Signer(store);
+    await oldWorker.setSecret(SECRET_BYTES);
+    await oldWorker.verify(oldFrame);
+
+    const repairedWorker = new Signer(store);
+    await repairedWorker.setSecret(SECRET_OTHER_BYTES);
+    expect(store.snapshot?.nonces).toEqual([]);
+    await expect(repairedWorker.verify(oldFrame)).rejects.toThrow(/mac mismatch/);
+  });
+
+  it('clears persisted replay state when unpaired', async () => {
+    const store = makeReplayStore();
+    const signer = new Signer(store);
+    const peer = await makeSigner(SECRET_BYTES);
+    await signer.setSecret(SECRET_BYTES);
+    await signer.verify(await peer.sign('ping', {}));
+    expect(store.snapshot?.nonces).toHaveLength(1);
+
+    await signer.clear();
+    expect(store.snapshot).toBeUndefined();
+  });
+
+  it('does not let an in-flight setSecret resurrect a key after clear', async () => {
+    let announceLoad!: () => void;
+    const loadStarted = new Promise<void>((resolve) => {
+      announceLoad = resolve;
+    });
+    let releaseLoad!: () => void;
+    const loadGate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    let clearCalls = 0;
+    const store: ReplayCacheStore = {
+      async load() {
+        announceLoad();
+        await loadGate;
+        return undefined;
+      },
+      async save() {},
+      async clear() {
+        clearCalls++;
+      },
+    };
+    const signer = new Signer(store);
+    const setting = signer.setSecret(SECRET_BYTES);
+    await loadStarted;
+
+    // clear() was invoked second, so it must linearize after the parked
+    // setSecret(). Before the shared operation queue it ran immediately;
+    // setSecret then resumed and silently restored the supposedly-cleared key.
+    const clearing = signer.clear();
+    await Promise.resolve();
+    expect(clearCalls).toBe(0);
+
+    releaseLoad();
+    await Promise.all([setting, clearing]);
+    expect(clearCalls).toBe(1);
+    await expect(signer.sign('ping', {})).rejects.toThrow(/no secret/);
+  });
+
+  it('keeps the operation queue usable after a rejected operation', async () => {
+    const signer = await makeSigner(SECRET_BYTES);
+    await expect(signer.verify('malformed')).rejects.toThrow(/object/);
+    await expect(signer.sign('ping', {})).resolves.toMatchObject({ type: 'ping' });
   });
 });
 

@@ -1,6 +1,6 @@
-import { attach, cdp } from './cdp.js';
+import { attach, cdp, cdpSession } from './cdp.js';
 import { BridgeError } from './errors.js';
-import { classifyPasswordProbe, findActiveField } from './focus.js';
+import { collectFrameIds, domNodeIsPassword, focusedBackendNodeIds } from './focus.js';
 import { ensureAllowed } from './gates.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
@@ -164,15 +164,6 @@ async function dispatchKeys(tabId: number, keysStr: string, allowPassword: boole
   }
 }
 
-// Page probe for the focused field: the pure `findActiveField` (in focus.ts,
-// unit-tested) serialised and invoked with the page's `document`. It descends
-// open shadow roots so a focused <input type=password> inside a custom
-// element is seen (a naive document.activeElement.type reads the shadow
-// *host* and the gate is bypassed). A fixed literal — no agent interpolation
-// — so it carries the same trust shape as fetch_in_page's fixed body and
-// does not require the per-domain evaluate flag.
-const ACTIVE_FIELD_PROBE = '(' + findActiveField.toString() + ')(document)';
-
 /** Mirror `fill`'s password-field gate for keystroke-level tools.
  *
  * `Input.insertText` and `Input.dispatchKeyEvent` go to whatever element is
@@ -181,32 +172,110 @@ const ACTIVE_FIELD_PROBE = '(' + findActiveField.toString() + ')(document)';
  * lands in the password field, and then `key_type` / `send_keys` would
  * happily type into it, bypassing `fill`'s `password_field` check.
  *
- * Coverage: the top frame, including OPEN shadow roots (the common case —
- * `attachShadow({mode:'open'})` is the default). A probe exception (a page
- * with a throwing getter for `type`/`shadowRoot`) fails CLOSED via
- * `classifyPasswordProbe` — `focus_probe_failed` — rather than silently
- * passing. Two residual blind spots remain, both documented in SECURITY.md:
- * (1) CLOSED shadow roots, whose `.shadowRoot` is null to page script, so the
- * focused node can't be reached; (2) cross-origin iframes, whose inner
- * activeElement the top frame can't see. Both require an allowlisted page
- * the user already trusted. We probe rather than ship a partial frame
- * traversal that would lie about its coverage. */
-async function ensureNotPasswordField(
+ * This stays below the page-JS boundary: Page.getFrameTree enumerates every
+ * document; Accessibility.getFullAXTree identifies each frame's focused node
+ * (including closed shadow descendants); DOM.describeNode reads the real tag
+ * and attributes. Any missing/malformed frame, focus, backend id, or DOM node
+ * fails closed as focus_probe_failed rather than pretending typing is safe. */
+export async function ensureNotPasswordField(
   tabId: number,
   allowPassword: boolean,
   tool: string,
 ): Promise<void> {
   if (allowPassword) return;
-  const probe = await cdp<{
-    result: { value?: { tag: string; type: string } };
-    exceptionDetails?: { text: string; exception?: { description?: string } };
-  }>(tabId, 'Runtime.evaluate', {
-    expression: ACTIVE_FIELD_PROBE,
-    returnByValue: true,
-  });
-  const outcome = classifyPasswordProbe(probe.result, probe.exceptionDetails !== undefined);
-  if (outcome.blocked) {
-    throw new BridgeError(outcome.code, `${tool}: ${outcome.reason}`);
+  const fail = (): never => {
+    throw new BridgeError(
+      'focus_probe_failed',
+      `${tool}: could not verify the focused field is safe to type into — use fill instead, ` +
+        'or inspect the field with snapshot/get_state',
+    );
+  };
+  type TargetInfo = { targetId?: unknown; type?: unknown };
+  let targetInfos: TargetInfo[] | null = null;
+
+  const inspectAxNodes = async (
+    nodes: unknown,
+    sessionId?: string,
+  ): Promise<{ sawFocus: boolean }> => {
+    const backendIds = focusedBackendNodeIds(nodes);
+    if (backendIds === null) return fail();
+    for (const backendNodeId of backendIds) {
+      const params = { backendNodeId, depth: 0 };
+      const described = sessionId
+        ? await cdpSession<{ node?: unknown }>(tabId, sessionId, 'DOM.describeNode', params)
+        : await cdp<{ node?: unknown }>(tabId, 'DOM.describeNode', params);
+      const password = domNodeIsPassword(described.node);
+      if (password === null) return fail();
+      if (password) {
+        throw new BridgeError(
+          'password_field',
+          `${tool}: focus is on <input type=password>; pass allowPassword=true to override`,
+        );
+      }
+    }
+    return { sawFocus: backendIds.length > 0 };
+  };
+
+  const inspectOopif = async (frameId: string): Promise<{ sawFocus: boolean }> => {
+    if (targetInfos === null) {
+      const targets = await cdp<{ targetInfos?: unknown }>(tabId, 'Target.getTargets');
+      if (!Array.isArray(targets.targetInfos)) return fail();
+      targetInfos = targets.targetInfos as TargetInfo[];
+    }
+    const target = targetInfos.find(
+      (candidate) => candidate?.type === 'iframe' && candidate.targetId === frameId,
+    );
+    if (!target || typeof target.targetId !== 'string') return fail();
+
+    const attached = await cdp<{ sessionId?: unknown }>(tabId, 'Target.attachToTarget', {
+      targetId: target.targetId,
+      flatten: true,
+    });
+    if (typeof attached.sessionId !== 'string' || !attached.sessionId) return fail();
+    const sessionId = attached.sessionId;
+    try {
+      const ax = await cdpSession<{ nodes?: unknown }>(
+        tabId,
+        sessionId,
+        'Accessibility.getFullAXTree',
+      );
+      return await inspectAxNodes(ax.nodes, sessionId);
+    } finally {
+      try {
+        await cdp(tabId, 'Target.detachFromTarget', { sessionId });
+      } catch {
+        // The child may have navigated/disappeared. Inspection above remains
+        // authoritative; detach is cleanup, not part of the password result.
+      }
+    }
+  };
+
+  try {
+    const frameTree = await cdp<{ frameTree?: unknown }>(tabId, 'Page.getFrameTree');
+    const frameIds = collectFrameIds(frameTree.frameTree);
+    if (frameIds === null) return fail();
+
+    let sawFocusedNode = false;
+    for (const frameId of frameIds) {
+      let result: { sawFocus: boolean };
+      try {
+        const ax = await cdp<{ nodes?: unknown }>(tabId, 'Accessibility.getFullAXTree', {
+          frameId,
+        });
+        result = await inspectAxNodes(ax.nodes);
+      } catch (error) {
+        if (error instanceof BridgeError) throw error;
+        // Site-isolated cross-origin frames may live in their own target.
+        // Route the same AX + DOM inspection through a temporary flat child
+        // session instead of treating every OOPIF as an unusable page.
+        result = await inspectOopif(frameId);
+      }
+      if (result.sawFocus) sawFocusedNode = true;
+    }
+    if (!sawFocusedNode) fail();
+  } catch (error) {
+    if (error instanceof BridgeError) throw error;
+    fail();
   }
 }
 

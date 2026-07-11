@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { segmentTypesText } from '../src/tools/keyboard.js';
+import { ensureNotPasswordField, segmentTypesText } from '../src/tools/keyboard.js';
 
 // The password gate on send_keys re-probes before every character-typing segment
 // (after the first), so a `<focus-mover> secret` sequence can't land the
@@ -54,5 +54,150 @@ describe('segmentTypesText', () => {
     expect(segmentTypesText('  s  ')).toBe(true);
     expect(segmentTypesText('  tab  ')).toBe(false);
     expect(segmentTypesText('notarealkey')).toBe(false); // resolveKey throws -> false
+  });
+});
+
+type CDPResponder = (
+  method: string,
+  params?: Record<string, unknown>,
+  source?: { tabId: number; sessionId?: string },
+) => unknown;
+
+function installCdpResponder(respond: CDPResponder): void {
+  (globalThis as unknown as { chrome: unknown }).chrome = {
+    debugger: {
+      async sendCommand(
+        _source: { tabId: number },
+        method: string,
+        params?: Record<string, unknown>,
+      ) {
+        return respond(method, params, _source);
+      },
+    },
+  };
+}
+
+const focusedAxNode = (backendDOMNodeId: number): Record<string, unknown> => ({
+  backendDOMNodeId,
+  properties: [{ name: 'focused', value: { type: 'boolean', value: true } }],
+});
+
+describe('ensureNotPasswordField — CDP focus walk', () => {
+  it('blocks a password input focused inside a cross-origin child frame', async () => {
+    installCdpResponder((method, params) => {
+      if (method === 'Page.getFrameTree') {
+        return {
+          frameTree: {
+            frame: { id: 'top' },
+            childFrames: [{ frame: { id: 'cross-origin-child' } }],
+          },
+        };
+      }
+      if (method === 'Accessibility.getFullAXTree') {
+        return params?.frameId === 'top'
+          ? { nodes: [focusedAxNode(10)] }
+          : { nodes: [focusedAxNode(20)] };
+      }
+      if (method === 'DOM.describeNode') {
+        return params?.backendNodeId === 20
+          ? { node: { nodeName: 'INPUT', attributes: ['type', 'password'] } }
+          : { node: { nodeName: 'IFRAME', attributes: [] } };
+      }
+      throw new Error(`unexpected command: ${method}`);
+    });
+
+    await expect(ensureNotPasswordField(1, false, 'key_type')).rejects.toMatchObject({
+      code: 'password_field',
+    });
+  });
+
+  it('routes a site-isolated OOPIF through its flat child session', async () => {
+    const calls: Array<{ method: string; sessionId?: string }> = [];
+    installCdpResponder((method, params, source) => {
+      calls.push({ method, sessionId: source?.sessionId });
+      if (method === 'Page.getFrameTree') {
+        return {
+          frameTree: {
+            frame: { id: 'top' },
+            childFrames: [{ frame: { id: 'oopif-target' } }],
+          },
+        };
+      }
+      if (method === 'Accessibility.getFullAXTree' && params?.frameId === 'top') {
+        return { nodes: [focusedAxNode(10)] };
+      }
+      if (method === 'Accessibility.getFullAXTree' && params?.frameId === 'oopif-target') {
+        throw new Error('Frame with the given frameId is not found');
+      }
+      if (method === 'Target.getTargets') {
+        return { targetInfos: [{ targetId: 'oopif-target', type: 'iframe' }] };
+      }
+      if (method === 'Target.attachToTarget') return { sessionId: 'child-session' };
+      if (method === 'Accessibility.getFullAXTree' && source?.sessionId === 'child-session') {
+        return { nodes: [focusedAxNode(20)] };
+      }
+      if (method === 'DOM.describeNode' && source?.sessionId === 'child-session') {
+        return { node: { nodeName: 'INPUT', attributes: ['type', 'password'] } };
+      }
+      if (method === 'DOM.describeNode') return { node: { nodeName: 'IFRAME', attributes: [] } };
+      if (method === 'Target.detachFromTarget') return {};
+      throw new Error(`unexpected command: ${method}`);
+    });
+
+    await expect(ensureNotPasswordField(1, false, 'key_type')).rejects.toMatchObject({
+      code: 'password_field',
+    });
+    expect(calls).toContainEqual({
+      method: 'Accessibility.getFullAXTree',
+      sessionId: 'child-session',
+    });
+    expect(calls.at(-1)).toEqual({ method: 'Target.detachFromTarget', sessionId: undefined });
+  });
+
+  it('blocks a password input exposed by AX inside a closed shadow root', async () => {
+    installCdpResponder((method) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'top' } } };
+      if (method === 'Accessibility.getFullAXTree') return { nodes: [focusedAxNode(30)] };
+      if (method === 'DOM.describeNode') {
+        return { node: { nodeName: 'INPUT', attributes: ['type', 'PASSWORD'] } };
+      }
+      throw new Error(`unexpected command: ${method}`);
+    });
+
+    await expect(ensureNotPasswordField(1, false, 'send_keys')).rejects.toMatchObject({
+      code: 'password_field',
+    });
+  });
+
+  it('allows a fully described focused text input', async () => {
+    installCdpResponder((method) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'top' } } };
+      if (method === 'Accessibility.getFullAXTree') return { nodes: [focusedAxNode(40)] };
+      if (method === 'DOM.describeNode') {
+        return { node: { nodeName: 'INPUT', attributes: ['type', 'text'] } };
+      }
+      throw new Error(`unexpected command: ${method}`);
+    });
+
+    await expect(ensureNotPasswordField(1, false, 'key_type')).resolves.toBeUndefined();
+  });
+
+  it('fails closed when any frame response is malformed', async () => {
+    installCdpResponder((method) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'top' } } };
+      if (method === 'Accessibility.getFullAXTree') return { nodes: undefined };
+      throw new Error(`unexpected command: ${method}`);
+    });
+
+    await expect(ensureNotPasswordField(1, false, 'key_type')).rejects.toMatchObject({
+      code: 'focus_probe_failed',
+    });
+  });
+
+  it('skips every CDP probe only with the explicit allowPassword override', async () => {
+    installCdpResponder(() => {
+      throw new Error('must not be called');
+    });
+    await expect(ensureNotPasswordField(1, true, 'key_type')).resolves.toBeUndefined();
   });
 });

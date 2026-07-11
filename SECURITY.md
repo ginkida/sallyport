@@ -37,7 +37,10 @@ Concretely we try to defend against:
    rejects paths outside the sandbox; `Path.resolve()` defeats symlink
    escapes.
 4. **Replay** — every WS frame carries an HMAC, a timestamp (±30 s
-   tolerance), and a one-time nonce (4096-entry rolling cache).
+   tolerance), and a one-time nonce (4096-entry rolling cache). The extension
+   serialises verification and persists its receive cache in
+   `chrome.storage.session`, tagged to the pairing secret, so concurrent
+   duplicates and normal MV3 worker eviction cannot reopen the window.
 
 We do **not** try to defend against:
 
@@ -60,8 +63,8 @@ the "Tools" table for per-tool notes. Quick reference:
 | Daemon ↔ extension authenticity | HMAC-SHA256, ts±30 s, 4096-nonce cache | `daemon/.../protocol.py`, `extension/src/crypto.ts` |
 | Network exposure | Loopback-only bind (`refuse_non_loopback`) | `daemon/.../__main__.py` |
 | Domain scope | Allowlist enforced before every DOM tool | `extension/src/allowlist.ts`, `extension/src/tools/gates.ts` |
-| Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, keystroke password probe, `snapshot`'s DOM-fallback walker, `screenshot`'s `document.visibilityState` probe, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `focus.ts`, `domtree.ts`, `screenshot.ts`, `aim.ts` |
-| Password input | `fill` reads the `type` attribute via CDP `DOM.getAttributes` (browser DOM, not page JS); `key_type`/`send_keys` probe `activeElement.type` | `extension/src/tools/dom.ts`, `keyboard.ts` |
+| Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, `snapshot`'s DOM-fallback walker, `screenshot`'s `document.visibilityState` probe, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `domtree.ts`, `screenshot.ts`, `aim.ts` |
+| Password input | `fill` reads `type` via browser DOM; `key_type`/`send_keys` enumerate frames (temporary flat child sessions for OOPIFs), locate focused AX nodes through closed shadow DOM, then inspect browser-owned DOM attributes | `extension/src/tools/dom.ts`, `focus.ts`, `keyboard.ts` |
 | Closing tabs | Allowlist-gated like other DOM tools | `extension/src/tools/tabs.ts:closeTab` |
 | Filesystem (write) | `save_to_file` sandbox to `~/Downloads/sallyport/` | `daemon/.../local_tools.py:save_to_file` |
 | Filesystem (read via Chrome) | `upload` paths must resolve under the same sandbox; symlink-safe | `daemon/.../local_tools.py:validate_upload_paths` + `PRE_CALL_VALIDATORS` |
@@ -126,88 +129,6 @@ process itself is compromised, all partitions fall at once.
 
 ## Known limitations
 
-### Nonce cache lives only as long as the extension's service worker
-
-MV3 service workers are killed after ~30 s of inactivity. The
-`Signer`'s in-memory nonce cache (`extension/src/crypto.ts`) goes with
-it. A captured WS frame could in principle be replayed inside the
-±30 s `MAX_CLOCK_SKEW_S` window in a freshly-spawned SW.
-
-Reconnecting to the same daemon no longer clears the cache: `setSecret`
-is a no-op when the secret is unchanged, so a network blip or a daemon
-restart keeps the replay window closed on the extension side. The only
-remaining reset is genuine SW termination — the gap is bounded by the SW
-lifetime, not by every reconnect.
-
-**Exploitability:** very low. Everything is loopback, so capture requires
-local root or a kernel-level shim, and timing requires the SW to be down
-exactly when the replay arrives. The daemon side's nonce cache is
-process-lifetime, so a replay against the daemon (which is the actual
-target) is always caught.
-
-**Possible fix:** persist `seenNonces` in `chrome.storage.session` —
-not done because the storage write per frame is a real overhead and the
-practical exposure is near-zero.
-
-### Password probe: closed shadow roots and cross-origin iframes
-
-The keystroke gate (`key_type` / `send_keys`) finds the focused element
-by walking `document.activeElement` down through **open** shadow roots
-(`fill` resolves a specific node by selector/ref and reads its `type`
-attribute via CDP `DOM.getAttributes`, so it is immune to the in-page
-getter trick below; for its `insertText` paths `fill` then re-checks the
-deepest focused leaf after `focus()`, so a `delegatesFocus` shadow host —
-whose `focus()` delegates to an inner control while `document.activeElement`
-retargets back to the host — cannot route a value into an inner password
-field the resolved-node gate never inspected). Within a `send_keys` sequence the gate is
-**re-asserted before every character-typing segment** (not merely after
-an enumerated focus-moving key), so however focus moved mid-sequence —
-Tab's default action, Space/Enter *activating* the focused control, or a
-site keydown handler calling `.focus()` on any key — a `<mover> <secret>`
-sequence can't deposit the credential into a password field the single
-up-front probe never saw. It fails with `password_field` before the
-credential character, which also triggers the audit-log redaction path.
-Two cases the keystroke gate still cannot reach:
-
-- **Closed shadow roots.** `element.shadowRoot` is `null` to page
-  script for `attachShadow({mode:'closed'})`, so a focused
-  `<input type=password>` inside a closed root is invisible to the
-  probe. Open roots (the default and overwhelmingly common case) are
-  covered.
-- **Iframes (any origin).** The probe runs in the top frame and descends
-  only `.shadowRoot`, never `.contentDocument`, so `document.activeElement`
-  returns the `<iframe>` element, not the focused element inside it.
-  Typing into a password field inside *any* iframe — same-origin or
-  cross-origin — isn't caught.
-
-**Fixed: hostile in-page getters (keystroke gate only).** The keystroke
-probe reads the focused element's `type` / `shadowRoot` via
-`Runtime.evaluate`. A page that defines a throwing getter for one of those
-makes the probe throw; previously the result then read as `undefined` and
-the keystroke gate silently passed. `classifyPasswordProbe` (`focus.ts`)
-now checks the CDP response's `exceptionDetails` (and an `undefined` value
-with no exception, belt-and-braces) and fails **closed** with
-`focus_probe_failed` instead of treating an unreadable probe as "no
-field" — we don't actually know it IS a password field, just that we
-couldn't rule it out, so the code is deliberately distinct from
-`password_field` (whose recovery hint suggests `allowPassword=true`,
-which would be misleading here). `fill` was never affected: it reads the
-`type` attribute from the browser's DOM via CDP `DOM.getAttributes`, which
-a page cannot shadow with a throwing or lying JS accessor.
-
-**Exploitability (residual — closed shadow roots / iframes):** the agent
-must (a) drive focus into the closed root / iframe and (b) the page (or
-iframe) must be on an allowlisted domain — a site the user already
-trusted. Real but narrow blind spots, and only for `key_type` /
-`send_keys`; `fill` into the same field reads the DOM attribute directly
-and is caught regardless.
-
-**Possible fix:** resolve the focused node at the CDP `DOM` level (which
-can pierce closed roots) and walk frames via `Target.getTargets` — the
-same approach `fill` already uses for its node. Not done for the
-keystroke gate yet — it adds CDP round-trips on every keystroke tool call
-for a narrow, already-trusted-origin case.
-
 ### Audit log persistence depends on `chrome.storage.local` quota
 
 Per-entry truncation (`MAX_AUDIT_STRING = 1024` per string, including
@@ -234,8 +155,8 @@ passwords are not retained at rest or surfaced by the popup's Export.
 The same redaction applies when a typing call is REJECTED for touching
 (or possibly touching) a password field — both the confirmed
 `password_field` case and the fail-closed `focus_probe_failed` case (the
-page's `type`/`shadowRoot` accessor threw or returned nothing, so the
-field couldn't be ruled out) — so an attempted credential doesn't leak
+CDP frame/AX/DOM focus walk returned incomplete data, so the field couldn't
+be ruled out) — so an attempted credential doesn't leak
 into the audit log just because the keystroke itself was correctly
 blocked. Values typed into non-password fields are kept verbatim — that
 is the point of a visible audit trail — so treat the exported log as

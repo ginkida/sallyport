@@ -6,6 +6,29 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.1] — 2026-07-12
+
+### Security
+
+- Serialized extension-side HMAC verification so concurrent copies of one
+  authenticated frame cannot both pass the nonce-cache check while WebCrypto
+  is yielding. Exactly one copy now succeeds and the other is rejected as a
+  replay. The same FIFO critical section now covers signing, secret changes,
+  unpair clearing, and verification: an in-flight async `setSecret` can no
+  longer resume after `clear` and resurrect a stale key, nor can a cache/key
+  swap interleave with an old frame verification.
+- Persisted the extension's receive-side nonce cache in
+  `chrome.storage.session`, keyed to a digest of the pairing secret, so MV3
+  service-worker eviction no longer resets replay protection.
+- Replaced the page-JavaScript keystroke password probe with a fail-closed CDP
+  walk: all frames are enumerated, focused accessibility nodes are resolved to
+  browser DOM nodes, and their real attributes are inspected. `key_type` and
+  `send_keys` now catch password fields inside closed shadow roots and
+  same/cross-origin iframes, while hostile page getters are no longer involved.
+  Site-isolated cross-origin frames (OOPIFs) are inspected through temporary
+  flat child protocol sessions; failure to resolve or attach the exact iframe
+  target remains fail-closed.
+
 ## [0.15.0] — 2026-07-10
 
 ### Added
@@ -1706,7 +1729,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/ginkida/sallyport/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/ginkida/sallyport/compare/v0.14.5...v0.15.0
 [0.14.5]: https://github.com/ginkida/sallyport/compare/v0.14.4...v0.14.5
 [0.14.4]: https://github.com/ginkida/sallyport/compare/v0.14.3...v0.14.4

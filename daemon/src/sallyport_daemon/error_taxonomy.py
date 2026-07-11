@@ -198,9 +198,9 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
         ),
         "focus_probe_failed": (
             "retryable=no; key_type/send_keys couldn't verify the focused field is safe to type "
-            "into (the page's type/shadowRoot accessor threw or returned nothing) — use fill "
-            "instead (reads the DOM attribute directly, unaffected by in-page getters), or inspect "
-            "the field first with snapshot/get_state."
+            "into (the CDP frame/AX/DOM focus walk returned incomplete data) — use fill instead "
+            "with an explicit field selector/ref, or inspect the field first with "
+            "snapshot/get_state."
         ),
         "error": (
             "retryable=maybe; an unclassified tool failure (the message carries whatever detail "
