@@ -35,6 +35,8 @@ secret
 CLAUDE.md
 .claude/
 .mcp.json
+AGENTS.md
+.codex/
 .vscode/
 .idea/
 
