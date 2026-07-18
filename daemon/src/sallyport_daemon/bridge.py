@@ -459,7 +459,7 @@ class Bridge:
         # Local-only tools run in this process and don't need the extension.
         # Imported lazily to avoid a circular reference (local_tools imports
         # ToolError from this module).
-        from .local_tools import LOCAL_TOOLS, PRE_CALL_VALIDATORS
+        from .local_tools import LOCAL_TOOLS, POST_CALL_PROCESSORS, PRE_CALL_VALIDATORS
         from .ownership import (
             CREATE_CAPABLE,
             ensure_owns,
@@ -504,6 +504,13 @@ class Bridge:
                     record_close(self._ownership, client_id, name, args)
                     if name == "list_tabs":
                         result = scope_list_tabs(self._ownership, client_id, result)
+                    # Daemon-side post-call processing — print_to_pdf writes its
+                    # PDF into the download sandbox here so the base64 payload
+                    # never reaches the MCP caller's context. Runs after the
+                    # ownership bookkeeping above, in-process.
+                    processor = POST_CALL_PROCESSORS.get(name)
+                    if processor is not None:
+                        result = await processor(args, result)
         except Exception as exc:
             # CancelledError is a BaseException, so a cancelled call is NOT
             # recorded here — only genuinely completed (errored) calls are.

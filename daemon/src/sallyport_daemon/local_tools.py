@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import os
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,29 +28,29 @@ def _resolve_dir() -> Path:
     return Path(env).expanduser() if env else DEFAULT_DOWNLOAD_DIR
 
 
-def _sanitise_filename(filename: str) -> str:
+def _sanitise_filename(filename: str, *, tool: str = "save_to_file") -> str:
     """Reject anything that could escape the sandbox.
 
     We refuse: empty, leading dot (hidden files), any slash/backslash,
     any '..' segment. The result is a single component that lands inside
-    the download directory; nothing else.
+    the download directory; nothing else. `tool` only prefixes error text.
     """
     if not filename:
-        raise ToolError("save_to_file: filename required", code="bad_args")
+        raise ToolError(f"{tool}: filename required", code="bad_args")
     if "\x00" in filename:
-        raise ToolError("save_to_file: filename contains null byte", code="unsafe_path")
+        raise ToolError(f"{tool}: filename contains null byte", code="unsafe_path")
     if "/" in filename or "\\" in filename:
         raise ToolError(
-            f"save_to_file: filename {filename!r} must be a single name, not a path",
+            f"{tool}: filename {filename!r} must be a single name, not a path",
             code="unsafe_path",
         )
     if filename in {".", ".."} or filename.startswith("."):
         raise ToolError(
-            f"save_to_file: filename {filename!r} starts with a dot (hidden / traversal)",
+            f"{tool}: filename {filename!r} starts with a dot (hidden / traversal)",
             code="unsafe_path",
         )
     if len(filename) > 255:
-        raise ToolError("save_to_file: filename too long (>255 chars)", code="bad_args")
+        raise ToolError(f"{tool}: filename too long (>255 chars)", code="bad_args")
     return filename
 
 
@@ -77,17 +78,26 @@ async def save_to_file(args: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         raise ToolError(f"save_to_file: not valid base64: {exc}", code="bad_args") from exc
 
+    return _write_sandbox_blob(filename, raw, tool="save_to_file")
+
+
+def _write_sandbox_blob(filename: str, raw: bytes, *, tool: str) -> dict[str, Any]:
+    """Write bytes into the download sandbox; return {"path", "size"}.
+
+    Shared by save_to_file and print_to_pdf's post-call processor. Both
+    guards matter (invariant #10): the name already passed
+    _sanitise_filename, and resolve()+relative_to re-proves the final path
+    stays under the download dir. Filesystem failures (read-only volume,
+    permission denied, disk full, name too long for the OS) surface as
+    ToolError, not an uncaught OSError — the latter would crash the MCP
+    dispatch loop and leave the caller hanging until its own timeout.
+    """
     download_dir = _resolve_dir()
-    # Filesystem failures (read-only volume, permission denied, disk full,
-    # name too long for the OS) must surface as a ToolError, not an uncaught
-    # OSError — the latter would crash the MCP dispatch loop and leave the
-    # caller hanging until its own timeout. Base64 decode above is already
-    # guarded the same way; this closes the matching gap on the write path.
     try:
         download_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise ToolError(
-            f"save_to_file: cannot create download dir {download_dir}: {exc}",
+            f"{tool}: cannot create download dir {download_dir}: {exc}",
             code="filesystem_error",
         ) from exc
     target = download_dir / filename
@@ -98,7 +108,7 @@ async def save_to_file(args: dict[str, Any]) -> dict[str, Any]:
         resolved.relative_to(sandbox)
     except ValueError as exc:
         raise ToolError(
-            f"save_to_file: resolved path {resolved} escaped sandbox {sandbox}",
+            f"{tool}: resolved path {resolved} escaped sandbox {sandbox}",
             code="unsafe_path",
         ) from exc
 
@@ -106,7 +116,7 @@ async def save_to_file(args: dict[str, Any]) -> dict[str, Any]:
         resolved.write_bytes(raw)
     except OSError as exc:
         raise ToolError(
-            f"save_to_file: write failed ({exc.__class__.__name__}): {exc}",
+            f"{tool}: write failed ({exc.__class__.__name__}): {exc}",
             code="filesystem_error",
         ) from exc
     return {"path": str(resolved), "size": len(raw)}
@@ -177,6 +187,45 @@ def validate_upload_paths(paths: object) -> None:
             ) from exc
 
 
+def _validate_pdf_filename(args: dict[str, Any]) -> None:
+    """Fail before the extension round-trip when print_to_pdf's filename is
+    unusable — same sandbox rules as save_to_file (invariant #10), applied
+    early so we don't render a PDF we then refuse to write."""
+    filename = args.get("filename")
+    if filename is None:
+        return
+    if not isinstance(filename, str):
+        raise ToolError("print_to_pdf: filename must be a string", code="bad_args")
+    _sanitise_filename(filename, tool="print_to_pdf")
+
+
+async def _print_to_pdf_result(args: dict[str, Any], result: Any) -> dict[str, Any]:
+    """Write the extension's PDF payload into the download sandbox.
+
+    The extension returns {pdfBase64, base64Length}; routing the bytes
+    through the daemon keeps them OUT of the MCP caller's context (a
+    multi-MiB PDF would otherwise land in the model's window) and puts the
+    write behind exactly the same sandbox guards as save_to_file. Returns
+    {path, size, filename} — small enough to be a safe tool result.
+    """
+    if not isinstance(result, dict) or not isinstance(result.get("pdfBase64"), str):
+        raise ToolError("print_to_pdf: extension returned no PDF payload", code="error")
+    filename = args.get("filename")
+    if filename is None:
+        filename = datetime.now(timezone.utc).strftime("print-%Y%m%dT%H%M%SZ.pdf")
+    if not isinstance(filename, str):
+        raise ToolError("print_to_pdf: filename must be a string", code="bad_args")
+    filename = _sanitise_filename(filename, tool="print_to_pdf")
+    try:
+        raw = base64.b64decode(result["pdfBase64"], validate=True)
+    except Exception as exc:
+        raise ToolError(
+            f"print_to_pdf: extension payload not valid base64: {exc}", code="error"
+        ) from exc
+    written = _write_sandbox_blob(filename, raw, tool="print_to_pdf")
+    return {**written, "filename": filename}
+
+
 # Registry consumed by Bridge.call_tool. Keep the keys identical to the
 # MCP tool names so routing is purely a dict lookup.
 LOCAL_TOOLS: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
@@ -189,4 +238,13 @@ LOCAL_TOOLS: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
 # `args` dict and raises `ToolError` to abort the call.
 PRE_CALL_VALIDATORS: dict[str, Callable[[dict[str, Any]], None]] = {
     "upload": lambda args: validate_upload_paths(args.get("paths")),
+    "print_to_pdf": _validate_pdf_filename,
+}
+
+
+# Per-tool post-call processors that run on the daemon AFTER the extension
+# round-trip: each receives (args, extension result) and returns the result
+# the MCP caller actually sees.
+POST_CALL_PROCESSORS: dict[str, Callable[[dict[str, Any], Any], Awaitable[Any]]] = {
+    "print_to_pdf": _print_to_pdf_result,
 }

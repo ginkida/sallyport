@@ -735,6 +735,39 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="print_to_pdf",
+        description=(
+            "Render the page to a PDF and save it into the download sandbox "
+            "(~/Downloads/sallyport/, or SALLYPORT_DOWNLOAD_DIR); returns "
+            "{path, size, filename} — the PDF bytes never enter the model "
+            "context. filename is optional (default print-<UTC timestamp>.pdf) "
+            "and must be a single name with no path separators. landscape, "
+            "printBackground (default true) and scale (0.1-2, default 1) map "
+            "to Page.printToPDF. Works on hidden tabs — unlike screenshot, no "
+            "rendered frame is needed — so broker-mode background agent tabs "
+            "are printable. Allowlist-gated; no evaluate opt-in needed. Fails "
+            "with pdf_too_large when the PDF would exceed the bridge frame "
+            "cap (~9 MiB binary)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "Output filename inside the download sandbox (single "
+                        "component; default print-<UTC timestamp>.pdf)"
+                    ),
+                },
+                "landscape": {"type": "boolean", "default": False},
+                "printBackground": {"type": "boolean", "default": True},
+                "scale": {"type": "number", "minimum": 0.1, "maximum": 2, "default": 1},
+                "tabId": _TAB_ID_SCHEMA,
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
         name="wait_for",
         description=(
             "Wait until a CSS selector (or @eN ref) is present AND visible, "

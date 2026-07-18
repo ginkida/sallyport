@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 
 from sallyport_daemon.bridge import ToolError
-from sallyport_daemon.local_tools import save_to_file, validate_upload_paths
+from sallyport_daemon.local_tools import (
+    PRE_CALL_VALIDATORS,
+    _print_to_pdf_result,
+    save_to_file,
+    validate_upload_paths,
+)
 
 
 @pytest.fixture
@@ -245,3 +250,62 @@ async def test_bridge_call_tool_runs_upload_validator_before_extension(
     with pytest.raises(ToolError) as exc_info:
         await bridge.call_tool("upload", {"selector": "#f", "paths": ["/etc/passwd"]})
     assert exc_info.value.code == "unsafe_path"
+
+
+# ---------------------------------------------------------------- print_to_pdf
+
+
+async def test_print_to_pdf_writes_bytes(sandbox: Path) -> None:
+    """A valid base64 PDF payload lands in the sandbox; the MCP-visible
+    result is the compact metadata shape, not the payload itself."""
+    body = base64.b64encode(b"%PDF-1.7 fake").decode()
+    result = await _print_to_pdf_result(
+        {"filename": "report.pdf"}, {"pdfBase64": body, "base64Length": len(body)}
+    )
+    assert result["filename"] == "report.pdf"
+    assert result["size"] == len(b"%PDF-1.7 fake")
+    assert "pdfBase64" not in result
+    assert Path(result["path"]).read_bytes() == b"%PDF-1.7 fake"
+    assert Path(result["path"]).parent == sandbox
+
+
+async def test_print_to_pdf_default_filename(sandbox: Path) -> None:
+    body = base64.b64encode(b"%PDF").decode()
+    result = await _print_to_pdf_result({}, {"pdfBase64": body})
+    assert result["filename"].startswith("print-")
+    assert result["filename"].endswith(".pdf")
+    assert Path(result["path"]).name == result["filename"]
+
+
+async def test_print_to_pdf_rejects_traversal(sandbox: Path) -> None:
+    body = base64.b64encode(b"%PDF").decode()
+    with pytest.raises(ToolError) as exc_info:
+        await _print_to_pdf_result({"filename": "../evil.pdf"}, {"pdfBase64": body})
+    assert exc_info.value.code == "unsafe_path"
+
+
+async def test_print_to_pdf_rejects_bad_base64(sandbox: Path) -> None:
+    with pytest.raises(ToolError) as exc_info:
+        await _print_to_pdf_result({}, {"pdfBase64": "!!!not-base64!!!"})
+    assert exc_info.value.code == "error"
+
+
+async def test_print_to_pdf_rejects_missing_payload(sandbox: Path) -> None:
+    with pytest.raises(ToolError) as exc_info:
+        await _print_to_pdf_result({}, {"unexpected": True})
+    assert exc_info.value.code == "error"
+
+
+def test_print_to_pdf_validator_rejects_bad_filename() -> None:
+    validator = PRE_CALL_VALIDATORS["print_to_pdf"]
+    for bad in ("../x.pdf", "/abs/x.pdf", ".hidden.pdf", "dir/x.pdf"):
+        with pytest.raises(ToolError) as exc_info:
+            validator({"filename": bad})
+        assert exc_info.value.code == "unsafe_path"
+    with pytest.raises(ToolError) as exc_info:
+        validator({"filename": 42})
+    assert exc_info.value.code == "bad_args"
+    # Absent filename and a plain name both pass.
+    validator({})
+    validator({"filename": "ok.pdf"})
+

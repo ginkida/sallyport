@@ -49,6 +49,11 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "retry; in broker mode bringToFront is forbidden (bringtofront_forbidden), "
             "so use snapshot/read_text instead, which don't need a visible tab."
         ),
+        "pdf_too_large": (
+            "retryable=no; the generated PDF exceeds the bridge frame cap — shrink the "
+            "page first (smaller scale, print stylesheet) or capture the needed region "
+            "with screenshot instead."
+        ),
         "not_visible": (
             "retryable=yes; the target has zero size / isn't laid out yet — wait_for (or "
             "settle) until it renders then retry, or re-snapshot to pick a visible element."

@@ -18,6 +18,7 @@ import { historyGo } from './tools/history.js';
 import { keyType, sendKeys } from './tools/keyboard.js';
 import { hover, mouseClick } from './tools/mouse.js';
 import { networkTail } from './tools/network.js';
+import { printToPdf } from './tools/pdf.js';
 import { reveal } from './tools/reveal.js';
 import { screenshot } from './tools/screenshot.js';
 import { selectOption } from './tools/select.js';
@@ -52,6 +53,7 @@ const tools: Record<string, Tool> = {
   key_type: keyType,
   send_keys: sendKeys,
   screenshot,
+  print_to_pdf: printToPdf,
   wait_for: waitFor,
   settle,
   find,

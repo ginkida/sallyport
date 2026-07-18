@@ -6,6 +6,23 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`print_to_pdf` tool — save the page as a PDF file.** `Page.printToPDF`
+  (structured CDP only, no page JavaScript — same trust shape as
+  `screenshot`, so the allowlist suffices and no per-domain `allowEvaluate`
+  is needed) renders the tab with `landscape` / `printBackground` / `scale`
+  (0.1–2) mapping straight to the CDP parameters. Unlike `screenshot` it
+  needs no visible tab: print rendering doesn't wait for a compositor frame,
+  so background broker-mode agent tabs are printable too. The base64 payload
+  crosses the bridge once and the daemon decodes it straight into the
+  `~/Downloads/sallyport/` sandbox (the same filename validation and
+  containment re-check as `save_to_file`), so the MCP caller only ever sees
+  `{path, size, filename}` — the binary never enters model context. A
+  generated PDF over 12 MiB of base64 is refused extension-side with
+  `pdf_too_large` before it can trip the 16 MiB WS frame cap and
+  1009-close the connection, stranding the call entirely.
+
 ## [0.15.1] — 2026-07-12
 
 ### Security

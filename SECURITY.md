@@ -66,7 +66,7 @@ the "Tools" table for per-tool notes. Quick reference:
 | Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, `snapshot`'s DOM-fallback walker, `screenshot`'s `document.visibilityState` probe, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `domtree.ts`, `screenshot.ts`, `aim.ts` |
 | Password input | `fill` reads `type` via browser DOM; `key_type`/`send_keys` enumerate frames (temporary flat child sessions for OOPIFs), locate focused AX nodes through closed shadow DOM, then inspect browser-owned DOM attributes | `extension/src/tools/dom.ts`, `focus.ts`, `keyboard.ts` |
 | Closing tabs | Allowlist-gated like other DOM tools | `extension/src/tools/tabs.ts:closeTab` |
-| Filesystem (write) | `save_to_file` sandbox to `~/Downloads/sallyport/` | `daemon/.../local_tools.py:save_to_file` |
+| Filesystem (write) | `save_to_file` and `print_to_pdf`'s daemon post-call processor sandbox to `~/Downloads/sallyport/` (shared `_write_sandbox_blob`: filename rules + resolved-path containment re-check) | `daemon/.../local_tools.py:save_to_file`, `POST_CALL_PROCESSORS` |
 | Filesystem (read via Chrome) | `upload` paths must resolve under the same sandbox; symlink-safe | `daemon/.../local_tools.py:validate_upload_paths` + `PRE_CALL_VALIDATORS` |
 | Frame size | 16 MiB cap, 1009 close on overflow | `daemon/.../bridge.py:MAX_FRAME_BYTES` |
 | Secret file | `chmod 600`, perms warned on relax | `daemon/.../secret.py` |

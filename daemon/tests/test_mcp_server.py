@@ -65,6 +65,7 @@ def test_tools_catalogue_covers_extension() -> None:
         "key_type",
         "send_keys",
         "screenshot",
+        "print_to_pdf",
         "wait_for",
         "settle",
         "find",
