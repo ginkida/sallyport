@@ -1,9 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  MAX_PDF_BASE64_CHARS,
-  checkPdfSize,
-  parsePrintArgs,
-} from '../src/tools/pdf.js';
+import { MAX_PDF_BASE64_CHARS, checkPdfSize, parsePrintArgs } from '../src/tools/pdf.js';
 
 describe('print_to_pdf.parsePrintArgs', () => {
   it('defaults to portrait, background on, scale 1', () => {
@@ -56,7 +52,9 @@ describe('print_to_pdf.checkPdfSize', () => {
   });
 
   it('rejects a payload one char over the cap', () => {
-    expect(() => checkPdfSize('a'.repeat(MAX_PDF_BASE64_CHARS + 1))).toThrow(/pdf_too_large|over the/);
+    expect(() => checkPdfSize('a'.repeat(MAX_PDF_BASE64_CHARS + 1))).toThrow(
+      /pdf_too_large|over the/,
+    );
   });
 
   it('keeps the cap under the daemon 16 MiB frame budget', () => {

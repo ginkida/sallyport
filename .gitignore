@@ -48,3 +48,9 @@ BROKER-DESIGN.md
 # Gokin working files
 .gokin/
 GOKIN.local.md
+.gokin/.session-memory.md
+.gokin/.working-memory.md
+.gokin/project-memory.md
+.gokin/task-output/
+.gokin/checkpoints/
+.gokin/learning.yaml
