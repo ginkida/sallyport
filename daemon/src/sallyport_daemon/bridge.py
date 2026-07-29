@@ -429,9 +429,12 @@ class Bridge:
             # busy the other sessions are. Standalone (client_id is None)
             # reports its own lane's count, which is the whole process.
             "pendingCalls": sum(1 for c in self._pending_clients.values() if c == client_id),
-            # Static admission-control shape, so an agent can reason about a
-            # `busy` failure. A constant and a queue depth for THIS caller only
-            # — never a global in-flight count (that would be the oracle above).
+            # A CONSTANT — how many calls the browser runs at once across all
+            # sessions — so an agent can reason about a `busy` failure. There is
+            # deliberately no queue-depth field beside it: a caller that just got
+            # `busy` never entered `_pending` (that happens after the permit is
+            # taken), and anything counting OTHER clients' waiting calls would be
+            # the live cross-session activity oracle `pendingCalls` above avoids.
             "maxConcurrentCalls": self._permits.size,
             "uptimeS": round(time.monotonic() - self._started_monotonic, 1),
             # Recent tool-call outcomes (oldest→newest) + the latest failure, so

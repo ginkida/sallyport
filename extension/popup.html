@@ -135,6 +135,16 @@
             otherwise freezes the page and stalls automation. Off by default — it widens the
             debugger's CDP footprint and answers dialogs you might have wanted to see.
           </div>
+          <label class="checkbox">
+            <input type="checkbox" id="close-agent-tabs" /> close a session's tabs when it
+            disconnects
+          </label>
+          <div class="muted small hint">
+            Off by default: an agent's tabs are usually the result you wanted to see, and closing
+            half-finished work is what close_tab's gate protects against. Turn it on for
+            dispatched/one-shot agents — each run is a new session, so their tabs otherwise pile up
+            with no later session able to reach them.
+          </div>
         </details>
 
         <details id="status-agents" class="disclosure">

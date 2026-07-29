@@ -273,6 +273,27 @@ allowlisted site acts **as the signed-in user**. That is the premise of the
 whole project (see the threat model), not an oversight — the allowlist and
 per-domain `evaluate` opt-in are what bound it.
 
+### Broker mode: there is no per-session allowlist, and one would not be a boundary
+
+Every session shares one allowlist. A tempting ask — "let this dispatched agent
+reach only `localhost`, while my own session keeps its full list" — cannot be
+satisfied here in any meaningful sense, and it is worth writing down why rather
+than re-deriving it.
+
+Scoping needs a key the daemon can trust. The `clientId` is trustworthy but
+ephemeral and server-minted, so there is nothing stable for a human to attach a
+policy to. The session label is stable and human-meaningful but **peer-declared**:
+any process that can pair can claim any label. And the floor is same-uid — a
+process able to reach the socket can already read the secret, pair as anything,
+and drive the browser across the whole allowlist. A per-session allowlist would
+therefore be a *convenience* (stopping a well-behaved agent from wandering),
+never a confinement boundary, and shipping it as a security feature would
+misrepresent what it does.
+
+If a session genuinely must be confined more tightly than the user, that is a
+different OS-level boundary — a separate uid, container, or VM, each with its own
+secret and its own browser.
+
 ### Broker mode: a session's label is peer-declared
 
 A connecting session names itself in its `hello` (its working-directory name by

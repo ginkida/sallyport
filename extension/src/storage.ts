@@ -40,6 +40,15 @@ export type Settings = {
    * Default OFF — it lazily enables CDP `Network.enable` and reads response
    * bodies (widening the observable CDP footprint), so it is opt-in. */
   captureNetwork: boolean;
+  /** Close a session's agent tabs when that session disconnects, instead of
+   * leaving them open and unowned (release.ts). Default OFF: closing an
+   * agent's half-finished work is exactly the loss `close_tab`'s allowlist gate
+   * exists to prevent, and for an interactive session the tabs are usually
+   * what you want to look at. Turn it ON for EPHEMERAL agents — a dispatched
+   * one-shot run is a fresh session every time, so its tabs otherwise
+   * accumulate with nobody able to reach them (a later session can't: tabs are
+   * owner-scoped, and its ownership epoch is dropped on release). */
+  closeAgentTabsOnDisconnect: boolean;
   /** Auto-answer native JS dialogs (alert/confirm/prompt/beforeunload) on
    * driven tabs (dialog-capture.ts) — an open dialog freezes the page's JS
    * and no tool can click it — steerable via the `handle_dialog` tool.
@@ -116,6 +125,7 @@ export async function getSettings(): Promise<Settings> {
     captureConsole: !!v?.captureConsole, // default off (opt-in)
     captureNetwork: !!v?.captureNetwork, // default off (opt-in)
     handleDialogs: !!v?.handleDialogs, // default off (opt-in)
+    closeAgentTabsOnDisconnect: !!v?.closeAgentTabsOnDisconnect, // default off (destructive)
   };
 }
 

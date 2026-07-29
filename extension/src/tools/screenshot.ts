@@ -133,6 +133,13 @@ export const screenshot: Tool = async (args) => {
   const params: Record<string, unknown> = { format };
   if (format === 'jpeg') params.quality = typeof args.quality === 'number' ? args.quality : 80;
 
+  // A clip is NOT free: Chrome implements a clipped capture by resizing the
+  // tab's view to the clip dimensions and restoring it in the completion
+  // handler, so the live page reflows and fires `resize` mid-capture. That is
+  // inherent for `region` (there is no other way to crop server-side) and is
+  // the price of `maxWidth` too — downscaling without a clip would need a
+  // rasteriser in the daemon. The MCP schema says so, so an agent reaching for
+  // maxWidth "to cut size" knows it is touching the page.
   if (region || maxWidth !== null) {
     const metrics = await cdp<{
       cssVisualViewport?: {

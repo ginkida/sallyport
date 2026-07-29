@@ -410,6 +410,7 @@ $('#status-settings').addEventListener('toggle', async () => {
   ($('#capture-console') as HTMLInputElement).checked = s.captureConsole;
   ($('#capture-network') as HTMLInputElement).checked = s.captureNetwork;
   ($('#handle-dialogs') as HTMLInputElement).checked = s.handleDialogs;
+  ($('#close-agent-tabs') as HTMLInputElement).checked = s.closeAgentTabsOnDisconnect;
 });
 
 $('#status-advanced').addEventListener('toggle', async () => {
@@ -494,6 +495,14 @@ $('#handle-dialogs').addEventListener('change', async () => {
   // Takes effect on the next tool call — handleDialogs is re-read per attach,
   // which lazily issues Page.enable for the driven tab when on.
   await setSettings({ handleDialogs: ($('#handle-dialogs') as HTMLInputElement).checked });
+});
+
+$('#close-agent-tabs').addEventListener('change', async () => {
+  // Read at release time, so this takes effect for the next session that
+  // disconnects — no need to restart anything.
+  await setSettings({
+    closeAgentTabsOnDisconnect: ($('#close-agent-tabs') as HTMLInputElement).checked,
+  });
 });
 
 $('#settings-save').addEventListener('click', async () => {

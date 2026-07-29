@@ -204,8 +204,11 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
         "busy": (
             "retryable=yes; every browser slot was occupied by other sessions for the whole "
             "queue window, so this call was never sent — nothing happened in the browser, which "
-            "is what makes an immediate retry safe. Back off briefly first; `status` reports "
-            "maxConcurrentCalls and your own pendingCalls."
+            "is what makes an immediate retry safe. Back off (exponentially) and retry: there is "
+            "deliberately NO per-caller signal for how contended the browser is — reporting one "
+            "would be a live read on how busy the other sessions are. `status.maxConcurrentCalls` "
+            "is the only number here, and it is a constant: how many calls the browser runs at "
+            "once across ALL sessions."
         ),
         "no_history": (
             "retryable=no; the tab's session history doesn't reach that far in that direction "

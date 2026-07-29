@@ -451,3 +451,17 @@ describe('appendAudit under concurrent tool calls', () => {
     expect(log.map((e) => e.ts)).toEqual([2]);
   });
 });
+
+describe('closeAgentTabsOnDisconnect setting', () => {
+  it('defaults OFF — releasing a session must not destroy its work by default', async () => {
+    const s = await getSettings();
+    expect(s.closeAgentTabsOnDisconnect).toBe(false);
+  });
+
+  it('round-trips like the other opt-ins', async () => {
+    await setSettings({ closeAgentTabsOnDisconnect: true });
+    expect((await getSettings()).closeAgentTabsOnDisconnect).toBe(true);
+    await setSettings({ closeAgentTabsOnDisconnect: false });
+    expect((await getSettings()).closeAgentTabsOnDisconnect).toBe(false);
+  });
+});

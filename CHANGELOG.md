@@ -6,6 +6,30 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Popup setting: "close a session's tabs when it disconnects."** Off by
+  default, and deliberately so — an agent's tabs are usually the result you
+  wanted to see, and closing half-finished work is exactly the loss
+  `close_tab`'s allowlist gate exists to prevent. Turn it on for **ephemeral**
+  agents: a dispatched one-shot run is a fresh MCP session every time, so each
+  run's tabs are orphaned on exit and no later session can reach them (tabs are
+  owner-scoped and the ownership epoch is dropped on release), which means they
+  accumulate until a human sweeps them from the popup.
+
+### Changed
+
+- `screenshot`'s schema now says that `region`/`maxWidth` are **observable on
+  the page**: Chrome implements a clipped capture by resizing the tab's view to
+  the clip and restoring it afterwards, so the page reflows and fires `resize`.
+  The description previously recommended `maxWidth` as a free way to cut the
+  payload; on a layout-sensitive page it can change what you capture.
+- The `busy` recovery hint no longer tells an agent to check its own
+  `pendingCalls` — that counter is populated only after a browser slot is
+  taken, so a call rejected with `busy` never appears in it and reads 0. There
+  is deliberately no per-caller contention signal (it would be a live read on
+  how busy the other sessions are), so the hint now says: back off and retry.
+
 ## [0.17.0] — 2026-07-29
 
 ### Added
