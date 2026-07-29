@@ -97,6 +97,19 @@ export function keepAwakeAction(keepAwake: boolean): 'enable' | 'disable' {
   return keepAwake ? 'enable' : 'disable';
 }
 
+/** Revoke keep-awake on EVERY currently-attached tab.
+ *
+ * The per-tab `attach` path only reaches a tab the next time something drives
+ * it, so unchecking the popup toggle used to leave every idle tab still
+ * reporting itself focused — indefinitely, since a tab nobody drives again is
+ * never re-attached. The popup calls this on the toggle so "off" means off now,
+ * across the board. Best-effort per tab. */
+export async function releaseKeepAwakeEverywhere(): Promise<void> {
+  for (const tabId of [...attached]) {
+    await releaseKeepAwake(tabId);
+  }
+}
+
 // The MV3 service worker always has the full chrome.*; vitest imports this
 // module transitively (tabs.ts/poll.ts pull pure helpers) where it doesn't
 // exist at load time — guard the top-level registrations so importing never
@@ -210,6 +223,30 @@ async function releaseKeepAwake(tabId: number): Promise<void> {
   } catch {
     // older Chrome / command unavailable — nothing to revoke
   }
+}
+
+/** Stop driving a tab: detach the debugger if we hold it.
+ *
+ * Nothing used to call this — `attach` had no counterpart at all — so every tab
+ * an agent ever touched kept a CDP session until it closed or the human clicked
+ * Cancel on the debugger banner (which detaches EVERY tab at once and breaks
+ * whatever else is running). That left three things the human sees, long after
+ * the agent that caused them is gone: Chrome's "started debugging this browser"
+ * bar, a disabled back/forward cache on that tab, and a sticky
+ * `setFocusEmulationEnabled` making the page believe it is focused. Detaching
+ * clears all three — every CDP override ends with the session.
+ *
+ * Best-effort by construction: a tab that is already gone, or was never
+ * attached, is simply not our problem. `chrome.debugger.onDetach` does the
+ * bookkeeping (attached set, refs, capture rings). */
+export async function detach(tabId: number): Promise<void> {
+  if (!attached.has(tabId)) return;
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch {
+    // already detached, tab closed, or never ours — nothing to undo
+  }
+  attached.delete(tabId);
 }
 
 export async function cdp<T = unknown>(

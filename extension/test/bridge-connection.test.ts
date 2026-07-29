@@ -960,4 +960,46 @@ describe('broker-mode signal (hello_ack body)', () => {
     await until(() => order.includes('runTool'));
     expect(order).toEqual(['brokerMode', 'runTool']);
   });
+
+  // The whole point of concurrent sessions: one agent's slow call must not
+  // hold up another agent's. Until 0.17 tool execution was awaited INSIDE the
+  // arrival-order chain, so the extension was a hard serial queue no matter
+  // what the daemon did — a 30 s wait_for from one session delayed every other
+  // session's next call for its full duration.
+  it('runs two tool_calls concurrently instead of head-of-line queueing them', async () => {
+    const started: string[] = [];
+    let releaseSlow: (() => void) | null = null;
+    const { deps } = makeDeps({
+      runTool: async (name: string) => {
+        started.push(name);
+        if (name === 'slow') {
+          await new Promise<void>((resolve) => {
+            releaseSlow = resolve;
+          });
+        }
+        return { ok: true, data: name };
+      },
+    });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.simulateOpen();
+    await until(() => ws.sent.length === 1);
+
+    ws.simulateMessage(
+      JSON.stringify(signEnvelope('tool_call', { name: 'slow', args: {} }, { id: 'r1' })),
+    );
+    ws.simulateMessage(
+      JSON.stringify(signEnvelope('tool_call', { name: 'fast', args: {} }, { id: 'r2' })),
+    );
+
+    // The fast call must START and FINISH while the slow one is still running.
+    await until(() => started.length === 2);
+    expect(started).toEqual(['slow', 'fast']);
+    await until(() => ws.sent.some((raw) => JSON.parse(raw).id === 'r2'));
+    expect(ws.sent.some((raw) => JSON.parse(raw).id === 'r1')).toBe(false);
+
+    releaseSlow?.();
+    await until(() => ws.sent.some((raw) => JSON.parse(raw).id === 'r1'));
+  });
 });

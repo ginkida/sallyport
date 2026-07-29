@@ -23,7 +23,7 @@ import {
   reconcileEpochs,
   serializeEpochs,
   setBrokerMode,
-  stripEpochArg,
+  stripBrokerArgs,
 } from '../src/tools/ownership.js';
 
 beforeEach(() => {
@@ -131,17 +131,17 @@ describe('assertBringToFrontAllowed (focus-theft mitigation)', () => {
   });
 });
 
-describe('stripEpochArg', () => {
+describe('stripBrokerArgs', () => {
   it('removes the broker-internal epoch field, returning a copy', () => {
     const args = { tabId: 5, [EXPECTED_EPOCH_ARG]: 'e1', selector: '#x' };
-    const out = stripEpochArg(args);
+    const out = stripBrokerArgs(args);
     expect(out).toEqual({ tabId: 5, selector: '#x' });
     expect(EXPECTED_EPOCH_ARG in args).toBe(true); // original untouched
   });
 
   it('returns args unchanged when no epoch field is present', () => {
     const args = { tabId: 5 };
-    expect(stripEpochArg(args)).toBe(args);
+    expect(stripBrokerArgs(args)).toBe(args);
   });
 });
 

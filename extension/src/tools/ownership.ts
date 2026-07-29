@@ -28,6 +28,14 @@ import { BridgeError } from './errors.js';
  * the daemon's ownership.EPOCH_ARG byte-for-byte (it is part of the contract). */
 export const EXPECTED_EPOCH_ARG = 'expectedEpoch';
 
+/** Field the daemon injects carrying the calling session's cosmetic label (its
+ * working-directory name, sanitised broker-side). Must match the daemon's
+ * ownership.CLIENT_LABEL_ARG byte-for-byte. It is peer-declared and therefore
+ * NEVER an identity: it only tags audit rows and groups the session's tabs into
+ * their own window. Ownership keys on the server-minted clientId, which never
+ * leaves the daemon. */
+export const CLIENT_LABEL_ARG = 'clientLabel';
+
 let brokerMode = false;
 
 /** Record the daemon's broker-vs-standalone signal (from the hello_ack). */
@@ -92,13 +100,15 @@ export function assertBringToFrontAllowed(bringToFront: boolean): void {
   }
 }
 
-/** Strip the broker-internal epoch field from a tool_call's args, so neither the
- * tool body nor the audit log ever sees it. Returns a copy; the original is
- * untouched. No-op (returns the same object) when the field is absent. */
-export function stripEpochArg(args: Record<string, unknown>): Record<string, unknown> {
-  if (!(EXPECTED_EPOCH_ARG in args)) return args;
+/** Strip the broker-internal fields (epoch, session label) from a tool_call's
+ * args, so neither the tool body nor the audit's `args` sees them as ordinary
+ * arguments. Returns a copy; the original is untouched. No-op (returns the same
+ * object) when neither field is present. */
+export function stripBrokerArgs(args: Record<string, unknown>): Record<string, unknown> {
+  if (!(EXPECTED_EPOCH_ARG in args) && !(CLIENT_LABEL_ARG in args)) return args;
   const rest = { ...args };
   delete rest[EXPECTED_EPOCH_ARG];
+  delete rest[CLIENT_LABEL_ARG];
   return rest;
 }
 

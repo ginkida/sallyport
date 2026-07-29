@@ -1,152 +1,205 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=400, initial-scale=1">
-  <title>Sallyport</title>
-  <link rel="stylesheet" href="popup.css">
-</head>
-<body>
-  <header>
-    <h1>Sallyport</h1>
-    <div id="state-badge" class="badge">loading…</div>
-  </header>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=400, initial-scale=1" />
+    <title>Sallyport</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Sallyport</h1>
+      <div id="state-badge" class="badge">loading…</div>
+    </header>
 
-  <!-- ──────────────── Onboarding (shown only before pairing) ──────────────── -->
-  <section id="onboarding" class="onboarding hidden">
-    <p class="lede">Connect this extension to your local Sallyport daemon to give an MCP agent a controlled view of your browser.</p>
+    <!-- ──────────────── Onboarding (shown only before pairing) ──────────────── -->
+    <section id="onboarding" class="onboarding hidden">
+      <p class="lede">
+        Connect this extension to your local Sallyport daemon to give an MCP agent a controlled view
+        of your browser.
+      </p>
 
-    <ol class="steps">
-      <li>Start the daemon — Claude Code does this when you run <code>claude mcp add sallyport sallyport-daemon</code>, or run <code>sallyport-daemon serve</code> in a shell.</li>
-      <li>On first start it prints a one-line secret inside a <code>===</code> banner. Copy the whole banner.</li>
-      <li>Paste below — we'll find the secret for you.</li>
-    </ol>
+      <ol class="steps">
+        <li>
+          Start the daemon — Claude Code does this when you run
+          <code>claude mcp add sallyport sallyport-daemon</code>, or run
+          <code>sallyport-daemon serve</code> in a shell.
+        </li>
+        <li>
+          On first start it prints a one-line secret inside a <code>===</code> banner. Copy the
+          whole banner.
+        </li>
+        <li>Paste below — we'll find the secret for you.</li>
+      </ol>
 
-    <textarea id="pair-secret" rows="4" placeholder="paste the daemon banner here — or just the base64 secret line"></textarea>
-    <div id="pair-detect" class="detect"></div>
+      <textarea
+        id="pair-secret"
+        rows="4"
+        placeholder="paste the daemon banner here — or just the base64 secret line"
+      ></textarea>
+      <div id="pair-detect" class="detect"></div>
 
-    <details class="advanced">
-      <summary>Advanced</summary>
-      <label class="muted small" for="pair-url">Daemon URL</label>
-      <input type="text" id="pair-url" placeholder="ws://127.0.0.1:10086/ws">
-    </details>
-
-    <button id="pair-submit" class="primary large" disabled>Pair</button>
-    <div id="onboard-error" class="error"></div>
-  </section>
-
-  <!-- ──────────────── Main UI (shown after pairing) ──────────────── -->
-  <div id="main" class="hidden">
-    <nav id="tabs">
-      <button data-tab="status" class="tab active">Status</button>
-      <button data-tab="allowlist" class="tab">Allowlist</button>
-      <button data-tab="audit" class="tab">Audit</button>
-    </nav>
-
-    <section id="tab-status" class="tab-panel active">
-      <div id="status-card" class="status-card">
-        <div class="status-dot"></div>
-        <div class="status-text">
-          <div id="status-title" class="status-title">—</div>
-          <div id="status-sub" class="status-sub muted small">—</div>
-        </div>
-      </div>
-
-      <div id="status-error" class="error"></div>
-
-      <div id="status-summary" class="status-summary muted small hidden"></div>
-
-      <!-- This tab — one-click allow for the active site (only on http(s) tabs) -->
-      <div id="current-tab" class="current-tab hidden">
-        <div class="ct-label muted small">This tab</div>
-        <div class="ct-row">
-          <span id="ct-host" class="ct-host"></span>
-          <span id="ct-state" class="ct-state"></span>
-        </div>
-        <button id="ct-add" class="primary hidden">+ Allow this site</button>
-      </div>
-
-      <!-- Recent activity — compact tail of the audit log; full history in the Audit tab -->
-      <div id="activity" class="activity hidden">
-        <div class="activity-head">
-          <span class="muted small">Recent activity</span>
-          <button id="activity-refresh" class="icon-btn" title="Refresh" aria-label="Refresh activity">⟳</button>
-        </div>
-        <ul id="activity-list" class="activity-list"></ul>
-        <div id="activity-error" class="activity-error"></div>
-      </div>
-
-      <div id="paused-block" class="block hidden">
-        <p>Sallyport is paused — no commands will run.</p>
-        <button id="resume-btn" class="primary">Resume</button>
-      </div>
-
-      <details id="status-settings" class="disclosure">
-        <summary>Settings</summary>
-        <label class="checkbox">
-          <input type="checkbox" id="keep-awake"> keep automated tabs awake
-        </label>
-        <div class="muted small hint">Unfreezes background tabs while the bridge drives them; the page believes it is focused (e.g. Telegram sends read receipts).</div>
-        <label class="checkbox">
-          <input type="checkbox" id="capture-console"> capture page console errors
-        </label>
-        <div class="muted small hint">Records console errors/warnings + uncaught exceptions on driven tabs, readable via the console_tail tool. Off by default — it widens the debugger's CDP footprint.</div>
-        <label class="checkbox">
-          <input type="checkbox" id="capture-network"> capture API responses (canvas dashboards)
-        </label>
-        <div class="muted small hint">Records XHR/fetch JSON responses on driven tabs, readable via the network_tail tool — the data behind canvas charts (e.g. Metrika) without screenshots. Off by default — it reads response bodies and widens the debugger's CDP footprint.</div>
-        <label class="checkbox">
-          <input type="checkbox" id="handle-dialogs"> auto-handle JS dialogs (alert/confirm)
-        </label>
-        <div class="muted small hint">Answers alert/confirm/prompt/beforeunload dialogs on driven tabs automatically (alert → OK, everything else → cancel; steerable via the handle_dialog tool) — an open dialog otherwise freezes the page and stalls automation. Off by default — it widens the debugger's CDP footprint and answers dialogs you might have wanted to see.</div>
-      </details>
-
-      <details id="status-advanced" class="disclosure">
+      <details class="advanced">
         <summary>Advanced</summary>
-        <label class="muted small" for="settings-url">Daemon URL</label>
-        <div class="row">
-          <input type="text" id="settings-url" placeholder="ws://127.0.0.1:10086/ws">
-          <button id="settings-save">Save</button>
-        </div>
-        <div class="muted small adv-section-label">Available tools (<span id="tool-count">0</span>)</div>
-        <ul id="tool-list" class="muted small tool-list"></ul>
+        <label class="muted small" for="pair-url">Daemon URL</label>
+        <input type="text" id="pair-url" placeholder="ws://127.0.0.1:10086/ws" />
       </details>
 
-      <div id="actions-block" class="actions hidden">
-        <button id="pause-btn">Pause</button>
-        <button id="reconnect-btn">Reconnect</button>
-        <button id="unpair-btn" class="danger ghost">Unpair</button>
-      </div>
-
-      <div id="status-flash" class="flash"></div>
+      <button id="pair-submit" class="primary large" disabled>Pair</button>
+      <div id="onboard-error" class="error"></div>
     </section>
 
-    <section id="tab-allowlist" class="tab-panel">
-      <p class="muted small">Tools only run on domains in this list. Add sites you want the agent to touch.</p>
-      <div class="row">
-        <input type="text" id="allow-input" placeholder="example.com or *.example.com">
-        <label class="checkbox">
-          <input type="checkbox" id="allow-eval"> allow evaluate()
-        </label>
-        <button id="allow-add" class="primary">Add</button>
-      </div>
-      <div id="allow-error" class="error"></div>
-      <div id="allow-flash" class="flash"></div>
-      <ul id="allow-list"></ul>
-    </section>
+    <!-- ──────────────── Main UI (shown after pairing) ──────────────── -->
+    <div id="main" class="hidden">
+      <nav id="tabs">
+        <button data-tab="status" class="tab active">Status</button>
+        <button data-tab="allowlist" class="tab">Allowlist</button>
+        <button data-tab="audit" class="tab">Audit</button>
+      </nav>
 
-    <section id="tab-audit" class="tab-panel">
-      <div id="audit-summary" class="audit-summary muted small"></div>
-      <input type="text" id="audit-filter" placeholder="filter — tool name, url, error text">
-      <div class="row audit-toolbar">
-        <button id="audit-refresh">Refresh</button>
-        <button id="audit-export">Export JSON</button>
-        <button id="audit-clear" class="danger">Clear</button>
-      </div>
-      <ul id="audit-list"></ul>
-    </section>
-  </div>
+      <section id="tab-status" class="tab-panel active">
+        <div id="status-card" class="status-card">
+          <div class="status-dot"></div>
+          <div class="status-text">
+            <div id="status-title" class="status-title">—</div>
+            <div id="status-sub" class="status-sub muted small">—</div>
+          </div>
+        </div>
 
-  <script type="module" src="popup.js"></script>
-</body>
+        <div id="status-error" class="error"></div>
+
+        <div id="status-summary" class="status-summary muted small hidden"></div>
+
+        <!-- This tab — one-click allow for the active site (only on http(s) tabs) -->
+        <div id="current-tab" class="current-tab hidden">
+          <div class="ct-label muted small">This tab</div>
+          <div class="ct-row">
+            <span id="ct-host" class="ct-host"></span>
+            <span id="ct-state" class="ct-state"></span>
+          </div>
+          <button id="ct-add" class="primary hidden">+ Allow this site</button>
+        </div>
+
+        <!-- Recent activity — compact tail of the audit log; full history in the Audit tab -->
+        <div id="activity" class="activity hidden">
+          <div class="activity-head">
+            <span class="muted small">Recent activity</span>
+            <button
+              id="activity-refresh"
+              class="icon-btn"
+              title="Refresh"
+              aria-label="Refresh activity"
+            >
+              ⟳
+            </button>
+          </div>
+          <ul id="activity-list" class="activity-list"></ul>
+          <div id="activity-error" class="activity-error"></div>
+        </div>
+
+        <div id="paused-block" class="block hidden">
+          <p>Sallyport is paused — no commands will run.</p>
+          <button id="resume-btn" class="primary">Resume</button>
+        </div>
+
+        <details id="status-settings" class="disclosure">
+          <summary>Settings</summary>
+          <label class="checkbox">
+            <input type="checkbox" id="keep-awake" /> keep automated tabs awake
+          </label>
+          <div class="muted small hint">
+            Unfreezes background tabs while the bridge drives them; the page believes it is focused
+            (e.g. Telegram sends read receipts).
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" id="capture-console" /> capture page console errors
+          </label>
+          <div class="muted small hint">
+            Records console errors/warnings + uncaught exceptions on driven tabs, readable via the
+            console_tail tool. Off by default — it widens the debugger's CDP footprint.
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" id="capture-network" /> capture API responses (canvas dashboards)
+          </label>
+          <div class="muted small hint">
+            Records XHR/fetch JSON responses on driven tabs, readable via the network_tail tool —
+            the data behind canvas charts (e.g. Metrika) without screenshots. Off by default — it
+            reads response bodies and widens the debugger's CDP footprint.
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" id="handle-dialogs" /> auto-handle JS dialogs (alert/confirm)
+          </label>
+          <div class="muted small hint">
+            Answers alert/confirm/prompt/beforeunload dialogs on driven tabs automatically (alert →
+            OK, everything else → cancel; steerable via the handle_dialog tool) — an open dialog
+            otherwise freezes the page and stalls automation. Off by default — it widens the
+            debugger's CDP footprint and answers dialogs you might have wanted to see.
+          </div>
+        </details>
+
+        <details id="status-agents" class="disclosure">
+          <summary>Agent tabs (<span id="agent-tab-count">0</span>)</summary>
+          <div class="muted small hint">
+            Tabs the agents opened, grouped by session. They are ordinary tabs in this profile —
+            same logins as yours — and they stay open when a session ends, so this is where you
+            sweep up what's left behind.
+          </div>
+          <ul id="agent-tab-list" class="muted small tool-list"></ul>
+          <div class="row">
+            <button id="agent-tabs-close">Close all agent tabs</button>
+          </div>
+        </details>
+
+        <details id="status-advanced" class="disclosure">
+          <summary>Advanced</summary>
+          <label class="muted small" for="settings-url">Daemon URL</label>
+          <div class="row">
+            <input type="text" id="settings-url" placeholder="ws://127.0.0.1:10086/ws" />
+            <button id="settings-save">Save</button>
+          </div>
+          <div class="muted small adv-section-label">
+            Available tools (<span id="tool-count">0</span>)
+          </div>
+          <ul id="tool-list" class="muted small tool-list"></ul>
+        </details>
+
+        <div id="actions-block" class="actions hidden">
+          <button id="pause-btn">Pause</button>
+          <button id="reconnect-btn">Reconnect</button>
+          <button id="unpair-btn" class="danger ghost">Unpair</button>
+        </div>
+
+        <div id="status-flash" class="flash"></div>
+      </section>
+
+      <section id="tab-allowlist" class="tab-panel">
+        <p class="muted small">
+          Tools only run on domains in this list. Add sites you want the agent to touch.
+        </p>
+        <div class="row">
+          <input type="text" id="allow-input" placeholder="example.com or *.example.com" />
+          <label class="checkbox">
+            <input type="checkbox" id="allow-eval" /> allow evaluate()
+          </label>
+          <button id="allow-add" class="primary">Add</button>
+        </div>
+        <div id="allow-error" class="error"></div>
+        <div id="allow-flash" class="flash"></div>
+        <ul id="allow-list"></ul>
+      </section>
+
+      <section id="tab-audit" class="tab-panel">
+        <div id="audit-summary" class="audit-summary muted small"></div>
+        <input type="text" id="audit-filter" placeholder="filter — tool name, url, error text" />
+        <div class="row audit-toolbar">
+          <button id="audit-refresh">Refresh</button>
+          <button id="audit-export">Export JSON</button>
+          <button id="audit-clear" class="danger">Clear</button>
+        </div>
+        <ul id="audit-list"></ul>
+      </section>
+    </div>
+
+    <script type="module" src="popup.js"></script>
+  </body>
 </html>

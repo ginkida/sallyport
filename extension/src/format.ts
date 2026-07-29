@@ -37,7 +37,7 @@ export function formatRelativeTime(ts: number, now: number = Date.now()): string
  * when triaging the log. Pure so it can be unit tested.
  */
 export function matchesAuditFilter(
-  entry: { tool: string; url?: string; error?: string },
+  entry: { tool: string; url?: string; error?: string; client?: string },
   query: string,
 ): boolean {
   const q = query.trim().toLowerCase();
@@ -45,6 +45,9 @@ export function matchesAuditFilter(
   if (entry.tool.toLowerCase().includes(q)) return true;
   if (entry.url && entry.url.toLowerCase().includes(q)) return true;
   if (entry.error && entry.error.toLowerCase().includes(q)) return true;
+  // Session label, so "show me only what the `checkout` agent did" is a
+  // one-word filter rather than a manual scan of an interleaved log.
+  if (entry.client && entry.client.toLowerCase().includes(q)) return true;
   return false;
 }
 

@@ -44,10 +44,15 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "mis-target."
         ),
         "tab_not_visible": (
-            "retryable=yes; a hidden tab can't render a frame — in standalone mode "
-            "activate it first (screenshot bringToFront=true, or switch to it) then "
-            "retry; in broker mode bringToFront is forbidden (bringtofront_forbidden), "
-            "so use snapshot/read_text instead, which don't need a visible tab."
+            "retryable=yes; the tab produced no frame in time. screenshot already "
+            "activates an agent tab inside its own (unfocused) window, so this means "
+            "the window is fully occluded or minimised, or the display is asleep — "
+            "none of which an agent can fix. Prefer snapshot/read_text (no frame "
+            "needed at all) or print_to_pdf (renders a hidden tab). Check the popup's "
+            "'keep automated tabs awake' setting is on: turning it off also stops the "
+            "tab painting. In standalone you may also pass bringToFront=true, which "
+            "visibly steals the user's focus and is refused in broker mode "
+            "(bringtofront_forbidden)."
         ),
         "pdf_too_large": (
             "retryable=no; the generated PDF exceeds the bridge frame cap — shrink the "

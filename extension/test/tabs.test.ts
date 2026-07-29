@@ -30,8 +30,10 @@ type Calls = {
   update: Array<{ tabId: number; url: string }>;
   create: Array<{ url: string }>;
   // Broker-mode focus mitigation: dedicated agent window + windowed tab creates.
-  windowsCreate: Array<{ url: string; focused?: boolean }>;
+  windowsCreate: Array<{ url: string; focused?: boolean; incognito?: boolean }>;
   tabCreate: Array<{ url: string; windowId?: number; active?: boolean }>;
+  muted: Array<{ tabId: number; muted: boolean }>;
+  windowsFocus: Array<{ windowId: number; focused?: boolean }>;
   // Which tabs got a chrome.debugger.attach — navigate/reload now attach
   // unconditionally (not just when a waitFor is given) so opted-in capture
   // (dialog handling above all) is live for the page's own load.
@@ -45,12 +47,15 @@ function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls 
     create: [],
     windowsCreate: [],
     tabCreate: [],
+    muted: [],
+    windowsFocus: [],
     debuggerAttach: [],
   };
   const byId = new Map<number, MockTab>();
   const windows = new Set<number>();
   let nextTabId = 999;
   let nextWindowId = 5000;
+  let focusedWindowId = 1;
   for (const t of opts.tabs ?? []) byId.set(t.id, t);
   if (opts.active) byId.set(opts.active.id, opts.active);
 
@@ -98,9 +103,16 @@ function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls 
         }
         return Promise.resolve(tab);
       },
-      update(tabId: number, info: { url: string }) {
-        calls.update.push({ tabId, url: info.url });
-        const next = { id: tabId, url: info.url, status: 'complete' };
+      update(tabId: number, info: { url?: string; muted?: boolean; active?: boolean }) {
+        // MERGE, don't replace: agent tabs get a mute-only update after
+        // creation, and a replacing mock would blank the url and hang
+        // waitForLoad forever.
+        if (info.url !== undefined) calls.update.push({ tabId, url: info.url });
+        if (info.muted !== undefined) calls.muted.push({ tabId, muted: info.muted });
+        const cur = getTab(tabId);
+        // A url update completes the load (as before); other fields merge.
+        const next = { ...cur, ...(info.url !== undefined ? { url: info.url } : {}) };
+        next.status = 'complete';
         byId.set(tabId, next);
         return Promise.resolve(next);
       },
@@ -139,8 +151,12 @@ function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls 
       onDetach: { addListener() {} },
     },
     windows: {
-      create(info: { url: string; focused?: boolean }) {
-        calls.windowsCreate.push({ url: info.url, focused: info.focused });
+      create(info: { url: string; focused?: boolean; incognito?: boolean }) {
+        calls.windowsCreate.push({
+          url: info.url,
+          focused: info.focused,
+          ...(info.incognito !== undefined ? { incognito: info.incognito } : {}),
+        });
         const winId = nextWindowId++;
         windows.add(winId);
         const id = nextTabId++;
@@ -151,6 +167,14 @@ function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls 
       get(windowId: number) {
         if (windows.has(windowId)) return Promise.resolve({ id: windowId });
         return Promise.reject(new Error('no such window'));
+      },
+      getLastFocused() {
+        return Promise.resolve({ id: focusedWindowId });
+      },
+      update(windowId: number, info: { focused?: boolean }) {
+        calls.windowsFocus.push({ windowId, focused: info.focused });
+        if (info.focused) focusedWindowId = windowId;
+        return Promise.resolve({ id: windowId });
       },
     },
   };
@@ -377,6 +401,40 @@ describe('navigate — broker-mode create-own + epoch (invariant #13)', () => {
     const data = res.data as { tabId?: number; epoch?: string };
     expect(typeof data.epoch).toBe('string');
     expect(getEpoch(999)).toBe(data.epoch); // first created tab id
+  });
+
+  it("opens agent tabs in the human's OWN profile — never incognito", async () => {
+    // Load-bearing, not cosmetic: the whole point of driving the user's own
+    // Chrome is that an agent inherits the sessions they are already signed
+    // into. An incognito (or otherwise separate-profile) window would have its
+    // own cookie jar, so every agent tab would land on a login page. The
+    // separation this project provides is about WHO MAY DRIVE WHICH TAB, never
+    // about identity.
+    const calls = installChromeMock({});
+    resetAgentWindow();
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    setBrokerMode(true);
+    await navigate({ url: ALLOW });
+    expect(calls.windowsCreate).toHaveLength(1);
+    expect(calls.windowsCreate[0].incognito).toBeUndefined();
+  });
+
+  it('gives each session its own agent window, and mutes agent tabs', async () => {
+    const calls = installChromeMock({});
+    resetAgentWindow();
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    setBrokerMode(true);
+    await navigate({ url: ALLOW }, { client: 'alpha' });
+    await navigate({ url: ALLOW }, { client: 'beta' });
+    await navigate({ url: ALLOW }, { client: 'alpha' });
+    // Two windows for two sessions; alpha's second tab reuses alpha's window.
+    expect(calls.windowsCreate).toHaveLength(2);
+    expect(calls.tabCreate).toHaveLength(1);
+    expect(calls.tabCreate[0].active).toBe(false);
+    // Every agent tab is muted: an agent has no use for audio, and a page
+    // autoplaying from a window nobody is looking at is hard to track down.
+    expect(calls.muted.length).toBeGreaterThanOrEqual(3);
+    expect(calls.muted.every((m) => m.muted)).toBe(true);
   });
 
   it('reuses the agent window (non-active tab) for a second create-own', async () => {

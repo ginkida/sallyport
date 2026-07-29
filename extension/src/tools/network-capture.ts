@@ -296,10 +296,24 @@ export function parseNetworkArgs(args: { limit?: unknown; filter?: unknown }): {
 // --- chrome-bound state + wiring -------------------------------------------
 
 const buffers = new Map<number, NetworkEntry[]>();
-// requestId -> in-flight metadata, assembled across requestWillBeSent (method,
-// url, type) and responseReceived (final url, status, mimeType), finalised at
-// loadingFinished. Capped so a request-heavy page can't grow it without bound.
-const pending = new Map<string, { tabId: number; meta: NetworkMeta }>();
+// tabId -> (requestId -> in-flight metadata), assembled across
+// requestWillBeSent (method, url, type) and responseReceived (final url,
+// status, mimeType), finalised at loadingFinished. Capped PER TAB: one shared
+// map with a global cap let a request-heavy tab evict another session's
+// in-flight entries, whose responses were then silently never recorded — that
+// session's network_tail just came back short with no indication anything was
+// lost. Keying by tab also makes clearNetwork an O(1) delete instead of a scan,
+// and removes any chance of a requestId colliding across tabs.
+const pending = new Map<number, Map<string, NetworkMeta>>();
+
+function pendingFor(tabId: number): Map<string, NetworkMeta> {
+  let forTab = pending.get(tabId);
+  if (forTab === undefined) {
+    forTab = new Map();
+    pending.set(tabId, forTab);
+  }
+  return forTab;
+}
 const enabledTabs = new Set<number>();
 
 function normalizeType(t: unknown): string {
@@ -346,46 +360,45 @@ function onNetworkEvent(source: { tabId?: number }, method: string, params?: unk
   if (method === 'Network.requestWillBeSent') {
     const type = normalizeType(p.type);
     if (!CAPTURED_RESOURCE_TYPES.has(type)) return;
-    if (pending.size >= NETWORK_MAX_PENDING) {
-      const oldest = pending.keys().next().value;
-      if (oldest !== undefined) pending.delete(oldest);
+    const forTab = pendingFor(tabId);
+    if (forTab.size >= NETWORK_MAX_PENDING) {
+      const oldest = forTab.keys().next().value;
+      if (oldest !== undefined) forTab.delete(oldest);
     }
     const req = p.request ?? {};
-    pending.set(requestId, {
-      tabId,
-      meta: {
-        ts: Date.now(),
-        method: typeof req.method === 'string' ? req.method : '',
-        url: typeof req.url === 'string' ? req.url : '',
-        status: 0,
-        type,
-        contentType: '',
-        size: 0,
-      },
+    forTab.set(requestId, {
+      ts: Date.now(),
+      method: typeof req.method === 'string' ? req.method : '',
+      url: typeof req.url === 'string' ? req.url : '',
+      status: 0,
+      type,
+      contentType: '',
+      size: 0,
     });
     return;
   }
 
-  const rec = pending.get(requestId);
-  if (rec === undefined || rec.tabId !== tabId) return;
+  const forTab = pending.get(tabId);
+  const rec = forTab?.get(requestId);
+  if (forTab === undefined || rec === undefined) return;
 
   if (method === 'Network.responseReceived') {
     const resp = p.response ?? {};
-    if (typeof resp.url === 'string') rec.meta.url = resp.url; // final URL post-redirect
-    if (typeof resp.status === 'number') rec.meta.status = resp.status;
-    if (typeof resp.mimeType === 'string') rec.meta.contentType = resp.mimeType;
+    if (typeof resp.url === 'string') rec.url = resp.url; // final URL post-redirect
+    if (typeof resp.status === 'number') rec.status = resp.status;
+    if (typeof resp.mimeType === 'string') rec.contentType = resp.mimeType;
     return;
   }
 
   if (method === 'Network.loadingFinished') {
-    pending.delete(requestId);
-    if (typeof p.encodedDataLength === 'number') rec.meta.size = p.encodedDataLength;
-    void captureBody(requestId, tabId, rec.meta);
+    forTab.delete(requestId);
+    if (typeof p.encodedDataLength === 'number') rec.size = p.encodedDataLength;
+    void captureBody(requestId, tabId, rec);
     return;
   }
 
   if (method === 'Network.loadingFailed') {
-    pending.delete(requestId);
+    forTab.delete(requestId);
   }
 }
 
@@ -417,9 +430,7 @@ export async function ensureNetworkCapture(tabId: number): Promise<void> {
 export function clearNetwork(tabId: number): void {
   buffers.delete(tabId);
   enabledTabs.delete(tabId);
-  for (const [rid, rec] of pending) {
-    if (rec.tabId === tabId) pending.delete(rid);
-  }
+  pending.delete(tabId);
 }
 
 /** Snapshot a tab's captured entries (a copy, oldest→newest). */

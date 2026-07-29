@@ -16,6 +16,11 @@ export type AuditEntry = {
   args: Record<string, unknown>;
   ok: boolean;
   error?: string;
+  /** Which session made the call — the cosmetic label the daemon forwards in
+   * broker mode (absent standalone). With several agents driving one browser,
+   * the log is otherwise an unattributable interleaved stream. Peer-declared,
+   * so it is display metadata and never an identity. */
+  client?: string;
 };
 
 export type Settings = {
@@ -223,7 +228,22 @@ export function truncateAuditValue(v: unknown): unknown {
   return truncateAuditValueBudgeted(v, { left: MAX_AUDIT_ITEMS });
 }
 
-export async function appendAudit(entry: AuditEntry): Promise<void> {
+/** Serialises audit appends. `appendAuditOnce` is a read-modify-write across
+ * two awaited storage round-trips, so two calls finishing near-simultaneously
+ * both read the same snapshot and the second `set` silently drops the first's
+ * entry. That was unreachable while the connection ran tools one at a time;
+ * with concurrent calls it is the steady state. Same shape as the Signer's own
+ * FIFO in crypto.ts. The `.catch` keeps one failed write from breaking the
+ * chain for every later entry. */
+let auditTail: Promise<void> = Promise.resolve();
+
+export function appendAudit(entry: AuditEntry): Promise<void> {
+  const done = auditTail.then(() => appendAuditOnce(entry));
+  auditTail = done.catch(() => undefined);
+  return done;
+}
+
+async function appendAuditOnce(entry: AuditEntry): Promise<void> {
   const safe: AuditEntry = {
     ...entry,
     // Pass the WHOLE args object through the budgeted truncator (not a

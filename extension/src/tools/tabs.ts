@@ -11,11 +11,12 @@ import { persistEpochs } from './ownership-store.js';
 import { createAgentTab } from './agent-window.js';
 import type { Tool } from './types.js';
 
-/** Open a fresh tab loading `url`. In broker mode it goes into the dedicated,
- * non-focused agent window (no focus theft, kept out of the human's windows);
- * standalone opens it active in the current window, as today. */
-async function openTab(url: string): Promise<chrome.tabs.Tab> {
-  return isBrokerMode() ? createAgentTab(url) : chrome.tabs.create({ url, active: true });
+/** Open a fresh tab loading `url`. In broker mode it goes into the calling
+ * session's dedicated, non-focused agent window (no focus theft, kept out of
+ * the human's windows, one window per session so it stays legible with several
+ * agents running); standalone opens it active in the current window, as today. */
+async function openTab(url: string, session?: string): Promise<chrome.tabs.Tab> {
+  return isBrokerMode() ? createAgentTab(url, session) : chrome.tabs.create({ url, active: true });
 }
 
 /** `chrome.tabs.get`, but a vanished tab — closed, crashed, or its id recycled
@@ -148,7 +149,7 @@ export function isBlankTarget(url: string | undefined): boolean {
   return url === 'about:blank' || url === 'about:newtab';
 }
 
-export const navigate: Tool = async (args) => {
+export const navigate: Tool = async (args, ctx) => {
   const url = String(args.url || '');
   if (!url) throw new BridgeError('bad_args', 'navigate: url required');
   try {
@@ -170,7 +171,7 @@ export const navigate: Tool = async (args) => {
   let tab: chrome.tabs.Tab;
   let created = false;
   if (createOwn) {
-    tab = await openTab(url);
+    tab = await openTab(url, ctx?.client);
     created = true;
     // Attach right away so any capture opted into (console/network/dialog)
     // is live for the page's OWN load, not just from the next tool call —
@@ -188,7 +189,7 @@ export const navigate: Tool = async (args) => {
     if (current.startsWith('chrome://') || current.startsWith('edge://')) {
       // Browser-internal page: can't navigate it in place, and there is no
       // user content to lose — open the target in a fresh tab instead.
-      tab = await openTab(url);
+      tab = await openTab(url, ctx?.client);
       created = true;
       await bestEffortAttach(tab.id!);
     } else {
@@ -256,8 +257,19 @@ export const closeTab: Tool = async (args) => {
   // agent could enumerate tabs via list_tabs and selectively close any
   // non-allowlisted ones (banking, email, in-progress forms), losing user
   // work behind the allowlist's back.
+  //
+  // ONE exception, and it is strictly stronger rather than weaker: a tab this
+  // agent CREATED, in broker mode. The daemon already proved the caller owns
+  // the tabId before the call reached us (invariant #13), and ownership is a
+  // stronger answer to "may I destroy this tab" than the allowlist is. Without
+  // the exception an agent tab that followed a redirect off the allowlist (an
+  // SSO bounce, a shortener, an error page) could never be closed by its own
+  // owner, so agent tabs would accumulate until the human swept them up.
+  // Fail-closed: no recorded epoch (standalone, or a tab we did not create)
+  // keeps the allowlist check verbatim.
   const tab = await getTabOrGone(tabId);
-  await ensureAllowed(tab.url);
+  const ownAgentTab = isBrokerMode() && getEpoch(tabId) !== undefined;
+  if (!ownAgentTab) await ensureAllowed(tab.url);
   await chrome.tabs.remove(tabId);
   return { tabId, url: tab.url, data: { closed: tabId } };
 };

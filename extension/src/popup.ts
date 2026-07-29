@@ -13,6 +13,7 @@ import { matchAllowlist, normalizePattern, validatePattern } from './allowlist.j
 import { classifySecretInput, EXPECTED_SECRET_BYTES } from './pairing.js';
 import { extractHostname, formatRelativeTime, matchesAuditFilter } from './format.js';
 import { nextReconnectKick } from './reconnect-kick.js';
+import type { AgentTabRow } from './background.js';
 
 type Status = {
   state: 'disconnected' | 'connecting' | 'connected' | 'no_secret';
@@ -434,8 +435,47 @@ $('#status-advanced').addEventListener('toggle', async () => {
 $('#activity-refresh').addEventListener('click', () => void renderActivity(liveConnected));
 
 $('#keep-awake').addEventListener('change', async () => {
-  // Takes effect on the next tool call — keepAwake is re-read per attach.
-  await setSettings({ keepAwake: ($('#keep-awake') as HTMLInputElement).checked });
+  const on = ($('#keep-awake') as HTMLInputElement).checked;
+  await setSettings({ keepAwake: on });
+  // Turning it ON takes effect on the next tool call (keepAwake is re-read per
+  // attach). Turning it OFF must take effect NOW, on every attached tab: the
+  // attach path only reaches a tab when something drives it again, so an idle
+  // tab would otherwise keep reporting itself focused indefinitely.
+  if (!on) await send({ type: 'KEEP_AWAKE_OFF' });
+});
+
+// -------------------------------------------------------------------------
+// Agent tabs — what the sessions left in this browser
+// -------------------------------------------------------------------------
+
+async function renderAgentTabs(): Promise<void> {
+  const resp = await send<{ ok: boolean; tabs: AgentTabRow[] }>({ type: 'AGENT_TABS' });
+  const rows = resp?.tabs ?? [];
+  ($('#agent-tab-count') as HTMLElement).textContent = String(rows.length);
+  const ul = $('#agent-tab-list') as HTMLUListElement;
+  ul.innerHTML = '';
+  if (rows.length === 0) {
+    ul.innerHTML = '<li class="muted small">No agent tabs open.</li>';
+    return;
+  }
+  for (const row of rows) {
+    const li = document.createElement('li');
+    const who = row.session ? `[${row.session}] ` : '';
+    li.textContent = `${who}${row.title || row.url}`;
+    li.title = row.url;
+    ul.appendChild(li);
+  }
+}
+
+$('#status-agents').addEventListener('toggle', async () => {
+  if (!($('#status-agents') as HTMLDetailsElement).open) return;
+  await renderAgentTabs();
+});
+
+$('#agent-tabs-close').addEventListener('click', async () => {
+  const resp = await send<{ ok: boolean; closed: number }>({ type: 'CLOSE_AGENT_TABS' });
+  flash('#status-flash', `closed ${resp?.closed ?? 0} agent tab(s)`);
+  await renderAgentTabs();
 });
 
 $('#capture-console').addEventListener('change', async () => {
@@ -552,6 +592,17 @@ function renderAuditEntry(entry: AuditEntry, now: number): HTMLLIElement {
   time.textContent = formatRelativeTime(entry.ts, now);
   time.title = new Date(entry.ts).toLocaleString();
   head.append(okSpan, tool, time);
+  // Which session did this. With several agents driving one browser, and their
+  // calls now genuinely interleaving, the log is otherwise an unattributable
+  // stream — there isn't even the weak "this burst was probably one session"
+  // proxy that strict serialisation used to give.
+  if (entry.client) {
+    const who = document.createElement('span');
+    who.className = 'audit-client';
+    who.textContent = entry.client;
+    who.title = `session: ${entry.client}`;
+    head.appendChild(who);
+  }
   li.appendChild(head);
   if (entry.url) {
     const u = document.createElement('div');

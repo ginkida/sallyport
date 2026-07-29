@@ -351,12 +351,20 @@ export class BridgeConnection {
       }
     });
 
-    // Process signed envelopes strictly in arrival order: chain each on the
-    // previous so the hello_ack's broker-mode signal is applied before any
-    // tool_call the daemon sent after it. The per-message `verify()` awaits can
-    // otherwise resolve out of order, dispatching a tool_call while brokerMode
-    // is still stale right after a service-worker wake — which would let a
-    // tabId-less navigate fall back to (and clobber) the human's active tab.
+    // VERIFY frames strictly in arrival order — chain each on the previous — so
+    // the hello_ack's broker-mode signal is applied before any tool_call the
+    // daemon sent after it. The per-message `verify()` awaits can otherwise
+    // resolve out of order, dispatching a tool_call while brokerMode is still
+    // stale right after a service-worker wake, which would let a tabId-less
+    // navigate fall back to (and clobber) the human's active tab.
+    //
+    // EXECUTION of a tool_call, by contrast, is deliberately NOT chained: it is
+    // started inside the ordered link and then left to run on its own. Awaiting
+    // it here (as this did until 0.17) made the extension a hard serial queue
+    // for every session at once — one agent's 30 s `wait_for` held up every
+    // other agent's next call for its full duration, no matter what the daemon
+    // did. The ordering property the chain exists for survives, because the
+    // tool_call is still *started* after every earlier frame was applied.
     // `dispatchMessage` swallows its own errors, and the `.catch` is a belt so a
     // single bad frame can never break the chain for later frames.
     let inbound: Promise<void> = Promise.resolve();
@@ -442,11 +450,13 @@ export class BridgeConnection {
     this.deps.alarms.create(ALARM_RECONNECT, { delayInMinutes: alarmDelayMin });
   }
 
-  /** Verify and dispatch one inbound WS frame. Runs serialised through the
-   * connection's `inbound` chain (see the message listener), so completing
-   * fully — including the hello_ack's brokerMode update — before the next frame
-   * is what guarantees in-order envelope processing. Swallows its own errors so
-   * the chain is never broken by a bad frame or a failing tool dispatch. */
+  /** Verify and route one inbound WS frame. Runs serialised through the
+   * connection's `inbound` chain (see the message listener): verification and
+   * every control frame — the hello_ack's brokerMode update above all —
+   * complete before the next frame is looked at. A `tool_call` is STARTED here
+   * and then detached, so concurrent calls from different sessions overlap
+   * instead of queueing behind each other. Swallows its own errors so the chain
+   * is never broken by a bad frame or a failing tool dispatch. */
   private async dispatchMessage(evt: MessageEvent): Promise<void> {
     let raw: unknown;
     try {
@@ -489,7 +499,16 @@ export class BridgeConnection {
         this.deps.onBrokerMode?.(Boolean((env.body as { broker?: unknown } | null)?.broker));
         break;
       case 'tool_call':
-        await this.handleToolCall(env);
+        // Detached on purpose (see the message listener): starting it inside
+        // the ordered chain preserves "every earlier frame was applied first",
+        // while not awaiting it is what lets one session's slow call run
+        // alongside another session's fast one. Errors are handled inside
+        // handleToolCall, which always answers the daemon; the catch is a belt
+        // so a throw can never surface as an unhandled rejection.
+        void this.handleToolCall(env).catch((e: unknown) => {
+          this.lastError = 'tool dispatch error: ' + (e as Error).message;
+          this.pushStatus();
+        });
         break;
       default:
         // Unknown but signed — ignore.

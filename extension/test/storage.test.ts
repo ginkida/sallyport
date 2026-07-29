@@ -419,3 +419,35 @@ describe('appendAudit — truncates entries before storage', () => {
     expect(log[0].args['…']).toBe('<more keys omitted, audit budget exhausted>');
   });
 });
+
+describe('appendAudit under concurrent tool calls', () => {
+  it('keeps every entry when appends overlap', async () => {
+    // appendAudit is a read-modify-write across two awaited storage
+    // round-trips. That was unreachable while the connection ran tools one at
+    // a time; with concurrent sessions two calls finishing together both read
+    // the same snapshot and the second set() silently dropped the first entry.
+    const entries = Array.from({ length: 25 }, (_v, i) => mkEntry(i));
+    await Promise.all(entries.map((e) => appendAudit(e)));
+    const log = await getAudit();
+    expect(log).toHaveLength(entries.length);
+    // ...and the chain preserves invocation order, so the log stays readable.
+    expect(log.map((e) => e.ts)).toEqual(entries.map((e) => e.ts));
+  });
+
+  it('one failed write does not break the chain for later entries', async () => {
+    const original = chrome.storage.local.set;
+    let failNext = true;
+    (chrome.storage.local as unknown as { set: unknown }).set = async (obj: unknown) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error('quota exceeded');
+      }
+      return (original as (o: unknown) => Promise<void>)(obj);
+    };
+    await expect(appendAudit(mkEntry(1))).rejects.toThrow('quota');
+    await appendAudit(mkEntry(2));
+    (chrome.storage.local as unknown as { set: unknown }).set = original;
+    const log = await getAudit();
+    expect(log.map((e) => e.ts)).toEqual([2]);
+  });
+});

@@ -7,7 +7,13 @@
 
 import { appendAudit, getSettings, redactAuditArgs, type AuditEntry } from './storage.js';
 import { BridgeError } from './tools/errors.js';
-import { confirmEpoch, EXPECTED_EPOCH_ARG, stripEpochArg } from './tools/ownership.js';
+import {
+  CLIENT_LABEL_ARG,
+  confirmEpoch,
+  EXPECTED_EPOCH_ARG,
+  stripBrokerArgs,
+} from './tools/ownership.js';
+import { releaseTabs } from './tools/release.js';
 import { evaluate } from './tools/evaluate.js';
 import { consoleTail } from './tools/console.js';
 import { handleDialog } from './tools/dialog.js';
@@ -66,21 +72,68 @@ const tools: Record<string, Tool> = {
 
 export const TOOL_NAMES = Object.keys(tools);
 
+/** Tools the DAEMON calls on its own initiative, never an agent. Kept out of
+ * `tools` (and therefore out of `TOOL_NAMES` and the MCP catalogue) so the
+ * advertised surface stays exactly what an agent may ask for. */
+const internalTools: Record<string, Tool> = {
+  _release_tabs: releaseTabs,
+};
+
+/** Per-tab serialisation of tool bodies.
+ *
+ * Calls now overlap (the daemon runs one lane per session, and the connection
+ * no longer queues them), and per-tab state is emphatically NOT safe for two
+ * concurrent calls on the SAME tab: `buildSnapshotTree` resets that tab's refs
+ * mid-flight, and snapshot/mouse release a shared CDP object group in their
+ * `finally` — a second call would have its handles freed under it and its `@eN`
+ * refs renumbered.
+ *
+ * Ownership is exclusive per client (invariant #13) and each client has one
+ * lane, so in broker mode this chain is never actually contended — it is
+ * defence-in-depth, and it costs nothing when uncontended. In standalone, where
+ * two calls really can target one tab, it is load-bearing. */
+const tabChains = new Map<number, Promise<unknown>>();
+
+function onTab<T>(tabId: number | undefined, run: () => Promise<T>): Promise<T> {
+  if (typeof tabId !== 'number') return run();
+  const prior = tabChains.get(tabId) ?? Promise.resolve();
+  const next = prior.then(run, run);
+  // Never let a rejection break the chain for later calls, and drop the entry
+  // once the tab goes quiet so the map doesn't grow with every tab ever driven.
+  const settled = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  tabChains.set(tabId, settled);
+  void settled.then(() => {
+    if (tabChains.get(tabId) === settled) tabChains.delete(tabId);
+  });
+  return next;
+}
+
+/** Reset the per-tab chains (test hook). */
+export function resetTabChains(): void {
+  tabChains.clear();
+}
+
 export async function runTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   const settings = await getSettings();
   if (settings.paused) {
     throw new BridgeError('paused', 'Sallyport is paused — resume from the popup');
   }
-  const tool = tools[name];
+  const tool = tools[name] ?? internalTools[name];
   if (!tool) throw new BridgeError('unknown_tool', `unknown tool: ${name}`);
 
   // Broker-mode ownership confirmation (invariant #13, defence-in-depth). The
   // daemon is the authoritative gate but injects the create-time epoch it
   // recorded for the owned tab; we confirm it matches what we minted before
   // acting, so a recycled Chrome tabId can't silently retarget us (tab_gone).
-  // Strip the broker-internal field so neither the tool nor the audit sees it.
+  // Strip the broker-internal fields so neither the tool nor the audit sees
+  // them as ordinary arguments.
   const expectedEpoch = args[EXPECTED_EPOCH_ARG];
-  const callArgs = stripEpochArg(args);
+  const rawLabel = args[CLIENT_LABEL_ARG];
+  const client = typeof rawLabel === 'string' && rawLabel ? rawLabel : undefined;
+  const callArgs = stripBrokerArgs(args);
 
   const audit: AuditEntry = {
     ts: Date.now(),
@@ -88,13 +141,21 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
     args: redactAuditArgs(name, callArgs),
     ok: false,
   };
+  // Which session did this. With several agents driving one browser the audit
+  // log is otherwise an unattributable interleaved stream — and losing the
+  // serialisation that used to make it roughly chronological per session
+  // removes even that weak proxy.
+  if (client !== undefined) audit.client = client;
   if (typeof callArgs.tabId === 'number') audit.tabId = callArgs.tabId;
 
   try {
     if (expectedEpoch !== undefined && typeof callArgs.tabId === 'number') {
       confirmEpoch(callArgs.tabId, expectedEpoch);
     }
-    const result = await tool(callArgs);
+    const result = await onTab(
+      typeof callArgs.tabId === 'number' ? callArgs.tabId : undefined,
+      () => tool(callArgs, { client }),
+    );
     audit.ok = true;
     if (result.tabId !== undefined) audit.tabId = result.tabId;
     if (result.url !== undefined) audit.url = result.url;

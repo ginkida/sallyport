@@ -18,8 +18,10 @@ import {
 } from './storage.js';
 import { badgeFromStatus } from './badge.js';
 import { extractHostname } from './format.js';
-import { dropEpoch, setBrokerMode } from './tools/ownership.js';
+import { agentTabIds, dropEpoch, setBrokerMode } from './tools/ownership.js';
 import { loadEpochs, persistEpochs, reconcileWithLiveTabs } from './tools/ownership-store.js';
+import { sessionOfWindow } from './tools/agent-window.js';
+import { releaseKeepAwakeEverywhere } from './tools/cdp.js';
 
 async function updateBadge(snapshot: StatusSnapshot): Promise<void> {
   const { paused } = await getSettings();
@@ -194,7 +196,48 @@ type PopupMessage =
   | { type: 'PAUSE' }
   | { type: 'RESUME' }
   | { type: 'RECONNECT' }
-  | { type: 'LIST_TOOLS' };
+  | { type: 'LIST_TOOLS' }
+  | { type: 'AGENT_TABS' }
+  | { type: 'CLOSE_AGENT_TABS' }
+  | { type: 'KEEP_AWAKE_OFF' };
+
+export type AgentTabRow = { tabId: number; title: string; url: string; session?: string };
+
+/** The tabs agents currently own, for the popup's "Agent tabs" list.
+ *
+ * Read from the extension's own epoch map rather than by scanning windows: a
+ * tab the human dragged out of an agent window is still an agent tab, and a
+ * tab they dragged IN is still theirs. Runs in the worker because the popup has
+ * no access to that state. */
+async function listAgentTabs(): Promise<AgentTabRow[]> {
+  const owned = agentTabIds();
+  if (owned.size === 0) return [];
+  const rows: AgentTabRow[] = [];
+  for (const tab of await chrome.tabs.query({})) {
+    if (tab.id === undefined || !owned.has(tab.id)) continue;
+    rows.push({
+      tabId: tab.id,
+      title: tab.title ?? '',
+      url: tab.url ?? '',
+      session: await sessionOfWindow(tab.windowId),
+    });
+  }
+  return rows;
+}
+
+/** Close every agent-owned tab. The human's own tabs are never touched: the
+ * set comes from the epoch map, which only ever holds tabs an agent created. */
+async function closeAgentTabs(): Promise<number> {
+  const rows = await listAgentTabs();
+  for (const row of rows) {
+    try {
+      await chrome.tabs.remove(row.tabId);
+    } catch {
+      // already gone — nothing to close
+    }
+  }
+  return rows.length;
+}
 
 chrome.runtime.onMessage.addListener((msg: PopupMessage, sender, sendResponse) => {
   // Fail-closed: only the extension's own popup may drive PAIR/UNPAIR/PAUSE/etc.
@@ -232,6 +275,20 @@ chrome.runtime.onMessage.addListener((msg: PopupMessage, sender, sendResponse) =
           break;
         case 'LIST_TOOLS':
           sendResponse({ ok: true, tools: TOOL_NAMES });
+          break;
+        case 'AGENT_TABS':
+          sendResponse({ ok: true, tabs: await listAgentTabs() });
+          break;
+        case 'CLOSE_AGENT_TABS':
+          sendResponse({ ok: true, closed: await closeAgentTabs() });
+          break;
+        case 'KEEP_AWAKE_OFF':
+          // The per-tab attach path only reaches a tab the next time something
+          // drives it, so without this sweep unchecking the toggle left every
+          // idle tab still reporting itself focused — forever, for a tab nobody
+          // drives again.
+          await releaseKeepAwakeEverywhere();
+          sendResponse({ ok: true });
           break;
         default:
           sendResponse({ ok: false, error: 'unknown message' });
