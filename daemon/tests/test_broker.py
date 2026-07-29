@@ -719,9 +719,16 @@ def test_unlink_socket_only_removes_our_own_inode(tmp_path: Path) -> None:
     ours = socket_identity(path)
     assert ours is not None
 
-    # Someone replaced the file with a different inode under the same name.
-    path.unlink()
-    path.write_text("theirs")
+    # Someone replaced the file under the same name. Built via rename-over, NOT
+    # unlink-then-create: Linux filesystems hand a just-freed inode number
+    # straight back, so recreating at the same path can reuse the very number we
+    # recorded (this test failed on ext4 CI for exactly that reason). A
+    # replacement allocated while the original still exists is guaranteed to
+    # differ — which is also what a racing broker's fresh socket would be.
+    successor = tmp_path / "successor"
+    successor.write_text("theirs")
+    successor.replace(path)
+    assert socket_identity(path) != ours
     assert unlink_socket_if_ours(path, ours) is False
     assert path.exists()
 

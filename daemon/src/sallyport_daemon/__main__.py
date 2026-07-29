@@ -1265,9 +1265,15 @@ async def _run_shim(
     # `pump_up` blocks on readline() forever. It holds no port any more, but it
     # does hold one of the broker's authenticated client slots — leak enough of
     # those and the broker starts refusing real sessions.
+    # NOT in the wait set below — it signals through `shutdown` (which `stop`
+    # waits on), exactly like the stdio path. Putting it in the set tore the
+    # session down instantly whenever the watchdog returns early, which it does
+    # for any process whose parent is already PID 1 (its own "started under
+    # init, nothing to watch" exemption) — a service-manager launch, or a
+    # container. Caught on Linux; a shell-parented macOS run never hits it.
     watchdog = asyncio.create_task(_watch_parent(shutdown), name="parent-watchdog")
     try:
-        await asyncio.wait({shim, stop, watchdog}, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait({shim, stop}, return_when=asyncio.FIRST_COMPLETED)
     finally:
         stop.cancel()
         shim.cancel()

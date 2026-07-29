@@ -779,6 +779,17 @@ async def test_default_mode_attaches_to_running_broker_as_shim(
     port = _free_port()
     sock = broker_socket_path(port, short_secret.parent)
 
+    # The parent watchdog RETURNS IMMEDIATELY when the process was started under
+    # init (its documented ppid==1 exemption). The shim must survive that: it is
+    # a signal source, not a lifetime. Forcing the early return here reproduces
+    # on every OS what only Linux CI showed — a shell-parented macOS run never
+    # takes the exemption, so the shim looked fine while it was dying the moment
+    # it attached anywhere the parent is PID 1 (container, service manager).
+    async def _immediate_watchdog(_shutdown: object, **_kw: object) -> None:
+        return None
+
+    monkeypatch.setattr("sallyport_daemon.__main__._watch_parent", _immediate_watchdog)
+
     broker_ns = parse_args(["--secret-file", str(short_secret), "--port", str(port), "broker"])
     broker = asyncio.create_task(amain(broker_ns))
 

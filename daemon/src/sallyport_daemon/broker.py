@@ -511,12 +511,22 @@ def socket_identity(path: Path) -> tuple[int, int] | None:
 
 
 def unlink_socket_if_ours(path: Path, identity: tuple[int, int] | None) -> bool:
-    """Remove the socket file only if it is still the inode WE bound.
+    """Remove the socket file only if it still looks like the inode WE bound.
 
     A bare ``path.unlink()`` at shutdown deletes whatever happens to be at that
     name — which, after a racing broker rebinds the path, is the successor's
     LIVE socket. Every session then finds no socket, spawns another broker, and
-    the failure cascades. Compare identity first."""
+    the failure cascades.
+
+    HONEST LIMIT: ``(st_dev, st_ino)`` is a belt, not the guarantee. Linux
+    filesystems reuse a just-freed inode number immediately (ext4 hands the same
+    number straight back), so a successor created at this path can legitimately
+    carry the identity we recorded. What actually prevents the scenario is the
+    ordering around the claim in :func:`acquire_broker_lock`: a broker unlinks
+    while it still holds the flock, and no successor can bind before that lock is
+    released. This check is what catches a future refactor that breaks that
+    ordering, plus every case where the file was replaced by something that is
+    not a socket at all."""
     if identity is None:
         return False
     if socket_identity(path) != identity:
