@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import json
 import os
 import secrets as _secrets
@@ -35,6 +34,11 @@ import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - POSIX-only; Windows has neither this nor AF_UNIX
+    fcntl = None  # type: ignore[assignment]
 
 from .framing import FramingError, read_frame, write_frame
 from .protocol import Envelope, ProtocolError, Signer
@@ -80,6 +84,18 @@ def _running_version() -> str:
 # while still running the OLD code in memory, and the skew warning could never
 # fire for the upgrade case it exists for. This is the build actually running.
 RUNNING_VERSION = _running_version()
+
+
+def broker_supported() -> bool:
+    """Whether this platform can run broker mode at all.
+
+    Broker mode needs an AF_UNIX socket and ``flock``; neither exists on Windows,
+    where the daemon has always been standalone-only. pyproject claims
+    ``OS Independent``, and ``__main__`` imports this module unconditionally, so
+    a hard ``import fcntl`` at the top would take the WHOLE CLI down there rather
+    than just this one mode. Callers use this to fall back silently instead.
+    """
+    return fcntl is not None and hasattr(asyncio, "start_unix_server")
 
 
 def sanitise_label(raw: Any) -> str | None:
@@ -441,6 +457,8 @@ def acquire_file_lock(lock_path: Path) -> int | None:
     """``flock`` a lockfile exclusively, non-blocking. Returns the held fd, or
     None if another live process holds it. The kernel releases the lock when the
     holder dies, so there is no stale-lock state to garbage-collect."""
+    if fcntl is None:  # pragma: no cover - POSIX-only
+        return None
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -475,7 +493,7 @@ def acquire_broker_lock(sock_path: Path) -> int | None:
 
 def release_broker_lock(fd: int | None) -> None:
     """Drop the claim (also implicit on process death)."""
-    if fd is None:
+    if fd is None or fcntl is None:
         return
     with contextlib.suppress(OSError):
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -657,7 +675,15 @@ async def call_tool_via_broker(
     reader, writer = await asyncio.open_unix_connection(str(path))
     try:
         await write_frame(writer, _dump_json(signer.sign(Envelope(type="hello", body={}))))
-        ack = await asyncio.wait_for(read_frame(reader), timeout=10.0)
+        # Every timeout here becomes a BrokerError. On Python 3.10
+        # `asyncio.TimeoutError` is `concurrent.futures.TimeoutError` — NOT the
+        # builtin `TimeoutError`, and therefore NOT an OSError — so letting it
+        # propagate would escape `exec`'s handler as a raw traceback on exactly
+        # one of the three supported interpreters.
+        try:
+            ack = await asyncio.wait_for(read_frame(reader), timeout=10.0)
+        except asyncio.TimeoutError as exc:
+            raise BrokerError("broker did not answer the handshake") from exc
         if ack is None or signer.verify(_parse_json(ack)).type != "hello_ack":
             raise BrokerError("broker refused the handshake")
 
@@ -669,7 +695,12 @@ async def call_tool_via_broker(
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     raise BrokerError(f"broker did not answer {method} within {call_timeout:.0f}s")
-                raw = await asyncio.wait_for(read_frame(reader), timeout=remaining)
+                try:
+                    raw = await asyncio.wait_for(read_frame(reader), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise BrokerError(
+                        f"broker did not answer {method} within {call_timeout:.0f}s"
+                    ) from exc
                 if raw is None:
                     raise BrokerError("broker closed mid-request")
                 env = signer.verify(_parse_json(raw))

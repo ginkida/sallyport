@@ -40,6 +40,7 @@ from .broker import (
     acquire_file_lock,
     broker_is_available,
     broker_socket_path,
+    broker_supported,
     call_tool_via_broker,
     close_broker_clients,
     release_broker_lock,
@@ -1005,6 +1006,11 @@ def auto_broker_enabled(args: argparse.Namespace) -> bool:
     exists to fix, so it is the default rather than an opt-in.
     """
     if getattr(args, "no_broker", False):
+        return False
+    if not broker_supported():
+        # No AF_UNIX / flock (Windows): silently keep the standalone behaviour
+        # that platform has always had, rather than spending the start budget
+        # failing to bring up a broker that cannot exist there.
         return False
     env = os.environ.get("SALLYPORT_NO_BROKER", "").strip().lower()
     return env in ("", "0", "false", "no")

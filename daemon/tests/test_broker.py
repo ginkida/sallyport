@@ -789,3 +789,51 @@ async def test_broker_state_tracks_clients_and_idle_time(sock_path: Path) -> Non
         server.close()
         with contextlib.suppress(Exception):
             await asyncio.wait_for(server.wait_closed(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_via_broker_maps_a_silent_broker_to_brokererror(sock_path: Path) -> None:
+    """`exec` catches (BrokerError, OSError, ProtocolError). A bare
+    `asyncio.TimeoutError` would slip through that on Python 3.10, where it is
+    `concurrent.futures.TimeoutError` and NOT an OSError — it only became the
+    builtin `TimeoutError` (an OSError subclass) in 3.11. Version-independent
+    regression: a broker that acks and then goes silent must surface as
+    BrokerError, not a raw traceback."""
+    from sallyport_daemon.broker import call_tool_via_broker
+
+    async def _ack_then_silence(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        signer = Signer(SECRET)
+        raw = await read_frame(reader)
+        assert raw is not None
+        await write_frame(writer, _dump_json(signer.sign(Envelope(type="hello_ack", body={}))))
+        await asyncio.sleep(30)  # never answers the initialize
+
+    server = await asyncio.start_unix_server(_ack_then_silence, path=str(sock_path))
+    try:
+        with pytest.raises(BrokerError, match="did not answer"):
+            await call_tool_via_broker(sock_path, SECRET, "status", {}, call_timeout=0.1)
+    finally:
+        server.close()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(server.wait_closed(), timeout=2)
+
+
+def test_broker_supported_reflects_the_platform() -> None:
+    """`__main__` imports this module unconditionally, so the POSIX-only pieces
+    (flock, AF_UNIX) must not be able to take the whole CLI down on a platform
+    the package claims to support — auto-broker just turns itself off there."""
+    from sallyport_daemon import broker as broker_mod
+
+    assert broker_mod.broker_supported() is True  # this test runs on POSIX CI
+
+    original = broker_mod.fcntl
+    broker_mod.fcntl = None  # type: ignore[assignment]
+    try:
+        assert broker_mod.broker_supported() is False
+        # And the claim degrades to "not ours" rather than raising.
+        assert broker_mod.acquire_file_lock(Path("/tmp/sp-nonexistent.lock")) is None  # noqa: S108
+        broker_mod.release_broker_lock(3)  # must not touch a real fd
+    finally:
+        broker_mod.fcntl = original
