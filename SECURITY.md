@@ -65,17 +65,19 @@ the "Tools" table for per-tool notes. Quick reference:
 | Domain scope | Allowlist enforced before every DOM tool | `extension/src/allowlist.ts`, `extension/src/tools/gates.ts` |
 | Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, `snapshot`'s DOM-fallback walker, `screenshot`'s `document.visibilityState` probe, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `domtree.ts`, `screenshot.ts`, `aim.ts` |
 | Password input | `fill` reads `type` via browser DOM; `key_type`/`send_keys` enumerate frames (temporary flat child sessions for OOPIFs), locate focused AX nodes through closed shadow DOM, then inspect browser-owned DOM attributes | `extension/src/tools/dom.ts`, `focus.ts`, `keyboard.ts` |
-| Closing tabs | Allowlist-gated like other DOM tools | `extension/src/tools/tabs.ts:closeTab` |
+| Closing tabs | Allowlist-gated like other DOM tools, EXCEPT a tab the caller created in broker mode: the daemon has already proved ownership, which is a stronger answer to "may I destroy this tab" (and without it an agent tab that redirected off-allowlist could never be closed by its owner) | `extension/src/tools/tabs.ts:closeTab` |
 | Filesystem (write) | `save_to_file` and `print_to_pdf`'s daemon post-call processor sandbox to `~/Downloads/sallyport/` (shared `_write_sandbox_blob`: filename rules + resolved-path containment re-check) | `daemon/.../local_tools.py:save_to_file`, `POST_CALL_PROCESSORS` |
 | Filesystem (read via Chrome) | `upload` paths must resolve under the same sandbox; symlink-safe | `daemon/.../local_tools.py:validate_upload_paths` + `PRE_CALL_VALIDATORS` |
 | Frame size | 16 MiB cap, 1009 close on overflow | `daemon/.../bridge.py:MAX_FRAME_BYTES` |
 | Secret file | `chmod 600`, perms warned on relax | `daemon/.../secret.py` |
-| Concurrent calls | Daemon `_call_lock` serialises MCP tool calls | `daemon/.../bridge.py` |
+| Concurrent calls | One serial lane per client + a FIFO permit pool capping calls in flight; the lane spans the ownership check-then-act, the permit only the WS round-trip. The extension chains per TAB. Sessions run concurrently; a session's own calls stay serial | `daemon/.../scheduling.py`, `bridge.py`, `extension/src/tools.ts` |
 | Multiple WS clients | Slot claimed only after verified signed hello; second authenticated client rejected with 1008 | `daemon/.../bridge.py:_handle_client` |
 | Unauthenticated slot-squatting / probing | Hello-before-slot + 10 s hello deadline + browser-page Origins refused | `daemon/.../bridge.py:_handle_client` |
 | Tab ownership (broker mode) | Daemon `ensure_owns` gate before every tab-touching call; `(clientId,tabId,epoch)` registry; extension epoch confirm | `daemon/.../ownership.py`, `extension/src/tools/ownership.ts` |
 | MCP-client auth (broker mode) | Signed `hello` before any disclosure/action; server-minted connection-bound `clientId`; per-connection nonce cache | `daemon/.../broker.py:authenticate_connection` |
 | Broker socket exposure | `0600` AF_UNIX socket beside the secret (same uid gate); authenticated-client cap (16), with half-open handshakes bounded separately so a never-hello peer can't consume an earned slot | `daemon/.../broker.py:start_broker_server` |
+| Broker socket ownership | `flock` held for the process lifetime claims the path before binding — `asyncio.start_unix_server` unlinks a LIVE socket there, so the lock, not the file, is the exclusion. Shutdown unlinks only the inode it bound | `daemon/.../broker.py:acquire_broker_lock`, `unlink_socket_if_ours` |
+| Session label (broker mode) | Peer-declared, sanitised (charset + 24 chars), used only for audit display and window grouping — never for a gate. Ownership keys on the server-minted `clientId`, which never leaves the daemon | `daemon/.../broker.py:sanitise_label` |
 
 ## Broker mode
 
@@ -109,11 +111,29 @@ clobbering the human's focused one). Ownership keys on `(tabId, epoch)`, never
 tabId resolves to `tab_gone` rather than the wrong page. `list_tabs` is
 owner-scoped at both layers (extension filters to agent-created tabs, daemon
 re-scopes per-client, **fail-closed**), and `screenshot bringToFront` is refused
-(`bringtofront_forbidden`) so automation can't yank the human's focus. The
-diagnostic `status` ring (recent tool outcomes + last error) is owner-scoped too:
-a session sees only its own calls, never another client's tools, codes, or
-server-minted `clientId` — so the shared ring can't become a cross-client
-activity oracle.
+(`bringtofront_forbidden`) so automation can't yank the human's focus —
+`screenshot` instead makes the tab active *within its own unfocused window*,
+which the human never sees. The diagnostic `status` ring (recent tool outcomes +
+last error) is stored **per client** rather than filtered out of a shared one, so
+a session sees only its own calls — never another client's tools, codes, or
+server-minted `clientId` — and there is no shared structure left to leak through.
+
+Since 0.17 a broker is started **automatically** by the first session, so this is
+the default deployment rather than an opt-in. That also means the tab-ownership
+semantics above (explicit `tabId`, owner-scoped `list_tabs`, no active-tab
+fallback) are what an agent normally sees. `--no-broker` /
+`SALLYPORT_NO_BROKER=1` restores single-session standalone behaviour.
+
+Each session's tabs open in **its own** non-focused window, muted, with the
+human's previously-focused window restored afterwards. Those are ordinary
+windows in the human's profile — same cookie jar, same logins — because the
+point of driving the user's own browser is that an agent inherits the sessions
+they are already signed into. The separation is ownership, never identity: there
+is no incognito/profile boundary here and adding one would break that premise.
+When a session disconnects its tabs stay OPEN but stop being driven — the daemon
+fires an internal `_release_tabs` so the debugger detaches, ending Chrome's
+"started debugging this browser" bar, the disabled back/forward cache and the
+sticky focus emulation for tabs whose agent is gone.
 
 **Honest framing — what broker mode is and isn't.** It is a **software partition**
 of one shared browser profile, bounded by the allowlist + ownership + secret-gated
@@ -215,24 +235,51 @@ reaping is on next-call / next-wake, not instant.
 orphaned tab is just a tab the human can see and close. It is a tidiness gap, not
 a confinement hole.
 
-### Broker mode: tool calls are fair-by-arrival, not round-robin-fair
+The tidiness half is now largely handled from the other direction: on disconnect
+the daemon calls the extension (daemon→extension is an ordinary `tool_call`, so
+no protocol bump) to stop driving that session's tabs, and the popup's **Agent
+tabs** section lists what every session left open with a one-click sweep. A tab
+the registry never learned about still won't appear there — that is the residual
+gap, and it is still just a tab.
 
-All MCP tool calls across all sessions serialise through one daemon lock (the
-single browser can do one thing at a time, invariant #8). The lock is FIFO **by
-arrival**, so a session that pipelines many calls can delay a latecomer from
-another session until its queue drains. Every call is still bounded by the 60 s
-request timeout, and `status` answers without taking the lock, so a stall is
-always attributable. A per-owner round-robin scheduler is designed but deferred
-(it is a fairness optimisation on an already-correct lock, and a custom scheduler
-in the per-call critical path carries more risk than the benefit warrants for
-v1). DoS here is **within the trusted set** (the user's own sessions).
+### Broker mode: concurrency is capped, and the cap is shared
 
-### Broker mode: the dedicated agent window is presentation, not isolation
+Sessions no longer serialise against each other: each has its own lane, and a
+FIFO pool caps how many calls are on the wire at once (default 8, so it only
+binds once more than that many sessions are busy together). Because a session
+can have at most one call waiting for a permit, the FIFO queue is round-robin
+across sessions for free — a session that pipelines calls cannot get ahead of
+one that doesn't. A call that waits out the queue window fails `busy` having
+never been sent, which is what makes it safe to retry. `status` takes neither a
+lane nor a permit, so it answers during any stall.
 
-Agent-created tabs open in one non-focused window to keep them out of the human's
-way. Ownership never keys on `windowId` (the human may drag a tab between
-windows), so the window is purely cosmetic separation — it is **not** a security
-boundary. Confinement is the daemon ownership gate, not the window.
+What remains is resource contention, not unfairness: N sessions genuinely
+sharing one browser will each be slower than one session alone, and a runaway
+session can keep the browser busy. That is DoS **within the trusted set** (the
+user's own sessions), the same floor as everything else here.
+
+### Broker mode: agent windows are presentation, not isolation
+
+Agent-created tabs open in a non-focused window per session, to keep them out of
+the human's way and to make "what is this session doing" legible. Ownership
+never keys on `windowId` (the human may drag a tab between windows), so the
+window is purely cosmetic separation — it is **not** a security boundary.
+Confinement is the daemon ownership gate, not the window.
+
+The same goes the other way: these are ordinary windows in the human's own
+Chrome profile, sharing their cookies and logins by design. An agent driving an
+allowlisted site acts **as the signed-in user**. That is the premise of the
+whole project (see the threat model), not an oversight — the allowlist and
+per-domain `evaluate` opt-in are what bound it.
+
+### Broker mode: a session's label is peer-declared
+
+A connecting session names itself in its `hello` (its working-directory name by
+default). The broker sanitises it — charset-folded, 24 chars — and forwards it
+to the extension for audit rows and window grouping. It is **display metadata
+only**: any same-uid process that can pair could claim any label, so it must
+never reach a gate, and it doesn't. Ownership keys on the server-minted
+`clientId`, which never leaves the daemon.
 
 ## Adding a new tool safely
 

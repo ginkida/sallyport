@@ -188,49 +188,63 @@ popup's **Allowlist** tab, add an entry like `example.com` or
 `*.github.com`. Tick **allow evaluate()** only if you actually need
 arbitrary JS on that host.
 
-## Running a shared broker (multiple sessions)
+## Several sessions, one browser (automatic)
 
-By default each Claude Code session spawns its own daemon, and only one can own
-the browser at a time (they'd fight over `127.0.0.1:10086`). **Broker mode** lets
-several sessions — and you, working in the same browser — share one extension:
+Sallyport is built for the case where *you* are using Chrome while one or more
+Claude Code sessions drive tabs in it. That works out of the box: the first
+`sallyport-daemon` starts a small **broker** in the background and attaches to
+it, and every session after that attaches to the same one. Register Sallyport as
+in step 3 from **as many project folders as you like** — nothing else to set up.
 
 ```sh
-# Start one long-lived broker (owns the extension; stays up until Ctrl-C).
-sallyport-daemon broker
+# Nothing. Just start a second Claude Code session.
 ```
 
-Now register and use Sallyport exactly as above (absolute-path
-`claude mcp add`, step 3) from **as many project folders as you like**. Each plain
-`sallyport-daemon` session **auto-detects** the running broker and attaches to it
-as a thin relay over a `0600` Unix-domain socket (`broker-10086.sock`, next to
-the secret); with no broker running, a session falls back to standalone, exactly
-as before. Pair the extension once, against the broker.
-
-You can leave the broker running in the background (`sallyport-daemon broker &`,
-`nohup`, or your own service manager); it's meant to be long-lived. `doctor`
-recognises it as an intentional broker rather than a stale daemon: its port check
-reports the busy port as **OK** (a broker holding it is the intended setup, not a
-conflict), and `sallyport-daemon doctor --kill-stale` reports it and leaves it
-running — stop it explicitly with `kill <pid>` (or Ctrl-C) when you're done.
+Under the hood the broker owns the extension connection and the port; each
+session relays its MCP over a `0600` Unix-domain socket next to the secret
+(`broker-10086.sock`). Before this, the second session simply failed to start —
+the first one held the port — and had no browser tools at all.
 
 What you get:
 
-- **Many sessions at once.** N agents drive the one browser concurrently; calls
-  are serialised so they never corrupt each other's state.
+- **Sessions don't block each other.** Calls from different sessions run
+  concurrently (a session's own calls stay in order, and a tab is only ever
+  touched by one call at a time). One agent's 30-second wait no longer freezes
+  everyone else's next click.
 - **Each agent stays in its own tabs.** An agent can only see and act on tabs it
   created (`navigate` with no tab opens a fresh one); it cannot touch — or even
-  list — your tabs or another agent's. `list_tabs` shows a session only its own
-  tabs.
-- **It won't steal your focus.** Agent tabs open in a separate, un-focused window
-  and never foreground themselves, so you can keep working while agents do.
-- **You're logged in.** It's your real browser profile, so agents operate on the
-  sites you're already signed into — scoped, as always, to the allowlist.
+  list — your tabs or another agent's. `list_tabs` shows a session only its own.
+- **It won't steal your focus.** Each session's tabs live in its own un-focused,
+  muted window, and the window you were using is re-focused if Chrome tries to
+  raise the new one. Screenshots work there too, without foregrounding anything.
+- **You can see who did what.** The popup's Audit tab tags every row with the
+  session (its folder name by default), and its **Agent tabs** section lists what
+  each session left open, with a one-click sweep.
+- **You're logged in.** These are ordinary tabs in your real Chrome profile, so
+  agents operate on the sites you're already signed into — scoped, as always, to
+  the allowlist. There is no incognito or separate profile involved: the
+  separation is about *who may drive which tab*, not about identity.
 
-Broker mode is a *software partition* of one shared profile, not an OS-level
-sandbox: the security floor is still "any process running as you" (it can read
-the secret and drive the browser within the allowlist). See
-[`SECURITY.md`](SECURITY.md) for the full model, including the new tab-ownership
-and MCP-client-auth invariants.
+Useful knobs:
+
+```sh
+sallyport-daemon --no-broker            # single session, own the port directly
+                                        # (or SALLYPORT_NO_BROKER=1)
+sallyport-daemon --session-label review # name this session in the audit log
+sallyport-daemon broker --idle-exit 3600  # start one explicitly, exit when idle
+sallyport-daemon doctor --stop-broker   # stop it (needed after an upgrade:
+                                        # a broker outlives `pip install -U`
+                                        # and serves its build to everyone)
+```
+
+The broker is long-lived by design, so `doctor` treats it as the intended setup
+rather than a stale daemon: the port check reports **OK**, and
+`doctor --kill-stale` leaves it running.
+
+This is a *software partition* of one shared profile, not an OS-level sandbox:
+the security floor is still "any process running as you" (it can read the secret
+and drive the browser within the allowlist). See [`SECURITY.md`](SECURITY.md) for
+the full model, including the tab-ownership and MCP-client-auth invariants.
 
 ## Tools
 
@@ -318,9 +332,8 @@ That alone proves: WS reach, HMAC handshake, perms.
 
 ### B. Fire individual tools from the shell — no Claude Code
 
-`sallyport-daemon exec <tool> key=value...` spins up the daemon, waits for the
-extension, calls one tool, prints JSON, exits. Values are JSON when
-parseable, otherwise strings.
+`sallyport-daemon exec <tool> key=value...` calls one tool and exits, printing
+the result. Values are JSON when parseable, otherwise strings.
 
 ```sh
 # Catalogue of tools (works offline, no extension needed):
@@ -343,11 +356,13 @@ sallyport-daemon exec screenshot format=jpeg quality=70
 ```
 
 Notes:
-- `exec` mode is mutually exclusive with the Claude Code MCP session
-  (single-client invariant in the WS server). Stop Claude Code first, or
-  pass a different `--port` here and update the popup's daemon URL.
-- The first `exec` waits up to 10s (`--wait 30` to bump it) for the popup
-  to connect. Once paired, the extension reconnects on its own.
+- `exec` works **alongside** running Claude Code sessions: when a broker is up
+  (the normal case) it goes through it as a one-shot client rather than
+  fighting for the port. With no broker it owns the port itself, and is then
+  mutually exclusive with a running session — stop it, or pass a different
+  `--port` here and update the popup's daemon URL.
+- Without a broker, the first `exec` waits up to 10s (`--wait 30` to bump it)
+  for the popup to connect. Once paired, the extension reconnects on its own.
 - Screenshot blobs are truncated in the printout — they're still passed
   in full to a real MCP client.
 
@@ -373,7 +388,10 @@ Claude Code, and ask it to do anything web-shaped. Watch the popup's
 | `not_visible` (from `mouse_click`) | Element has zero size — likely `display:none` or detached. Snapshot again; if it's hidden by design, drive the toggle that reveals it. |
 | `mouse_click` reports `covered: true` | Another node sits on top of the target at every probe point. The result includes `hitTarget` (what ate the click) and `hitTargetRef` — an `@eN` for that node; click it directly, or aim manually with `mouse_click x= y=`. |
 | Automation stalls when the browser window is in the background | Chrome freezes background tabs and fully-occluded windows. The bridge keeps driven tabs awake automatically (popup → **Advanced → keep automated tabs awake**, default on; note the page then believes it is focused — e.g. Telegram sends read receipts). If a page must stay alive *before* the bridge attaches, add its site under `chrome://settings/performance` → "Always keep these sites active", or run a dedicated automation profile with `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling`. |
-| `tab_not_visible` (from `screenshot`) | Hidden tabs render no frames — keep-awake can't help with pixels. Pass `bringToFront=true` (steals focus), activate the tab yourself, or keep a sliver of the window visible: macOS occlusion only kicks in when it's *fully* covered. |
+| `tab_not_visible` (from `screenshot`) | The tab produced no frame within 8s. `screenshot` already activates an agent tab inside its own un-focused window, so this means the window is **fully** occluded or minimised, or the display is asleep (macOS reports every window occluded once displays sleep). Keep a sliver of the agent window visible, or use `snapshot`/`read_text` (no frame needed) or `print_to_pdf` (renders a hidden tab). Check **keep automated tabs awake** is on — turning it off also stops the tab painting. `bringToFront=true` works in standalone and steals focus; it's refused in broker mode. |
+| Several sessions feel slower than one | They share one browser: up to 8 calls run at once, then calls queue. A call that waits out the queue fails `busy` (safe to retry — it was never sent). `status` reports `maxConcurrentCalls` and your own `pendingCalls`. |
+| A session lost its browser tools mid-run | Its broker went away. The session says so and exits non-zero; start it again (a new one starts a fresh broker). `sallyport-daemon doctor` shows the current state. |
+| Agents left tabs everywhere | Popup → **Agent tabs**: lists what each session opened, with **Close all agent tabs**. Tabs deliberately survive the session that made them — closing an agent's half-finished work is the loss `close_tab`'s gate exists to prevent. |
 | `bad_ref` | An `@eN` ref is stale (snapshot expired) or addressed at the wrong tab. Re-`snapshot` the right tab. Refs are per-tab and per-snapshot. |
 | `mac mismatch` (in popup) | Secret in `~/.config/sallyport/secret` no longer matches the one paired in the popup. Run `sallyport-daemon --show-secret`, copy, **Unpair** → paste → **Pair**. |
 | `timestamp skew` | Clocks are >30 s apart. Check NTP. |

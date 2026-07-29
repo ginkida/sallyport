@@ -6,6 +6,141 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **A shared broker now starts itself.** Plain `sallyport-daemon` no longer
+  binds the WebSocket port directly: it attaches to a running broker, starting
+  one in the background if there isn't one yet, and relays this session's MCP
+  over it. That makes "several Claude Code sessions plus the human, one
+  browser" the default rather than something you had to set up. Before this,
+  the second session on a machine simply exited — the first one held the port —
+  so it had no browser tools at all, and the first session's agent drove
+  whatever tab the human happened to be looking at. Opt out with `--no-broker`
+  or `SALLYPORT_NO_BROKER=1` for the old single-session behaviour.
+
+  Concurrent launches elect exactly one spawner through a held `flock`, and the
+  broker takes a second `flock` before binding, because `start_unix_server`
+  unlinks whatever socket file is at the path — live or not — so two brokers
+  racing one path would both "succeed", the loser silently stealing the path
+  from a listener that keeps running on an unlinked inode. If no broker can be
+  reached within the start budget the session falls back to standalone, so a
+  broker problem never leaves a session with no bridge at all.
+
+- **`doctor --stop-broker`** — the supported way to stop or restart a broker.
+  It is deliberately exempt from `--kill-stale` (it is long-lived by design and
+  re-parents to PID 1), so the only remedy used to be a hand-written `kill`.
+  Related: the broker publishes its version in the socket handshake and a shim
+  warns when it differs from the session's own, since an auto-started broker
+  happily outlives a `pip install -U` and serves its build to every session.
+
+- **Per-session agent windows, and audit rows that say which session.** Each
+  session's tabs open in their own non-focused window, and every audit entry
+  carries that session's label (its working-directory name by default,
+  `--session-label` to override). The popup shows it as a chip, filters on it,
+  and gains an **Agent tabs** section listing what each session left open with
+  a "close all" button. The label is cosmetic and peer-declared: ownership
+  still keys on the server-minted `clientId`, which never leaves the daemon.
+
+  Agent windows are ordinary windows **in your own Chrome profile** — same
+  cookie jar, same logins. An agent working on a site you are signed into is
+  signed in too. This is now pinned by a test: the separation Sallyport
+  provides is about *who may drive which tab*, never about identity.
+
+### Changed
+
+- **Agents no longer block each other.** The daemon's single global call lock
+  is replaced by one serial lane per session plus a FIFO pool capping calls in
+  flight (default 8). Lane first, then permit — the reverse lets a client that
+  pipelines calls hold permits while blocked on its own lane and starve
+  everyone else. Because tab ownership is exclusive per session, "one call in
+  flight per session" still implies "one call in flight per tab", which is what
+  the extension's per-tab state actually needs. `client_id=None` is a
+  first-class lane key, so standalone behaves exactly as before.
+
+  The extension had to change with it: it chained every inbound frame on one
+  promise *and awaited the tool body inside that chain*, so it was a hard
+  serial queue no matter what the daemon did — one session's 30 s `wait_for`
+  delayed every other session's next call for its full duration. Frame
+  verification and control frames stay strictly ordered (the `hello_ack` →
+  broker-mode guarantee is unchanged); a `tool_call` is now started inside that
+  ordered link and left to run.
+
+- **`screenshot` works for background agent tabs.** It makes the target tab the
+  active tab *of its own unfocused window* — which costs you no focus at all,
+  unlike `bringToFront` — and races the capture against an 8 s deadline instead
+  of hanging out the daemon's 60 s request window. Only the first tab of an
+  agent window was ever the selected one, so every later tab was uncaptureable
+  purely as an artefact of how we opened it. `bringToFront` still means "really
+  foreground this" and is still refused in broker mode.
+
+- **`status` diagnostics are per-session.** The recent-call ring and last error
+  are stored per client instead of filtered out of one shared ring, so a chatty
+  session can no longer evict a quiet one's diagnostics — and there is nothing
+  left to filter on the way out. `status` also reports `maxConcurrentCalls`.
+
+- **`exec` routes through a live broker** instead of fighting it for the port,
+  so the documented shell-level debugging layer keeps working now that a broker
+  is normally running. Exit codes are unchanged.
+
+- **A disconnected session's tabs stop being driven.** They stay open (closing
+  an agent's half-finished work is the loss invariant #12 exists to prevent),
+  but the debugger is detached, so Chrome's "started debugging this browser"
+  bar, the disabled back/forward cache and the sticky focus emulation no longer
+  outlive the session that caused them. Nothing ever detached before.
+
+- Unchecking **keep automated tabs awake** now takes effect immediately on
+  every attached tab. It previously only reached a tab the next time something
+  drove it — which, for an idle tab, was never.
+
+- Agent tabs are muted on creation, and creating an agent window restores
+  whatever window you had focused (`focused:false` is a request to the window
+  manager, not a guarantee).
+
+### Fixed
+
+- **A broker whose WebSocket bind failed still served sessions.** It never
+  observed that task, so it published its socket anyway and every attached
+  session's calls failed `not_connected` forever while `doctor` cheerfully
+  reported "port held by your broker". It now waits for the bind before
+  publishing, and exits if the browser leg dies later.
+- Broker shutdown closes attached sessions before `wait_closed()` (which, from
+  Python 3.12, waits for them — with a shim attached that never returns) and
+  unlinks the socket only if it is still the inode it bound, so a clobbered
+  predecessor cannot delete a live successor's socket.
+- A shim whose broker went away exited 0, indistinguishable from a normal
+  session end. It now says so and exits non-zero.
+- **Two sessions printing in the same second overwrote each other's PDF.**
+  `print_to_pdf`'s default filename had one-second resolution and the write was
+  an unconditional overwrite, so the later write won and *both* callers were
+  handed that path — one of them reading a PDF rendered from the other's page.
+  Default names now carry a random suffix.
+- Sandbox writes (`save_to_file`, `print_to_pdf`) moved off the event-loop
+  thread. With calls running concurrently, a multi-MiB blocking write stalled
+  the WebSocket read loop — delaying every other session's results — and the
+  `status` builtin that is supposed to answer during a slow call.
+- `appendAudit` was a read-modify-write across two storage round-trips with no
+  lock, so overlapping calls silently dropped audit entries. Serialised.
+- The agent window could be created twice under concurrent `navigate` calls
+  (both the `loaded` flag set before its own await and the null-check-then-
+  create were check-then-act across a suspension point), leaving orphaned
+  windows — the exact clutter the dedicated window exists to prevent.
+- `network_tail`'s in-flight request map was global with a global cap, so a
+  request-heavy tab evicted another session's entries and those responses were
+  silently never recorded. It is now keyed and capped per tab.
+- A `ConnectionClosed` while sending a tool call escaped as an untagged MCP
+  protocol error with no recovery hint; it is now `not_connected` like every
+  other "the extension isn't there" failure.
+- `close_tab` refused to close an agent's OWN tab once the page redirected off
+  the allowlist (an SSO bounce, a shortener, an error page), guaranteeing tab
+  accumulation. In broker mode the daemon has already proved ownership, which
+  is a stronger answer to "may I destroy this tab" than the allowlist; the
+  check is unchanged everywhere else.
+- The daemon's request timeout threw with **no error code at all**, so it got
+  no recovery hint. It is now `extension_timeout`, documented as *not* safe to
+  blindly retry (the call was sent and may already have acted) — distinct from
+  the extension's page-load `timeout` watchdog. A call that never reached the
+  browser because every slot was busy fails `busy`, which *is* safe to retry.
+
 ## [0.16.0] — 2026-07-18
 
 ### Added
