@@ -415,28 +415,54 @@ async def test_request_timeout_fires() -> None:
         await ext.handshake()
         call_task = asyncio.create_task(h.bridge.call_tool("snapshot", {}))
         await ext.recv()  # drain the request — never reply
-        with pytest.raises(ToolError, match="timeout"):
+        with pytest.raises(ToolError, match="did not reply") as excinfo:
             await call_task
+        # A DISTINCT code from the extension's page-load watchdog `timeout`:
+        # this call was already sent, so it is not safe to blindly retry.
+        assert excinfo.value.code == "extension_timeout"
         await ext.close()
     finally:
         await h.stop()
 
 
-async def test_concurrent_call_tool_is_serialised(harness: BridgeHarness) -> None:
-    """Two parallel MCP-side calls must be serialised: the daemon sends the
-    second tool_call only after the first one has been answered.
+async def test_busy_when_every_permit_is_held(harness: BridgeHarness) -> None:
+    """With the global browser cap saturated, a queued call gives up with the
+    RETRYABLE `busy` code — and nothing was ever put on the wire, which is what
+    makes it safe to retry."""
+    ext = await FakeExtension.connect(harness.url)
+    try:
+        await ext.handshake()
+        harness.bridge._queue_timeout = 0.1  # noqa: SLF001
+        for _ in range(harness.bridge._permits.size):  # noqa: SLF001
+            await harness.bridge._permits.acquire()  # noqa: SLF001
+
+        # list_tabs: reaches the browser, but carries no ownership requirement,
+        # so the failure under test is admission control and nothing else.
+        with pytest.raises(ToolError) as excinfo:
+            await harness.bridge.call_tool("list_tabs", {}, client_id="A")
+        assert excinfo.value.code == "busy"
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(ext.ws.recv(), timeout=0.1)
+    finally:
+        await ext.close()
+
+
+async def test_calls_from_one_client_are_serialised(harness: BridgeHarness) -> None:
+    """Two parallel calls from the SAME client must be serialised: the daemon
+    sends the second tool_call only after the first has been answered.
 
     This is the contract that lets the extension keep per-tab state without
-    cross-call interference."""
+    cross-call interference — tab ownership is exclusive per client, so one
+    call in flight per client implies one call in flight per tab."""
     ext = await FakeExtension.connect(harness.url)
     try:
         await ext.handshake()
 
-        first = asyncio.create_task(harness.bridge.call_tool("a", {}))
-        second = asyncio.create_task(harness.bridge.call_tool("b", {}))
+        first = asyncio.create_task(harness.bridge.call_tool("list_tabs", {}, client_id="A"))
+        second = asyncio.create_task(harness.bridge.call_tool("list_tabs", {}, client_id="A"))
 
         req1 = await ext.recv()
-        assert req1.body == {"name": "a", "args": {}}
+        assert req1.body == {"name": "list_tabs", "args": {}}
 
         # Even though the second call is already awaiting, the daemon must
         # not have sent it yet.
@@ -450,9 +476,61 @@ async def test_concurrent_call_tool_is_serialised(harness: BridgeHarness) -> Non
         await first
 
         req2 = await ext.recv()
-        assert req2.body == {"name": "b", "args": {}}
         await ext.send("tool_result", {"ok": True, "data": "B"}, id=req2.id)
         assert await second == "B"
+    finally:
+        await ext.close()
+
+
+async def test_standalone_calls_share_one_lane(harness: BridgeHarness) -> None:
+    """client_id=None is a first-class lane key, NOT 'no lane': standalone keeps
+    exactly the serialised behaviour it always had."""
+    ext = await FakeExtension.connect(harness.url)
+    try:
+        await ext.handshake()
+        first = asyncio.create_task(harness.bridge.call_tool("a", {}))
+        second = asyncio.create_task(harness.bridge.call_tool("b", {}))
+        req1 = await ext.recv()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(ext.ws.recv(), timeout=0.1)
+        await ext.send("tool_result", {"ok": True, "data": "A"}, id=req1.id)
+        await first
+        req2 = await ext.recv()
+        await ext.send("tool_result", {"ok": True, "data": "B"}, id=req2.id)
+        assert await second == "B"
+    finally:
+        await ext.close()
+
+
+async def test_calls_from_different_clients_run_concurrently(harness: BridgeHarness) -> None:
+    """The whole point of lanes: one session's slow call must not delay another
+    session's. Both tool_calls reach the wire before EITHER is answered, and the
+    second can complete first."""
+    ext = await FakeExtension.connect(harness.url)
+    try:
+        await ext.handshake()
+
+        slow = asyncio.create_task(
+            harness.bridge.call_tool("list_tabs", {"mark": "a"}, client_id="A")
+        )
+        fast = asyncio.create_task(
+            harness.bridge.call_tool("list_tabs", {"mark": "b"}, client_id="B")
+        )
+
+        first = await ext.recv()
+        second = await ext.recv()  # <- would time out under the old global lock
+        assert {first.body["args"]["mark"], second.body["args"]["mark"]} == {"a", "b"}
+        assert not slow.done()
+
+        # Answer B's call first: it completes while A's is still outstanding.
+        b_req = first if first.body["args"]["mark"] == "b" else second
+        a_req = second if b_req is first else first
+        await ext.send("tool_result", {"ok": True, "data": "B"}, id=b_req.id)
+        assert await fast == "B"
+        assert not slow.done()
+
+        await ext.send("tool_result", {"ok": True, "data": "A"}, id=a_req.id)
+        assert await slow == "A"
     finally:
         await ext.close()
 

@@ -44,6 +44,15 @@ UNGATED_TOOLS = frozenset({"list_tabs"})
 # tabId-recycling defence. Absent when the broker has no epoch on record yet.
 EPOCH_ARG = "expectedEpoch"
 
+# Field injected into EVERY forwarded tool_call carrying the calling session's
+# short human label (see ``broker.py:sanitise_label``). Purely cosmetic: it
+# gives the extension something to write in the audit log and to group agent
+# windows by, so a human watching one browser driven by several sessions can
+# tell who did what. It is NOT an identity: it is peer-declared, so it must
+# never reach a gate. Ownership keys on the server-minted ``clientId``, which
+# never leaves the daemon.
+CLIENT_LABEL_ARG = "clientLabel"
+
 
 def _is_tab_id(value: Any) -> TypeGuard[int]:
     """A Chrome tab id is an int — but NOT a bool. ``isinstance(True, int)`` is
@@ -68,9 +77,20 @@ class OwnedTab:
 class OwnershipRegistry:
     """``clientId -> {tabId -> OwnedTab}``. Lives on the shared :class:`Bridge`;
     one instance serves all broker connections (the Bridge owns the one
-    extension). All access is serialised by ``Bridge._call_lock`` on the call
-    path plus the synchronous ``release_client`` on disconnect, so no internal
-    locking is needed."""
+    extension).
+
+    No internal locking, for two separate reasons that must both hold:
+
+    * WITHIN a client, the composite ``ensure_owns → await round-trip →
+      record_result`` is a check-then-act across a suspension point. It is made
+      atomic by that client's serial lane (``scheduling.LaneRegistry``), which
+      replaced the old global call lock and spans exactly the same region.
+    * ACROSS clients, every method here is synchronous with no ``await`` inside,
+      and each client mutates only its own ``self._owned[client_id]`` sub-dict,
+      so under single-threaded asyncio no interleaving is observable.
+
+    ``release_client`` runs on disconnect after the MCP SDK has joined that
+    connection's handler tasks, so it cannot race an in-flight call either."""
 
     def __init__(self) -> None:
         self._owned: dict[str, dict[int, OwnedTab]] = {}

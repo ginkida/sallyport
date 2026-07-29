@@ -1503,3 +1503,156 @@ def test_ensure_port_available_refuses_non_sallyport_holder(
         m.ensure_port_available("127.0.0.1", 10086, Path("/nonexistent"))
     assert exc.value.code == 2
     assert killed == []
+
+
+# --- auto-broker: the default that keeps a SECOND session from being toolless ---
+
+
+def test_auto_broker_is_on_by_default_and_opt_outable(monkeypatch: Any) -> None:
+    from sallyport_daemon.__main__ import auto_broker_enabled
+
+    monkeypatch.delenv("SALLYPORT_NO_BROKER", raising=False)
+    assert auto_broker_enabled(parse_args([])) is True
+    assert auto_broker_enabled(parse_args(["--no-broker"])) is False
+
+    monkeypatch.setenv("SALLYPORT_NO_BROKER", "1")
+    assert auto_broker_enabled(parse_args([])) is False
+    monkeypatch.setenv("SALLYPORT_NO_BROKER", "0")
+    assert auto_broker_enabled(parse_args([])) is True
+    monkeypatch.setenv("SALLYPORT_NO_BROKER", "")
+    assert auto_broker_enabled(parse_args([])) is True
+
+
+def test_session_label_defaults_to_the_working_directory(monkeypatch: Any, tmp_path: Path) -> None:
+    from sallyport_daemon.__main__ import session_label
+
+    workdir = tmp_path / "my project"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    assert session_label(parse_args([])) == "my-project"
+    assert session_label(parse_args(["--session-label", "checkout flow"])) == "checkout-flow"
+
+
+def test_broker_spawn_argv_stays_recognisable_to_the_reapers(tmp_path: Path) -> None:
+    """Two hard constraints on the spawned broker's argv: `_is_broker_command`
+    must see a standalone `broker` token (else `doctor --kill-stale` reaps a live
+    broker out from under every attached session), and `find_sallyport_processes`
+    must be able to see the process at all."""
+    from sallyport_daemon.__main__ import _is_broker_command, broker_spawn_argv
+
+    args = parse_args(["--port", "10999", "--secret-file", str(tmp_path / "secret")])
+    argv = broker_spawn_argv(args)
+    command = " ".join(argv)
+
+    assert _is_broker_command(command)
+    assert argv[-1] == "broker"
+    found = find_sallyport_processes(f"111 1 00:01 {command}\n", own_pid=999)
+    assert len(found) == 1
+    assert found[0].pid == 111
+    # And it carries this session's own port/secret so the broker serves the
+    # same bridge the session would have started itself.
+    assert "10999" in argv
+    assert str(tmp_path / "secret") in argv
+
+
+def test_spawn_broker_detaches_all_three_std_fds(monkeypatch: Any, tmp_path: Path) -> None:
+    """Inheriting stdout would put a SECOND writer on the MCP wire and hold the
+    pipe open past our exit (Claude Code never sees EOF); inheriting stdin would
+    let the broker eat MCP request bytes meant for us."""
+    import subprocess as _subprocess
+
+    from sallyport_daemon.__main__ import spawn_broker
+
+    captured: dict[str, Any] = {}
+
+    class _FakePopen:
+        returncode = None
+
+        def __init__(self, argv: list[str], **kwargs: Any) -> None:
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr(_subprocess, "Popen", _FakePopen)
+    args = parse_args(["--port", "10999", "--secret-file", str(tmp_path / "secret")])
+    assert spawn_broker(args, tmp_path) is not None
+
+    kwargs = captured["kwargs"]
+    assert kwargs["stdin"] is _subprocess.DEVNULL
+    assert kwargs["stdout"] is _subprocess.DEVNULL
+    assert kwargs["stderr"] is not None
+    assert kwargs["stderr"] is not _subprocess.DEVNULL
+    assert kwargs["start_new_session"] is True
+    assert kwargs["close_fds"] is True
+    # Its stderr goes to a 0600 log beside the secret, so a failed start is
+    # diagnosable rather than silent.
+    log = tmp_path / "broker-10999.log"
+    assert log.exists()
+    assert log.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.fixture
+def short_tmp_dir() -> Iterator[Path]:
+    """A short config dir: macOS caps an AF_UNIX path at ~104 bytes, and pytest's
+    tmp_path is far too long for a broker socket to bind under."""
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp(prefix="spm", dir="/tmp")  # noqa: S108 - AF_UNIX needs a short path
+    try:
+        yield Path(d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_attach_refuses_an_unbindable_socket_path_without_spawning(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Too long for sun_path: say so and fall back to standalone rather than
+    spawn a broker that cannot bind and then wait out the whole start budget."""
+    from sallyport_daemon.__main__ import attach_or_start_broker
+
+    deep = tmp_path / ("d" * 90) / ("e" * 90)
+    called = False
+
+    def _never(*_a: Any, **_kw: Any) -> None:
+        nonlocal called
+        called = True
+        return None
+
+    monkeypatch.setattr("sallyport_daemon.__main__.spawn_broker", _never)
+    assert await attach_or_start_broker(parse_args([]), deep) is None
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sessions_spawn_exactly_one_broker(
+    monkeypatch: Any, short_tmp_dir: Path
+) -> None:
+    """N sessions launching at once must elect ONE spawner. The elected session
+    holds the spawn lock for its whole wait, so a sibling cannot re-check
+    "still no broker" and start a second one while the first is coming up."""
+    from sallyport_daemon.__main__ import attach_or_start_broker
+
+    spawns = 0
+
+    class _AliveChild:
+        returncode = None
+
+        def poll(self) -> None:
+            return None  # still starting for the whole (short) budget
+
+    def _count(*_a: Any, **_kw: Any) -> Any:
+        nonlocal spawns
+        spawns += 1
+        return _AliveChild()
+
+    monkeypatch.setattr("sallyport_daemon.__main__.spawn_broker", _count)
+    monkeypatch.setattr("sallyport_daemon.__main__.BROKER_START_BUDGET_S", 0.6)
+    args = parse_args(["--port", "10999"])
+    results = await asyncio.gather(*(attach_or_start_broker(args, short_tmp_dir) for _ in range(4)))
+    assert results == [None, None, None, None]
+    assert spawns == 1

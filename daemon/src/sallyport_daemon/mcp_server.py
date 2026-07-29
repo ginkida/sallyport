@@ -1095,7 +1095,11 @@ TOOLS: list[Tool] = [
 
 
 async def _dispatch_call(
-    bridge: Bridge, name: str, arguments: dict[str, Any] | None, client_id: str | None = None
+    bridge: Bridge,
+    name: str,
+    arguments: dict[str, Any] | None,
+    client_id: str | None = None,
+    client_label: str | None = None,
 ) -> list[TextContent | ImageContent]:
     """Run a tool through the bridge and wrap the outcome as MCP content.
 
@@ -1103,7 +1107,7 @@ async def _dispatch_call(
     tested directly without standing up an MCP stdio server.
     """
     try:
-        data = await bridge.call_tool(name, arguments or {}, client_id)
+        data = await bridge.call_tool(name, arguments or {}, client_id, client_label)
     except ExtensionNotConnected as exc:
         # Tag + hint it like a ToolError so a looping agent can branch on
         # [not_connected] (poll status until it auto-reconnects) instead of a
@@ -1155,10 +1159,13 @@ def _as_image_content(name: str, data: Any) -> list[TextContent | ImageContent] 
     ]
 
 
-def build_server(bridge: Bridge, client_id: str | None = None) -> Server:
+def build_server(
+    bridge: Bridge, client_id: str | None = None, client_label: str | None = None
+) -> Server:
     """Build the MCP server. In broker mode `client_id` is the per-connection
-    identity threaded into every tool call (tab ownership / audit scope); the
-    stdio/standalone path leaves it None, unchanged."""
+    identity threaded into every tool call (tab ownership / diagnostics scope)
+    and `client_label` is that session's cosmetic name for the audit log; the
+    stdio/standalone path leaves both None, unchanged."""
     server: Server = Server("sallyport")
 
     @server.list_tools()  # type: ignore[no-untyped-call]
@@ -1167,7 +1174,7 @@ def build_server(bridge: Bridge, client_id: str | None = None) -> Server:
 
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
-        return await _dispatch_call(bridge, name, arguments, client_id)
+        return await _dispatch_call(bridge, name, arguments, client_id, client_label)
 
     return server
 

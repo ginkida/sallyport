@@ -189,6 +189,19 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "retrying would move further than intended. Instead read_text/snapshot the tab to see "
             "where it actually landed, or wait_for/settle a concrete selector."
         ),
+        "extension_timeout": (
+            "retryable=no; the call reached the extension but no reply came back inside the "
+            "daemon's request window — the browser action may STILL be running (or may have "
+            "already completed), so a blind retry can double-act (navigate twice, click twice). "
+            "Read the tab's actual state first with snapshot/read_text/get_state, then decide. "
+            "Distinct from `timeout`, which is the extension's own page-load watchdog."
+        ),
+        "busy": (
+            "retryable=yes; every browser slot was occupied by other sessions for the whole "
+            "queue window, so this call was never sent — nothing happened in the browser, which "
+            "is what makes an immediate retry safe. Back off briefly first; `status` reports "
+            "maxConcurrentCalls and your own pendingCalls."
+        ),
         "no_history": (
             "retryable=no; the tab's session history doesn't reach that far in that direction "
             "(the message says how far it does) — reduce steps, flip direction, or navigate to "

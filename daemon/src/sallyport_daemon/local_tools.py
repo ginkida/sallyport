@@ -10,8 +10,10 @@ JSON-serialisable value or raises :class:`ToolError`. Routing lives in
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
+import secrets as _secrets
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,7 +80,7 @@ async def save_to_file(args: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         raise ToolError(f"save_to_file: not valid base64: {exc}", code="bad_args") from exc
 
-    return _write_sandbox_blob(filename, raw, tool="save_to_file")
+    return await _write_blob_async(filename, raw, tool="save_to_file")
 
 
 def _write_sandbox_blob(filename: str, raw: bytes, *, tool: str) -> dict[str, Any]:
@@ -91,6 +93,10 @@ def _write_sandbox_blob(filename: str, raw: bytes, *, tool: str) -> dict[str, An
     permission denied, disk full, name too long for the OS) surface as
     ToolError, not an uncaught OSError — the latter would crash the MCP
     dispatch loop and leave the caller hanging until its own timeout.
+
+    Fully synchronous on purpose, and always run via :func:`_write_blob_async`
+    so the containment re-check and the write stay in the SAME threaded unit —
+    splitting them would reopen the TOCTOU the re-check exists to close.
     """
     download_dir = _resolve_dir()
     try:
@@ -120,6 +126,18 @@ def _write_sandbox_blob(filename: str, raw: bytes, *, tool: str) -> dict[str, An
             code="filesystem_error",
         ) from exc
     return {"path": str(resolved), "size": len(raw)}
+
+
+async def _write_blob_async(filename: str, raw: bytes, *, tool: str) -> dict[str, Any]:
+    """Off-thread wrapper around :func:`_write_sandbox_blob`.
+
+    Every step in there is blocking (`mkdir`, two `resolve()` calls that stat
+    and follow symlinks, and a `write_bytes` of up to ~12 MiB for a PDF). Since
+    tool calls now run concurrently, doing that on the event-loop thread would
+    stall the WS read loop — delaying every OTHER session's tool_result — and
+    the `status` builtin that is supposed to answer during a slow call.
+    """
+    return await asyncio.to_thread(_write_sandbox_blob, filename, raw, tool=tool)
 
 
 def validate_upload_paths(paths: object) -> None:
@@ -212,7 +230,7 @@ async def _print_to_pdf_result(args: dict[str, Any], result: Any) -> dict[str, A
         raise ToolError("print_to_pdf: extension returned no PDF payload", code="error")
     filename = args.get("filename")
     if filename is None:
-        filename = datetime.now(timezone.utc).strftime("print-%Y%m%dT%H%M%SZ.pdf")
+        filename = _default_pdf_filename()
     if not isinstance(filename, str):
         raise ToolError("print_to_pdf: filename must be a string", code="bad_args")
     filename = _sanitise_filename(filename, tool="print_to_pdf")
@@ -222,8 +240,22 @@ async def _print_to_pdf_result(args: dict[str, Any], result: Any) -> dict[str, A
         raise ToolError(
             f"print_to_pdf: extension payload not valid base64: {exc}", code="error"
         ) from exc
-    written = _write_sandbox_blob(filename, raw, tool="print_to_pdf")
+    written = await _write_blob_async(filename, raw, tool="print_to_pdf")
     return {**written, "filename": filename}
+
+
+def _default_pdf_filename() -> str:
+    """Name for a print_to_pdf call that supplied none.
+
+    The timestamp alone has one-second resolution and the write is an
+    unconditional overwrite, so two sessions printing in the same second used to
+    land on the same path: the later write won and BOTH callers were handed that
+    path — one of them reading a PDF rendered from the other's page. A random
+    suffix makes the default collision-proof across concurrent sessions. An
+    explicit `filename` is still honoured verbatim (the caller chose it, and two
+    callers choosing the same name is their own coordination problem)."""
+    stamp = datetime.now(timezone.utc).strftime("print-%Y%m%dT%H%M%SZ")
+    return f"{stamp}-{_secrets.token_hex(3)}.pdf"
 
 
 # Registry consumed by Bridge.call_tool. Keep the keys identical to the

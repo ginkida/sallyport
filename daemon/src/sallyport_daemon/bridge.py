@@ -19,6 +19,12 @@ import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
 from .protocol import Envelope, ProtocolError, Signer
+from .scheduling import (
+    DEFAULT_MAX_CONCURRENT_CALLS,
+    DEFAULT_QUEUE_TIMEOUT_S,
+    LaneRegistry,
+    PermitPool,
+)
 
 log = logging.getLogger("sallyport.ws")
 
@@ -39,10 +45,24 @@ class ExtensionNotConnected(Exception):
 # LOCAL_TOOLS (local_tools.py) these need Bridge state, so they live here.
 BUILTIN_TOOLS = frozenset({"status"})
 
+# Extension-side housekeeping tool the daemon calls on its own initiative when a
+# broker client disconnects. Deliberately absent from the MCP catalogue (no
+# agent ever calls it) and leading-underscored so it can never collide with a
+# real tool name.
+RELEASE_TABS_TOOL = "_release_tabs"
+
 # Diagnostic last-call ring surfaced via `status`: how many recent calls to
-# keep, and the cap on the echoed error string (mirrors the handshake-reason
-# cap). The ring records call OUTCOMES only — tool name, ok, ms, code — never
-# the args, which for fill/key_type/send_keys would carry credentials.
+# keep PER CLIENT, and the cap on the echoed error string (mirrors the
+# handshake-reason cap). The ring records call OUTCOMES only — tool name, ok,
+# ms, code — never the args, which for fill/key_type/send_keys would carry
+# credentials.
+#
+# Per-client, not global: with concurrent lanes a chatty session would evict
+# every other session's entries out of one shared 10-slot ring within ten calls,
+# so a quiet session's `lastCalls` would be reliably empty and `lastError`
+# reliably someone else's. Keying by client also removes the cross-client oracle
+# surface outright instead of filtering it out on the way to the caller
+# (invariants #13/#14).
 LAST_CALLS_MAXLEN = 10
 MAX_CALL_ERROR = 200
 
@@ -69,6 +89,8 @@ class Bridge:
         hello_timeout: float = 10.0,
         status_path: Path | None = None,
         broker_mode: bool = False,
+        max_concurrent_calls: int = DEFAULT_MAX_CONCURRENT_CALLS,
+        queue_timeout: float = DEFAULT_QUEUE_TIMEOUT_S,
     ) -> None:
         self._signer = Signer(secret)
         self._host = host
@@ -89,10 +111,16 @@ class Bridge:
         # in-flight call as an activity oracle). None entries = standalone.
         self._pending_clients: dict[str, str | None] = {}
         self._send_lock = asyncio.Lock()
-        # Serialise MCP-side tool calls. The extension's tools share per-tab
-        # state (CDP attachments, accessibility refs), so two concurrent
-        # tool_calls can race. We make it impossible from this side.
-        self._call_lock = asyncio.Lock()
+        # Admission control (see scheduling.py). One serial lane per client
+        # keeps a client's own calls ordered — which is what the extension's
+        # per-tab state (CDP attachment, `@eN` refs, snapshot object groups)
+        # actually needs, since tab ownership is exclusive per client — while
+        # DIFFERENT clients run concurrently. The permit pool caps how many
+        # calls are on the wire at once. Standalone maps to a single lane, so
+        # single-client behaviour is unchanged.
+        self._lanes = LaneRegistry()
+        self._permits = PermitPool(max_concurrent_calls)
+        self._queue_timeout = queue_timeout
         self._started_monotonic = time.monotonic()
         # Diagnostic connection snapshot (see pidfile.write_status). None in
         # short-lived modes (exec / unit tests) — set via set_status_path for
@@ -106,14 +134,13 @@ class Bridge:
         self._pending_handshakes = 0
         self._last_handshake_error: str | None = None
         self._last_handshake_error_at: float | None = None
-        # Diagnostic ring of recent tool-call outcomes (no args — see
-        # LAST_CALLS_MAXLEN) + the most recent failure, surfaced via `status`
-        # so a loop can attribute "it just timed out" to a specific tool/code.
-        self._last_calls: deque[dict[str, Any]] = deque(maxlen=LAST_CALLS_MAXLEN)
-        self._last_error: dict[str, Any] | None = None
-        # Which broker client the latest failure belongs to, so `status` scopes
-        # lastError per-caller (invariants #13/#14). None in standalone.
-        self._last_error_client: str | None = None
+        # Per-client diagnostic ring of recent tool-call outcomes (no args — see
+        # LAST_CALLS_MAXLEN) + that client's most recent failure, surfaced via
+        # `status` so a loop can attribute "it just timed out" to a specific
+        # tool/code. Keyed by client_id (None = standalone), dropped with the
+        # client's lane on disconnect.
+        self._last_calls: dict[str | None, deque[dict[str, Any]]] = {}
+        self._last_error: dict[str | None, dict[str, Any]] = {}
         # Per-client tab ownership (broker mode, invariant #13). Lazy import to
         # avoid the bridge<->ownership cycle (ownership imports ToolError here).
         # One registry on the shared Bridge serves all broker connections; in
@@ -150,11 +177,19 @@ class Bridge:
     # deny service to the real extension).
     MAX_PENDING_HANDSHAKES = 32
 
-    async def serve_forever(self, *, shutdown: asyncio.Event | None = None) -> None:
+    async def serve_forever(
+        self, *, shutdown: asyncio.Event | None = None, ready: asyncio.Event | None = None
+    ) -> None:
         """Run the WS server until cancelled or until ``shutdown`` is set.
 
         Bound to a loopback address only: anyone with the secret on this
         machine can connect; nobody on the network can even try.
+
+        ``ready`` is set once the listening socket is actually bound. The broker
+        waits on it before publishing its own AF_UNIX socket: without that
+        signal a broker whose WS bind lost a race would still advertise itself
+        and serve sessions whose every tool call fails `not_connected` forever,
+        with the bind error sitting unobserved in this task.
         """
         log.info("ws: listening on %s:%d", self._host, self._port)
         async with serve(
@@ -168,6 +203,8 @@ class Bridge:
             ping_interval=20,
             ping_timeout=20,
         ):
+            if ready is not None:
+                ready.set()
             if shutdown is None:
                 await asyncio.Future()
             else:
@@ -356,27 +393,16 @@ class Bridge:
         """Cheap health snapshot for loop preflight. Exposes no secret
         material — connection state, version, port, queue depth, uptime.
 
-        In broker mode (``client_id`` set) the diagnostic ring + lastError are
-        owner-scoped to the CALLING client: a session sees only its own recent
-        outcomes, never another client's tools, codes or server-minted clientId
-        (invariants #13/#14 — the shared ring must not become a cross-client
-        activity oracle). Standalone (``client_id is None``) returns the full
-        single-client view unchanged."""
+        The diagnostic ring + lastError are stored PER CLIENT, so a session
+        reads only its own recent outcomes — never another client's tools,
+        codes or server-minted clientId (invariants #13/#14: the diagnostics
+        must not become a cross-client activity oracle). Standalone
+        (``client_id is None``) is just another key with the same view it
+        always had."""
         from .pidfile import daemon_version
 
-        if client_id is None:
-            last_calls = list(self._last_calls)
-            last_error = self._last_error
-        else:
-            # Strip the broker-internal ``client`` tag from the entries we return
-            # — the caller doesn't need its own id echoed, and others' must never
-            # leak. lastError rides through only when it belongs to this caller.
-            last_calls = [
-                {k: v for k, v in entry.items() if k != "client"}
-                for entry in self._last_calls
-                if entry.get("client") == client_id
-            ]
-            last_error = self._last_error if self._last_error_client == client_id else None
+        last_calls = list(self._last_calls.get(client_id, ()))
+        last_error = self._last_error.get(client_id)
         return {
             "connected": self.connected,
             # Run mode, so an agent knows WHY tabId is required and navigate with
@@ -386,15 +412,15 @@ class Bridge:
             "version": daemon_version(),
             "port": self._port,
             # Owner-scoped in broker mode: a client sees only its OWN in-flight
-            # calls, never another client's (which — since the call lock
-            # serialises everything, so at most one pending call exists globally
-            # — would otherwise be a 0/1 cross-client activity oracle). Standalone
-            # (client_id is None) reports the full count.
-            "pendingCalls": (
-                len(self._pending)
-                if client_id is None
-                else sum(1 for c in self._pending_clients.values() if c == client_id)
-            ),
+            # calls, never another client's — which, now that lanes let several
+            # calls be in flight at once, would otherwise be a live read on how
+            # busy the other sessions are. Standalone (client_id is None)
+            # reports its own lane's count, which is the whole process.
+            "pendingCalls": sum(1 for c in self._pending_clients.values() if c == client_id),
+            # Static admission-control shape, so an agent can reason about a
+            # `busy` failure. A constant and a queue depth for THIS caller only
+            # — never a global in-flight count (that would be the oracle above).
+            "maxConcurrentCalls": self._permits.size,
             "uptimeS": round(time.monotonic() - self._started_monotonic, 1),
             # Recent tool-call outcomes (oldest→newest) + the latest failure, so
             # a loop can attribute a stall to a specific tool/code. Outcomes
@@ -444,10 +470,19 @@ class Bridge:
         self._last_handshake_error_at = time.time()
         self._write_status()
 
-    async def call_tool(self, name: str, args: dict[str, Any], client_id: str | None = None) -> Any:
+    async def call_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        client_id: str | None = None,
+        client_label: str | None = None,
+    ) -> Any:
         # `client_id` identifies the MCP client in broker mode (per-connection,
-        # server-minted) and is the scope future tab-ownership/audit hang on.
-        # In single-client/standalone mode it is None and changes nothing.
+        # server-minted) and is the scope tab-ownership, scheduling lanes and
+        # diagnostics hang on. In single-client/standalone mode it is None and
+        # changes nothing. `client_label` is the cosmetic, peer-declared session
+        # name forwarded to the extension for the audit log and agent-window
+        # grouping — never a gate input (see ownership.CLIENT_LABEL_ARG).
         # Built-ins answer BEFORE the call lock on purpose: `status` exists
         # so a loop iteration can fail fast / report progress even while a
         # slow tool call (e.g. a 30 s embedded wait) holds the lock. It is also
@@ -461,6 +496,7 @@ class Bridge:
         # ToolError from this module).
         from .local_tools import LOCAL_TOOLS, POST_CALL_PROCESSORS, PRE_CALL_VALIDATORS
         from .ownership import (
+            CLIENT_LABEL_ARG,
             CREATE_CAPABLE,
             ensure_owns,
             record_close,
@@ -470,8 +506,18 @@ class Bridge:
 
         started = time.monotonic()
         try:
-            async with self._call_lock:
+            # LANE FIRST, then the global permit (scheduling.py explains why the
+            # reverse order starves). The lane spans the whole
+            # ensure_owns → round-trip → record_result sequence, exactly as the
+            # old global call lock did, so the ownership check-then-act stays
+            # atomic for this client. Cross-client safety comes from the
+            # registry's per-client sub-dicts plus single-threaded asyncio.
+            async with self._lanes.lane(client_id):
                 if name in LOCAL_TOOLS:
+                    # Daemon-local tools touch no browser, so they take the lane
+                    # (ordering within a client) but never a browser permit —
+                    # a `save_to_file` must not consume a slot another session
+                    # needs to drive Chrome.
                     result = await LOCAL_TOOLS[name](args)
                 else:
                     # Daemon-side pre-call validation (sandbox membership for
@@ -485,7 +531,27 @@ class Bridge:
                     # (client_id=None). May raise tab_required/tab_not_owned, and
                     # injects the expected epoch for the extension to confirm.
                     args = ensure_owns(self._ownership, client_id, name, args)
-                    result = await self._call_tool_locked(name, args, client_id)
+                    if client_label:
+                        # Cosmetic session name for the extension's audit log and
+                        # agent-window grouping. Stripped extension-side before
+                        # the tool body runs, exactly like the epoch.
+                        args = {**args, CLIENT_LABEL_ARG: client_label}
+                    # Hold a browser permit only across the WS round-trip, not
+                    # across the ownership bookkeeping or the post-processor
+                    # (which writes files and needs no browser).
+                    try:
+                        await self._permits.acquire(timeout=self._queue_timeout)
+                    except asyncio.TimeoutError as exc:
+                        raise ToolError(
+                            f"busy: {self._permits.size} browser calls already in flight for "
+                            f"{self._queue_timeout:.0f}s — another session is holding the "
+                            "browser; nothing was sent, so this is safe to retry",
+                            code="busy",
+                        ) from exc
+                    try:
+                        result = await self._call_tool_locked(name, args, client_id)
+                    finally:
+                        self._permits.release()
                     # Record a freshly-created owned tab, evict a just-closed one,
                     # then owner-scope a list_tabs result (fail-closed) before it
                     # leaves the daemon.
@@ -533,16 +599,47 @@ class Bridge:
         )
         return result
 
-    def release_client(self, client_id: str | None) -> None:
+    def release_client(self, client_id: str | None) -> list[int]:
         """Release a disconnected broker client's tab ownership (invariant #13).
 
-        Called by the broker when an MCP connection closes. v1 keeps the tabs
-        OPEN — they merely become unowned, so the human can use or close them —
-        rather than auto-closing work the agent left behind. No-op in standalone
-        (client_id=None), where there is no per-client ownership."""
+        Called by the broker when an MCP connection closes. The tabs stay OPEN —
+        they merely become unowned, so the human can use or close them — rather
+        than auto-closing work the agent left behind. Returns the released tab
+        ids so the caller can ask the extension to stop *driving* them (detach
+        the debugger, drop the focus emulation); leaving them attached is what
+        made Chrome's "started debugging this browser" bar outlive every session
+        that ever ran. No-op in standalone (client_id=None), where there is no
+        per-client ownership.
+
+        Also drops the per-client scheduling lane and diagnostic ring: broker
+        clientIds are minted fresh per connection, so without this both would
+        accumulate for the whole (long) life of a broker process."""
         if client_id is None:
+            return []
+        released = sorted(self._ownership.release_client(client_id))
+        self._lanes.drop(client_id)
+        self._last_calls.pop(client_id, None)
+        self._last_error.pop(client_id, None)
+        return released
+
+    async def release_tabs_in_browser(self, tab_ids: list[int]) -> None:
+        """Ask the extension to stop DRIVING a disconnected client's tabs.
+
+        Fire-and-forget housekeeping, not a gate: it detaches the debugger and
+        drops the focus emulation on tabs whose session is gone, so Chrome's
+        "started debugging this browser" bar, the disabled back/forward cache
+        and the "this tab thinks it is focused" override don't outlive the agent
+        that caused them. The tabs themselves stay OPEN (invariant #13's
+        orphan-don't-close rule) — the human decides what to do with them.
+
+        Every failure is swallowed: the extension may already be gone, and a
+        disconnect path must never raise into the accept loop."""
+        if not tab_ids:
             return
-        self._ownership.release_client(client_id)
+        try:
+            await self.call_tool(RELEASE_TABS_TOOL, {"tabIds": tab_ids})
+        except Exception:  # noqa: BLE001 - best-effort housekeeping
+            log.debug("ws: releasing tabs %s failed", tab_ids, exc_info=True)
 
     def _record_call(
         self,
@@ -554,26 +651,27 @@ class Bridge:
         error: str | None,
         client_id: str | None = None,
     ) -> None:
-        """Append a tool-call OUTCOME to the diagnostic ring (and, on failure,
-        set lastError). Records the tool name, ok, integer ms and — on failure —
-        the BridgeError code; NEVER the args (which for fill/key_type/send_keys
-        carry credentials). The compact ring entry omits the error string; the
-        full (capped) message lives only in lastError."""
+        """Append a tool-call OUTCOME to the CALLING CLIENT's diagnostic ring
+        (and, on failure, set that client's lastError). Records the tool name,
+        ok, integer ms and — on failure — the BridgeError code; NEVER the args
+        (which for fill/key_type/send_keys carry credentials). The compact ring
+        entry omits the error string; the full (capped) message lives only in
+        lastError. Rings are per-client so one busy session cannot evict another
+        session's diagnostics — and so nothing needs filtering on the way out."""
         entry: dict[str, Any] = {"tool": name, "ok": ok, "ms": ms}
-        if client_id is not None:
-            entry["client"] = client_id
         if not ok and code:
             entry["code"] = code
-        self._last_calls.append(entry)
+        ring = self._last_calls.get(client_id)
+        if ring is None:
+            ring = deque(maxlen=LAST_CALLS_MAXLEN)
+            self._last_calls[client_id] = ring
+        ring.append(entry)
         if not ok:
-            self._last_error = {
+            self._last_error[client_id] = {
                 "tool": name,
                 "code": code,
                 "error": (error or "")[:MAX_CALL_ERROR],
             }
-            # Remember which client owns this failure so `status` only surfaces it
-            # to that client in broker mode (None in standalone — full view).
-            self._last_error_client = client_id
 
     async def _call_tool_locked(
         self, name: str, args: dict[str, Any], client_id: str | None = None
@@ -599,16 +697,38 @@ class Bridge:
         self._pending[req_id] = fut
         self._pending_clients[req_id] = client_id
         try:
-            await self._send_raw(self._client, env)
+            try:
+                await self._send_raw(self._client, env)
+            except websockets.ConnectionClosed as exc:
+                # The extension dropped while we queued on the send lock. Without
+                # this the raw ConnectionClosed escapes past _dispatch_call's
+                # ExtensionNotConnected/ToolError handlers and reaches the MCP
+                # caller as an untagged protocol error with no recovery hint.
+                raise ExtensionNotConnected(
+                    "extension disconnected mid-request", code="not_connected"
+                ) from exc
             try:
                 result = await asyncio.wait_for(fut, timeout=self._request_timeout)
             except asyncio.TimeoutError as exc:
+                # Deliberately NOT the `timeout` code: that one documents the
+                # extension's page-load watchdog and tells the agent a retry is
+                # safe. This timeout means the call WAS sent and the extension
+                # may still be executing it, so a blind retry can double-act
+                # (navigate twice, click twice). Distinct code, distinct hint.
                 raise ToolError(
-                    f"timeout: extension did not reply within {self._request_timeout}s"
+                    f"extension did not reply within {self._request_timeout}s — the call may "
+                    "still be running in the browser; read the tab's state before retrying",
+                    code="extension_timeout",
                 ) from exc
         finally:
             self._pending.pop(req_id, None)
             self._pending_clients.pop(req_id, None)
+            # A future the disconnect path already failed (bridge._handle_client
+            # sets ExtensionNotConnected on every pending future) would otherwise
+            # be garbage-collected with an unretrieved exception, logging a noisy
+            # "Future exception was never retrieved" per in-flight call.
+            if fut.done() and not fut.cancelled():
+                fut.exception()
 
         if not isinstance(result, dict):
             # A verified-but-malformed tool_result body (truthy non-dict —

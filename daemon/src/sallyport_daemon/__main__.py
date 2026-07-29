@@ -35,10 +35,20 @@ from .bridge import Bridge, ExtensionNotConnected, ToolError
 from .broker import (
     MAX_BROKER_CLIENTS,
     BrokerError,
+    BrokerState,
+    acquire_broker_lock,
+    acquire_file_lock,
     broker_is_available,
     broker_socket_path,
+    call_tool_via_broker,
+    close_broker_clients,
+    release_broker_lock,
     run_shim,
+    sanitise_label,
+    socket_identity,
+    socket_path_is_bindable,
     start_broker_server,
+    unlink_socket_if_ours,
 )
 from .framing import MAX_FRAME_BYTES
 from .mcp_server import TOOLS, run_stdio
@@ -51,11 +61,20 @@ from .pidfile import (
     status_path,
     write_pidfile,
 )
-from .protocol import Signer
+from .protocol import ProtocolError, Signer
 from .secret import DEFAULT_PATH, check_perms, encode_b64, load_or_create
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 10086
+
+# How long a session waits for a broker to come up (its own spawn, or one a
+# sibling session is spawning) before giving up and running standalone.
+BROKER_START_BUDGET_S = 12.0
+# Poll interval while waiting for the broker socket to appear.
+BROKER_POLL_S = 0.15
+# Cap on the auto-started broker's stderr log before it is rotated away. The
+# broker is long-lived, so an unbounded log would grow for weeks.
+BROKER_LOG_MAX_BYTES = 1 * 1024 * 1024
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -71,6 +90,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--secret-file", default=str(DEFAULT_PATH), help="Path to shared secret file")
     p.add_argument("--show-secret", action="store_true", help="Print secret and exit")
     p.add_argument("--verbose", "-v", action="store_true", help="Verbose logging to stderr")
+    p.add_argument(
+        "--no-broker",
+        action="store_true",
+        help=(
+            "Don't auto-start or attach to a shared broker: own the WS port directly "
+            "(one session only). Also settable as SALLYPORT_NO_BROKER=1. Without a "
+            "broker a second Claude Code session cannot get browser tools at all."
+        ),
+    )
+    p.add_argument(
+        "--session-label",
+        default=None,
+        help=(
+            "Cosmetic name for this session in the extension's audit log and agent "
+            "window (default: the current directory's name). Not a credential."
+        ),
+    )
 
     sub = p.add_subparsers(dest="command", metavar="COMMAND")
 
@@ -108,6 +144,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "Daemons whose parent is alive are listed but left running."
         ),
     )
+    doctor_p.add_argument(
+        "--stop-broker",
+        action="store_true",
+        help=(
+            "Stop the shared broker holding this port. It is long-lived by design "
+            "(and therefore exempt from --kill-stale), so this is the supported way "
+            "to restart it after an upgrade. Attached sessions lose browser tools "
+            "until they are restarted; the next new session starts a fresh broker."
+        ),
+    )
 
     sub.add_parser(
         "serve",
@@ -117,12 +163,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
 
-    sub.add_parser(
+    broker_p = sub.add_parser(
         "broker",
         help=(
             "Run a shared broker: one process owns the extension (WS) and serves "
             "many Claude Code sessions over a 0600 AF_UNIX socket. Stays alive "
-            "until SIGINT. Plain `sallyport-daemon` sessions auto-attach as shims."
+            "until SIGINT. Plain `sallyport-daemon` sessions auto-start/attach one."
+        ),
+    )
+    broker_p.add_argument(
+        "--idle-exit",
+        type=float,
+        default=0.0,
+        help=(
+            "Exit after this many seconds with no attached sessions (0 = never, the "
+            "default). Off by default on purpose: an idle broker costs one process, "
+            "while a restart drops the extension's WebSocket and the next session can "
+            "hit not_connected while it reconnects on backoff."
         ),
     )
 
@@ -598,6 +655,32 @@ def ensure_port_available(host: str, port: int, config_dir: Path) -> None:
     sys.exit(2)
 
 
+async def _watch_broker_idle(
+    state: BrokerState, shutdown: asyncio.Event, idle_exit_s: float, *, interval: float = 5.0
+) -> None:
+    """Optional idle-exit for a broker (``broker --idle-exit``).
+
+    OFF by default. An idle broker costs one process and one WebSocket, whereas
+    each restart drops the extension's connection and it reconnects on exponential
+    backoff (1 s → 30 s), so the next session's first tool call can plausibly
+    fail `not_connected` for no reason the user can see. The timer only counts
+    while zero sessions are attached AND none is mid-handshake.
+    """
+    if idle_exit_s <= 0:
+        return
+    while not shutdown.is_set():
+        if state.idle_for() >= idle_exit_s:
+            print(
+                f"Sallyport: broker idle for {idle_exit_s:.0f}s with no attached "
+                "sessions — exiting; the next session starts a fresh one.",
+                file=sys.stderr,
+            )
+            shutdown.set()
+            return
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(shutdown.wait(), interval)
+
+
 async def _watch_parent(
     shutdown: asyncio.Event,
     *,
@@ -629,6 +712,43 @@ async def _watch_parent(
             await asyncio.wait_for(shutdown.wait(), interval)
 
 
+def _run_stop_broker(port: int, config_dir: Path) -> None:
+    """SIGTERM the broker holding ``port``, if one is positively identified.
+
+    The supported way to restart a broker: it is long-lived by design and
+    therefore exempt from ``--kill-stale``, so without this the only remedy is
+    a hand-written `kill`. Attached sessions lose their browser tools (the shim
+    prints why and exits non-zero); the next new session starts a fresh one.
+    """
+    pids = _listening_pids(port)
+    if not pids:
+        print(f"  --stop-broker: nothing is listening on port {port}")
+        return
+    by_pid = {p.pid: p for p in find_sallyport_processes(_ps_snapshot(), own_pid=os.getpid())}
+    recorded = read_pidfile(pidfile_path(config_dir, port))
+    stopped = False
+    for pid in pids:
+        proc = by_pid.get(pid)
+        if not _pid_is_broker(pid, proc.command if proc else None, recorded):
+            print(f"  --stop-broker: PID {pid} holds port {port} but is not a broker — left alone")
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(f"  STOP  PID {pid} (broker on port {port}) — sent SIGTERM")
+            stopped = True
+        except OSError as exc:
+            print(f"  FAIL  PID {pid}: {exc}")
+    if not stopped:
+        return
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not _listening_pids(port):
+            print("  --stop-broker: broker stopped; the next session will start a fresh one")
+            return
+        time.sleep(0.1)
+    print("  WARN  the broker is still holding the port — inspect it before forcing a kill")
+
+
 def _run_doctor(args: argparse.Namespace, secret: bytes, created: bool, secret_path: Path) -> int:
     """Self-diagnostic for the daemon side of the setup.
 
@@ -638,6 +758,8 @@ def _run_doctor(args: argparse.Namespace, secret: bytes, created: bool, secret_p
     it is always safe to run in a normal shell. Exit 0 if every check passes,
     1 otherwise.
     """
+    if getattr(args, "stop_broker", False):
+        _run_stop_broker(args.port, secret_path.parent)
     if getattr(args, "kill_stale", False):
         _run_kill_stale()
 
@@ -736,16 +858,73 @@ def _run_doctor_secret_error(secret_path: Path, error: str) -> int:
     return 1
 
 
-async def _run_exec(args: argparse.Namespace, bridge: Bridge, shutdown: asyncio.Event) -> int:
+def _print_exec_content(blocks: list[dict[str, Any]]) -> bool:
+    """Print an MCP content list the way `exec` prints a tool result. Returns
+    whether it looks like a tool ERROR (the dispatcher's text starts with
+    'Error'), so the caller keeps exec's exit-code contract."""
+    failed = False
+    for block in blocks:
+        if block.get("type") == "image":
+            data = block.get("data")
+            size = len(data) if isinstance(data, str) else 0
+            print(f"<image {block.get('mimeType', '?')}, {size} bytes base64; truncated>")
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            if text.startswith("Error"):
+                failed = True
+            print(text)
+    return failed
+
+
+async def _run_exec_via_broker(args: argparse.Namespace, secret: bytes, sock_path: Path) -> int:
+    """`exec` against the running broker instead of owning the WS port.
+
+    Keeps the documented exit codes: 2 bad args, 5 tool error, 0 ok. A broker
+    that refuses or dies mid-call is reported as 3 (same class as "the extension
+    never connected": there was no working bridge to run against)."""
+    try:
+        tool_args = _parse_kv(args.args)
+    except ValueError as exc:
+        print(f"exec: {exc}", file=sys.stderr)
+        return 2
+    print(f"exec: calling {args.tool}({tool_args}) via broker {sock_path}", file=sys.stderr)
+    try:
+        blocks = await call_tool_via_broker(sock_path, secret, args.tool, tool_args)
+    except (BrokerError, OSError, ProtocolError) as exc:
+        print(f"exec: broker call failed: {exc}", file=sys.stderr)
+        return 3
+    return 5 if _print_exec_content(blocks) else 0
+
+
+async def _run_exec(
+    args: argparse.Namespace, bridge: Bridge, shutdown: asyncio.Event, secret: bytes = b""
+) -> int:
     # Local-only tools (e.g. save_to_file) and daemon built-ins (status)
     # don't need an extension at all, so we skip both the WS server startup
     # and the connect-wait for them.
     from .bridge import BUILTIN_TOOLS
     from .local_tools import LOCAL_TOOLS
 
-    is_local = args.tool in LOCAL_TOOLS or args.tool in BUILTIN_TOOLS
+    # LOCAL_TOOLS (save_to_file) genuinely need no bridge and stay in this
+    # process, so `exec` keeps working with no browser and no broker at all.
+    is_local = args.tool in LOCAL_TOOLS
 
     ws_task: asyncio.Task[None] | None = None
+    if not is_local:
+        # A broker owns the port whenever one is running, so exec must go
+        # THROUGH it rather than fight it for the port — otherwise the project's
+        # own shell-level debugging layer stops working the moment broker mode
+        # is the default. `status` routes there too: the interesting health is
+        # the shared broker's, not a throwaway Bridge this process just built.
+        sock_path = broker_socket_path(args.port, Path(args.secret_file).parent)
+        if secret and await broker_is_available(sock_path):
+            shutdown.set()
+            return await _run_exec_via_broker(args, secret, sock_path)
+        if args.tool in BUILTIN_TOOLS:
+            # No broker to ask, so answer from this process as before — a
+            # builtin needs no extension and must not wait for one.
+            is_local = True
     if not is_local:
         ensure_port_available(args.host, args.port, Path(args.secret_file).parent)
         ws_task = asyncio.create_task(bridge.serve_forever(shutdown=shutdown), name="ws-server")
@@ -803,6 +982,186 @@ async def _run_exec(args: argparse.Namespace, bridge: Bridge, shutdown: asyncio.
                 await asyncio.wait_for(ws_task, timeout=2.0)
 
 
+def auto_broker_enabled(args: argparse.Namespace) -> bool:
+    """Whether a plain `sallyport-daemon` may start/attach a shared broker.
+
+    On by default. Without a broker the SECOND Claude Code session on a machine
+    gets no browser tools at all — `ensure_port_available` refuses to start
+    because the first session's daemon holds the WS port — and the first
+    session's agent drives whatever tab the human happens to be looking at
+    (the standalone active-tab fallback). Both are exactly what broker mode
+    exists to fix, so it is the default rather than an opt-in.
+    """
+    if getattr(args, "no_broker", False):
+        return False
+    env = os.environ.get("SALLYPORT_NO_BROKER", "").strip().lower()
+    return env in ("", "0", "false", "no")
+
+
+def session_label(args: argparse.Namespace) -> str | None:
+    """This session's cosmetic name: --session-label, else the working
+    directory's name. Shown in the extension's audit log and used to group the
+    session's tabs into their own window. Never a credential."""
+    explicit = getattr(args, "session_label", None)
+    if explicit is not None:
+        return sanitise_label(explicit)
+    try:
+        return sanitise_label(Path.cwd().name)
+    except OSError:  # pragma: no cover - cwd deleted under us
+        return None
+
+
+def _broker_log_path(config_dir: Path, port: int) -> Path:
+    return config_dir / f"broker-{port}.log"
+
+
+def _open_broker_log(config_dir: Path, port: int) -> int | None:
+    """Open (0600, append) the auto-started broker's stderr log, rotating it away
+    once it grows past the cap. Returns a raw fd, or None if it can't be opened —
+    the broker still starts, we just lose its diagnostics."""
+    path = _broker_log_path(config_dir, port)
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > BROKER_LOG_MAX_BYTES:
+            path.replace(path.with_suffix(".log.old"))
+        return os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    except OSError:
+        return None
+
+
+def broker_spawn_argv(args: argparse.Namespace) -> list[str]:
+    """argv for the broker process a session starts on demand.
+
+    Two hard constraints, both load-bearing elsewhere in this file:
+      * it must contain a STANDALONE ``broker`` token, or ``_is_broker_command``
+        stops recognising it and ``doctor --kill-stale`` reaps a live broker out
+        from under every attached session;
+      * it must contain ``sallyport_daemon``/``sallyport-daemon``, or
+        ``find_sallyport_processes`` cannot see it at all.
+    Using ``sys.executable -m`` satisfies both and works when the console script
+    isn't on PATH (a GUI-launched Claude Code often has a minimal PATH).
+    """
+    return [
+        sys.executable,
+        "-m",
+        "sallyport_daemon",
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--secret-file",
+        str(args.secret_file),
+        "broker",
+    ]
+
+
+def spawn_broker(args: argparse.Namespace, config_dir: Path) -> subprocess.Popen[bytes] | None:
+    """Start a detached broker for this port, returning its handle (None if the
+    spawn itself failed). The caller polls both the socket AND this handle, so a
+    broker that dies on startup is noticed at once instead of after the whole
+    start budget.
+
+    Detachment matters in two ways, each a real failure otherwise:
+      * ``start_new_session`` puts it in its own session, so it survives the
+        spawning shell and never receives that terminal's signals;
+      * stdin/stdout go to /dev/null — inheriting our stdout would put a SECOND
+        writer on the MCP wire and keep the pipe's write end open after we exit,
+        so Claude Code would never see EOF; inheriting stdin would let the
+        broker eat MCP request bytes meant for us. Its stderr goes to a 0600 log
+        beside the secret, so a failed start is diagnosable.
+
+    It stays OUR child rather than being double-forked to init: that is what
+    lets us detect an early death (and reap it). A broker that outlives this
+    session is re-parented to init when we exit, so it leaves no zombie either
+    way — and if it dies later, the shim's relay sees EOF and exits with it.
+    """
+    log_fd = _open_broker_log(config_dir, args.port)
+    try:
+        return subprocess.Popen(  # noqa: S603 - fixed argv built from our own args
+            broker_spawn_argv(args),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=log_fd if log_fd is not None else subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"Sallyport: could not start a broker ({exc}).", file=sys.stderr)
+        return None
+    finally:
+        if log_fd is not None:
+            os.close(log_fd)
+
+
+async def attach_or_start_broker(
+    args: argparse.Namespace, config_dir: Path
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
+    """Connect this session to a shared broker, starting one if needed.
+
+    Returns the connected socket streams, or None if no broker could be reached
+    within :data:`BROKER_START_BUDGET_S` — in which case the caller falls back
+    to standalone, so a broker problem never leaves a session with NO bridge.
+
+    Concurrency: N sessions launched at once must produce exactly ONE broker.
+    A separate non-blocking spawn lock elects the single spawner; everyone else
+    just waits for the socket to appear. (The broker process then takes its own
+    lock, which is what actually prevents two brokers binding one path — see
+    ``broker.acquire_broker_lock``.)
+    """
+    sock_path = broker_socket_path(args.port, config_dir)
+    if not socket_path_is_bindable(sock_path):
+        # A path over the kernel's sun_path limit fails at bind() with a bare
+        # "AF_UNIX path too long" from inside asyncio. Say so here instead of
+        # spawning a broker that cannot possibly come up and then waiting out
+        # the full budget for it.
+        print(
+            f"Sallyport: {sock_path} is too long for an AF_UNIX socket — running "
+            "standalone. Use a shorter --secret-file directory to share one browser "
+            "across sessions.",
+            file=sys.stderr,
+        )
+        return None
+
+    spawn_lock = sock_path.with_name(sock_path.name + ".spawn")
+    deadline = time.monotonic() + BROKER_START_BUDGET_S
+    lock_fd: int | None = None
+    child: subprocess.Popen[bytes] | None = None
+    try:
+        while time.monotonic() < deadline:
+            if await broker_is_available(sock_path):
+                try:
+                    return await asyncio.open_unix_connection(str(sock_path))
+                except OSError:
+                    pass  # vanished between probe and connect — loop and retry
+            elif lock_fd is None:
+                # Try to become THE spawner. Whoever wins holds the lock for its
+                # whole wait, not just across the spawn call: releasing it early
+                # would let each waiting session in turn re-check "no broker yet"
+                # and start another one while the first is still coming up.
+                # Re-tried each round so a spawner that dies hands the job on.
+                lock_fd = acquire_file_lock(spawn_lock)
+            elif child is None:
+                child = spawn_broker(args, config_dir)
+                if child is None:
+                    return None
+            elif child.poll() is not None:
+                # Our broker died on startup (bad secret dir, port lost,
+                # unbindable socket). Its stderr is in the log; don't sit out
+                # the rest of the budget waiting for a process that is gone.
+                print(
+                    f"Sallyport: the broker exited immediately (status {child.returncode}).",
+                    file=sys.stderr,
+                )
+                return None
+            await asyncio.sleep(BROKER_POLL_S)
+        return None
+    finally:
+        # Hand the spawn role on. A broker still coming up when our budget ran
+        # out keeps running: it may well serve the NEXT session even though it
+        # was too slow for this one.
+        release_broker_lock(lock_fd)
+
+
 async def _open_stdio_streams() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """Wrap this process's stdin/stdout as asyncio streams for the shim relay.
 
@@ -838,8 +1197,22 @@ def _shim_failure_message(err: BrokerError, *, sock_path: Path, secret_path: Pat
         f"broker's secret, or delete it so both regenerate together); (2) the "
         f"broker is at its client cap (MAX_BROKER_CLIENTS={MAX_BROKER_CLIENTS}) — "
         f"free a slot. The broker owns the port, so this session can't start "
-        f"standalone; fix the cause and retry, or stop the broker to run "
-        f"standalone."
+        f"standalone; fix the cause and retry, or stop it with "
+        f"`sallyport-daemon doctor --stop-broker` to run standalone."
+    )
+
+
+def _broker_vanished_message(sock_path: Path) -> str:
+    """Why this session lost its browser tools mid-flight.
+
+    A broker that dies takes every attached session's tools with it. The relay
+    just sees EOF, and returning 0 there would look exactly like a normal
+    session end — Claude Code would report nothing and the user would be left
+    wondering why the browser stopped responding."""
+    return (
+        f"Sallyport: the broker at {sock_path} went away — this session has no browser "
+        "tools any more. Restart the session (a new one starts a fresh broker); run "
+        "`sallyport-daemon doctor` to see what happened."
     )
 
 
@@ -851,6 +1224,7 @@ async def _run_shim(
     *,
     sock_path: Path,
     secret_path: Path,
+    label: str | None = None,
 ) -> int:
     """Default-mode shim: relay this stdio MCP session to a running broker.
 
@@ -863,7 +1237,8 @@ async def _run_shim(
     cc_reader, cc_writer = await _open_stdio_streams()
     signer = Signer(secret)
     shim = asyncio.create_task(
-        run_shim(cc_reader, cc_writer, sock_reader, sock_writer, signer), name="broker-shim"
+        run_shim(cc_reader, cc_writer, sock_reader, sock_writer, signer, label=label),
+        name="broker-shim",
     )
     stop = asyncio.create_task(shutdown.wait(), name="shim-shutdown")
     try:
@@ -882,6 +1257,11 @@ async def _run_shim(
             _shim_failure_message(shim_result, sock_path=sock_path, secret_path=secret_path),
             file=sys.stderr,
         )
+        return 1
+    if shim_result == "broker":
+        # The broker hung up rather than Claude Code: say so and exit non-zero,
+        # instead of a silent 0 that reads as a clean session end.
+        print(_broker_vanished_message(sock_path), file=sys.stderr)
         return 1
     return 0
 
@@ -954,15 +1334,47 @@ async def amain(args: argparse.Namespace) -> int:
     )
 
     if args.command == "exec":
-        return await _run_exec(args, bridge, shutdown)
+        return await _run_exec(args, bridge, shutdown, secret)
 
-    # Default mode (no subcommand) auto-attaches to a running broker. If one we
-    # own is live on the socket, become a thin stdio shim relaying MCP to it
-    # instead of binding the WS port ourselves — this is how N Claude Code
-    # sessions share one extension leg. A shim binds nothing and writes no
-    # pidfile; the broker is the port holder. `serve`/`broker` are explicit
-    # "own the port" commands and never auto-attach.
-    if args.command is None:
+    # Default mode (no subcommand) shares ONE browser leg across every session:
+    # attach to the running broker, starting one if there isn't one yet, and
+    # become a thin stdio shim relaying MCP to it instead of binding the WS port
+    # ourselves. A shim binds nothing and writes no pidfile; the broker is the
+    # port holder. `serve`/`broker` are explicit "own the port" commands and
+    # never auto-attach.
+    if args.command is None and auto_broker_enabled(args):
+        sock_path = broker_socket_path(args.port, secret_path.parent)
+        streams = await attach_or_start_broker(args, secret_path.parent)
+        if streams is not None:
+            label = session_label(args)
+            print(
+                f"Sallyport: attached to broker via {sock_path} (shim mode"
+                + (f", session '{label}'" if label else "")
+                + ").",
+                file=sys.stderr,
+            )
+            return await _run_shim(
+                secret,
+                streams[0],
+                streams[1],
+                shutdown,
+                sock_path=sock_path,
+                secret_path=secret_path,
+                label=label,
+            )
+        # No broker could be reached or started. Falling through to standalone
+        # keeps THIS session working; it only fails if the port is genuinely
+        # held by someone else, which ensure_port_available reports below.
+        print(
+            f"Sallyport: no broker reachable at {sock_path} within "
+            f"{BROKER_START_BUDGET_S:.0f}s — running standalone (single session). "
+            f"See {_broker_log_path(secret_path.parent, args.port)} for why it "
+            "wouldn't start.",
+            file=sys.stderr,
+        )
+    elif args.command is None:
+        # Broker explicitly disabled: keep today's attach-if-present behaviour so
+        # --no-broker still cooperates with a broker someone started by hand.
         sock_path = broker_socket_path(args.port, secret_path.parent)
         if await broker_is_available(sock_path):
             try:
@@ -987,6 +1399,7 @@ async def amain(args: argparse.Namespace) -> int:
                     shutdown,
                     sock_path=sock_path,
                     secret_path=secret_path,
+                    label=session_label(args),
                 )
 
     # Long-lived modes leave a diagnostic pidfile next to the secret so
@@ -994,6 +1407,21 @@ async def amain(args: argparse.Namespace) -> int:
     # volatile status file so it can also report live extension connectivity.
     pidpath = pidfile_path(secret_path.parent, args.port)
     statuspath = status_path(secret_path.parent, args.port)
+
+    # A broker claims its socket path BEFORE the port guard, so the WS port and
+    # the AF_UNIX socket are taken under one mutex. Without that, two brokers
+    # racing can end up with the one that LOST the port owning the socket —
+    # every session then attaches to a broker with a dead browser leg.
+    broker_lock_fd: int | None = None
+    if args.command == "broker":
+        broker_lock_fd = acquire_broker_lock(broker_socket_path(args.port, secret_path.parent))
+        if broker_lock_fd is None:
+            print(
+                f"Sallyport: another broker already holds port {args.port} — "
+                "not starting a second one.",
+                file=sys.stderr,
+            )
+            return 1
 
     # Single-instance guard BEFORE binding: reclaim the port from a stale orphan
     # or refuse with a clear message, instead of spawning a doomed second daemon
@@ -1030,29 +1458,71 @@ async def amain(args: argparse.Namespace) -> int:
         # Stamp mode=broker so doctor/--kill-stale recognise an orphan-by-design
         # broker (re-parents to PID 1 when its shell exits) and never reap it.
         write_pidfile(pidpath, args.port, mode="broker")
-        ws_task = asyncio.create_task(bridge.serve_forever(shutdown=shutdown), name="ws-server")
+        ws_ready = asyncio.Event()
+        ws_task = asyncio.create_task(
+            bridge.serve_forever(shutdown=shutdown, ready=ws_ready), name="ws-server"
+        )
+        state = BrokerState()
         mcp_server: asyncio.Server | None = None
+        sock_ident: tuple[int, int] | None = None
         try:
+            # Publish the MCP socket only once the browser leg is actually bound.
+            # A broker that lost the port race would otherwise still bind the
+            # socket and serve sessions whose every call fails not_connected,
+            # while the bind error sat unobserved inside ws_task and `doctor`
+            # cheerfully reported "port held by your broker".
+            ready_task = asyncio.create_task(ws_ready.wait(), name="ws-ready")
+            settled, _ = await asyncio.wait(
+                {ws_task, ready_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            ready_task.cancel()
+            if ws_task in settled:
+                exc = ws_task.exception() if not ws_task.cancelled() else None
+                print(
+                    f"Sallyport: broker could not bind {args.host}:{args.port}"
+                    + (f" ({exc})" if exc else "")
+                    + " — not starting; nothing was published.",
+                    file=sys.stderr,
+                )
+                return 1
             try:
-                mcp_server = await start_broker_server(bridge, secret, sock_path)
+                mcp_server = await start_broker_server(
+                    bridge, secret, sock_path, state=state, lock_fd=broker_lock_fd
+                )
             except BrokerError as broker_exc:
                 print(f"Sallyport: cannot start broker socket: {broker_exc}", file=sys.stderr)
                 return 1
+            sock_ident = socket_identity(sock_path)
             print(
                 f"Sallyport: broker mode — WS on {args.host}:{args.port}, "
                 f"MCP clients via {sock_path}. Ctrl-C to stop.",
                 file=sys.stderr,
             )
-            await shutdown.wait()
+            idle_task = asyncio.create_task(
+                _watch_broker_idle(state, shutdown, getattr(args, "idle_exit", 0.0)),
+                name="broker-idle",
+            )
+            stop_task = asyncio.create_task(shutdown.wait(), name="broker-shutdown")
+            # Watch the WS task too: if the browser leg dies mid-life, the broker
+            # is useless and must exit loudly rather than keep serving sessions
+            # that can never reach a browser.
+            await asyncio.wait({ws_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+            for task in (idle_task, stop_task):
+                task.cancel()
+            await asyncio.gather(idle_task, stop_task, return_exceptions=True)
         finally:
             if mcp_server is not None:
                 mcp_server.close()
+                # Close attached sessions FIRST: close() only stops accepting,
+                # and from 3.12 wait_closed() waits for established connections —
+                # with a shim attached that await never returns.
+                await close_broker_clients(state)
                 with contextlib.suppress(Exception):
-                    await mcp_server.wait_closed()
-                # asyncio's UnixServer.close() does not unlink the socket file;
-                # only remove the one WE bound (never a refused peer's).
-                with contextlib.suppress(OSError):
-                    sock_path.unlink()
+                    await asyncio.wait_for(mcp_server.wait_closed(), timeout=2.0)
+                # asyncio's UnixServer.close() does not unlink the socket file.
+                # Only remove the inode WE bound: after a racing rebind, the name
+                # points at somebody else's LIVE socket.
+                unlink_socket_if_ours(sock_path, sock_ident)
             shutdown.set()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(ws_task, timeout=2.0)
@@ -1061,6 +1531,7 @@ async def amain(args: argparse.Namespace) -> int:
                 await asyncio.gather(ws_task, return_exceptions=True)
             remove_pidfile(pidpath)
             remove_status(statuspath)
+            release_broker_lock(broker_lock_fd)
         return 0
 
     write_pidfile(pidpath, args.port)

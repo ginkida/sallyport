@@ -99,16 +99,52 @@ async def test_valid_hello_returns_client_id_and_acks() -> None:
     client_signer = Signer(SECRET)
     await write_frame(cw, _dump_json(client_signer.sign(Envelope(type="hello", body={}))))
 
-    client_id = await authenticate_connection(sr, sw, Signer(SECRET))
-    assert isinstance(client_id, str)
-    assert len(client_id) == 32
+    identity = await authenticate_connection(sr, sw, Signer(SECRET))
+    assert identity is not None
+    assert isinstance(identity.id, str)
+    assert len(identity.id) == 32
+    assert identity.label is None  # none declared
 
     # The client receives a verifiable hello_ack.
     ack_raw = await read_frame(cr)
     assert ack_raw is not None
     ack = client_signer.verify(_parse_json(ack_raw))
     assert ack.type == "hello_ack"
+    # The ack carries the broker's build so a shim can warn about version skew —
+    # and nothing identifying: the clientId never travels to the peer (#14).
+    assert isinstance(ack.body["version"], str)
+    assert identity.id not in json.dumps(ack.body)
     await _drain_close(sw, cw)
+
+
+@pytest.mark.asyncio
+async def test_hello_label_is_sanitised_and_capped() -> None:
+    """A session may declare a cosmetic label. It is peer-supplied text that
+    ends up in the extension's persisted audit log, so it is normalised and
+    bounded — and it is never an identity (ownership keys on the minted id)."""
+    (sr, sw), (_cr, cw) = await _stream_pair()
+    signer = Signer(SECRET)
+    await write_frame(
+        cw,
+        _dump_json(signer.sign(Envelope(type="hello", body={"label": "my repo/../<x>"}))),
+    )
+    identity = await authenticate_connection(sr, sw, Signer(SECRET))
+    assert identity is not None
+    assert identity.label == "my-repo-..--x"
+    await _drain_close(sw, cw)
+
+
+def test_sanitise_label_rules() -> None:
+    from sallyport_daemon.broker import MAX_LABEL_CHARS, sanitise_label
+
+    assert sanitise_label("bridge") == "bridge"
+    assert sanitise_label("  spaced  ") == "spaced"
+    assert sanitise_label("a" * 100) == "a" * MAX_LABEL_CHARS
+    assert sanitise_label("...") == "..."  # dots are kept, only edges trimmed
+    assert sanitise_label("///") is None  # nothing printable survives
+    assert sanitise_label("") is None
+    assert sanitise_label(42) is None
+    assert sanitise_label(None) is None
 
 
 @pytest.mark.asyncio
@@ -633,3 +669,123 @@ async def test_shim_raises_when_broker_rejects_hello() -> None:
             await asyncio.wait_for(task, timeout=5)
     finally:
         await _drain_close(shim_cc_w, shim_sk_w, cc_w, brk_w)
+
+
+# --- socket claim: the flock is the real exclusion, not _claim_socket_path ---
+
+
+def test_file_lock_is_exclusive(tmp_path: Path) -> None:
+    """`asyncio.start_unix_server` unlinks whatever socket file is at the path
+    before binding — live or not — so two brokers racing one path would BOTH
+    'succeed'. The flock is what actually prevents that."""
+    from sallyport_daemon.broker import acquire_file_lock, release_broker_lock
+
+    lock = tmp_path / "claim"
+    first = acquire_file_lock(lock)
+    assert first is not None
+    # A second acquire in the SAME process still sees its own lock as held only
+    # across processes, so assert via the documented API on a second path plus
+    # the release round-trip (cross-process exclusion is covered by the broker
+    # e2e below, which really does start two).
+    release_broker_lock(first)
+    again = acquire_file_lock(lock)
+    assert again is not None
+    release_broker_lock(again)
+
+
+def test_broker_lock_path_sits_beside_the_socket(tmp_path: Path) -> None:
+    from sallyport_daemon.broker import broker_lock_path
+
+    sock = tmp_path / "broker-10086.sock"
+    assert broker_lock_path(sock) == tmp_path / "broker-10086.sock.lock"
+
+
+def test_socket_path_length_is_checked_before_binding(tmp_path: Path) -> None:
+    """A path over the kernel's sun_path limit fails at bind() with a bare
+    'AF_UNIX path too long' from inside asyncio — check it up front instead."""
+    from sallyport_daemon.broker import socket_path_is_bindable
+
+    assert socket_path_is_bindable(Path("/tmp/sp/broker-10086.sock"))  # noqa: S108 - a path string
+    assert not socket_path_is_bindable(Path("/" + "x" * 120 + "/broker-10086.sock"))
+
+
+def test_unlink_socket_only_removes_our_own_inode(tmp_path: Path) -> None:
+    """After a racing broker rebinds the path, the NAME points at somebody
+    else's live socket — a bare unlink() at shutdown would delete it."""
+    from sallyport_daemon.broker import socket_identity, unlink_socket_if_ours
+
+    path = tmp_path / "broker.sock"
+    path.write_text("first")
+    ours = socket_identity(path)
+    assert ours is not None
+
+    # Someone replaced the file with a different inode under the same name.
+    path.unlink()
+    path.write_text("theirs")
+    assert unlink_socket_if_ours(path, ours) is False
+    assert path.exists()
+
+    # Our own inode is removed.
+    theirs = socket_identity(path)
+    assert unlink_socket_if_ours(path, theirs) is True
+    assert not path.exists()
+    # And a vanished socket is simply not ours to remove.
+    assert unlink_socket_if_ours(path, theirs) is False
+
+
+@pytest.mark.asyncio
+async def test_second_broker_cannot_bind_a_claimed_socket(sock_path: Path) -> None:
+    from sallyport_daemon.bridge import Bridge
+    from sallyport_daemon.broker import BrokerError, acquire_broker_lock, release_broker_lock
+
+    bridge = Bridge(secret=SECRET, host="127.0.0.1", port=10086)
+    server = await start_broker_server(bridge, SECRET, sock_path)
+    try:
+        # A second broker on the same path must be refused, not silently steal it.
+        with pytest.raises(BrokerError):
+            await start_broker_server(bridge, SECRET, sock_path)
+        assert sock_path.exists()
+    finally:
+        server.close()
+        with contextlib.suppress(Exception):
+            await server.wait_closed()
+        release_broker_lock(acquire_broker_lock(sock_path))
+
+
+@pytest.mark.asyncio
+async def test_broker_state_tracks_clients_and_idle_time(sock_path: Path) -> None:
+    """The idle-exit watcher and the shutdown path both read these counters, so
+    they must move with the accept loop rather than live in its closure."""
+    from sallyport_daemon.bridge import Bridge
+    from sallyport_daemon.broker import BrokerState, close_broker_clients
+
+    state = BrokerState()
+    assert state.idle_for() >= 0.0
+    state.active = 1
+    assert state.idle_for() == 0.0  # never counts down while a session is attached
+
+    bridge = Bridge(secret=SECRET, host="127.0.0.1", port=10086)
+    server = await start_broker_server(bridge, SECRET, sock_path, state=state)
+    try:
+        state.active = 0
+        state.pending = 0
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        signer = Signer(SECRET)
+        await write_frame(writer, _dump_json(signer.sign(Envelope(type="hello", body={}))))
+        assert await asyncio.wait_for(read_frame(reader), timeout=5) is not None
+        await asyncio.sleep(0.05)
+        assert state.active == 1
+        assert state.served_total == 1
+        assert len(state.writers) == 1
+
+        # Shutdown must close attached connections BEFORE wait_closed(), or a
+        # broker with a shim attached hangs there forever on Python 3.12+.
+        await close_broker_clients(state)
+        assert state.writers == set()
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    finally:
+        server.close()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(server.wait_closed(), timeout=2)

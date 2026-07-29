@@ -277,6 +277,22 @@ async def test_print_to_pdf_default_filename(sandbox: Path) -> None:
     assert Path(result["path"]).name == result["filename"]
 
 
+async def test_print_to_pdf_default_filenames_do_not_collide(sandbox: Path) -> None:
+    """Two sessions printing in the same wall-clock second must not land on the
+    same path — the later write would win and hand BOTH callers that path, so
+    one of them would read a PDF rendered from the other's page."""
+    a = base64.b64encode(b"%PDF-A").decode()
+    b = base64.b64encode(b"%PDF-BB").decode()
+    first = await _print_to_pdf_result({}, {"pdfBase64": a})
+    second = await _print_to_pdf_result({}, {"pdfBase64": b})
+    assert first["path"] != second["path"]
+    assert Path(first["path"]).read_bytes() == b"%PDF-A"
+    assert Path(second["path"]).read_bytes() == b"%PDF-BB"
+    # And each caller's reported size matches the file actually on disk.
+    assert first["size"] == Path(first["path"]).stat().st_size
+    assert second["size"] == Path(second["path"]).stat().st_size
+
+
 async def test_print_to_pdf_rejects_traversal(sandbox: Path) -> None:
     body = base64.b64encode(b"%PDF").decode()
     with pytest.raises(ToolError) as exc_info:
@@ -308,4 +324,3 @@ def test_print_to_pdf_validator_rejects_bad_filename() -> None:
     # Absent filename and a plain name both pass.
     validator({})
     validator({"filename": "ok.pdf"})
-

@@ -159,17 +159,32 @@ async def test_status_reports_broker_mode() -> None:
     assert broker._status(client_id="c1")["mode"] == "broker"  # noqa: SLF001
 
 
-async def test_status_does_not_queue_behind_call_lock() -> None:
-    """status must answer while another tool call holds the call lock —
-    that's the whole point of answering before lock acquisition."""
+async def test_status_answers_while_the_caller_s_lane_is_busy() -> None:
+    """status must answer while another tool call holds this caller's lane —
+    that's the whole point of answering before admission control."""
     import asyncio
 
     from sallyport_daemon.bridge import Bridge
 
     bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
-    async with bridge._call_lock:  # noqa: SLF001 - simulating a slow in-flight call
+    async with bridge._lanes.lane(None):  # noqa: SLF001 - simulate a slow in-flight call
         out = await asyncio.wait_for(bridge.call_tool("status", {}), timeout=1.0)
     assert out["connected"] is False
+
+
+async def test_status_answers_while_every_browser_permit_is_taken() -> None:
+    """The global cap must never become a cross-client DoS on the one tool
+    designed to always answer: `status` takes no permit at all."""
+    import asyncio
+
+    from sallyport_daemon.bridge import Bridge
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086, max_concurrent_calls=2)
+    for _ in range(2):
+        await bridge._permits.acquire()  # noqa: SLF001 - saturate the pool
+    out = await asyncio.wait_for(bridge.call_tool("status", {}, client_id="B"), timeout=1.0)
+    assert out["connected"] is False
+    assert out["maxConcurrentCalls"] == 2
 
 
 async def test_status_carries_empty_call_ring_initially() -> None:
@@ -252,45 +267,86 @@ async def test_successful_local_tool_records_ok_outcome(tmp_path: Any) -> None:
         del os.environ["SALLYPORT_DOWNLOAD_DIR"]
 
 
-async def test_call_tool_stamps_client_in_ring(tmp_path: Any) -> None:
-    """A supplied client_id (broker mode) tags the outcome ring entry with a
-    `client` field for per-connection attribution; standalone (None) omits it."""
+async def test_call_ring_is_per_client_not_a_shared_ring(tmp_path: Any) -> None:
+    """Each client gets its OWN outcome ring: a chatty session can never evict a
+    quiet session's diagnostics, and no entry carries another client's identity
+    (invariants #13/#14 — nothing to filter, because nothing is shared)."""
     import os
 
-    from sallyport_daemon.bridge import Bridge
+    from sallyport_daemon.bridge import LAST_CALLS_MAXLEN, Bridge
 
     os.environ["SALLYPORT_DOWNLOAD_DIR"] = str(tmp_path)
     try:
         bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
-        await bridge.call_tool(
-            "save_to_file", {"data": "aGk=", "filename": "n1.txt"}, client_id="client-xyz"
-        )
-        assert bridge._status()["lastCalls"][-1]["client"] == "client-xyz"  # noqa: SLF001
-        # A call with no client_id (standalone) leaves the field off entirely.
-        await bridge.call_tool("save_to_file", {"data": "aGk=", "filename": "n2.txt"})
-        assert "client" not in bridge._status()["lastCalls"][-1]  # noqa: SLF001
+        await bridge.call_tool("save_to_file", {"data": "aGk=", "filename": "a.txt"}, "A")
+        # B floods well past the ring size; A's single entry must survive.
+        for i in range(LAST_CALLS_MAXLEN + 5):
+            await bridge.call_tool("save_to_file", {"data": "aGk=", "filename": f"b{i}.txt"}, "B")
+
+        a_calls = bridge._status(client_id="A")["lastCalls"]  # noqa: SLF001
+        b_calls = bridge._status(client_id="B")["lastCalls"]  # noqa: SLF001
+        assert len(a_calls) == 1
+        assert len(b_calls) == LAST_CALLS_MAXLEN
+        # No client identity is echoed in either view.
+        assert all("client" not in entry for entry in a_calls + b_calls)
+        # A third client (and standalone) see nothing at all.
+        assert bridge._status(client_id="C")["lastCalls"] == []  # noqa: SLF001
+        assert bridge._status()["lastCalls"] == []  # noqa: SLF001
     finally:
         del os.environ["SALLYPORT_DOWNLOAD_DIR"]
 
 
+async def test_last_error_is_per_client(tmp_path: Any) -> None:
+    """One client's failure must not surface as another client's lastError."""
+    from sallyport_daemon.bridge import Bridge, ToolError
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
+    with pytest.raises(ToolError):
+        await bridge.call_tool("snapshot", {"tabId": 1}, "A")
+    a_error = bridge._status(client_id="A")["lastError"]  # noqa: SLF001
+    assert a_error["tool"] == "snapshot"
+    assert a_error["code"] == "tab_not_owned"
+    assert bridge._status(client_id="B")["lastError"] is None  # noqa: SLF001
+
+
+async def test_release_client_drops_lane_ring_and_returns_owned_tabs(tmp_path: Any) -> None:
+    """A disconnected client leaves nothing behind in the broker: no lane, no
+    ring, no ownership rows — and the caller learns which tabs to stop driving."""
+    import time as _time
+
+    from sallyport_daemon.bridge import Bridge, ExtensionNotConnected
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086, broker_mode=True)
+    bridge._ownership.record_create("A", 11, "e1", opened_at=_time.time())  # noqa: SLF001
+    bridge._ownership.record_create("A", 12, "e2", opened_at=_time.time())  # noqa: SLF001
+    with pytest.raises(ExtensionNotConnected):
+        await bridge.call_tool("snapshot", {"tabId": 11}, "A")
+    assert len(bridge._lanes) == 1  # noqa: SLF001
+
+    assert bridge.release_client("A") == [11, 12]
+    assert len(bridge._lanes) == 0  # noqa: SLF001
+    assert bridge._status(client_id="A")["lastCalls"] == []  # noqa: SLF001
+    assert bridge._status(client_id="A")["lastError"] is None  # noqa: SLF001
+    # Standalone has no per-client anything and is a no-op.
+    assert bridge.release_client(None) == []
+
+
 def test_status_pending_calls_owner_scoped_in_broker_mode() -> None:
-    """status.pendingCalls must not leak another client's in-flight call. The
-    call lock serialises all clients, so at most one pending entry exists
-    globally — a broker client must see only its OWN pending count (else it's a
-    0/1 cross-client activity oracle), while standalone sees the full count
-    (invariants #13/#14)."""
+    """status.pendingCalls must not leak another client's in-flight call. Now
+    that lanes let several calls be in flight at once, an unscoped count would
+    be a live read on how busy the other sessions are — each client sees only
+    its own (invariants #13/#14)."""
     from sallyport_daemon.bridge import Bridge
 
     bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086)
-    # Client "A" has a call in flight (as if mid-_call_tool_locked).
-    bridge._pending["r1"] = None  # type: ignore[assignment]  # noqa: SLF001
-    bridge._pending_clients["r1"] = "A"  # noqa: SLF001
+    # Clients "A" and "B" each have a call in flight (as if mid-round-trip),
+    # plus one standalone-tagged call.
+    bridge._pending_clients.update({"r1": "A", "r2": "B", "r3": "B", "r4": None})  # noqa: SLF001
 
-    # Client "B" polling status must NOT see A's activity...
-    assert bridge._status(client_id="B")["pendingCalls"] == 0  # noqa: SLF001
-    # ...A sees its own...
     assert bridge._status(client_id="A")["pendingCalls"] == 1  # noqa: SLF001
-    # ...and standalone (no client_id) keeps the full global count.
+    assert bridge._status(client_id="B")["pendingCalls"] == 2  # noqa: SLF001
+    assert bridge._status(client_id="C")["pendingCalls"] == 0  # noqa: SLF001
+    # Standalone is just another key: it sees its own, not the whole process.
     assert bridge._status()["pendingCalls"] == 1  # noqa: SLF001
 
 
@@ -368,10 +424,18 @@ class _FakeBridge:
         self._raises = raises
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.client_ids: list[str | None] = []
+        self.client_labels: list[str | None] = []
 
-    async def call_tool(self, name: str, args: dict[str, Any], client_id: str | None = None) -> Any:
+    async def call_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        client_id: str | None = None,
+        client_label: str | None = None,
+    ) -> Any:
         self.calls.append((name, args))
         self.client_ids.append(client_id)
+        self.client_labels.append(client_label)
         if self._raises is not None:
             raise self._raises
         return self._result
@@ -395,6 +459,16 @@ async def test_dispatch_call_threads_client_id() -> None:
     await _dispatch_call(bridge, "snapshot", {"tabId": 1}, "client-abc")
     await _dispatch_call(bridge, "snapshot", {"tabId": 1})
     assert bridge.client_ids == ["client-abc", None]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_call_threads_client_label() -> None:
+    """The cosmetic session label rides alongside the id (it is what the
+    extension writes into the audit log); absent by default."""
+    bridge: Any = _FakeBridge(result=None)
+    await _dispatch_call(bridge, "snapshot", {"tabId": 1}, "client-abc", "checkout")
+    await _dispatch_call(bridge, "snapshot", {"tabId": 1})
+    assert bridge.client_labels == ["checkout", None]
 
 
 @pytest.mark.asyncio
