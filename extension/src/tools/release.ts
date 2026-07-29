@@ -18,7 +18,7 @@
  */
 
 import { detach } from './cdp.js';
-import { dropEpoch } from './ownership.js';
+import { dropEpoch, getEpoch } from './ownership.js';
 import { persistEpochs } from './ownership-store.js';
 import type { Tool } from './types.js';
 
@@ -28,6 +28,13 @@ export const releaseTabs: Tool = async (args) => {
   let released = 0;
   let dropped = false;
   for (const tabId of tabIds) {
+    // Defence in depth: only ever touch a tab WE created. The daemon refuses
+    // this tool by name for any MCP client (bridge.INTERNAL_TOOLS) precisely
+    // because `tabIds` is an array the ownership gate never inspects; if that
+    // gate were ever bypassed, an arbitrary id list must still be inert here.
+    // Only agent-created tabs have a recorded epoch, so this is exactly the
+    // right filter — and it is fail-closed.
+    if (getEpoch(tabId) === undefined) continue;
     await detach(tabId);
     try {
       // The human owns it now; a tab that keeps agent-imposed mute would be a

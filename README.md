@@ -303,7 +303,6 @@ features are deliberately *not* here:
 | Kimi feature | Why Sallyport omits it | If you need the behaviour |
 |---|---|---|
 | `network` (start/stop/list/detail HTTP capture via `Network.enable`) | Kimi's version captures auth headers, cookies, and every request body with no per-domain gate — that ungated shape is what Sallyport omits. | Use `network_tail`: a gated subset — opt-in per popup, **response bodies only** (no headers/cookies), origin-filtered to the allowlist. Or `fetch_in_page` against a specific URL. |
-| `save_as_pdf` (`Page.printToPDF`) | Niche — `screenshot` (full-page PNG/JPEG) already covers "preserve what's on screen" for the agent tasks we've seen. | Speak up if you hit a case where selectable PDF text matters; trivial to add. |
 | `_session` (per-agent Chrome tab groups, coloured) | Cosmetic flair that complicates tab handling without solving a real problem at current scale. | Use `list_tabs` to find what you opened. |
 
 `find_tab` is also intentionally absent: Sallyport's `list_tabs` returns the
@@ -314,6 +313,9 @@ full set and the agent filters client-side — one round trip instead of two.
 Three layers, from fastest to most realistic:
 
 ### A. Wire only — no MCP, no Claude Code
+
+> A running broker owns the port, so stop it first (`sallyport-daemon doctor
+> --stop-broker`) or pass a different `--port` and update the popup's daemon URL.
 
 Confirms HMAC pairing, allowlist, audit log without any tools firing.
 

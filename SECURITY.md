@@ -30,8 +30,9 @@ Concretely we try to defend against:
 2. **An agent over-reaching its scope** — the per-domain allowlist gates
    every DOM tool, the per-domain `evaluate` flag gates arbitrary JS, the
    per-tool `password_field` / `unsafe_path` / `wrong_element` checks
-   gate the most damaging actions, and `close_tab` won't even close
-   non-allowlisted tabs.
+   gate the most damaging actions, and `close_tab` won't close a
+   non-allowlisted tab — unless it is one the calling session created
+   itself, where proven ownership stands in for the allowlist.
 3. **Filesystem exfiltration via `upload`** — the daemon-side sandbox
    (`~/Downloads/sallyport/` by default, override `SALLYPORT_DOWNLOAD_DIR`)
    rejects paths outside the sandbox; `Path.resolve()` defeats symlink
@@ -63,7 +64,7 @@ the "Tools" table for per-tool notes. Quick reference:
 | Daemon ↔ extension authenticity | HMAC-SHA256, ts±30 s, 4096-nonce cache | `daemon/.../protocol.py`, `extension/src/crypto.ts` |
 | Network exposure | Loopback-only bind (`refuse_non_loopback`) | `daemon/.../__main__.py` |
 | Domain scope | Allowlist enforced before every DOM tool | `extension/src/allowlist.ts`, `extension/src/tools/gates.ts` |
-| Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, `snapshot`'s DOM-fallback walker, `screenshot`'s `document.visibilityState` probe, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `domtree.ts`, `screenshot.ts`, `aim.ts` |
+| Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, `snapshot`'s DOM-fallback walker, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `domtree.ts`, `aim.ts`. `screenshot` and `print_to_pdf` run NO page JS at all — structured CDP only |
 | Password input | `fill` reads `type` via browser DOM; `key_type`/`send_keys` enumerate frames (temporary flat child sessions for OOPIFs), locate focused AX nodes through closed shadow DOM, then inspect browser-owned DOM attributes | `extension/src/tools/dom.ts`, `focus.ts`, `keyboard.ts` |
 | Closing tabs | Allowlist-gated like other DOM tools, EXCEPT a tab the caller created in broker mode: the daemon has already proved ownership, which is a stronger answer to "may I destroy this tab" (and without it an agent tab that redirected off-allowlist could never be closed by its owner) | `extension/src/tools/tabs.ts:closeTab` |
 | Filesystem (write) | `save_to_file` and `print_to_pdf`'s daemon post-call processor sandbox to `~/Downloads/sallyport/` (shared `_write_sandbox_blob`: filename rules + resolved-path containment re-check) | `daemon/.../local_tools.py:save_to_file`, `POST_CALL_PROCESSORS` |

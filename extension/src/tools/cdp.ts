@@ -240,7 +240,12 @@ async function releaseKeepAwake(tabId: number): Promise<void> {
  * attached, is simply not our problem. `chrome.debugger.onDetach` does the
  * bookkeeping (attached set, refs, capture rings). */
 export async function detach(tabId: number): Promise<void> {
-  if (!attached.has(tabId)) return;
+  // UNCONDITIONAL, deliberately not gated on the in-memory `attached` set — the
+  // same reasoning as keep-awake's off-path. That set is ephemeral module
+  // state an MV3 service-worker restart wipes, while the underlying CDP session
+  // survives it, so a gated detach would silently no-op for exactly the tabs
+  // that have been attached longest. Detaching a tab we never held is a
+  // harmless no-op that throws, which we swallow.
   try {
     await chrome.debugger.detach({ tabId });
   } catch {

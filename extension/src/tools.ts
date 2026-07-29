@@ -88,10 +88,14 @@ const internalTools: Record<string, Tool> = {
  * `finally` — a second call would have its handles freed under it and its `@eN`
  * refs renumbered.
  *
- * Ownership is exclusive per client (invariant #13) and each client has one
- * lane, so in broker mode this chain is never actually contended — it is
- * defence-in-depth, and it costs nothing when uncontended. In standalone, where
- * two calls really can target one tab, it is load-bearing. */
+ * It is defence-in-depth EVERYWHERE, not a load-bearing gate: the daemon's
+ * per-client lane is what actually serialises, and since ownership is exclusive
+ * per client (invariant #13) "one call per client" already implies "one call
+ * per tab". Standalone is a single lane too, so it is uncontended there as
+ * well. The point is that this file is the one chokepoint every tool passes
+ * through, so a future change that widens daemon concurrency cannot silently
+ * corrupt per-tab state (refs, snapshot/mouse object groups) before anyone
+ * notices. It costs nothing when uncontended. */
 const tabChains = new Map<number, Promise<unknown>>();
 
 function onTab<T>(tabId: number | undefined, run: () => Promise<T>): Promise<T> {
@@ -109,11 +113,6 @@ function onTab<T>(tabId: number | undefined, run: () => Promise<T>): Promise<T> 
     if (tabChains.get(tabId) === settled) tabChains.delete(tabId);
   });
   return next;
-}
-
-/** Reset the per-tab chains (test hook). */
-export function resetTabChains(): void {
-  tabChains.clear();
 }
 
 export async function runTool(name: string, args: Record<string, unknown>): Promise<unknown> {

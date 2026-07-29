@@ -625,3 +625,48 @@ def test_build_server_wires_a_named_server() -> None:
     registration. Catches type-signature regressions in the mcp SDK glue."""
     server = build_server(_FakeBridge())  # type: ignore[arg-type]
     assert server.name == "sallyport"
+
+
+async def test_internal_tools_are_not_callable_by_a_client() -> None:
+    """`_release_tabs` is daemon-initiated housekeeping. Absence from the MCP
+    catalogue is NOT a gate — the SDK forwards an unlisted name to our handler
+    unvalidated and `call_tool` routes anything that isn't a builtin or a local
+    tool straight to the extension. Worse, it acts on a `tabIds` ARRAY that the
+    ownership gate (which only ever inspects `args["tabId"]`) never sees, so a
+    client owning one tab could name it with `tabIds:[1..N]` and deregister
+    every tab in the profile, including other sessions' and the human's."""
+    from sallyport_daemon.bridge import RELEASE_TABS_TOOL, Bridge, ToolError
+
+    bridge = Bridge(secret=bytes(32), host="127.0.0.1", port=10086, broker_mode=True)
+    # Own a tab, so the ownership gate would have been satisfied.
+    bridge._ownership.record_create("A", 42, "e1", opened_at=0.0)  # noqa: SLF001
+
+    with pytest.raises(ToolError) as excinfo:
+        await bridge.call_tool(RELEASE_TABS_TOOL, {"tabId": 42, "tabIds": [1, 2, 3]}, "A")
+    assert excinfo.value.code == "unknown_tool"
+    # Standalone can't reach it either — this is a name gate, not an ownership one.
+    with pytest.raises(ToolError) as excinfo:
+        await bridge.call_tool(RELEASE_TABS_TOOL, {"tabIds": [1, 2, 3]})
+    assert excinfo.value.code == "unknown_tool"
+
+
+async def test_release_tabs_in_browser_still_reaches_the_wire() -> None:
+    """The daemon's own housekeeping path bypasses `call_tool` (which now
+    refuses the name), and swallows failures — a disconnect path must never
+    raise into the accept loop."""
+    from sallyport_daemon.bridge import RELEASE_TABS_TOOL, Bridge
+
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    class _SpyBridge(Bridge):
+        async def _call_tool_locked(self, name, args, client_id=None):  # type: ignore[no-untyped-def]
+            sent.append((name, args))
+            raise RuntimeError("extension went away mid-release")
+
+    bridge = _SpyBridge(secret=bytes(32), host="127.0.0.1", port=10086, broker_mode=True)
+    await bridge.release_tabs_in_browser([11, 12])  # must not raise
+    assert sent == [(RELEASE_TABS_TOOL, {"tabIds": [11, 12]})]
+    # An empty release is a no-op, not a wasted round-trip.
+    sent.clear()
+    await bridge.release_tabs_in_browser([])
+    assert sent == []

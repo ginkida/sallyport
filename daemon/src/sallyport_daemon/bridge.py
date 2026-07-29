@@ -46,10 +46,22 @@ class ExtensionNotConnected(Exception):
 BUILTIN_TOOLS = frozenset({"status"})
 
 # Extension-side housekeeping tool the daemon calls on its own initiative when a
-# broker client disconnects. Deliberately absent from the MCP catalogue (no
-# agent ever calls it) and leading-underscored so it can never collide with a
+# broker client disconnects. Leading-underscored so it can never collide with a
 # real tool name.
 RELEASE_TABS_TOOL = "_release_tabs"
+
+# Tool names the DAEMON may send but an MCP client may NOT ask for.
+#
+# Absence from the MCP catalogue is not a gate: the SDK forwards an unlisted
+# tool name to our handler unvalidated, and `call_tool` routes anything that
+# isn't a builtin or a local tool straight to the extension. `_release_tabs`
+# takes a `tabIds` ARRAY that the ownership gate — which only ever inspects
+# `args["tabId"]` — never sees, so a client with one owned tab could name it
+# with `tabIds:[1..N]` and detach/unmute/deregister every tab in the profile,
+# including other sessions' and the human's. This set is the actual gate: a
+# client naming one of these gets `unknown_tool`, exactly as if it did not
+# exist, and the daemon's own call path bypasses `call_tool` entirely.
+INTERNAL_TOOLS = frozenset({RELEASE_TABS_TOOL})
 
 # Diagnostic last-call ring surfaced via `status`: how many recent calls to
 # keep PER CLIENT, and the cap on the echoed error string (mirrors the
@@ -491,6 +503,12 @@ class Bridge:
         if name == "status":
             return self._status(client_id)
 
+        # Daemon-only tools are not part of the agent-facing surface at all.
+        # Refuse by NAME before anything else looks at the arguments — see
+        # INTERNAL_TOOLS for why absence from the catalogue is not enough.
+        if name in INTERNAL_TOOLS:
+            raise ToolError(f"unknown tool: {name}", code="unknown_tool")
+
         # Local-only tools run in this process and don't need the extension.
         # Imported lazily to avoid a circular reference (local_tools imports
         # ToolError from this module).
@@ -632,14 +650,28 @@ class Bridge:
         that caused them. The tabs themselves stay OPEN (invariant #13's
         orphan-don't-close rule) — the human decides what to do with them.
 
+        Goes STRAIGHT to the wire rather than through `call_tool`, which now
+        refuses this tool by name (INTERNAL_TOOLS): the agent-facing entry point
+        is not a path the daemon's own housekeeping should be able to take
+        either, or the refusal would be one `if` away from being bypassable.
+        It takes a browser permit like any other call so it cannot jump a
+        saturated queue, but no lane — the client it belongs to is gone.
+
         Every failure is swallowed: the extension may already be gone, and a
         disconnect path must never raise into the accept loop."""
         if not tab_ids:
             return
         try:
-            await self.call_tool(RELEASE_TABS_TOOL, {"tabIds": tab_ids})
+            await self._permits.acquire(timeout=self._queue_timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            log.debug("ws: no free slot to release tabs %s", tab_ids)
+            return
+        try:
+            await self._call_tool_locked(RELEASE_TABS_TOOL, {"tabIds": tab_ids})
         except Exception:  # noqa: BLE001 - best-effort housekeeping
             log.debug("ws: releasing tabs %s failed", tab_ids, exc_info=True)
+        finally:
+            self._permits.release()
 
     def _record_call(
         self,

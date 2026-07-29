@@ -647,11 +647,21 @@ def ensure_port_available(host: str, port: int, config_dir: Path) -> None:
     print(f"Sallyport: refusing to start — {host}:{port} is already in use.", file=sys.stderr)
     for line in _describe_port_holder(port, config_dir):
         print(line.strip(), file=sys.stderr)
-    print(
-        "Sallyport: stop that daemon, run `sallyport-daemon doctor --kill-stale`, "
-        "or start with a different --port.",
-        file=sys.stderr,
-    )
+    if _port_held_by_broker(port, config_dir):
+        # --kill-stale deliberately refuses to touch a broker, so advising it
+        # here would send the user to a guaranteed no-op — and now that a broker
+        # starts itself, it is the usual holder.
+        print(
+            "Sallyport: that's the shared broker. Run `sallyport-daemon doctor --stop-broker` "
+            "to stop it, or start with a different --port.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "Sallyport: stop that daemon, run `sallyport-daemon doctor --kill-stale`, "
+            "or start with a different --port.",
+            file=sys.stderr,
+        )
     sys.exit(2)
 
 
@@ -918,7 +928,9 @@ async def _run_exec(
         # is the default. `status` routes there too: the interesting health is
         # the shared broker's, not a throwaway Bridge this process just built.
         sock_path = broker_socket_path(args.port, Path(args.secret_file).parent)
-        if secret and await broker_is_available(sock_path):
+        # --no-broker means what it says here too: own the port, or fail with
+        # the port-holder message (which names `doctor --stop-broker`).
+        if secret and auto_broker_enabled(args) and await broker_is_available(sock_path):
             shutdown.set()
             return await _run_exec_via_broker(args, secret, sock_path)
         if args.tool in BUILTIN_TOOLS:
@@ -1241,12 +1253,20 @@ async def _run_shim(
         name="broker-shim",
     )
     stop = asyncio.create_task(shutdown.wait(), name="shim-shutdown")
+    # Same backstop the stdio daemon has always had, and now MORE needed, not
+    # less: the shim is the default path, and if Claude Code dies without our
+    # stdin reaching EOF (its write end inherited by a surviving grandchild)
+    # `pump_up` blocks on readline() forever. It holds no port any more, but it
+    # does hold one of the broker's authenticated client slots — leak enough of
+    # those and the broker starts refusing real sessions.
+    watchdog = asyncio.create_task(_watch_parent(shutdown), name="parent-watchdog")
     try:
-        await asyncio.wait({shim, stop}, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait({shim, stop, watchdog}, return_when=asyncio.FIRST_COMPLETED)
     finally:
         stop.cancel()
         shim.cancel()
-        results = await asyncio.gather(shim, stop, return_exceptions=True)
+        watchdog.cancel()
+        results = await asyncio.gather(shim, stop, watchdog, return_exceptions=True)
         sock_writer.close()
         with contextlib.suppress(OSError):
             await sock_writer.wait_closed()
@@ -1465,6 +1485,7 @@ async def amain(args: argparse.Namespace) -> int:
         state = BrokerState()
         mcp_server: asyncio.Server | None = None
         sock_ident: tuple[int, int] | None = None
+        ws_died = False
         try:
             # Publish the MCP socket only once the browser leg is actually bound.
             # A broker that lost the port race would otherwise still bind the
@@ -1506,10 +1527,21 @@ async def amain(args: argparse.Namespace) -> int:
             # Watch the WS task too: if the browser leg dies mid-life, the broker
             # is useless and must exit loudly rather than keep serving sessions
             # that can never reach a browser.
-            await asyncio.wait({ws_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+            ended, _ = await asyncio.wait(
+                {ws_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+            )
             for task in (idle_task, stop_task):
                 task.cancel()
             await asyncio.gather(idle_task, stop_task, return_exceptions=True)
+            if ws_task in ended:
+                exc = ws_task.exception() if not ws_task.cancelled() else None
+                print(
+                    "Sallyport: broker's browser leg died"
+                    + (f" ({exc})" if exc else "")
+                    + " — exiting; attached sessions have no browser tools.",
+                    file=sys.stderr,
+                )
+                ws_died = True
         finally:
             if mcp_server is not None:
                 mcp_server.close()
@@ -1529,10 +1561,14 @@ async def amain(args: argparse.Namespace) -> int:
             if not ws_task.done():
                 ws_task.cancel()
                 await asyncio.gather(ws_task, return_exceptions=True)
+            print(
+                f"Sallyport: broker stopped after serving {state.served_total} session(s).",
+                file=sys.stderr,
+            )
             remove_pidfile(pidpath)
             remove_status(statuspath)
             release_broker_lock(broker_lock_fd)
-        return 0
+        return 1 if ws_died else 0
 
     write_pidfile(pidpath, args.port)
     ws_task = asyncio.create_task(bridge.serve_forever(shutdown=shutdown), name="ws-server")

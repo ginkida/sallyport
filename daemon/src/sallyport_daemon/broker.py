@@ -68,6 +68,20 @@ MAX_PENDING_HANDSHAKES = MAX_BROKER_CLIENTS * 4
 MAX_LABEL_CHARS = 24
 
 
+def _running_version() -> str:
+    from .pidfile import daemon_version
+
+    return daemon_version()
+
+
+# Snapshotted at import, NOT read per handshake. `daemon_version()` goes to
+# `importlib.metadata`, which re-reads the on-disk dist-info — so a broker that
+# started before a `pip install -U` would cheerfully advertise the NEW version
+# while still running the OLD code in memory, and the skew warning could never
+# fire for the upgrade case it exists for. This is the build actually running.
+RUNNING_VERSION = _running_version()
+
+
 def sanitise_label(raw: Any) -> str | None:
     """Normalise a peer-declared session label, or None if unusable.
 
@@ -206,10 +220,8 @@ async def authenticate_connection(
     # The ack carries the broker's own version and nothing else identifying:
     # the clientId stays internal (it scopes ownership broker-side and never
     # travels to the peer). The version lets a shim warn when it is relaying to
-    # a broker from a different install than the one it was launched from.
-    from .pidfile import daemon_version
-
-    ack = signer.sign(Envelope(type="hello_ack", body={"version": daemon_version()}))
+    # a broker running a different build than the session was launched from.
+    ack = signer.sign(Envelope(type="hello_ack", body={"version": RUNNING_VERSION}))
     try:
         await write_frame(writer, _dump_json(ack))
     except (OSError, FramingError):
@@ -548,6 +560,10 @@ async def start_broker_server(
     caller already holds (``__main__`` takes it before the WS port guard so the
     port and the socket are claimed under ONE mutex); if omitted this function
     takes it itself and refuses to bind when another broker holds it."""
+    if not socket_path_is_bindable(path):
+        # Otherwise this surfaces as a raw "AF_UNIX path too long" OSError out of
+        # asyncio, AFTER the WS port is bound and the pidfile written.
+        raise BrokerError(f"{path} is too long for an AF_UNIX socket")
     _prepare_socket_dir(path)
     own_lock = False
     if lock_fd is None:
@@ -797,7 +813,11 @@ async def run_shim(
         # Claude Code closed our stdin (normal); `down` draining means the
         # broker's socket EOF'd (it died or was killed) and this session now has
         # no browser tools at all.
-        return "client" if up in done else "broker"
+        # Prefer "broker" when BOTH pumps completed: `pump_up` also breaks on an
+        # OSError writing to the broker socket, which is exactly what happens if
+        # the broker dies while Claude Code is mid-request — reporting that as a
+        # clean client exit is the silent-0 this distinction exists to avoid.
+        return "broker" if down in done else "client"
     finally:
         for task in (up, down):
             task.cancel()
@@ -815,9 +835,7 @@ def _warn_on_version_skew(broker_version: Any) -> None:
         return
     import sys
 
-    from .pidfile import daemon_version
-
-    mine = daemon_version()
+    mine = RUNNING_VERSION
     if broker_version != mine:
         print(
             f"Sallyport: attached to a broker running {broker_version} while this session is "
