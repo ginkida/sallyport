@@ -11,19 +11,23 @@ uses [Semantic Versioning](https://semver.org/).
 - **Popup setting: "close a session's tabs when it disconnects."** Off by
   default, and deliberately so — an agent's tabs are usually the result you
   wanted to see, and closing half-finished work is exactly the loss
-  `close_tab`'s allowlist gate exists to prevent. Turn it on for **ephemeral**
+  `close_tab`'s allowlist gate exists to prevent. It is useful for **ephemeral**
   agents: a dispatched one-shot run is a fresh MCP session every time, so each
   run's tabs are orphaned on exit and no later session can reach them (tabs are
-  owner-scoped and the ownership epoch is dropped on release), which means they
-  accumulate until a human sweeps them from the popup.
+  owner-scoped), which means they accumulate until a human sweeps them from the
+  popup's **Agent tabs** panel.
+
+  The switch is **global** and cannot be otherwise — the extension is
+  identity-blind by design and the session label never reaches this path — so
+  with it on, every disconnecting session's tabs are closed, including your own
+  interactive one. Closing a tab additionally requires the daemon's recorded
+  ownership epoch to match the one the extension minted, so a recycled tab id
+  cannot destroy a live tab belonging to a different session; on a mismatch the
+  tab is handed back instead. It does no allowlist re-check, so an agent tab is
+  closed wherever it has since navigated.
 
 ### Changed
 
-- `screenshot`'s schema now says that `region`/`maxWidth` are **observable on
-  the page**: Chrome implements a clipped capture by resizing the tab's view to
-  the clip and restoring it afterwards, so the page reflows and fires `resize`.
-  The description previously recommended `maxWidth` as a free way to cut the
-  payload; on a layout-sensitive page it can change what you capture.
 - The `busy` recovery hint no longer tells an agent to check its own
   `pendingCalls` — that counter is populated only after a browser slot is
   taken, so a call rejected with `busy` never appears in it and reads 0. There

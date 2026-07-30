@@ -133,13 +133,12 @@ export const screenshot: Tool = async (args) => {
   const params: Record<string, unknown> = { format };
   if (format === 'jpeg') params.quality = typeof args.quality === 'number' ? args.quality : 80;
 
-  // A clip is NOT free: Chrome implements a clipped capture by resizing the
-  // tab's view to the clip dimensions and restoring it in the completion
-  // handler, so the live page reflows and fires `resize` mid-capture. That is
-  // inherent for `region` (there is no other way to crop server-side) and is
-  // the price of `maxWidth` too — downscaling without a clip would need a
-  // rasteriser in the daemon. The MCP schema says so, so an agent reaching for
-  // maxWidth "to cut size" knows it is touching the page.
+  // A clip DOES make Chrome resize the widget browser-side
+  // (page_handler.cc SetSize + restore), but it applies a compensating device
+  // emulation at the same time, so the page does NOT observe a reflow or a
+  // `resize` event. Checked against Chrome 150 — an earlier version of this
+  // comment claimed the opposite and was wrong. Don't warn agents off `region`
+  // or `maxWidth` on that basis.
   if (region || maxWidth !== null) {
     const metrics = await cdp<{
       cssVisualViewport?: {

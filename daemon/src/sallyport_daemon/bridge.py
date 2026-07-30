@@ -620,12 +620,14 @@ class Bridge:
         )
         return result
 
-    def release_client(self, client_id: str | None) -> list[int]:
+    def release_client(self, client_id: str | None) -> dict[int, str | None]:
         """Release a disconnected broker client's tab ownership (invariant #13).
 
-        Called by the broker when an MCP connection closes. The tabs stay OPEN —
-        they merely become unowned, so the human can use or close them — rather
-        than auto-closing work the agent left behind. Returns the released tab
+        Called by the broker when an MCP connection closes. By DEFAULT the tabs
+        stay open — they merely become unowned, so the human can use or close
+        them — rather than auto-closing work the agent left behind; the
+        extension's `closeAgentTabsOnDisconnect` setting (popup, off by default)
+        opts into closing them instead. Returns the released tab
         ids so the caller can ask the extension to stop *driving* them (detach
         the debugger, drop the focus emulation); leaving them attached is what
         made Chrome's "started debugging this browser" bar outlive every session
@@ -636,22 +638,27 @@ class Bridge:
         clientIds are minted fresh per connection, so without this both would
         accumulate for the whole (long) life of a broker process."""
         if client_id is None:
-            return []
-        released = sorted(self._ownership.release_client(client_id))
+            return {}
+        owned = self._ownership.release_client(client_id)
+        released = {tab_id: tab.epoch for tab_id, tab in owned.items()}
         self._lanes.drop(client_id)
         self._last_calls.pop(client_id, None)
         self._last_error.pop(client_id, None)
         return released
 
-    async def release_tabs_in_browser(self, tab_ids: list[int]) -> None:
+    async def release_tabs_in_browser(self, tabs: dict[int, str | None]) -> None:
         """Ask the extension to stop DRIVING a disconnected client's tabs.
 
         Fire-and-forget housekeeping, not a gate: it detaches the debugger and
         drops the focus emulation on tabs whose session is gone, so Chrome's
         "started debugging this browser" bar, the disabled back/forward cache
         and the "this tab thinks it is focused" override don't outlive the agent
-        that caused them. The tabs themselves stay OPEN (invariant #13's
-        orphan-don't-close rule) — the human decides what to do with them.
+        that caused them. By DEFAULT the tabs themselves stay open and the human
+        decides what to do with them; the extension's
+        `closeAgentTabsOnDisconnect` setting (popup, off by default) closes them
+        instead — which is why the epoch travels with each id: a close is allowed
+        only when it matches. Orphan-don't-close is the DEFAULT, not part of
+        invariant #13; do not reason about it as one.
 
         Goes STRAIGHT to the wire rather than through `call_tool`, which now
         refuses this tool by name (INTERNAL_TOOLS): the agent-facing entry point
@@ -660,19 +667,26 @@ class Bridge:
         It takes a browser permit like any other call so it cannot jump a
         saturated queue, but no lane — the client it belongs to is gone.
 
-        Every failure is swallowed: the extension may already be gone, and a
-        disconnect path must never raise into the accept loop."""
-        if not tab_ids:
+        Every failure is swallowed — the extension may already be gone (a paused
+        bridge has no WS client at all), and a disconnect path must never raise
+        into the accept loop — but a DROPPED release is logged at warning, not
+        debug: it means those tabs keep their debugger session, and the popup's
+        sweep is then the only way to tidy them."""
+        if not tabs:
             return
+        payload = [
+            {"tabId": tab_id, **({"epoch": epoch} if epoch is not None else {})}
+            for tab_id, epoch in sorted(tabs.items())
+        ]
         try:
             await self._permits.acquire(timeout=self._queue_timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError):
-            log.debug("ws: no free slot to release tabs %s", tab_ids)
+            log.warning("ws: no free browser slot to release tabs %s", sorted(tabs))
             return
         try:
-            await self._call_tool_locked(RELEASE_TABS_TOOL, {"tabIds": tab_ids})
+            await self._call_tool_locked(RELEASE_TABS_TOOL, {"tabs": payload})
         except Exception:  # noqa: BLE001 - best-effort housekeeping
-            log.debug("ws: releasing tabs %s failed", tab_ids, exc_info=True)
+            log.warning("ws: releasing tabs %s failed", sorted(tabs), exc_info=True)
         finally:
             self._permits.release()
 

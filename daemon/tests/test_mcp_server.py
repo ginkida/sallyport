@@ -323,12 +323,14 @@ async def test_release_client_drops_lane_ring_and_returns_owned_tabs(tmp_path: A
         await bridge.call_tool("snapshot", {"tabId": 11}, "A")
     assert len(bridge._lanes) == 1  # noqa: SLF001
 
-    assert bridge.release_client("A") == [11, 12]
+    # Returns {tabId: epoch}: the epoch is what lets the extension tell "the tab
+    # this client created" from "some tab that now has the same id".
+    assert bridge.release_client("A") == {11: "e1", 12: "e2"}
     assert len(bridge._lanes) == 0  # noqa: SLF001
     assert bridge._status(client_id="A")["lastCalls"] == []  # noqa: SLF001
     assert bridge._status(client_id="A")["lastError"] is None  # noqa: SLF001
     # Standalone has no per-client anything and is a no-op.
-    assert bridge.release_client(None) == []
+    assert bridge.release_client(None) == {}
 
 
 def test_status_pending_calls_owner_scoped_in_broker_mode() -> None:
@@ -664,9 +666,14 @@ async def test_release_tabs_in_browser_still_reaches_the_wire() -> None:
             raise RuntimeError("extension went away mid-release")
 
     bridge = _SpyBridge(secret=bytes(32), host="127.0.0.1", port=10086, broker_mode=True)
-    await bridge.release_tabs_in_browser([11, 12])  # must not raise
-    assert sent == [(RELEASE_TABS_TOOL, {"tabIds": [11, 12]})]
+    await bridge.release_tabs_in_browser({11: "e1", 12: None})  # must not raise
+    # Each id carries the recorded epoch so the extension can refuse to CLOSE a
+    # recycled id; a tab with no epoch on record simply travels without one
+    # (fail-closed extension-side: no epoch means hand back, never close).
+    assert sent == [
+        (RELEASE_TABS_TOOL, {"tabs": [{"tabId": 11, "epoch": "e1"}, {"tabId": 12}]})
+    ]
     # An empty release is a no-op, not a wasted round-trip.
     sent.clear()
-    await bridge.release_tabs_in_browser([])
+    await bridge.release_tabs_in_browser({})
     assert sent == []

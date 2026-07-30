@@ -131,10 +131,15 @@ windows in the human's profile — same cookie jar, same logins — because the
 point of driving the user's own browser is that an agent inherits the sessions
 they are already signed into. The separation is ownership, never identity: there
 is no incognito/profile boundary here and adding one would break that premise.
-When a session disconnects its tabs stay OPEN but stop being driven — the daemon
-fires an internal `_release_tabs` so the debugger detaches, ending Chrome's
-"started debugging this browser" bar, the disabled back/forward cache and the
-sticky focus emulation for tabs whose agent is gone.
+When a session disconnects its tabs stop being driven — the daemon fires an
+internal `_release_tabs` so the debugger detaches, ending Chrome's "started
+debugging this browser" bar, the disabled back/forward cache and the sticky focus
+emulation for tabs whose agent is gone. By DEFAULT the tabs themselves stay open;
+the popup's `closeAgentTabsOnDisconnect` (off by default) closes them instead.
+That switch is browser-global — the extension is identity-blind, so it cannot
+distinguish an ephemeral agent from an interactive one — and a close requires the
+daemon's recorded ownership epoch to match the extension's, so a recycled tab id
+cannot destroy a live tab belonging to a different session.
 
 **Honest framing — what broker mode is and isn't.** It is a **software partition**
 of one shared browser profile, bounded by the allowlist + ownership + secret-gated
@@ -239,9 +244,11 @@ a confinement hole.
 The tidiness half is now largely handled from the other direction: on disconnect
 the daemon calls the extension (daemon→extension is an ordinary `tool_call`, so
 no protocol bump) to stop driving that session's tabs, and the popup's **Agent
-tabs** section lists what every session left open with a one-click sweep. A tab
-the registry never learned about still won't appear there — that is the residual
-gap, and it is still just a tab.
+tabs** section lists what every session left open with a one-click sweep — the
+released tabs keep their extension-side ownership epoch precisely so they stay
+visible to it (it grants no access: the daemon has already forgotten them, so no
+client can name them). A tab the registry never learned about still won't appear
+there — that is the residual gap, and it is still just a tab.
 
 ### Broker mode: concurrency is capped, and the cap is shared
 

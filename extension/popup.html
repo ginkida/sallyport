@@ -141,9 +141,13 @@
           </label>
           <div class="muted small hint">
             Off by default: an agent's tabs are usually the result you wanted to see, and closing
-            half-finished work is what close_tab's gate protects against. Turn it on for
-            dispatched/one-shot agents — each run is a new session, so their tabs otherwise pile up
-            with no later session able to reach them.
+            half-finished work is what close_tab's gate protects against. Useful for
+            dispatched/one-shot agents, whose tabs pile up. This switch is GLOBAL — it cannot tell a
+            dispatched agent from an interactive one, so with it on your own session's tabs are
+            closed too when it exits. Closing is skipped for a tab whose ownership epoch no longer
+            matches, and it does no allowlist re-check: an agent tab is closed wherever it has since
+            navigated. No effect without a broker (--no-broker), and skipped while paused or while
+            the extension is disconnected.
           </div>
         </details>
 
@@ -151,8 +155,8 @@
           <summary>Agent tabs (<span id="agent-tab-count">0</span>)</summary>
           <div class="muted small hint">
             Tabs the agents opened, grouped by session. They are ordinary tabs in this profile —
-            same logins as yours — and they stay open when a session ends, so this is where you
-            sweep up what's left behind.
+            same logins as yours — and by default they stay open when a session ends, so this is
+            where you sweep up what's left behind.
           </div>
           <ul id="agent-tab-list" class="muted small tool-list"></ul>
           <div class="row">

@@ -356,11 +356,13 @@ async def _serve_authenticated(
         async with mcp_socket_streams(reader, writer, signer) as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
     finally:
-        # Release this client's owned tabs (invariant #13): they stay OPEN but
-        # become unowned, so the human can use/close them. We do ask the browser
-        # to stop DRIVING them (detach the debugger, drop the focus emulation) —
-        # otherwise Chrome's "started debugging this browser" bar and the
-        # disabled back/forward cache outlive every session that ever ran.
+        # Release this client's owned tabs (invariant #13). By default they stay
+        # open but become unowned, so the human can use/close them; the
+        # extension's `closeAgentTabsOnDisconnect` setting closes them instead.
+        # Either way we ask the browser to stop DRIVING them (detach the
+        # debugger, drop the focus emulation) — otherwise Chrome's "started
+        # debugging this browser" bar and the disabled back/forward cache
+        # outlive every session that ever ran.
         released = bridge.release_client(identity.id)
         if released:
             await bridge.release_tabs_in_browser(released)

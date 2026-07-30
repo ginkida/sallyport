@@ -22,10 +22,14 @@ function idsInHtml(html: string): Set<string> {
   return new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
 }
 
-/** Ids `popup.ts` looks up via the `$('#id')` helper. Only plain literal
- * selectors — a computed one could not be checked statically anyway. */
+/** Every `'#id'` string literal in `popup.ts`, not only those written directly
+ * inside `$(...)`. Selector-taking helpers matter too: `flash(sel)` does
+ * `$(sel)` internally and is called with `'#status-flash'` / `'#allow-flash'`,
+ * which a `$\('#…'\)`-only pattern misses entirely — identical runtime shape,
+ * identical failure. Computed selectors (`$(\`#tab-${id}\`)`) cannot be checked
+ * statically and are out of scope. */
 function idsUsedInTs(ts: string): Set<string> {
-  return new Set([...ts.matchAll(/\$\(\s*'#([A-Za-z0-9_-]+)'/g)].map((m) => m[1]));
+  return new Set([...ts.matchAll(/'#([A-Za-z0-9_-]+)'/g)].map((m) => m[1]));
 }
 
 describe('popup.ts <-> popup.html wiring', () => {

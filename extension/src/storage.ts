@@ -44,10 +44,16 @@ export type Settings = {
    * leaving them open and unowned (release.ts). Default OFF: closing an
    * agent's half-finished work is exactly the loss `close_tab`'s allowlist gate
    * exists to prevent, and for an interactive session the tabs are usually
-   * what you want to look at. Turn it ON for EPHEMERAL agents — a dispatched
+   * what you want to look at. Useful for EPHEMERAL agents — a dispatched
    * one-shot run is a fresh session every time, so its tabs otherwise
-   * accumulate with nobody able to reach them (a later session can't: tabs are
-   * owner-scoped, and its ownership epoch is dropped on release). */
+   * accumulate (a later session can't reach them: tabs are owner-scoped).
+   *
+   * GLOBAL, and it cannot be otherwise: the extension is identity-blind by
+   * design (ownership.ts) and the peer-declared session label never reaches
+   * this path, so with it on EVERY disconnecting session's tabs are closed —
+   * including your own interactive one. A close additionally requires the
+   * daemon's recorded ownership epoch to match (release.ts:mayClose), so a
+   * recycled tab id cannot destroy another session's tab. */
   closeAgentTabsOnDisconnect: boolean;
   /** Auto-answer native JS dialogs (alert/confirm/prompt/beforeunload) on
    * driven tabs (dialog-capture.ts) — an open dialog freezes the page's JS
