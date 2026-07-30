@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-07-30
+
 ### Added
 
 - **Popup setting: "close a session's tabs when it disconnects."** Off by
@@ -1913,7 +1915,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/ginkida/sallyport/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/ginkida/sallyport/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/ginkida/sallyport/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/ginkida/sallyport/compare/v0.15.0...v0.15.1
