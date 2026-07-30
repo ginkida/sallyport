@@ -133,7 +133,13 @@ describe('validatePattern', () => {
 
   it('rejects malformed', () => {
     expect(validatePattern('not a host')).toBeTruthy();
+  });
+
+  it('still refuses a dotless host that is not a reserved name', () => {
+    // Loosening this rule for `localhost` deliberately did NOT generalise to
+    // every label: `no-tld` stays refused, in both the exact and wildcard form.
     expect(validatePattern('no-tld')).toBeTruthy();
+    expect(validatePattern('*.no-tld')).toBeTruthy();
   });
 
   it('rejects malformed URL pattern', () => {
@@ -197,5 +203,127 @@ describe('matchAllowlist — port handling', () => {
 describe('normalizePattern', () => {
   it('trims and lowercases', () => {
     expect(normalizePattern('  EXAMPLE.com  ')).toBe('example.com');
+  });
+});
+
+describe('validatePattern — the localhost dev case, and how far it may go', () => {
+  const e = (pattern: string): AllowEntry => ({ pattern, allowEvaluate: false, addedAt: 0 });
+
+  it('accepts the shapes a local dev server actually needs', () => {
+    // The reason this rule was loosened at all: the matcher has always supported
+    // `localhost`, a test is named for it, and SECURITY.md offers it as why
+    // host-only entries match any port — but the Add field required a dot.
+    for (const p of [
+      'localhost',
+      '*.localhost',
+      '*.test',
+      'myapp.test',
+      'nas.local',
+      '*.corp.local',
+      '[::1]',
+      '127.0.0.1',
+      'http://localhost:3000/*',
+    ]) {
+      expect(validatePattern(p), p).toBeNull();
+    }
+  });
+
+  it('REFUSES a wildcard over a whole TLD — including via the URL form', () => {
+    // The URL branch is the reason this must be tested: `*` is not a forbidden
+    // host code point, so `new URL('https://*.com/')` parses with hostname
+    // `*.com` and lands in the same matcher. Leaving that branch unchecked put
+    // the entire rule nine characters from being bypassed.
+    for (const p of [
+      '*.com',
+      '*.dev',
+      '*.app',
+      '*.io',
+      'https://*.com/*',
+      'http://*.com/*',
+      'https://*.dev/*',
+    ]) {
+      expect(validatePattern(p), p).toBeTruthy();
+    }
+  });
+
+  it('REFUSES *.local and *.internal — unroutable is not trusted', () => {
+    // The mistake an earlier version of this rule made. `.local` is mDNS:
+    // unauthenticated, first-responder-wins, so it covers every device on
+    // whatever network the laptop is on. `.internal` is a whole intranet, and
+    // the agent drives the human's own logged-in profile. Both keep their
+    // scoped forms, asserted above.
+    expect(validatePattern('*.local')).toBeTruthy();
+    expect(validatePattern('*.internal')).toBeTruthy();
+  });
+
+  it('REFUSES a dotless host that is not a reserved name', () => {
+    // `localhost` has a specification behind it; `wiki` / `git` / `jira` are
+    // resolved by the DHCP search list, LLMNR or NBT-NS — unauthenticated,
+    // different on every network, the classic squatting target. Generalising to
+    // every label meant the gate stopped refusing anything dotless at all.
+    for (const p of ['wiki', 'git', 'jira', 'no-tld', 'com', 'dev', '-', '--']) {
+      expect(validatePattern(p), p).toBeTruthy();
+    }
+  });
+
+  it('REFUSES a wildcard over an IP literal — an IP has no subdomains', () => {
+    // `*.0.0.1` would reach 1.0.0.1 (a public resolver) and 10.0.0.1.
+    expect(validatePattern('*.0.0.1')).toBeTruthy();
+    expect(validatePattern('*.1.1')).toBeTruthy();
+  });
+
+  it('still refuses bare wildcards and malformed labels', () => {
+    expect(validatePattern('*')).toMatch(/scoped/);
+    expect(validatePattern('*.*')).toMatch(/scoped/);
+    expect(validatePattern('')).toMatch(/empty/);
+    expect(validatePattern('exa mple.com')).toMatch(/must look like/);
+    expect(validatePattern('foo..com')).toMatch(/must look like/);
+    expect(validatePattern('::1')).toMatch(/must look like/); // unbracketed IPv6
+    expect(validatePattern('[::1]:3000')).toBeTruthy();
+  });
+
+  it('every refusal names a shape that actually validates', () => {
+    // A refusal is the one moment a human reasons about scope, so its advice
+    // must not be a dead end. Pull each suggested pattern back through the
+    // validator rather than trusting the prose.
+    for (const refused of ['*.com', 'wiki', '*.local']) {
+      const msg = validatePattern(refused);
+      expect(msg, refused).toBeTruthy();
+      for (const suggested of (msg as string).match(/\*?\.?[a-z0-9-]+\.[a-z0-9-]+/g) ?? []) {
+        if (suggested.includes('example.com') || suggested.includes('localhost')) {
+          expect(validatePattern(suggested), `${refused} -> ${suggested}`).toBeNull();
+        }
+      }
+    }
+  });
+
+  it('the MATCHER enforces the same shape, so a stored illegal entry is inert', () => {
+    // Defence in depth: `validatePattern` guards typing, not authorisation. An
+    // entry can arrive from an older build, and until this guard existed
+    // invariant #3 held only because `hostMatches` happens to have no `*`-only
+    // branch. Each of these would previously have been honoured in full.
+    for (const [url, pattern] of [
+      ['https://evil.com/x', '*.com'],
+      ['https://mail.google.com/x', 'https://*.com/*'],
+      ['http://router.local/admin', '*.local'],
+      ['http://jenkins.internal/', '*.internal'],
+      ['http://1.0.0.1/', '*.0.0.1'],
+    ] as const) {
+      expect(matchAllowlist(url, [e(pattern)]).matched, `${url} vs ${pattern}`).toBe(false);
+    }
+  });
+
+  it('and still honours what it should', () => {
+    expect(matchAllowlist('http://localhost:3000/x', [e('*.localhost')]).matched).toBe(true);
+    expect(matchAllowlist('http://app.localhost:8000/x', [e('*.localhost')]).matched).toBe(true);
+    expect(matchAllowlist('http://localhost:5173/x', [e('localhost')]).matched).toBe(true);
+    expect(matchAllowlist('http://[::1]:5173/x', [e('[::1]')]).matched).toBe(true);
+    expect(matchAllowlist('http://myapp.test/x', [e('*.test')]).matched).toBe(true);
+    expect(matchAllowlist('http://nas.local/x', [e('nas.local')]).matched).toBe(true);
+    expect(matchAllowlist('https://api.example.com/x', [e('*.example.com')]).matched).toBe(true);
+    // A dotless exact entry must NOT quietly become a wildcard over that label.
+    expect(matchAllowlist('http://evil.localhost/x', [e('localhost')]).matched).toBe(false);
+    // ...and localhost is not the loopback IP, which the CHANGELOG calls out.
+    expect(matchAllowlist('http://127.0.0.1:3000/x', [e('localhost')]).matched).toBe(false);
   });
 });

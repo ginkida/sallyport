@@ -190,9 +190,43 @@ containing whatever the agent typed into ordinary inputs.
 
 ### Allowlist matches any port unless a port is pinned
 
-A host-only entry (`example.com`, `*.example.com`) authorizes the host
-on **any port** — intentional, so allowlisting `localhost` reaches a dev
-server on `localhost:3000`. To scope to one port, use the URL form with
+A host-only entry (`example.com`, `*.example.com`, `localhost`) authorizes
+the host on **any port** — intentional, so allowlisting `localhost` reaches a
+dev server on `localhost:3000`.
+
+Pattern shapes are gated in `allowlist.ts` and, importantly, at BOTH layers: the
+popup's two add paths share one `validatePattern`, and `hostMatches` re-checks
+the same shape at enforcement time, so an entry that arrives some other way (an
+older build, a hand-edited store) is inert rather than honoured. The rule:
+
+* a wildcard needs two labels of its own (`*.example.com`), or one of the
+  reserved names that never resolve publicly — `*.localhost`, `*.test`,
+  `*.invalid`, `*.example` (RFC 2606/6761);
+* `*.local` and `*.internal` are **refused**, though equally unroutable.
+  Unroutable is not trusted: `.local` is mDNS, where resolution is
+  unauthenticated and first-responder-wins, so `*.local` would cover every
+  device on whatever network the machine is attached to; `.internal` is
+  split-horizon corporate/cloud DNS, i.e. a whole intranet the human is already
+  logged into. Their scoped forms (`*.corp.local`) and exact hosts (`nas.local`)
+  still work, which is what a homelab needs;
+* a dotless host must be one of those reserved names. `localhost` has a
+  specification behind it; `wiki` / `git` / `jira` resolve via the DHCP search
+  list, LLMNR or NBT-NS — unauthenticated, different on every network;
+* a wildcard over an IP literal is refused (an IP has no subdomains, and
+  `*.0.0.1` would reach `1.0.0.1` and `10.0.0.1`);
+* the `http(s)://` form gets the SAME host check. `*` is not a forbidden host
+  code point, so `new URL('https://*.com/')` parses with hostname `*.com` and
+  reaches the identical matcher — leaving that branch unchecked would have put
+  the whole rule nine characters from a bypass.
+
+Known and deliberately NOT closed: a two-label wildcard can still span a public
+suffix or a shared-tenant host — `*.co.uk`, `*.github.io`, `*.vercel.app`,
+`*.pages.dev` — so anyone who can register a free subdomain there becomes an
+allowlisted origin. Closing that needs the Public Suffix List bundled into the
+extension, not a label count. Prefer an exact host on those.
+
+`localhost`, `127.0.0.1` and `[::1]` are distinct hosts to the matcher; add each
+one that reaches your server. To scope to one port, use the URL form with
 an explicit port: `https://example.com:8443/*` matches only `:8443`; a
 URL pattern with no port (`https://example.com/p/*`) matches only the
 scheme's default port. The matcher honors the port a URL pattern

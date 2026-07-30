@@ -6,6 +6,56 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`localhost` could not be added to the allowlist through the Add field**,
+  though the matcher has always supported it, a test is named for it, and
+  SECURITY.md offers it as the reason host-only entries match any port. The
+  validator required at least one dot, so the project's own flagship example —
+  and the only shape a local dev server needs — was refused. `*.localhost` and
+  `*.test` (Herd/Valet) went the same way. (A host could always be added by one
+  click from the popup's "+ Allow this site", which skipped validation
+  entirely — that inconsistency is fixed too: both add paths now share one gate.)
+
+  The allowlist pattern rule is now stated once and enforced at **both** layers —
+  `validatePattern` for typing and `hostMatches` at enforcement time, so an entry
+  that arrives from an older build or a hand-edited store is inert rather than
+  honoured. Until now invariant #3's "bare `*` is rejected" held only because the
+  matcher happens to have no `*`-only branch.
+
+  What is accepted: a wildcard with two labels of its own (`*.example.com`), or
+  over a reserved never-resolving name (`*.localhost`, `*.test`, `*.invalid`,
+  `*.example`); a dotless host that is one of those names; any exact host with a
+  dot; and a bracketed IPv6 literal (`[::1]`, the half of the loopback dev case
+  that was still missing — the daemon's own loopback set is
+  `{127.0.0.1, ::1, localhost}`).
+
+  What is refused, and why: `*.com` and the more tempting `*.dev` / `*.app` /
+  `*.io` span a whole public TLD. `*.local` and `*.internal` are refused even
+  though they are equally unroutable, because unroutable is not the same as
+  trusted — `.local` is mDNS, where resolution is unauthenticated and
+  first-responder-wins, so it would cover every device on whatever network the
+  machine is attached to, and `.internal` is split-horizon corporate/cloud DNS,
+  i.e. an entire intranet the human is already logged into. Both keep their
+  scoped forms (`*.corp.local`) and exact hosts (`nas.local`), which is what a
+  homelab actually needs. A dotless host that is not reserved (`wiki`, `git`,
+  `jira`) resolves via the DHCP search list, LLMNR or NBT-NS — unauthenticated
+  and different on every network. A wildcard over an IP literal is refused
+  because an IP has no subdomains and `*.0.0.1` would reach `1.0.0.1`.
+  The `http(s)://` form gets the same host check: `*` is not a forbidden host
+  code point, so `https://*.com/*` parses with hostname `*.com` and reaches the
+  identical matcher — without that, the whole rule was nine characters from a
+  bypass.
+
+  Still open by design, now written down in SECURITY.md: a two-label wildcard can
+  span a public suffix or a shared-tenant host (`*.co.uk`, `*.github.io`,
+  `*.vercel.app`, `*.pages.dev`), so anyone able to register a free subdomain
+  there becomes an allowlisted origin. Closing it needs the Public Suffix List
+  bundled into the extension rather than a label count. Prefer an exact host.
+
+  Note `localhost`, `127.0.0.1` and `[::1]` are distinct hosts to the matcher;
+  add each one that reaches your server.
+
 ## [0.18.0] — 2026-07-30
 
 ### Added

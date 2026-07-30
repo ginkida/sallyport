@@ -226,6 +226,15 @@ async function renderCurrentTab(connected: boolean): Promise<void> {
       // Re-fetch fresh — the list rendered into `match` above may be stale
       // by now (context menu, another popup) and we'd otherwise stomp on
       // concurrent edits.
+      // Through the SAME gate as the Allowlist tab's Add field. This path used
+      // to write the host unvalidated, so the two add paths disagreed about what
+      // a legal entry is — any hardening of `validatePattern` was one click away
+      // from being irrelevant.
+      const shapeError = validatePattern(host);
+      if (shapeError) {
+        flash('#status-flash', shapeError, 'err');
+        return;
+      }
       const cur = await getAllowlist();
       if (cur.some((e) => e.pattern === host)) return; // already added — no-op
       const next: AllowEntry[] = [
