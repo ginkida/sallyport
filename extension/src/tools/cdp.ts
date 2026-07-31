@@ -5,6 +5,11 @@ import { BridgeError } from './errors.js';
 import { clearNetwork, ensureNetworkCapture } from './network-capture.js';
 import { clearRefsForTab } from './refs.js';
 
+// How long the teardown path waits for a tab to give its viewport emulation
+// back before detaching anyway. Generous for a healthy renderer, short enough
+// that one wedged tab cannot hold up a whole session's hand-back.
+const VIEWPORT_RELEASE_DEADLINE_MS = 2000;
+
 // Cap on the chrome error text we echo back: a debugger attach failure can
 // embed a chrome:// or page URL, so bound it the same way the daemon caps a
 // handshake-rejection reason (reason[:200]) before it travels to the agent.
@@ -70,12 +75,37 @@ export function classifyAttachError(msg: string): BridgeError {
  * set stays accurate without polling. */
 const attached = new Set<number>();
 
+/** The device scale factor `set_viewport` is emulating on a tab, when it is.
+ *
+ * `screenshot` needs it: the returned image is sized by the EMULATED ratio,
+ * while `Page.getLayoutMetrics` keeps reporting the real display one (Chrome
+ * hands the compositor the real DSF to keep rasterisation sharp), so metrics
+ * alone cannot bound a capture that we ourselves emulated. We applied the
+ * emulation, so we are the authority — and a browser-owned number is what a
+ * size bound must rest on, rather than asking the page (invariant #5's
+ * reasoning, applied to geometry).
+ *
+ * tabId-keyed with synchronous mutation, like `attached` and `epochByTab`, so
+ * overlapping calls cannot interleave inside it. Ephemeral: an MV3 worker
+ * restart wipes it while the CDP emulation survives, so readers must treat a
+ * miss as "unknown", never as "not emulated". */
+const emulatedDsf = new Map<number, number>();
+
+export function recordEmulatedDsf(tabId: number, deviceScaleFactor: number): void {
+  emulatedDsf.set(tabId, deviceScaleFactor);
+}
+
+export function getEmulatedDsf(tabId: number): number | undefined {
+  return emulatedDsf.get(tabId);
+}
+
 /** Reset in-memory attach state (test hook — vitest reuses this module across
  * every `it()` in a file, so a mock tabId that collides with one attached in
  * an earlier test would otherwise silently skip `chrome.debugger.attach` here
  * and desync from the mock's own call log). */
 export function resetAttachedTabs(): void {
   attached.clear();
+  emulatedDsf.clear();
 }
 
 /** Decide what keep-awake should do for a tab on this attach: (re-)ENABLE the
@@ -121,6 +151,7 @@ if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
     clearConsole(tabId);
     clearNetwork(tabId);
     clearDialogs(tabId);
+    emulatedDsf.delete(tabId);
   });
 }
 
@@ -132,6 +163,9 @@ if (typeof chrome !== 'undefined' && chrome.debugger?.onDetach) {
       clearConsole(source.tabId);
       clearNetwork(source.tabId);
       clearDialogs(source.tabId);
+      // The emulation dies with the session — and so must our record of it, or
+      // a later capture would size itself against an emulation that is gone.
+      emulatedDsf.delete(source.tabId);
     }
   });
 }
@@ -225,6 +259,83 @@ async function releaseKeepAwake(tabId: number): Promise<void> {
   }
 }
 
+/** Undo everything `set_viewport` can apply, in the order Chrome wants it.
+ *
+ * Lives here rather than in `viewport.ts` for the same reason `releaseKeepAwake`
+ * does: this file owns the revoke paths for sticky per-session emulation, and
+ * `detach` has to be able to call it without the tool module.
+ *
+ * It is NOT redundant with the debugger session ending. Detaching runs
+ * `EmulationHandler::Disable()`, which is the one teardown path that never calls
+ * `WebContentsImpl::ClearDeviceEmulationSize()` — so the browser-side view stays
+ * sized to the emulated dimensions, `WebContents::GetSize()` keeps returning
+ * them, and the renderer's idea of the "original" size may itself have been
+ * overwritten with the emulated one. Only `Emulation.clearDeviceMetricsOverride`
+ * restores the real size, and it has to happen while the session is still alive.
+ * Skip it and the human inherits a tab that renders 393 px wide inside a full
+ * window, with no way back short of closing it.
+ *
+ * The UA reset is `userAgent: ''` because there is no `clearUserAgentOverride`:
+ * the empty string is the documented sentinel, and it must NOT be sent together
+ * with `userAgentMetadata` (Chrome rejects that combination outright).
+ *
+ * `deadlineMs` bounds the whole sequence and exists only for `detach`. Every
+ * command here is answered by the RENDERER (that is exactly what makes awaiting
+ * `setDeviceMetricsOverride` a real barrier), and `chrome.debugger.sendCommand`
+ * has no timeout of its own — so a tab whose main thread is wedged (an
+ * unanswered `confirm()` with dialog handling off, a runaway script) would
+ * never settle. `chrome.debugger.detach` is browser-side and always completes,
+ * so before this it could not hang; `release.ts` walks a disconnected session's
+ * tabs SEQUENTIALLY, and one such tab would strand every tab after it — no
+ * detach, no hand-back, debugging bar left up. Giving up early costs little:
+ * `clearDeviceMetricsOverride` does its browser-side `ClearDeviceEmulationSize`
+ * — the part that actually restores the tab's real size — before the command is
+ * forwarded at all. `set_viewport reset` passes no deadline, so a genuine
+ * failure there still surfaces rather than being silently timed out. */
+export async function releaseViewport(tabId: number, deadlineMs?: number): Promise<void> {
+  // Forget the emulated ratio FIRST: whether or not the commands below get
+  // through, this tab is no longer one we are knowingly emulating, and a stale
+  // record would make `screenshot` size a capture against an emulation that is
+  // being torn down.
+  emulatedDsf.delete(tabId);
+  const run = async (): Promise<void> => {
+    try {
+      await cdp(tabId, 'Emulation.setUserAgentOverride', { userAgent: '' });
+    } catch {
+      // never overridden / command unavailable — nothing to restore
+    }
+    try {
+      await cdp(tabId, 'Emulation.setTouchEmulationEnabled', { enabled: false });
+    } catch {
+      // never enabled / command unavailable — nothing to revoke
+    }
+    try {
+      await cdp(tabId, 'Emulation.clearDeviceMetricsOverride');
+    } catch (e) {
+      // This one is load-bearing (see above), so it is the only step that
+      // reports: `set_viewport reset` must not claim a tab is back to normal
+      // when it isn't.
+      throw new BridgeError(
+        'viewport_failed',
+        `could not clear the viewport override: ${((e as Error)?.message || String(e)).slice(0, 200)}`,
+      );
+    }
+  };
+
+  if (deadlineMs === undefined) return run();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, deadlineMs);
+  });
+  try {
+    // Both promises get handlers attached here, so a rejection arriving after
+    // the deadline won already has a home — no unhandled rejection.
+    await Promise.race([run(), deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /** Stop driving a tab: detach the debugger if we hold it.
  *
  * Nothing used to call this — `attach` had no counterpart at all — so every tab
@@ -240,6 +351,17 @@ async function releaseKeepAwake(tabId: number): Promise<void> {
  * attached, is simply not our problem. `chrome.debugger.onDetach` does the
  * bookkeeping (attached set, refs, capture rings). */
 export async function detach(tabId: number): Promise<void> {
+  // Drop any viewport emulation FIRST, while there is still a session to send
+  // it on. Unlike every other override, this one does not reliably end with the
+  // session — see `releaseViewport`. Best-effort AND bounded: a tab that was
+  // never emulated (or is already gone) throws, a tab whose renderer is wedged
+  // would never answer, and neither is a reason to skip the detach below —
+  // which is the step that always works.
+  try {
+    await releaseViewport(tabId, VIEWPORT_RELEASE_DEADLINE_MS);
+  } catch {
+    // never emulated, or the tab is already gone — nothing to restore
+  }
   // UNCONDITIONAL, deliberately not gated on the in-memory `attached` set — the
   // same reasoning as keep-awake's off-path. That set is ephemeral module
   // state an MV3 service-worker restart wipes, while the underlying CDP session

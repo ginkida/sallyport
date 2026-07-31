@@ -65,6 +65,7 @@ def test_tools_catalogue_covers_extension() -> None:
         "key_type",
         "send_keys",
         "screenshot",
+        "set_viewport",
         "print_to_pdf",
         "wait_for",
         "settle",
@@ -670,9 +671,7 @@ async def test_release_tabs_in_browser_still_reaches_the_wire() -> None:
     # Each id carries the recorded epoch so the extension can refuse to CLOSE a
     # recycled id; a tab with no epoch on record simply travels without one
     # (fail-closed extension-side: no epoch means hand back, never close).
-    assert sent == [
-        (RELEASE_TABS_TOOL, {"tabs": [{"tabId": 11, "epoch": "e1"}, {"tabId": 12}]})
-    ]
+    assert sent == [(RELEASE_TABS_TOOL, {"tabs": [{"tabId": 11, "epoch": "e1"}, {"tabId": 12}]})]
     # An empty release is a no-op, not a wasted round-trip.
     sent.clear()
     await bridge.release_tabs_in_browser({})

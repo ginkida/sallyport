@@ -34,6 +34,7 @@ import { snapshot } from './tools/snapshot.js';
 import { getState } from './tools/state.js';
 import { closeTab, listTabs, navigate, reload } from './tools/tabs.js';
 import { upload } from './tools/upload.js';
+import { setViewport } from './tools/viewport.js';
 import { waitFor } from './tools/wait.js';
 import type { Tool } from './tools/types.js';
 
@@ -59,6 +60,7 @@ const tools: Record<string, Tool> = {
   key_type: keyType,
   send_keys: sendKeys,
   screenshot,
+  set_viewport: setViewport,
   print_to_pdf: printToPdf,
   wait_for: waitFor,
   settle,

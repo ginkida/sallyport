@@ -689,8 +689,10 @@ TOOLS: list[Tool] = [
             "Take a screenshot of the viewport, returned as a native MCP image "
             "block (rendered directly — no base64 handling needed). format is "
             "'png' (default) or 'jpeg' (smaller; quality 1-100, default 80). "
-            "maxWidth downscales the capture to at most that many CSS px wide "
-            "(e.g. 800) to cut size. region={x,y,width,height} crops to a "
+            "maxWidth downscales so the returned IMAGE is at most that many "
+            "pixels wide (e.g. 800) — it accounts for the display's device pixel "
+            "ratio and for any set_viewport emulation, so it bounds the payload "
+            "directly. region={x,y,width,height} crops to a "
             "viewport-relative CSS-px rectangle (getBoundingClientRect "
             "coordinates); it is intersected with the viewport. In broker mode "
             "your tabs live in an unfocused window of their own, so screenshot "
@@ -717,7 +719,7 @@ TOOLS: list[Tool] = [
                 "maxWidth": {
                     "type": "integer",
                     "minimum": 16,
-                    "description": "Downscale so the image is at most this wide (CSS px)",
+                    "description": "Downscale so the returned image is at most this many px wide",
                 },
                 "region": {
                     "type": "object",
@@ -730,6 +732,108 @@ TOOLS: list[Tool] = [
                     "required": ["x", "y", "width", "height"],
                     "additionalProperties": False,
                     "description": "Viewport-relative crop rectangle in CSS px",
+                },
+                "tabId": _TAB_ID_SCHEMA,
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="set_viewport",
+        description=(
+            "Emulate a device viewport on the tab — the way to test responsive / "
+            "mobile layouts. This is DevTools' device mode, not a window resize: "
+            "it is per-tab, changes nothing the user sees in their own windows, "
+            "and gives you a device pixel ratio and mobile viewport-meta handling "
+            "that no window size can. Pass a preset ('mobile-small' 375x667, "
+            "'mobile' 393x852, 'mobile-large' 412x915, 'tablet' 820x1180, "
+            "'desktop' 1280x800, 'desktop-wide' 1920x1080) or explicit "
+            "width+height in CSS px, optionally with deviceScaleFactor (<=3), "
+            "mobile, touch and orientation ('portrait'|'landscape' just orients "
+            "the size you gave). mobile=true is what makes the page honour its "
+            "<meta name=viewport>; touch=true makes '(pointer: coarse)', "
+            "'(hover: none)' and ontouchstart match. The mobile presets also "
+            "present a mobile Chrome user agent (same Chrome version, Android "
+            "build) with matching UA client hints, so a server that branches on "
+            "the UA sends its mobile bundle — pass mobileUserAgent=false to keep "
+            "the real one. Every call states the UA in full, so switching to a "
+            "desktop preset (or mobileUserAgent=false) puts the real one back; it "
+            "never latches. SET IT BEFORE navigating (or reload after): the UA and "
+            "the mobile flag change what the server sends and how the page's own "
+            "load-time JS branches. The override survives navigate/reload on this "
+            "tab and lasts until reset=true, the tab closes, or the bridge "
+            "detaches; a NEW tab starts unemulated. reset=true (alone) restores "
+            "the real viewport. Call with no settings at all (just tabId) to READ "
+            "what the page currently sees. Returns {mode, requested?, page:{width, height, "
+            "deviceScaleFactor, screenWidth, screenHeight, orientation, touch, "
+            "maxTouchPoints, userAgent}} — page is what the page ACTUALLY reports, "
+            "so verify with it rather than assuming; on a mobile-emulated page "
+            "page.width can legitimately differ from the width you asked for "
+            "(the document's <meta name=viewport> defines the layout width) and "
+            "the result then carries a `note` saying so. Refs (@eN) are "
+            "invalidated — a breakpoint change remounts DOM, so re-snapshot. "
+            "A screenshot of an emulated tab comes back at width x "
+            "deviceScaleFactor pixels; screenshot's maxWidth knows about the "
+            "emulation, so use it to bound the image. Clicks stay real mouse events even "
+            "with touch=true. Structured CDP only, no evaluate flag. Domain must "
+            "be in allowlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "preset": {
+                    "type": "string",
+                    "enum": [
+                        "mobile-small",
+                        "mobile",
+                        "mobile-large",
+                        "tablet",
+                        "desktop",
+                        "desktop-wide",
+                    ],
+                    "description": "Named starting point; width/height/etc override its fields",
+                },
+                "width": {
+                    "type": "integer",
+                    "minimum": 50,
+                    "maximum": 4096,
+                    "description": "Viewport width in CSS px (give height too)",
+                },
+                "height": {
+                    "type": "integer",
+                    "minimum": 50,
+                    "maximum": 4096,
+                    "description": "Viewport height in CSS px (give width too)",
+                },
+                "deviceScaleFactor": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": 3,
+                    "description": "Device pixel ratio (default 1, or the preset's)",
+                },
+                "mobile": {
+                    "type": "boolean",
+                    "description": "Emulate a mobile device (viewport-meta handling, UA-CSS)",
+                },
+                "touch": {
+                    "type": "boolean",
+                    "description": "Report a touchscreen: ontouchstart, pointer:coarse, hover:none",
+                },
+                "orientation": {
+                    "type": "string",
+                    "enum": ["portrait", "landscape"],
+                    "description": "Orient the size (swaps width/height as needed)",
+                },
+                "mobileUserAgent": {
+                    "type": "boolean",
+                    "description": (
+                        "Also present a mobile Chrome UA + UA client hints "
+                        "(default: on for the mobile/tablet presets and when mobile=true)"
+                    ),
+                },
+                "reset": {
+                    "type": "boolean",
+                    "description": "Drop the override and restore the real viewport (pass alone)",
                 },
                 "tabId": _TAB_ID_SCHEMA,
             },

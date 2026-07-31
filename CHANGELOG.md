@@ -6,6 +6,129 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-07-31
+
+### Added
+
+- **`set_viewport` — device/viewport emulation per tab**, so an agent can
+  answer "does this render on a phone" instead of only ever measuring whatever
+  size the window happens to be. This is DevTools' device mode over structured
+  CDP (`Emulation.setDeviceMetricsOverride` + `setTouchEmulationEnabled`), not a
+  window resize, and the difference is the whole point: it is per **tab**, so it
+  disturbs neither the human's windows nor the session's other tabs; it can
+  produce a device pixel ratio of 3 and the mobile `<meta name=viewport>`
+  handling that no window size can; and it needs no focus, so it works in the
+  unfocused agent window broker mode opens.
+
+  Presets — `mobile-small` (375×667), `mobile` (393×852), `mobile-large`
+  (412×915), `tablet` (820×1180), `desktop` (1280×800), `desktop-wide`
+  (1920×1080) — or explicit `width`+`height` in CSS px, with optional
+  `deviceScaleFactor` (≤ 3), `mobile`, `touch` and `orientation`
+  (`portrait`/`landscape` orients the size you gave rather than being a third
+  source of truth). Sizes come from Chrome's own `EmulatedDevices` list but are
+  named by breakpoint: a preset called `iphone-15` would age badly and imply a
+  fidelity the emulation does not have. `reset: true` (alone) restores the real
+  viewport; **no arguments at all reads** what the page currently sees.
+
+  `mobile: true` is what makes the page honour its `<meta name=viewport>`, and
+  `touch: true` is what makes `(pointer: coarse)`, `(hover: none)` and
+  `ontouchstart` match — both are real layout inputs, not decoration. The
+  mobile presets also present a **mobile Chrome user agent with matching UA
+  client hints** (`mobileUserAgent: false` opts out), because a server that
+  branches on the UA would otherwise keep sending its desktop bundle and the
+  agent would measure that and report a layout bug that isn't there. The UA is
+  derived from the browser's own — same Chrome, presented as the Android build,
+  never a Safari/WebKit string: claiming a different *engine* would make a
+  server ship code this browser does not run. Client-hint metadata is sent with
+  it deliberately; overriding the UA string alone makes Chrome send no
+  `Sec-CH-UA` headers at all, which is both less useful and more conspicuous
+  than not spoofing. Every call states the UA **in full** rather than latching:
+  a later `desktop` preset (or `mobileUserAgent: false`) puts the real one back,
+  so a tab can never end up reporting a desktop viewport while still identifying
+  as a phone — which would send the UA-sniffing server's mobile bundle to be
+  measured at desktop width, the same wrong verdict in reverse.
+
+  Set it **before** navigating (or reload after) — the UA and the mobile flag
+  change what the server sends and how the page's own load-time JS branches. The
+  override survives `navigate`/`reload` on that tab (Chrome's emulation handler
+  is browser-side and outlives the renderer swap) and ends at `reset`, tab close,
+  or bridge detach; a *new* tab starts unemulated. Refs (`@eN`) are invalidated
+  exactly as `navigate`/`reload` invalidate them: a breakpoint change remounts
+  DOM, so a ref minted at 1280 px is meaningless at 393 px.
+
+  The result reports what the **page** actually says (`width`, `height`,
+  `deviceScaleFactor`, `screen*`, `orientation`, `touch`, `maxTouchPoints`,
+  `userAgent`) rather than echoing the request — and when the page's layout
+  viewport differs from the emulated width the result says so in a `note`
+  instead of leaving it looking like the emulation was ignored. The note
+  deliberately does **not** name a cause: a page with `<meta name=viewport>`
+  choosing its own layout width is nothing to see, but a page *without* one
+  falling back to ~980 px on a mobile device is itself the "not mobile-ready"
+  finding the tool was pointed at, and an explanation that assumed the first
+  would have explained away the second.
+
+  Allowlist-gated like every page-touching tool, owner-gated in broker mode, and
+  no `evaluate` flag: every command is structured CDP, and the single read-back
+  probe is a fixed literal with no interpolation. `Emulation.setEmitTouchEventsForMouse`
+  is deliberately **not** used — it would make Chrome swallow every injected
+  mouse event, silently breaking `mouse_click` and `hover` — so clicks stay real
+  mouse events even with `touch: true`.
+
+### Fixed
+
+- **`detach` now clears device emulation before dropping the debugger session.**
+  Ending the session is not enough: Chrome's teardown path is the one that never
+  calls `ClearDeviceEmulationSize()`, so the browser-side view can stay at the
+  emulated dimensions with no way back short of closing the tab. Every hand-back
+  path (`_release_tabs`, tab hand-off, `set_viewport reset`) now goes through an
+  explicit `Emulation.clearDeviceMetricsOverride` while the session is still
+  alive — bounded by a 2 s deadline on the teardown path, because those commands
+  are answered by the *renderer* and a tab wedged on an unanswered `confirm()`
+  would otherwise strand every tab queued behind it in the sequential hand-back
+  loop (`chrome.debugger.detach` is browser-side and always completes, so it now
+  runs either way; `set_viewport reset` stays unbounded, so a genuine failure
+  there still surfaces). The one case that cannot be covered is the human
+  clicking **Cancel** on Chrome's debugging bar while an emulation is active —
+  there is no session left to send the undo on; close and reopen the tab.
+
+- **`screenshot`'s `maxWidth` now means what it says.** It was applied against
+  the viewport's CSS width, but Chrome sizes a clipped capture as
+  `round(clip.width × clip.scale × deviceScaleFactor)` — the device scale factor
+  multiplies *on top of* the scale. So `maxWidth: 800` came back 1600 px wide on
+  any Retina display (four times the intended byte count and context cost), and
+  would have come back 2400 px on a `set_viewport` tab at dpr 3. It is now
+  measured in pixels of the returned image and divides the ratio out. Nothing
+  changes on an ordinary 1× display.
+
+  The ratio comes from browser-owned data: the emulation the extension itself
+  applied, or else `Page.getLayoutMetrics`' physical-to-CSS ratio. The page is
+  asked too (`window.devicePixelRatio`, a fixed literal — no agent
+  interpolation, no `evaluate` flag), but only to RAISE that floor, never to
+  lower it: it covers the one honest blind spot (a service-worker restart drops
+  the emulation record while the emulation itself survives, and layout metrics
+  deliberately keep reporting the *real* device scale factor while an emulation
+  is active), and a page that shadows the property still cannot make the image
+  come back wider than asked. Every reading is sanity-bounded.
+
+- **`screenshot`'s clip is now converted from CSS px to DIP.** `region`
+  coordinates are `getBoundingClientRect` CSS px, but `Page.captureScreenshot`'s
+  clip is in device-independent px — CSS px times the browser's ctrl+/- zoom,
+  which Chrome remembers per site. On a zoomed tab the capture was therefore
+  cropped to a 1/zoom sub-rectangle of the region asked for. The rect is also
+  floored to whole DIP now: Chrome truncates the clip when it computes the image
+  size but rounds it when it resizes the view, and a fractional clip that makes
+  those disagree lands on a crop path that fills the shortfall by *tiling* page
+  content rather than padding it.
+
+- **`screenshot` now refuses a capture the wire cannot carry** (12 MiB of
+  base64, the same ceiling `print_to_pdf` already used) with
+  `screenshot_too_large`, naming `maxWidth`/`region`/`format=jpeg` as the way
+  out. An oversize frame never failed just that call: the daemon answers it with
+  a 1009 close, which in broker mode drops the *shared* extension leg for every
+  attached session. A desktop viewport at DPR 1 never came close, which is why
+  the guard did not exist; emulating a phone at DPR 3 (or a HiDPI display, which
+  already captures at 2×) makes it reachable.
+
 ## [0.18.1] — 2026-07-30
 
 ### Fixed
@@ -1967,7 +2090,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/ginkida/sallyport/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/ginkida/sallyport/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/ginkida/sallyport/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/ginkida/sallyport/compare/v0.16.0...v0.17.0

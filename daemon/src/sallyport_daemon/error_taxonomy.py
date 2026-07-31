@@ -59,6 +59,16 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "page first (smaller scale, print stylesheet) or capture the needed region "
             "with screenshot instead."
         ),
+        "screenshot_too_large": (
+            "retryable=no as-is; the capture exceeds the bridge frame cap — retry WITH "
+            "maxWidth or region to shrink it, or format=jpeg; if you emulated a device, "
+            "lower deviceScaleFactor via set_viewport."
+        ),
+        "viewport_failed": (
+            "retryable=maybe; the browser refused the device-metrics emulation or the page "
+            "had no execution context to read it back (mid-navigation, error page) — settle "
+            "or wait_for the load, then retry set_viewport."
+        ),
         "not_visible": (
             "retryable=yes; the target has zero size / isn't laid out yet — wait_for (or "
             "settle) until it renders then retry, or re-snapshot to pick a visible element."
