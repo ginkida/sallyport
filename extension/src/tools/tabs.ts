@@ -1,9 +1,14 @@
 import { BridgeError } from './errors.js';
+import { getTabOrGone, resolveTab } from './tab-resolve.js';
+
+// Re-exported so the dozen tools that resolve a tab keep one obvious import.
+export { getTabOrGone, resolveTab } from './tab-resolve.js';
 import { matchAllowlist } from '../allowlist.js';
 import { getAllowlist } from '../storage.js';
 import { attach } from './cdp.js';
 import { clearArmedDialog } from './dialog-capture.js';
 import { ensureAllowed, hostnameOf } from './gates.js';
+import { parseObserve, runObserve } from './observe.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { clearRefsForTab } from './refs.js';
 import { agentTabIds, filterTabsToOwned, getEpoch, isBrokerMode, mintEpoch } from './ownership.js';
@@ -17,27 +22,6 @@ import type { Tool } from './types.js';
  * agents running); standalone opens it active in the current window, as today. */
 async function openTab(url: string, session?: string): Promise<chrome.tabs.Tab> {
   return isBrokerMode() ? createAgentTab(url, session) : chrome.tabs.create({ url, active: true });
-}
-
-/** `chrome.tabs.get`, but a vanished tab — closed, crashed, or its id recycled
- * out from under us — fails fast with a classified `tab_gone` the agent can
- * branch on ("open a fresh tab") instead of the raw "No tab with id: N", which
- * would reach the daemon as an opaque code:'error' the agent can't act on.
- * Broker mode already catches a vanished OWNED tab via the epoch confirm
- * (tools.ts:runTool); this closes the standalone path and any explicit tabId
- * that raced a tab close. Exported for history.ts's own post-hop tab lookup —
- * any `chrome.tabs.get` call on a tabId we don't already trust as live should
- * go through this, not the raw API. */
-export async function getTabOrGone(tabId: number): Promise<chrome.tabs.Tab> {
-  try {
-    return await chrome.tabs.get(tabId);
-  } catch {
-    throw new BridgeError(
-      'tab_gone',
-      `tab ${tabId} is gone (closed, or its id was recycled) — ` +
-        `open a fresh one with navigate(newTab:true)`,
-    );
-  }
 }
 
 /** `attach()`, but a failure (most commonly `attach_debugger_conflict` — the
@@ -89,23 +73,6 @@ export function landedElsewhere(requested: string, landed: string | undefined): 
   } catch {
     return requested !== landed;
   }
-}
-
-/** Resolve which tab a tool should operate on.
- *
- * Stateless across calls — no "last touched tab" memo. Callers must either
- * pass `tabId` explicitly (preferred for scripted use) or accept "active
- * tab in current window" (preferred for one-off interactive commands). */
-export async function resolveTab(args: Record<string, unknown>): Promise<chrome.tabs.Tab> {
-  const explicit = typeof args.tabId === 'number' ? (args.tabId as number) : null;
-  if (explicit !== null) {
-    return await getTabOrGone(explicit);
-  }
-  const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!active || active.id === undefined) {
-    throw new BridgeError('no_active_tab', 'no active tab in current window');
-  }
-  return active;
 }
 
 /** `toolName` names the message on a watchdog timeout — navigate/reload/
@@ -190,6 +157,7 @@ export const navigate: Tool = async (args, ctx) => {
     throw new BridgeError('bad_args', 'navigate: url is not a valid URL');
   }
   const waitSpec = parseWaitFor(args.waitFor, 'navigate');
+  const observeSpec = parseObserve(args.observe, 'navigate');
   const list = await getAllowlist();
   if (!matchAllowlist(url, list).matched) {
     throw new BridgeError('domain_not_allowed', `${hostnameOf(url)} is not in the allowlist`);
@@ -278,6 +246,7 @@ export const navigate: Tool = async (args, ctx) => {
   // and echoing the request made that invisible until some later call surprised
   // the agent — and wrote the wrong URL into the audit row. Read after the
   // embedded wait so the answer describes the tab as the call returns it.
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
   const landed = await currentUrl(tab.id!);
   const finalUrl = landed ?? url;
   return {
@@ -289,6 +258,7 @@ export const navigate: Tool = async (args, ctx) => {
       ...(landedElsewhere(url, landed) ? { redirectedFrom: url } : {}),
       ...(epoch ? { epoch } : {}),
       ...(wait ? { wait } : {}),
+      ...(observed ? { observed } : {}),
     },
   };
 };
@@ -321,6 +291,7 @@ export const closeTab: Tool = async (args) => {
 
 export const reload: Tool = async (args) => {
   const waitSpec = parseWaitFor(args.waitFor, 'reload');
+  const observeSpec = parseObserve(args.observe, 'reload');
   const tab = await resolveTab(args);
   // Allowlist gate: reloading the page exposes whatever it loads to our
   // subsequent tools, so apply the same domain check as snapshot/read_text.
@@ -345,6 +316,7 @@ export const reload: Tool = async (args) => {
   // wait in removes that second call. Errors inside it stay non-fatal
   // (runEmbeddedWait), so a bad selector can't retroactively fail the reload.
   const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
   const landed = await currentUrl(tab.id!);
   const finalUrl = landed ?? before;
   return {
@@ -359,6 +331,7 @@ export const reload: Tool = async (args) => {
       // reported back as though nothing had moved.
       ...(landedElsewhere(before, landed) ? { redirectedFrom: before } : {}),
       ...(wait ? { wait } : {}),
+      ...(observed ? { observed } : {}),
     },
   };
 };

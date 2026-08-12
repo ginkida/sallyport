@@ -33,6 +33,7 @@ import { clearArmedDialog } from './dialog-capture.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { getEpoch, isBrokerMode } from './ownership.js';
+import { parseObserve, runObserve } from './observe.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { clearRefsForTab } from './refs.js';
 import { getTabOrGone, resolveTab, waitForLoad } from './tabs.js';
@@ -155,6 +156,7 @@ export const historyGo: Tool = async (args) => {
   const direction = parseHistoryDirection(args.direction);
   const steps = parseHistorySteps(args.steps);
   const waitSpec = parseWaitFor(args.waitFor, 'history_go');
+  const observeSpec = parseObserve(args.observe, 'history_go');
   const tab = await resolveTab(args);
   // One allowlist fetch, reused for both the leaving-page gate and the
   // destination check below (matching navigate's single-fetch shape).
@@ -212,6 +214,7 @@ export const historyGo: Tool = async (args) => {
   if (waitSpec) {
     wait = await runEmbeddedWait(tab.id!, waitSpec);
   }
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
   return {
     tabId: tab.id,
     url: landedUrl,
@@ -222,6 +225,7 @@ export const historyGo: Tool = async (args) => {
       steps,
       ...(epoch ? { epoch } : {}),
       ...(wait ? { wait } : {}),
+      ...(observed ? { observed } : {}),
     },
   };
 };

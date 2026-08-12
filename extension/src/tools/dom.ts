@@ -1,12 +1,15 @@
-import { attach, cdp, looksLikeMissingNodeError, looksLikeSelectorSyntaxError } from './cdp.js';
-import { BridgeError, invalidSelectorError, staleRefError } from './errors.js';
+import { attach, cdp } from './cdp.js';
+import { BridgeError, staleRefError } from './errors.js';
 import { ensureAllowed } from './gates.js';
-import { parseWaitFor, runEmbeddedWait, READ_TEXT_FN } from './poll.js';
+import { parseObserve, runObserve } from './observe.js';
+import { parseWaitFor, runEmbeddedWait } from './poll.js';
+import { capText, parseMaxChars, parseOffset, READ_TEXT_FN } from './text.js';
 import { getRef, isRef } from './refs.js';
+import { resolveBackendNode, resolveSelectorOrRef } from './resolve.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
-export { READ_TEXT_FN } from './poll.js';
+export { READ_TEXT_FN } from './text.js';
 
 /** Guard for fill's insertText paths. CDP `Input.insertText` has no node
  * argument — it writes to `document.activeElement` — so a write is only safe
@@ -25,72 +28,6 @@ export function ensureFocusLanded(focused: boolean | undefined): void {
         'target a focusable field (input/textarea/contenteditable), or use method:value',
     );
   }
-}
-
-/** Resolve a browser-owned backendNodeId to a live page objectId.
- *
- * Split out of `resolveSelectorOrRef` for callers that have PINNED a node up
- * front and can no longer go through the ref map — `reveal`, whose own loop
- * re-snapshots on every pass and therefore renumbers the tab's refs out from
- * under the container it was handed. A backendNodeId is the browser's own
- * identity for the node and survives that. `label` is only for the error text. */
-export async function resolveBackendNode(
-  tabId: number,
-  backendNodeId: number,
-  label: string,
-  tool: string,
-): Promise<string> {
-  let resolved: { object: { objectId?: string } };
-  try {
-    resolved = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
-      backendNodeId,
-    });
-  } catch (e) {
-    if (looksLikeMissingNodeError(e)) throw staleRefError(tool, label);
-    throw e;
-  }
-  if (!resolved.object.objectId) {
-    throw new BridgeError('bad_ref', `${tool}: could not resolve ref to DOM`);
-  }
-  return resolved.object.objectId;
-}
-
-export async function resolveSelectorOrRef(
-  tabId: number,
-  selector: string,
-  tool: string,
-): Promise<string> {
-  if (isRef(selector)) {
-    const r = getRef(tabId, selector);
-    if (!r) {
-      throw new BridgeError(
-        'bad_ref',
-        `${tool}: unknown ref "${selector}" for tab ${tabId} — run snapshot first`,
-      );
-    }
-    return resolveBackendNode(tabId, r.backendDOMNodeId, selector, tool);
-  }
-  const doc = await cdp<{ root: { nodeId: number } }>(tabId, 'DOM.getDocument', { depth: 0 });
-  let q: { nodeId: number };
-  try {
-    q = await cdp<{ nodeId: number }>(tabId, 'DOM.querySelector', {
-      nodeId: doc.root.nodeId,
-      selector,
-    });
-  } catch (e) {
-    if (looksLikeSelectorSyntaxError(e)) throw invalidSelectorError(tool, selector);
-    throw e;
-  }
-  if (!q.nodeId) {
-    throw new BridgeError('not_found', `${tool}: element not found: ${selector}`);
-  }
-  const resolved = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
-    nodeId: q.nodeId,
-  });
-  if (!resolved.object.objectId) {
-    throw new BridgeError('not_found', `${tool}: could not resolve element`);
-  }
-  return resolved.object.objectId;
 }
 
 /**
@@ -236,6 +173,7 @@ export const click: Tool = async (args) => {
   const selector = String(args.selector || '');
   if (!selector) throw new BridgeError('bad_args', 'click: selector required');
   const waitSpec = parseWaitFor(args.waitFor, 'click');
+  const observeSpec = parseObserve(args.observe, 'click');
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
@@ -266,10 +204,11 @@ export const click: Tool = async (args) => {
     );
   }
   const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
   return {
     tabId: tab.id,
     url: tab.url,
-    data: { ok: true, ...probe, ...(wait ? { wait } : {}) },
+    data: { ok: true, ...probe, ...(wait ? { wait } : {}), ...(observed ? { observed } : {}) },
   };
 };
 
@@ -443,6 +382,7 @@ export const fill: Tool = async (args) => {
   const method = args.method === 'insertText' ? 'insertText' : 'value';
   const value = String(args.value);
   const waitSpec = parseWaitFor(args.waitFor, 'fill');
+  const observeSpec = parseObserve(args.observe, 'fill');
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
@@ -483,6 +423,7 @@ export const fill: Tool = async (args) => {
         ? null
         : await readBackApplied(tab.id!, objectId, value);
     const insertWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+    const insertObserved = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
     return {
       tabId: tab.id,
       url: tab.url,
@@ -492,6 +433,7 @@ export const fill: Tool = async (args) => {
         mode: 'insertText',
         ...(landed ?? {}),
         ...(insertWait ? { wait: insertWait } : {}),
+        ...(insertObserved ? { observed: insertObserved } : {}),
       },
     };
   }
@@ -562,6 +504,7 @@ export const fill: Tool = async (args) => {
         ? null
         : await readBackApplied(tab.id!, objectId, value);
     const fbWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+    const fbObserved = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
     return {
       tabId: tab.id,
       url: tab.url,
@@ -572,113 +515,24 @@ export const fill: Tool = async (args) => {
         fallbackFrom: 'value',
         ...(fbLanded ?? {}),
         ...(fbWait ? { wait: fbWait } : {}),
+        ...(fbObserved ? { observed: fbObserved } : {}),
       },
     };
   }
   const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
   return {
     tabId: tab.id,
     url: tab.url,
-    data: { ok: true, tag: res.tag, mode: res.mode, ...(wait ? { wait } : {}) },
+    data: {
+      ok: true,
+      tag: res.tag,
+      mode: res.mode,
+      ...(wait ? { wait } : {}),
+      ...(observed ? { observed } : {}),
+    },
   };
 };
-
-// A whole-page innerText on a chat SPA easily runs to tens of KB — past the
-// MCP tool-result budget, which shunts the payload into a file the agent
-// then has to re-read. Cap by default; `maxChars` overrides either way, and
-// the `truncated`/`totalChars` markers keep the cut visible.
-const DEFAULT_READ_MAX_CHARS = 20_000;
-// A ceiling on top of the default. Without one, `maxChars: 500000` was a single
-// call that put ~125k tokens into the window permanently — and unlike a
-// snapshot there is no structure to skim, so the model pays for all of it on
-// every later turn. With `offset` below, a genuinely long page is now readable
-// in pages instead, which is both cheaper and resumable.
-const MAX_READ_MAX_CHARS = 200_000;
-
-export function parseMaxChars(raw: unknown): number {
-  if (raw === undefined || raw === null) return DEFAULT_READ_MAX_CHARS;
-  const v = Number(raw);
-  if (!Number.isInteger(v) || v < 1) {
-    throw new BridgeError('bad_args', 'read_text: maxChars must be an integer >= 1');
-  }
-  return Math.min(v, MAX_READ_MAX_CHARS);
-}
-
-export function parseOffset(raw: unknown): number {
-  if (raw === undefined || raw === null) return 0;
-  const v = Number(raw);
-  if (!Number.isInteger(v) || v < 0) {
-    throw new BridgeError('bad_args', 'read_text: offset must be an integer >= 0');
-  }
-  return v;
-}
-
-export type CappedText = {
-  text: string;
-  truncated?: true;
-  totalChars?: number;
-  offset?: number;
-  nextOffset?: number;
-};
-
-function isHighSurrogate(c: number): boolean {
-  return c >= 0xd800 && c <= 0xdbff;
-}
-
-function isLowSurrogate(c: number): boolean {
-  return c >= 0xdc00 && c <= 0xdfff;
-}
-
-/** Slice the page text into one readable window.
- *
- * The cut used to be reported (`truncated`/`totalChars`) but not resumable: the
- * only way past character 20 000 was to re-read from zero with a bigger cap,
- * paying for the first 20 000 characters a second time and putting them in the
- * context twice. `nextOffset` is the whole fix — hand it straight back as
- * `offset` to continue.
- *
- * Both edges are snapped off the middle of a surrogate pair. JS string indices
- * are UTF-16 code units, so a naive slice through an emoji leaves a LONE
- * SURROGATE — which `protocol.ts` refuses to sign, turning the whole read into
- * `unserialisable_result`. On a chat SPA, the exact thing this tool is for,
- * that is not a rare boundary. Snapping costs at most one code unit per edge.
- *
- * A page is never returned empty while more text remains: with `maxChars: 1`
- * landing on a pair, the pair is taken whole rather than emitting
- * `{text:'', nextOffset: offset}`, which a paging agent would loop on forever.
- * Pure, so all of this is testable without chrome. */
-export function capText(text: string, maxChars: number, offset = 0): CappedText {
-  const total = text.length;
-  let start = Math.min(offset, total);
-  // A low surrogate at `start` means the previous read stopped mid-pair (or the
-  // caller invented the offset) — step past the orphan rather than emitting it.
-  if (start > 0 && start < total && isLowSurrogate(text.charCodeAt(start))) {
-    if (isHighSurrogate(text.charCodeAt(start - 1))) start += 1;
-  }
-  let end = Math.min(start + maxChars, total);
-  if (
-    end < total &&
-    isHighSurrogate(text.charCodeAt(end - 1)) &&
-    isLowSurrogate(text.charCodeAt(end))
-  ) {
-    end -= 1;
-    // …unless that would make this page empty, which would stall a paging loop.
-    if (end <= start) end = Math.min(start + 2, total);
-  }
-  const slice = text.slice(start, end);
-  const out: CappedText = { text: slice };
-  if (start > 0) out.offset = start;
-  if (end < total) {
-    out.truncated = true;
-    out.totalChars = total;
-    out.nextOffset = end;
-  } else if (start > 0) {
-    // Reached the end on a continuation read — say how long the whole thing was
-    // so the agent can tell "done" from "maybe more".
-    out.totalChars = total;
-  }
-  return out;
-}
 
 export const readText: Tool = async (args) => {
   const maxChars = parseMaxChars(args.maxChars);
@@ -695,20 +549,11 @@ export const readText: Tool = async (args) => {
         `unknown ref "${args.ref}" for tab ${tab.id} — run snapshot first`,
       );
     }
-    let resolved: { object: { objectId?: string } };
-    try {
-      resolved = await cdp<{ object: { objectId?: string } }>(tab.id!, 'DOM.resolveNode', {
-        backendNodeId: r.backendDOMNodeId,
-      });
-    } catch (e) {
-      if (looksLikeMissingNodeError(e)) throw staleRefError('read_text', args.ref);
-      throw e;
-    }
-    if (!resolved.object.objectId) {
-      throw new BridgeError('bad_ref', 'could not resolve ref to a DOM node');
-    }
+    // Same resolve, same classification as every other tool — this branch used
+    // to hand-roll it and drift.
+    const objectId = await resolveBackendNode(tab.id!, r.backendDOMNodeId, args.ref, 'read_text');
     const out = await cdp<{ result: { value?: string } }>(tab.id!, 'Runtime.callFunctionOn', {
-      objectId: resolved.object.objectId,
+      objectId,
       functionDeclaration: READ_TEXT_FN,
       returnByValue: true,
     });

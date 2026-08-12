@@ -11,6 +11,9 @@
 import { cdp, looksLikeMissingNodeError, looksLikeSelectorSyntaxError } from './cdp.js';
 import { BridgeError, staleRefError } from './errors.js';
 import { getRef, isRef } from './refs.js';
+import { READ_TEXT_FN } from './text.js';
+
+export { READ_TEXT_FN } from './text.js';
 
 const POLL_MS = 250;
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -18,12 +21,6 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 // turn into an opaque wire timeout. Mind the budget when combining an
 // embedded wait with a slow action.
 const MAX_TIMEOUT_MS = 30_000;
-
-// Trimmed innerText preferred; fall back to textContent (hidden-but-present
-// nodes). Pinned as a const so read_text's two branches and the text-wait
-// probe can't drift apart. FIXED literal.
-export const READ_TEXT_FN =
-  'function() { return (this.innerText || this.textContent || "").trim(); }';
 
 export type WaitSpec = {
   selector: string | null;
@@ -379,7 +376,9 @@ export function scrollStalled(
 // Bring `this` element into the centre of the viewport, then report the page's
 // resulting scroll offset (best-effort; falls back to 0 with no defaultView).
 export const SCROLL_INTO_VIEW_PROBE =
-  "function() { this.scrollIntoView({ block: 'center', inline: 'center' });" +
+  // `behavior: 'instant'` so the reported position is the settled one: a page
+  // with `scroll-behavior: smooth` would otherwise animate past our read.
+  "function() { this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });" +
   ' var w = this.ownerDocument && this.ownerDocument.defaultView;' +
   ' return { x: w ? w.scrollX : 0, y: w ? w.scrollY : 0 }; }';
 

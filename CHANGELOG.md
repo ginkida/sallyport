@@ -6,6 +6,117 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-08-12
+
+### Added
+
+- **`observe` — an optional post-action look at the page**, on the eleven tools
+  that already carry the embedded `waitFor`. Every action tool used to end
+  blind: `navigate`/`reload`/`history_go` invalidate every `@eN` you hold, so a
+  follow-up `snapshot` was structural rather than a choice, and a `click`
+  returns a tag and a hundred characters of text. Each of those follow-ups is a
+  whole model turn — seconds of latency plus a full context re-read. `observe`
+  folds it into the action's own result: `{snapshot: 'compact'|'tree',
+  text: true, maxChars}` → `observed:{source, elements|tree, text?}`.
+
+  Same discipline as `waitFor`: opt-in, additive, and unable to fail the action
+  it follows — an observation that blows up comes back as `observed.error`,
+  because the click already happened and calling it a failure would be a lie.
+  Runs after the wait, so it describes the page once it has settled.
+
+  It re-checks the allowlist against the page it is about to read rather than
+  leaning on the gate the tool already ran. That is load-bearing exactly once:
+  `navigate` gates the URL it was *asked* for, and the page can redirect
+  somewhere else. Without `observe`, that redirect is caught on the agent's next
+  call, since every tool gates the tab's *current* url — observing inside the
+  navigate would have been the one path that read a page the allowlist never
+  approved. A refusal comes back as `observed.skipped`, and nothing is read.
+
+- **The DOM-path snapshot mints refs in parallel.** One `DOM.describeNode` per
+  interactive element, issued one at a time, meant hundreds of serial CDP
+  round-trips per snapshot — and `reveal` repeats the whole walk once per scroll
+  step, so it could spend its entire budget minting refs it never returns. They
+  now go out in bounded batches. Numbering is unchanged by construction: the
+  describes may complete in any order, but `@eN` is assigned afterwards walking
+  the document-ordered list. (This is safe where the same trick was not for
+  `get_state`: `DOM.getDocument` discards every nodeId handed out so far,
+  `describeNode` invalidates nothing and we read only the browser-owned
+  `backendNodeId`.)
+- **The tool catalogue is ~7 KB smaller.** The shared `waitFor` and `observe`
+  schema descriptions ride on eleven tools each, so a sentence of rationale
+  there costs eleven times over; that and `set_viewport`'s design story moved
+  into the repo docs, where they were already written. What stays is the
+  contract the model reads: every gate, bound, result field and behavioural
+  warning. (The first pass at this did drop three of `set_viewport`'s — when to
+  call it relative to navigating, how long the override lasts, and that
+  `touch:true` does not turn clicks into taps — and they are back. A sentence
+  that changes what the agent *does* is not rationale, however much it reads
+  like it.)
+- **`find` takes a batch of predicates and an optional wait.** Locating several
+  controls is one intention — "the composer, the send button, the row I am
+  replying to" — that cost three model turns *and* three full accessibility-tree
+  walks for the same answer. `queries: [{role, name, …}]` (up to 10) answers
+  from one call and one walk. The matcher is pure and extension-side, so the
+  extra predicates cost microseconds and not one extra CDP command.
+  `timeoutMs` polls until every query has matched, for the "it has not rendered
+  yet" case where there is no selector to `wait_for` — at 500 ms a tick, because
+  each one is a whole tree rather than `wait_for`'s three cheap CDP calls.
+
+### Changed
+
+- Three extractions to keep the tool graph acyclic, all forced by `observe`
+  needing to build a snapshot while being imported by the action tools:
+  `resolveSelectorOrRef` into `resolve.ts`, the page-text cutting into
+  `text.ts`, and `resolveTab`/`getTabOrGone` into `tab-resolve.ts`. The same
+  reason `poll.ts` exists. `read_text`'s ref branch now uses the shared resolver
+  rather than its own copy, and a test walks the import graph and fails on a
+  cycle — the previous three fixes were comments claiming the graph was fine,
+  and one of them was wrong for a while.
+
+### Fixed
+
+- **`mouse_click`/`hover` refuse an aim point outside the viewport.** `visible`
+  is width>0 && height>0 — *size*, not position — so an element scrolled out of
+  view, translated off-canvas or clipped by an overflow container passed it
+  while the browser silently discarded the dispatched event, and the tool
+  reported `ok:true` for a click that never happened. Coordinate mode has been
+  guarded for exactly this reason all along; selector mode was not. The check
+  fails open when the viewport cannot be measured. The aim probe's
+  `scrollIntoView` is now explicitly instant, so the rect it measures is the
+  settled one — on a page with `scroll-behavior: smooth` it was reading the
+  position the element was about to leave, which mis-aimed the dispatch too.
+- **`observe` cut page text with a raw slice**, so an emoji at the cap left a
+  lone surrogate — which the signer refuses, discarding the **entire** tool
+  result. That broke the one promise `observe` makes: the agent would be told an
+  action that *did* happen had failed (and would retry it — a double submit),
+  and in broker mode the discarded body carried the `epoch` of a tab the call
+  had just created, leaving it permanently unowned and unclosable. It now shares
+  `read_text`'s surrogate-safe cut. The DOM walker's own name cap had the same
+  edge and is fixed with it.
+- **`mouse_click`/`hover` returned a `hitTargetRef` that the observation in the
+  same response had already invalidated.** The overlay ref is now minted after
+  the observation, in the ref space the result actually ships.
+- **`observe` reported a partial element list as complete** — it dropped the
+  snapshot walker's `truncated` flag and reused that name for text truncation.
+  The two are now separate (`snapshotTruncated` vs `truncated` + `nextOffset`).
+- **`find`'s poll re-checks the allowlist on every tick** and reports the URL it
+  actually read. A poll may run for 30 s, and one check at entry would let the
+  walk read whatever the tab drifted onto — the same hole `observe` had, in the
+  one other place that reads the page repeatedly under a single gate.
+- `find` refuses `queries` together with a top-level predicate instead of
+  inheriting `limit` while silently dropping `role`/`name`/`value`.
+- `observed.skipped` distinguishes `domain_not_allowed` from `tab_gone` instead
+  of collapsing an unrelated failure into the gate's answer.
+- **`scroll(selector)` reported the position it was leaving, not the one it
+  reached**, on any page with `scroll-behavior: smooth` — its probe read
+  `scrollX`/`scrollY` immediately after an animated `scrollIntoView`. The scroll
+  is now explicitly instant, so the reported offset is the settled one. (Same
+  edge as the aim probe above, same one-word fix.)
+- **`not_visible`'s recovery hint now names the scrolled-away case first.** It
+  only ever said "wait_for until it renders", which can never resolve an element
+  that is rendered and simply outside the viewport — the failure the check above
+  newly reports.
+
 ## [0.21.0] — 2026-08-12
 
 ### Added
@@ -2243,7 +2354,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/ginkida/sallyport/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/ginkida/sallyport/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/ginkida/sallyport/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/ginkida/sallyport/compare/v0.18.1...v0.19.0

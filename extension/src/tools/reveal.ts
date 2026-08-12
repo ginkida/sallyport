@@ -1,6 +1,6 @@
 import { collectInteractive } from './axtree.js';
 import { attach, cdp } from './cdp.js';
-import { resolveBackendNode, resolveSelectorOrRef } from './dom.js';
+import { resolveBackendNode, resolveSelectorOrRef } from './resolve.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { matchElements, parsePredicate } from './match.js';

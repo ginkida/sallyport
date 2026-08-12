@@ -17,9 +17,10 @@
  */
 
 import { attach, cdp } from './cdp.js';
-import { resolveSelectorOrRef } from './dom.js';
+import { resolveSelectorOrRef } from './resolve.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
+import { parseObserve, runObserve } from './observe.js';
 import { parseWaitFor, runEmbeddedWait, SCROLL_BY_PROBE, SCROLL_INTO_VIEW_PROBE } from './poll.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
@@ -95,6 +96,7 @@ export const scroll: Tool = async (args) => {
   // Lazy-load harvesting is scroll → wait-for-new-content → read, repeated. The
   // embedded wait folds the middle step in, halving the calls per screenful.
   const waitSpec = parseWaitFor(args.waitFor, 'scroll');
+  const observeSpec = parseObserve(args.observe, 'scroll');
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
@@ -109,6 +111,7 @@ export const scroll: Tool = async (args) => {
     );
     const v = out.result.value ?? { x: 0, y: 0 };
     const intoViewWait = waitSpec ? await runEmbeddedWait(tabId, waitSpec) : null;
+    const intoViewObserved = observeSpec ? await runObserve(tabId, observeSpec) : null;
     return {
       tabId,
       url: tab.url,
@@ -118,6 +121,7 @@ export const scroll: Tool = async (args) => {
         x: Math.round(v.x),
         y: Math.round(v.y),
         ...(intoViewWait ? { wait: intoViewWait } : {}),
+        ...(intoViewObserved ? { observed: intoViewObserved } : {}),
       },
     };
   }
@@ -148,6 +152,7 @@ export const scroll: Tool = async (args) => {
   // Whether we bottomed out — the signal a lazy-load loop needs to stop.
   const atBottom = v.y + v.clientHeight >= v.scrollHeight - 1;
   const wait = waitSpec ? await runEmbeddedWait(tabId, waitSpec) : null;
+  const observed = observeSpec ? await runObserve(tabId, observeSpec) : null;
   return {
     tabId,
     url: tab.url,
@@ -159,6 +164,7 @@ export const scroll: Tool = async (args) => {
       scrollHeight: Math.round(v.scrollHeight),
       atBottom,
       ...(wait ? { wait } : {}),
+      ...(observed ? { observed } : {}),
     },
   };
 };

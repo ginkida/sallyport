@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   describePoint,
   findClickPoint,
+  pointOutsideViewport,
   type AimDocumentLike,
   type AimElementLike,
   type AimRootLike,
@@ -185,5 +186,69 @@ describe('describePoint', () => {
 
     const revived = (0, eval)('(' + src + ')') as typeof describePoint;
     expect(revived(doc(null), 1, 1).vw).toBe(1280);
+  });
+});
+
+/**
+ * `visible` is width>0 && height>0 — SIZE, not position. An element scrolled
+ * out of view or translated off-canvas passes it while CDP silently discards
+ * the dispatched event, so `mouse_click` used to report ok:true for a click
+ * that never happened. Coordinate mode has been guarded all along; selector
+ * mode was not.
+ */
+describe('pointOutsideViewport', () => {
+  const vp = { vw: 1000, vh: 800 };
+
+  it('accepts a point inside', () => {
+    expect(pointOutsideViewport({ x: 500, y: 400, ...vp })).toBe(false);
+    expect(pointOutsideViewport({ x: 0, y: 0, ...vp })).toBe(false);
+    expect(pointOutsideViewport({ x: 999, y: 799, ...vp })).toBe(false);
+  });
+
+  it('rejects a point past any edge', () => {
+    expect(pointOutsideViewport({ x: 1000, y: 400, ...vp })).toBe(true);
+    expect(pointOutsideViewport({ x: 500, y: 800, ...vp })).toBe(true);
+    expect(pointOutsideViewport({ x: -1, y: 400, ...vp })).toBe(true);
+    expect(pointOutsideViewport({ x: 500, y: -1, ...vp })).toBe(true);
+    // The common real case: the element is below the fold.
+    expect(pointOutsideViewport({ x: 500, y: 4200, ...vp })).toBe(true);
+  });
+
+  it('fails OPEN when the viewport could not be measured', () => {
+    // Refusing on a reading we do not have would block legitimate clicks;
+    // dispatching is what happened before the check existed.
+    expect(pointOutsideViewport({ x: 5000, y: 5000, vw: 0, vh: 0 })).toBe(false);
+    expect(pointOutsideViewport({ x: 5000, y: 5000, vw: 1000, vh: 0 })).toBe(false);
+  });
+});
+
+describe('findClickPoint reports the viewport it measured', () => {
+  it('carries vw/vh out so the refusal decision can live in TypeScript', () => {
+    const el = {
+      tagName: 'BUTTON',
+      getBoundingClientRect: () => ({ left: 10, top: 20, width: 100, height: 40 }),
+      contains: () => true,
+      scrollIntoView: () => {},
+    };
+    const doc = {
+      elementFromPoint: () => el,
+      defaultView: { innerWidth: 1280, innerHeight: 720 },
+    };
+    const point = findClickPoint(el as never, doc as never);
+    expect(point.vw).toBe(1280);
+    expect(point.vh).toBe(720);
+    expect(pointOutsideViewport(point)).toBe(false);
+  });
+
+  it('reports zeros when there is no view to read, so the check fails open', () => {
+    const el = {
+      tagName: 'BUTTON',
+      getBoundingClientRect: () => ({ left: 0, top: 9000, width: 10, height: 10 }),
+      contains: () => true,
+      scrollIntoView: () => {},
+    };
+    const point = findClickPoint(el as never, { elementFromPoint: () => el } as never);
+    expect(point.vw).toBe(0);
+    expect(pointOutsideViewport(point)).toBe(false);
   });
 });

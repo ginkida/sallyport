@@ -1,5 +1,5 @@
 import { attach, cdp } from './cdp.js';
-import { resolveSelectorOrRef } from './dom.js';
+import { resolveSelectorOrRef } from './resolve.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { resolveTab } from './tabs.js';

@@ -25,9 +25,10 @@
  */
 
 import { attach, cdp } from './cdp.js';
-import { resolveSelectorOrRef } from './dom.js';
+import { resolveSelectorOrRef } from './resolve.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
+import { parseObserve, runObserve } from './observe.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
@@ -290,6 +291,7 @@ export const selectOption: Tool = async (args) => {
   if (!selector) throw new BridgeError('bad_args', 'select_option: selector required');
   const spec = buildSpec(args);
   const waitSpec = parseWaitFor(args.waitFor, 'select_option');
+  const observeSpec = parseObserve(args.observe, 'select_option');
 
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
@@ -309,6 +311,7 @@ export const selectOption: Tool = async (args) => {
   if (!r.ok) throw planError(r);
 
   const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
   return {
     tabId: tab.id,
     url: tab.url,
@@ -318,6 +321,7 @@ export const selectOption: Tool = async (args) => {
       multiple: r.multiple,
       selected: r.selected,
       ...(wait ? { wait } : {}),
+      ...(observed ? { observed } : {}),
     },
   };
 };

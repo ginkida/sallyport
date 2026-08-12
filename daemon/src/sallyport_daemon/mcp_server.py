@@ -45,15 +45,58 @@ _WAIT_FOR_SCHEMA: dict[str, Any] = {
     },
     "additionalProperties": False,
     "description": (
-        "Optional post-action wait (same engine as wait_for): after the action "
-        "succeeds, poll until selector/text is present-and-visible (or gone, "
-        "with absent=true). Saves the follow-up wait_for round-trip — prefer "
-        "this over a separate wait_for call. The result gains "
-        "wait:{found, elapsedMs, reason?}; a wait timeout or error never fails "
-        "the action itself. On found=false, reason says why so you can branch: "
-        "'timeout' (not true yet — retry/longer may help), 'bad_ref' (stale "
-        "@eN after a re-render — re-snapshot), 'invalid_selector' (malformed "
-        "CSS you passed — permanent, fix the selector), 'error' (other)."
+        "Post-action wait (same engine as wait_for): poll until selector/text is "
+        "present-and-visible, or gone with absent=true. Saves the follow-up wait_for "
+        "call — prefer it over a separate one. Adds wait:{found, elapsedMs, reason?}; "
+        "a wait timeout or error never fails the action. On found=false, reason says "
+        "why: 'timeout' (not true yet — longer may help), 'bad_ref' (stale @eN after a "
+        "re-render — re-snapshot), 'invalid_selector' (malformed CSS you passed — "
+        "permanent), 'error' (other)."
+    ),
+}
+
+# Embedded post-action OBSERVATION, shared by every tool that changes the page.
+# Its whole reason for existing: navigate and reload invalidate every @eN, and
+# an action's own result says almost nothing about the resulting page — so the
+# agent's next call was a snapshot it had no way to avoid. Folding it in turns
+# act → look into one call, i.e. removes a whole model turn from every step of
+# a task.
+_OBSERVE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "snapshot": {
+            "type": "string",
+            "enum": ["compact", "tree"],
+            "description": (
+                "'compact' = flat list of actionable elements {ref, role, name} — what "
+                "you need to click the next thing, and much smaller; 'tree' = the full "
+                "accessibility tree"
+            ),
+        },
+        "text": {"type": "boolean", "default": False, "description": "Page visible text"},
+        "maxChars": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20000,
+            "default": 2000,
+            "description": "Cap on observed text",
+        },
+    },
+    "additionalProperties": False,
+    "description": (
+        "Post-action look at the page, run after waitFor — saves the follow-up "
+        "snapshot/read_text call, and after navigate/reload/history_go (which kill "
+        "every @eN you hold) that call was otherwise unavoidable. Needs snapshot "
+        "and/or text:true. Returns observed:{source, elements|tree, text?, truncated?, "
+        "totalChars?, nextOffset?, snapshotTruncated?, skipped?, error?}, elements "
+        "being {ref, role, name, value?, type?} — truncated: "
+        "the TEXT was cut, resume with read_text offset=nextOffset; snapshotTruncated: "
+        "the ELEMENT LIST is partial (walker caps), so what you want may not be in it; "
+        "error: the look failed, the action still succeeded; skipped: nothing was read, "
+        "'domain_not_allowed' (the tab redirected off the allowlist) or 'tab_gone'. "
+        "A snapshot observation RE-MINTS the tab's @eN, so refs from an earlier "
+        "snapshot stop resolving (bad_ref, never a silent rebind) — use the ones it "
+        "returns. Prefer 'compact': this payload is re-read on every later turn."
     ),
 }
 
@@ -102,7 +145,10 @@ TOOLS: list[Tool] = [
             "Returns {tabId, url, wait?} where url is where the tab ACTUALLY "
             "landed, not the URL you asked for — plus redirectedFrom carrying "
             "your requested URL when they differ, which is how an SSO bounce, a "
-            "consent wall, a shortener or an expired session announces itself."
+            "consent wall, a shortener or an expired session announces itself. "
+            "A navigate invalidates every @eN you hold, so a follow-up snapshot is "
+            "otherwise unavoidable — pass observe:{snapshot:'compact'} to get the "
+            "new page's actionable elements back with this call instead."
         ),
         inputSchema={
             "type": "object",
@@ -111,6 +157,7 @@ TOOLS: list[Tool] = [
                 "newTab": {"type": "boolean", "default": False},
                 "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
+                "observe": _OBSERVE_SCHEMA,
             },
             "required": ["url"],
             "additionalProperties": False,
@@ -144,7 +191,9 @@ TOOLS: list[Tool] = [
             "second one on wait_for. Returns {tabId, url, bypassCache} where url "
             "is where the tab ACTUALLY ended up — plus redirectedFrom when that "
             "differs from the page you reloaded, which is the usual tell that the "
-            "session expired and the app bounced you to a login page."
+            "session expired and the app bounced you to a login page. Refs are "
+            "invalidated, so pass observe:{snapshot:'compact'} to get fresh ones "
+            "back here rather than spending a snapshot call on it."
         ),
         inputSchema={
             "type": "object",
@@ -152,6 +201,7 @@ TOOLS: list[Tool] = [
                 "tabId": _TAB_ID_SCHEMA,
                 "bypassCache": {"type": "boolean", "default": False},
                 "waitFor": _WAIT_FOR_SCHEMA,
+                "observe": _OBSERVE_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -200,6 +250,7 @@ TOOLS: list[Tool] = [
                 },
                 "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
+                "observe": _OBSERVE_SCHEMA,
             },
             "required": ["direction"],
             "additionalProperties": False,
@@ -513,6 +564,7 @@ TOOLS: list[Tool] = [
                 "selector": {"type": "string"},
                 "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
+                "observe": _OBSERVE_SCHEMA,
             },
             "required": ["selector"],
             "additionalProperties": False,
@@ -569,6 +621,7 @@ TOOLS: list[Tool] = [
                 },
                 "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
+                "observe": _OBSERVE_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -607,6 +660,7 @@ TOOLS: list[Tool] = [
                 },
                 "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
+                "observe": _OBSERVE_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -650,6 +704,7 @@ TOOLS: list[Tool] = [
                 "allowPassword": {"type": "boolean", "default": False},
                 "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
+                "observe": _OBSERVE_SCHEMA,
             },
             "required": ["selector", "value"],
             "additionalProperties": False,
@@ -705,6 +760,7 @@ TOOLS: list[Tool] = [
                 },
                 "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
+                "observe": _OBSERVE_SCHEMA,
             },
             "required": ["selector"],
             "additionalProperties": False,
@@ -732,6 +788,7 @@ TOOLS: list[Tool] = [
                 "allowPassword": {"type": "boolean", "default": False},
                 "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
+                "observe": _OBSERVE_SCHEMA,
             },
             "required": ["text"],
             "additionalProperties": False,
@@ -758,6 +815,7 @@ TOOLS: list[Tool] = [
                 "allowPassword": {"type": "boolean", "default": False},
                 "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
+                "observe": _OBSERVE_SCHEMA,
             },
             "required": ["keys"],
             "additionalProperties": False,
@@ -821,41 +879,37 @@ TOOLS: list[Tool] = [
     Tool(
         name="set_viewport",
         description=(
-            "Emulate a device viewport on the tab — the way to test responsive / "
-            "mobile layouts. This is DevTools' device mode, not a window resize: "
-            "it is per-tab, changes nothing the user sees in their own windows, "
-            "and gives you a device pixel ratio and mobile viewport-meta handling "
-            "that no window size can. Pass a preset ('mobile-small' 375x667, "
-            "'mobile' 393x852, 'mobile-large' 412x915, 'tablet' 820x1180, "
-            "'desktop' 1280x800, 'desktop-wide' 1920x1080) or explicit "
-            "width+height in CSS px, optionally with deviceScaleFactor (<=3), "
-            "mobile, touch and orientation ('portrait'|'landscape' just orients "
-            "the size you gave). mobile=true is what makes the page honour its "
-            "<meta name=viewport>; touch=true makes '(pointer: coarse)', "
-            "'(hover: none)' and ontouchstart match. The mobile presets also "
-            "present a mobile Chrome user agent (same Chrome version, Android "
-            "build) with matching UA client hints, so a server that branches on "
-            "the UA sends its mobile bundle — pass mobileUserAgent=false to keep "
-            "the real one. Every call states the UA in full, so switching to a "
-            "desktop preset (or mobileUserAgent=false) puts the real one back; it "
-            "never latches. SET IT BEFORE navigating (or reload after): the UA and "
-            "the mobile flag change what the server sends and how the page's own "
-            "load-time JS branches. The override survives navigate/reload on this "
-            "tab and lasts until reset=true, the tab closes, or the bridge "
-            "detaches; a NEW tab starts unemulated. reset=true (alone) restores "
-            "the real viewport. Call with no settings at all (just tabId) to READ "
-            "what the page currently sees. Returns {mode, requested?, page:{width, height, "
-            "deviceScaleFactor, screenWidth, screenHeight, orientation, touch, "
-            "maxTouchPoints, userAgent}} — page is what the page ACTUALLY reports, "
-            "so verify with it rather than assuming; on a mobile-emulated page "
-            "page.width can legitimately differ from the width you asked for "
-            "(the document's <meta name=viewport> defines the layout width) and "
-            "the result then carries a `note` saying so. Refs (@eN) are "
-            "invalidated — a breakpoint change remounts DOM, so re-snapshot. "
-            "A screenshot of an emulated tab comes back at width x "
-            "deviceScaleFactor pixels; screenshot's maxWidth knows about the "
-            "emulation, so use it to bound the image. Clicks stay real mouse events even "
-            "with touch=true. Structured CDP only, no evaluate flag. Domain must "
+            "Emulate a device viewport for ONE tab — DevTools device mode, not a "
+            "window resize, so it disturbs neither the human's windows nor the "
+            "session's other tabs, works in broker mode's unfocused window, and can "
+            "produce a device pixel ratio and mobile <meta viewport> handling no "
+            "window size can. preset: mobile-small (375x667), mobile (393x852), "
+            "mobile-large (412x915), tablet (820x1180), desktop (1280x800), "
+            "desktop-wide (1920x1080) — named by BREAKPOINT, not by device. Or give "
+            "width+height in CSS px. Optional deviceScaleFactor (<=3), mobile, touch, "
+            "orientation ('portrait'/'landscape' orients the size you gave). "
+            "mobile:true is what makes the page honour its <meta name=viewport>; "
+            "touch:true is what makes (pointer:coarse)/(hover:none)/ontouchstart "
+            "match — both are real layout inputs. The mobile presets also present a "
+            "mobile Chrome user agent with matching client hints (mobileUserAgent:false "
+            "opts out), because a server that branches on the UA would otherwise send "
+            "its desktop bundle and you would measure that — so SET IT BEFORE "
+            "navigating (or reload after), since the UA and the mobile flag decide "
+            "what the server sends and how the page's load-time JS branches. The "
+            "override survives navigate/reload on this tab until reset:true, the tab "
+            "closes, or the bridge detaches; a NEW tab starts unemulated. touch:true "
+            "is feature detection only — mouse_click/hover still dispatch real mouse "
+            "events, never taps. reset:true (alone) "
+            "restores the real viewport; NO arguments reads what the page currently "
+            "sees. Every set is a complete statement of the UA — a desktop preset "
+            "clears a mobile one. Bounded at 4096 px/side, dpr<=3, 4096^2 device px "
+            "(the emulated size x dpr IS a later screenshot's pixel size). Reports the "
+            "PAGE's reading, not your request, plus a note when the page's own <meta "
+            "viewport> sets the layout width; the dimensions live under `page` "
+            "({mode, requested?, page:{width, height, deviceScaleFactor, screenWidth, "
+            "screenHeight, orientation, touch, maxTouchPoints, userAgent}, note?}). "
+            "Invalidates @eN refs — a breakpoint "
+            "change remounts DOM. Structured CDP only, no evaluate flag. Domain must "
             "be in allowlist."
         ),
         inputSchema={
@@ -1079,6 +1133,7 @@ TOOLS: list[Tool] = [
                 },
                 "tabId": _TAB_ID_SCHEMA,
                 "waitFor": _WAIT_FOR_SCHEMA,
+                "observe": _OBSERVE_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -1094,13 +1149,70 @@ TOOLS: list[Tool] = [
             "ranked (exact-name first) and capped by limit. Returns {source, "
             "matches:[{ref,role,name,value,type,score}], total, truncated?} "
             "(truncated set when the snapshot was capped). Empty matches is a "
-            "normal not-found, not an error. The match runs in the extension "
+            "normal not-found, not an error. "
+            "Locating SEVERAL controls is one intention, not several: pass "
+            "queries:[{role,name,…,limit?}, …] (up to 10) and get "
+            "{source, results:[{query, matches, total}]} back from ONE call and "
+            "ONE tree walk — three separate finds cost three model turns and "
+            "three walks for the same answer. "
+            "timeoutMs (default 0 = answer from one snapshot) polls until EVERY "
+            "query has matched or the deadline passes, for the 'it has not "
+            "rendered yet' case where you would otherwise wait_for a selector you "
+            "do not have; the result then carries elapsedMs. Because the condition "
+            "is every query, do NOT put a predicate you expect to find nothing "
+            "into a batch with timeoutMs — it would wait out the whole deadline; "
+            "use wait_for with absent:true to assert something is gone. Each tick "
+            "is a whole accessibility tree, so it polls twice a second, not four "
+            "times. "
+            "The match runs in the extension "
             "over the snapshot — no page JS, no evaluate flag. Domain must be "
             "in allowlist."
         ),
         inputSchema={
             "type": "object",
             "properties": {
+                "queries": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "description": (
+                        "Batch of predicates to locate in one call and one tree walk; "
+                        "each entry takes the same role/name/nameExact/value/limit as "
+                        "the single form. Mutually exclusive with the top-level "
+                        "role/name/nameExact/value — passing both is bad_args"
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {"type": "array", "items": {"type": "string"}},
+                                ]
+                            },
+                            "name": {"type": "string"},
+                            "nameExact": {"type": "boolean", "default": False},
+                            "value": {"type": "string"},
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 50,
+                                "default": 10,
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 30000,
+                    "default": 0,
+                    "description": (
+                        "Poll until every query matches, or this deadline. 0 answers "
+                        "from a single snapshot"
+                    ),
+                },
                 "role": {
                     "oneOf": [
                         {"type": "string"},

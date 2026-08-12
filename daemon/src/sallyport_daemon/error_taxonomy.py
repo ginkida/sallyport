@@ -75,8 +75,11 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "or wait_for the load, then retry set_viewport."
         ),
         "not_visible": (
-            "retryable=yes; the target has zero size / isn't laid out yet — wait_for (or "
-            "settle) until it renders then retry, or re-snapshot to pick a visible element."
+            "retryable=yes; the target either has zero size / isn't laid out yet, OR it is "
+            "laid out but sits outside the viewport (the message says which, and the "
+            "browser discards events aimed off-screen). Scrolled away → scroll or reveal "
+            "it into view, then retry; not rendered yet → wait_for (or settle) until it "
+            "does, or re-snapshot to pick a visible element."
         ),
         "bad_ref": (
             "retryable=yes; the @eN ref is stale (the page re-rendered or navigated) — run "

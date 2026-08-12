@@ -125,7 +125,16 @@ export function collectDomTree(doc: DomDocumentLike, root?: DomNodeLike | null):
   let truncated = false;
 
   function cap(s: string): string {
-    return s.length > MAX_TEXT ? s.slice(0, MAX_TEXT) + '…' : s;
+    if (s.length <= MAX_TEXT) return s;
+    // Step back off a surrogate pair. A lone half is unsignable (protocol.ts),
+    // and this walker runs on every DOM-path snapshot — including the one an
+    // `observe` folds into an action's result, where an unsignable payload
+    // discards the whole action body. One emoji at the boundary of one node's
+    // name is enough; this is a chat-SPA fallback, so emoji are the norm.
+    let end = MAX_TEXT;
+    const c = s.charCodeAt(end - 1);
+    if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+    return s.slice(0, end) + '…';
   }
 
   function norm(s: string | null | undefined): string {

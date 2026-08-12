@@ -639,3 +639,75 @@ describe('navigate / reload report where the tab ACTUALLY landed', () => {
     expect(out.data).not.toHaveProperty('redirectedFrom');
   });
 });
+
+describe('navigate + observe', () => {
+  it('folds the observation into the action result', async () => {
+    installChromeMock({ active: { id: 1, url: 'about:blank', status: 'complete' } });
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+    const out = (await navigate(
+      { url: 'https://app.example.com/dash', observe: { snapshot: 'compact' } },
+      undefined,
+    )) as { data: { url: string; observed?: Record<string, unknown> } };
+    expect(out.data.url).toBe('https://app.example.com/dash');
+    expect(out.data.observed).toBeDefined();
+  });
+
+  it('an observation that blows up NEVER fails the navigation that already happened', async () => {
+    // The mock's CDP channel answers {} to everything, so the snapshot walk gets
+    // no a11y nodes and throws. The navigate has already committed — the page is
+    // loaded, the tab has moved — so turning that into an error would be a lie.
+    installChromeMock({ active: { id: 1, url: 'about:blank', status: 'complete' } });
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+    const out = (await navigate(
+      { url: 'https://app.example.com/dash', observe: { snapshot: 'tree' } },
+      undefined,
+    )) as { data: { url: string; observed?: { error?: string } } };
+    expect(out.data.url).toBe('https://app.example.com/dash');
+    expect(out.data.observed).toBeDefined();
+  });
+
+  it('is absent when not asked for — no action pays for it by default', async () => {
+    installChromeMock({ active: { id: 1, url: 'about:blank', status: 'complete' } });
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+    const out = (await navigate({ url: 'https://app.example.com/dash' }, undefined)) as {
+      data: Record<string, unknown>;
+    };
+    expect(out.data).not.toHaveProperty('observed');
+  });
+
+  it('rejects a malformed observe BEFORE navigating anywhere', async () => {
+    const calls = installChromeMock({ active: { id: 1, url: 'about:blank', status: 'complete' } });
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+    await expect(
+      navigate({ url: 'https://app.example.com/dash', observe: {} }, undefined),
+    ).rejects.toMatchObject({ code: 'bad_args' });
+    expect(calls.update).toHaveLength(0);
+    expect(calls.create).toHaveLength(0);
+  });
+});
+
+describe('observe re-gates the page it is about to read', () => {
+  it('refuses to observe a tab that redirected OFF the allowlist', async () => {
+    // navigate gates the URL it was ASKED for. If the page then bounces
+    // somewhere the allowlist does not cover, every ordinary tool would refuse
+    // on its next call — observing inside the action must not be the one path
+    // that reads it anyway (invariant #3).
+    installChromeMock({
+      active: { id: 1, url: 'about:blank', status: 'complete' },
+      redirectTo: 'https://tracker.evil.example/collect',
+    });
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+    const out = (await navigate(
+      { url: 'https://app.example.com/dash', observe: { snapshot: 'compact', text: true } },
+      undefined,
+    )) as { data: { url: string; observed?: Record<string, unknown> } };
+
+    // The navigation itself still succeeded and reports where it landed…
+    expect(out.data.url).toBe('https://tracker.evil.example/collect');
+    expect(out.data.redirectedFrom).toBe('https://app.example.com/dash');
+    // …but nothing of that page was read.
+    expect(out.data.observed).toEqual({ skipped: 'domain_not_allowed' });
+    expect(out.data.observed).not.toHaveProperty('text');
+    expect(out.data.observed).not.toHaveProperty('elements');
+  });
+});

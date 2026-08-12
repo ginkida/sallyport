@@ -272,3 +272,25 @@ describe('collectDomTree — snapshot DOM fallback', () => {
     ]);
   });
 });
+
+/**
+ * The node-name cap must not leave a lone surrogate. This walker feeds every
+ * DOM-path snapshot — including one folded into an action's result by
+ * `observe`, where an unsignable payload discards the whole action body and the
+ * agent is told an action that DID happen had failed.
+ */
+describe('name/text cap', () => {
+  it('never ends a capped string on half a surrogate pair', () => {
+    const emoji = '\u{1F600}';
+    // Build a name whose cut would land exactly between the pair's halves.
+    for (let pad = 0; pad < 4; pad += 1) {
+      const long = 'a'.repeat(200 + pad) + emoji.repeat(400);
+      const { tree } = collectDomTree(doc(el('BODY', {}, [text(long)])));
+      const serialised = JSON.stringify(tree);
+      // A lone surrogate is one that is not part of a pair.
+      expect(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(serialised),
+      ).toBe(false);
+    }
+  });
+});

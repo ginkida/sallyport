@@ -1,11 +1,11 @@
 import { buildTree, collectInteractive, type AXNode, type TreeNode } from './axtree.js';
 import { attach, cdp } from './cdp.js';
-import { resolveSelectorOrRef } from './dom.js';
+import { resolveSelectorOrRef } from './resolve.js';
 import { collectDomTree, type DomTreeNode, type DomTreeResult } from './domtree.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { newRef, refWatermark, resetRefsForTab } from './refs.js';
-import { resolveTab } from './tabs.js';
+import { resolveTab } from './tab-resolve.js';
 import type { Tool } from './types.js';
 
 // The serialised `collectDomTree` (domtree.ts) applied to the page document
@@ -78,29 +78,61 @@ async function domSnapshot(
       }
     }
 
-    const assignRefs = async (nodes: DomTreeNode[]): Promise<void> => {
+    // Collect first, in DOCUMENT order, then describe, then number. Splitting
+    // the three is what makes the middle step safe to parallelise while the
+    // ids stay exactly what a sequential walk would have produced.
+    const pending: Array<{ node: DomTreeNode; objectId: string }> = [];
+    const collect = (nodes: DomTreeNode[]): void => {
       for (const n of nodes) {
         if (n.idx !== undefined) {
           const objectId = elIds.get(n.idx);
           delete n.idx;
-          if (objectId) {
-            try {
-              const d = await cdp<{ node: { backendNodeId?: number } }>(tabId, 'DOM.describeNode', {
-                objectId,
-              });
-              if (d.node.backendNodeId !== undefined) {
-                n.ref = '@' + newRef(tabId, d.node.backendNodeId, n.role, n.name ?? '');
-              }
-            } catch {
-              // Node died between probe and describe (SPA re-render) — the
-              // entry stays in the tree, just without a ref.
-            }
-          }
+          if (objectId) pending.push({ node: n, objectId });
         }
-        if (n.children) await assignRefs(n.children);
+        if (n.children) collect(n.children);
       }
     };
-    await assignRefs(out.tree);
+    collect(out.tree);
+
+    // One `DOM.describeNode` per element, and there can be hundreds — a
+    // sequential walk spent that many serial round-trips, ×41 inside `reveal`,
+    // which could burn its whole budget minting refs it never returns.
+    //
+    // Concurrency here is safe in a way it is NOT for `DOM.getDocument`: that
+    // command calls DiscardFrontendBindings and invalidates every nodeId handed
+    // out so far, which is exactly how a batched `get_state` broke. `describeNode`
+    // invalidates nothing, and we read only `backendNodeId` — the browser's own
+    // identity for the node, unaffected by anything another in-flight command
+    // does. Bounded so a 400-element page doesn't dump 400 commands at once.
+    const backendIds: Array<number | undefined> = new Array(pending.length);
+    for (let i = 0; i < pending.length; i += DESCRIBE_CONCURRENCY) {
+      const slice = pending.slice(i, i + DESCRIBE_CONCURRENCY);
+      const described = await Promise.all(
+        slice.map(async (entry) => {
+          try {
+            const d = await cdp<{ node: { backendNodeId?: number } }>(tabId, 'DOM.describeNode', {
+              objectId: entry.objectId,
+            });
+            return d.node.backendNodeId;
+          } catch {
+            // Node died between probe and describe (SPA re-render) — the entry
+            // stays in the tree, just without a ref.
+            return undefined;
+          }
+        }),
+      );
+      for (let j = 0; j < described.length; j += 1) backendIds[i + j] = described[j];
+    }
+
+    // Numbering happens HERE, sequentially over the document-ordered list, so
+    // `@eN` is identical to what the old serial walk produced no matter what
+    // order the describes came back in.
+    for (let i = 0; i < pending.length; i += 1) {
+      const backendNodeId = backendIds[i];
+      if (backendNodeId === undefined) continue;
+      const n = pending[i].node;
+      n.ref = '@' + newRef(tabId, backendNodeId, n.role, n.name ?? '');
+    }
     return { tree: out.tree as TreeNode[], truncated: out.truncated };
   } finally {
     try {
@@ -119,6 +151,11 @@ async function domSnapshot(
 // extension while read_text saw the whole rendered chat. Whichever side
 // finds more actionable elements wins; ties keep a11y (richer semantics).
 const MIN_TRUSTED_AX_REFS = 4;
+
+// How many `DOM.describeNode` calls the DOM path keeps in flight. Enough to
+// turn hundreds of serial round-trips into a dozen waves; small enough that a
+// huge page does not hand Chrome one enormous burst.
+const DESCRIBE_CONCURRENCY = 24;
 
 export type SnapshotResult = { tree: TreeNode[]; source: 'a11y' | 'dom'; truncated: boolean };
 
