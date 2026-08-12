@@ -244,6 +244,75 @@ async def _print_to_pdf_result(args: dict[str, Any], result: Any) -> dict[str, A
     return {**written, "filename": filename}
 
 
+def _validate_fetch_filename(args: dict[str, Any]) -> None:
+    """Fail before the browser round-trip when fetch_in_page's `saveAs` is
+    unusable — same sandbox rules as save_to_file (invariant #10). Mirrors
+    :func:`_validate_pdf_filename`: there is no point downloading a multi-MiB
+    asset through the page only to refuse to write it."""
+    filename = args.get("saveAs")
+    if filename is None:
+        return
+    if not isinstance(filename, str):
+        raise ToolError("fetch_in_page: saveAs must be a string", code="bad_args")
+    _sanitise_filename(filename, tool="fetch_in_page")
+
+
+async def _fetch_in_page_result(args: dict[str, Any], result: Any) -> dict[str, Any] | Any:
+    """With `saveAs`, divert fetch_in_page's body into the download sandbox.
+
+    Without it, nothing changes — the body comes back in `data` as before.
+
+    The saving is the whole point: `fetch_in_page` exists to pull assets from a
+    logged-in page, and those are routinely images or archives. Base64 inflates
+    them by a third and every byte then sits in the model's context, re-read on
+    every subsequent turn, to no purpose — the agent almost never wants to LOOK
+    at an image, it wants the file on disk for `upload` or for the user. The old
+    route (fetch_in_page → save_to_file) did put it on disk, but only after the
+    payload had already made the trip through the context it was trying to avoid,
+    and it cost a second call.
+
+    Both content modes are handled: 'base64' decodes, 'text' is written as UTF-8
+    (a JSON/CSV export is a normal thing to want on disk). The result keeps the
+    metadata that lets the agent decide what happened — status, contentType,
+    mode — and replaces `data` with {path, size, filename}.
+    """
+    filename = args.get("saveAs")
+    if filename is None:
+        return result
+    if not isinstance(result, dict):
+        raise ToolError("fetch_in_page: extension returned no payload", code="error")
+    if not isinstance(filename, str):
+        raise ToolError("fetch_in_page: saveAs must be a string", code="bad_args")
+    filename = _sanitise_filename(filename, tool="fetch_in_page")
+
+    data = result.get("data")
+    if not isinstance(data, str):
+        raise ToolError("fetch_in_page: response carried no body to save", code="error")
+    mode = result.get("mode")
+    if mode == "base64":
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except Exception as exc:
+            raise ToolError(
+                f"fetch_in_page: response body was not valid base64: {exc}", code="error"
+            ) from exc
+    else:
+        # 'text' (or anything the extension labelled otherwise) — write the
+        # characters we were given. UTF-8 with surrogatepass would smuggle an
+        # unpaired surrogate onto disk, so encode strictly and report instead.
+        try:
+            raw = data.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ToolError(
+                f"fetch_in_page: response body is not encodable as UTF-8: {exc}",
+                code="error",
+            ) from exc
+
+    written = await _write_blob_async(filename, raw, tool="fetch_in_page")
+    saved = {k: v for k, v in result.items() if k not in ("data", "headers")}
+    return {**saved, **written, "filename": filename}
+
+
 def _default_pdf_filename() -> str:
     """Name for a print_to_pdf call that supplied none.
 
@@ -271,6 +340,7 @@ LOCAL_TOOLS: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
 PRE_CALL_VALIDATORS: dict[str, Callable[[dict[str, Any]], None]] = {
     "upload": lambda args: validate_upload_paths(args.get("paths")),
     "print_to_pdf": _validate_pdf_filename,
+    "fetch_in_page": _validate_fetch_filename,
 }
 
 
@@ -279,4 +349,5 @@ PRE_CALL_VALIDATORS: dict[str, Callable[[dict[str, Any]], None]] = {
 # the MCP caller actually sees.
 POST_CALL_PROCESSORS: dict[str, Callable[[dict[str, Any], Any], Awaitable[Any]]] = {
     "print_to_pdf": _print_to_pdf_result,
+    "fetch_in_page": _fetch_in_page_result,
 }

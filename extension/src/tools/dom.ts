@@ -131,20 +131,38 @@ async function targetIsPasswordField(tabId: number, objectId: string): Promise<b
   return attributesIndicatePassword(res.attributes);
 }
 
-// Walk document.activeElement down through OPEN shadow roots to the element that
-// ACTUALLY holds focus. CDP Input.insertText writes to this leaf, which is not
-// always the resolved node: a shadow host with `delegatesFocus:true` delegates
-// `focus()` to an inner control, yet `document.activeElement` (retargeted to the
-// document) still reports the HOST — so the up-front gate, which inspects the
-// resolved host, sees no password field while the write lands on the inner one.
-// FIXED literal, no agent interpolation (invariant #4). The descent runs in page
-// JS, so a hostile allowlisted page could hide a closed root or lie — the same
-// stronger-adversary residual documented for the keystroke probe (SECURITY.md);
-// against an honest page + agent mis-driving (the invariant #5 threat) it
-// resolves the true write target.
-const DEEPEST_ACTIVE_ELEMENT_EXPR =
+// Walk document.activeElement down to the element that ACTUALLY holds focus.
+// CDP Input.insertText writes to this leaf, which is not always the resolved
+// node, and TWO structures move it:
+//
+//  - a shadow host with `delegatesFocus:true` delegates `focus()` to an inner
+//    control, yet `document.activeElement` (retargeted to the document) still
+//    reports the HOST — so the up-front gate, inspecting the resolved host,
+//    sees no password field while the write lands on the inner one;
+//  - a same-origin IFRAME. `fill(selector='iframe.login')` resolves to the
+//    frame ELEMENT, which is not a password field, so the up-front gate passes;
+//    `focus()` on it moves focus INTO the frame, and the insertText then lands
+//    on whatever is focused there — which can be an `<input type=password>` the
+//    gate never saw. Descending into the frame closes that: the leaf is
+//    re-gated like any other. A cross-origin frame throws on `contentDocument`
+//    and the walk stops at the frame element, which is the honest answer — we
+//    cannot see in, and nothing is typed there that we could have inspected
+//    anyway (the keystroke tools use CDP's own OOPIF walk for that case).
+//
+// Bounded so a pathological focus cycle cannot spin. FIXED literal, no agent
+// interpolation (invariant #4). The descent runs in page JS, so a hostile
+// allowlisted page could hide a closed root or lie — the same stronger-adversary
+// residual documented for the keystroke probe (SECURITY.md); against an honest
+// page + agent mis-driving (the invariant #5 threat) it resolves the true
+// write target.
+export const DEEPEST_ACTIVE_ELEMENT_EXPR =
   '(() => { let a = document.activeElement;' +
-  ' while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;' +
+  ' for (let i = 0; i < 20 && a; i++) {' +
+  ' if (a.shadowRoot && a.shadowRoot.activeElement) { a = a.shadowRoot.activeElement; continue; }' +
+  ' if (a.tagName === "IFRAME" || a.tagName === "FRAME") {' +
+  ' let d = null; try { d = a.contentDocument; } catch (e) { d = null; }' +
+  ' if (d && d.activeElement) { a = d.activeElement; continue; } }' +
+  ' break; }' +
   ' return a; })()';
 
 /** After `focus()` has run, re-apply the password gate to the element that will
@@ -154,13 +172,16 @@ const DEEPEST_ACTIVE_ELEMENT_EXPR =
  * truth (`targetIsPasswordField`), so a value can't be routed into an
  * `<input type=password>` (invariant #5). No-op when `allowPassword`, or when
  * nothing is focused (`ensureFocusLanded` handles the no-focus case). */
-async function ensureFocusedLeafNotPassword(tabId: number, allowPassword: boolean): Promise<void> {
-  if (allowPassword) return;
+async function ensureFocusedLeafNotPassword(
+  tabId: number,
+  allowPassword: boolean,
+): Promise<string | null> {
+  if (allowPassword) return null;
   const active = await cdp<{ result: { objectId?: string } }>(tabId, 'Runtime.evaluate', {
     expression: DEEPEST_ACTIVE_ELEMENT_EXPR,
   });
   const objectId = active.result.objectId;
-  if (!objectId) return;
+  if (!objectId) return null;
   if (await targetIsPasswordField(tabId, objectId)) {
     throw new BridgeError(
       'password_field',
@@ -168,6 +189,7 @@ async function ensureFocusedLeafNotPassword(tabId: number, allowPassword: boolea
         'pass allowPassword=true to override',
     );
   }
+  return objectId;
 }
 
 /** Click the node — unless the click is guaranteed to do nothing, in which case
@@ -287,6 +309,128 @@ const FILL_CLEAR_FN = `function() {
   return { tag: this.tagName, focused: this.getRootNode().activeElement === this };
 }`;
 
+/** What the post-write read-back can honestly conclude.
+ *
+ *  - `yes`     the field contains what we sent;
+ *  - `no`      the field is EMPTY — nothing landed at all;
+ *  - `unclear` the field has content that is not literally our text. An input
+ *              mask ("+7 (912) …"), a normaliser, or a `maxlength` truncation
+ *              all look like this, and `len` is what tells them apart. Calling
+ *              this `false` would be a wrong verdict on a fill that worked,
+ *              which is worse than admitting the ambiguity.
+ */
+export type Applied = 'yes' | 'no' | 'unclear';
+
+/** Read back whether the text we just typed is actually in the field.
+ *
+ * `method:'value'` was already hardened against silently no-opping (a
+ * React-controlled input reverts a programmatic `.value` on its next render) —
+ * and its remedy is to fall through to `insertText`, which verified nothing at
+ * all. Masks, `maxlength`, and editors that swallow composition give exactly
+ * the same false `ok:true` there.
+ *
+ * Returns ONLY `{matched, len}` — never the string. That is what keeps
+ * invariant #5 intact: the caller already knows the text (it just sent it), so
+ * a boolean tells it nothing new, while the content itself never crosses back.
+ * `len` is the diagnostic that separates "nothing landed" from "landed but
+ * truncated to 20 by maxlength". Skipped entirely when `allowPassword` is set,
+ * i.e. on the only nodes where a length could describe a credential; with it
+ * unset the password gate has already proved this is not one. FIXED literal,
+ * the expected text travels as a structured callFunctionOn argument. */
+/** Ask BOTH plausible write targets whether the text is there.
+ *
+ * `Input.insertText` writes to the deepest focused leaf, which is not always
+ * the node the selector named — a `delegatesFocus` shadow host is not the
+ * field. But the reverse trap is just as real: for a field inside a same-origin
+ * iframe the main frame's `document.activeElement` is the `<iframe>` ELEMENT,
+ * which has no value at all, so reading only the leaf would report a perfectly
+ * successful fill as "nothing landed". Reading only the resolved node has the
+ * mirror-image failure on the shadow host. So read both and take the answer
+ * that found the text; on a miss report the longer of the two lengths, which is
+ * the one that describes an actual field rather than a wrapper.
+ *
+ * The walk starts from the node's OWN `ownerDocument`, never a bare `document`
+ * — both because the probe must be self-contained (a free identifier would be a
+ * ReferenceError in some contexts, and every other serialised probe here is
+ * pinned on that), and because it is more correct: for a field inside an
+ * iframe, that document's `activeElement` is the field itself, where the main
+ * frame's would be the `<iframe>` element. Open shadow roots and same-origin
+ * iframes are still descended defensively; a cross-origin one throws on
+ * `contentDocument` and the walk stops there, which is the honest answer — we
+ * cannot see in, and CDP's own frame walk (keyboard.ts) is what handles that.
+ * Bounded so a pathological structure cannot spin.
+ *
+ * Content NEVER leaves: only a length and a boolean. Both candidates have
+ * already cleared the password gate on the path that runs this — the resolved
+ * node via `targetIsPasswordField`, the focused leaf via
+ * `ensureFocusedLeafNotPassword` — and the whole read-back is skipped when
+ * `allowPassword` is set. FIXED literal; the expected text is a structured
+ * callFunctionOn argument. */
+export const FILL_READBACK_FN = `function(expected) {
+  function read(el) {
+    if (!el) return null;
+    if (el.isContentEditable) return el.innerText || el.textContent || '';
+    return 'value' in el ? String(el.value) : null;
+  }
+  function focusedLeaf(doc) {
+    var a = doc && doc.activeElement;
+    for (var i = 0; i < 20 && a; i++) {
+      if (a.shadowRoot && a.shadowRoot.activeElement) { a = a.shadowRoot.activeElement; continue; }
+      if (a.tagName === 'IFRAME') {
+        var d = null;
+        try { d = a.contentDocument; } catch (e) { d = null; }
+        if (d && d.activeElement) { a = d.activeElement; continue; }
+      }
+      break;
+    }
+    return a;
+  }
+  var candidates = [this, focusedLeaf(this.ownerDocument)];
+  var best = -1;
+  for (var i = 0; i < candidates.length; i++) {
+    var v = read(candidates[i]);
+    if (v === null) continue;
+    if (v === expected || v.indexOf(expected) !== -1) return { len: v.length, matched: true };
+    if (v.length > best) best = v.length;
+  }
+  return { len: best < 0 ? 0 : best, matched: false };
+}`;
+
+/** Turn the probe's two numbers into the tri-state verdict. Pure, so the one
+ * judgement call here — that a non-empty field which does not contain our text
+ * is `unclear`, not a failure — is pinned by a test rather than buried. */
+export function classifyApplied(matched: boolean, len: number): Applied {
+  if (matched) return 'yes';
+  return len === 0 ? 'no' : 'unclear';
+}
+
+async function readBackApplied(
+  tabId: number,
+  objectId: string,
+  expected: string,
+): Promise<{ applied: Applied; len: number } | null> {
+  try {
+    const out = await cdp<{ result: { value?: { matched?: boolean; len?: number } } }>(
+      tabId,
+      'Runtime.callFunctionOn',
+      {
+        objectId,
+        functionDeclaration: FILL_READBACK_FN,
+        arguments: [{ value: expected }],
+        returnByValue: true,
+      },
+    );
+    const v = out.result.value;
+    if (!v || typeof v.matched !== 'boolean' || typeof v.len !== 'number') return null;
+    return { applied: classifyApplied(v.matched, v.len), len: v.len };
+  } catch {
+    // The node died between the write and the read, or the page refused the
+    // call. Report nothing rather than guessing — an absent `applied` is
+    // honest, a wrong one would be worse than the silence it replaces.
+    return null;
+  }
+}
+
 export const fill: Tool = async (args) => {
   const selector = String(args.selector || '');
   if (!selector) throw new BridgeError('bad_args', 'fill: selector required');
@@ -334,6 +478,10 @@ export const fill: Tool = async (args) => {
     if (value !== '') {
       await cdp(tab.id!, 'Input.insertText', { text: value });
     }
+    const landed =
+      args.allowPassword === true || value === ''
+        ? null
+        : await readBackApplied(tab.id!, objectId, value);
     const insertWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
     return {
       tabId: tab.id,
@@ -342,6 +490,7 @@ export const fill: Tool = async (args) => {
         ok: true,
         tag: prep.result.value?.tag ?? '',
         mode: 'insertText',
+        ...(landed ?? {}),
         ...(insertWait ? { wait: insertWait } : {}),
       },
     };
@@ -408,6 +557,10 @@ export const fill: Tool = async (args) => {
     ensureFocusLanded(fbPrep.result.value?.focused);
     await ensureFocusedLeafNotPassword(tab.id!, args.allowPassword === true);
     if (value !== '') await cdp(tab.id!, 'Input.insertText', { text: value });
+    const fbLanded =
+      args.allowPassword === true || value === ''
+        ? null
+        : await readBackApplied(tab.id!, objectId, value);
     const fbWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
     return {
       tabId: tab.id,
@@ -417,6 +570,7 @@ export const fill: Tool = async (args) => {
         tag: res.tag,
         mode: 'insertText',
         fallbackFrom: 'value',
+        ...(fbLanded ?? {}),
         ...(fbWait ? { wait: fbWait } : {}),
       },
     };
@@ -434,26 +588,101 @@ export const fill: Tool = async (args) => {
 // then has to re-read. Cap by default; `maxChars` overrides either way, and
 // the `truncated`/`totalChars` markers keep the cut visible.
 const DEFAULT_READ_MAX_CHARS = 20_000;
+// A ceiling on top of the default. Without one, `maxChars: 500000` was a single
+// call that put ~125k tokens into the window permanently — and unlike a
+// snapshot there is no structure to skim, so the model pays for all of it on
+// every later turn. With `offset` below, a genuinely long page is now readable
+// in pages instead, which is both cheaper and resumable.
+const MAX_READ_MAX_CHARS = 200_000;
 
-function parseMaxChars(raw: unknown): number {
+export function parseMaxChars(raw: unknown): number {
   if (raw === undefined || raw === null) return DEFAULT_READ_MAX_CHARS;
   const v = Number(raw);
   if (!Number.isInteger(v) || v < 1) {
     throw new BridgeError('bad_args', 'read_text: maxChars must be an integer >= 1');
   }
+  return Math.min(v, MAX_READ_MAX_CHARS);
+}
+
+export function parseOffset(raw: unknown): number {
+  if (raw === undefined || raw === null) return 0;
+  const v = Number(raw);
+  if (!Number.isInteger(v) || v < 0) {
+    throw new BridgeError('bad_args', 'read_text: offset must be an integer >= 0');
+  }
   return v;
 }
 
-function capText(
-  text: string,
-  maxChars: number,
-): { text: string; truncated?: true; totalChars?: number } {
-  if (text.length <= maxChars) return { text };
-  return { text: text.slice(0, maxChars), truncated: true, totalChars: text.length };
+export type CappedText = {
+  text: string;
+  truncated?: true;
+  totalChars?: number;
+  offset?: number;
+  nextOffset?: number;
+};
+
+function isHighSurrogate(c: number): boolean {
+  return c >= 0xd800 && c <= 0xdbff;
+}
+
+function isLowSurrogate(c: number): boolean {
+  return c >= 0xdc00 && c <= 0xdfff;
+}
+
+/** Slice the page text into one readable window.
+ *
+ * The cut used to be reported (`truncated`/`totalChars`) but not resumable: the
+ * only way past character 20 000 was to re-read from zero with a bigger cap,
+ * paying for the first 20 000 characters a second time and putting them in the
+ * context twice. `nextOffset` is the whole fix — hand it straight back as
+ * `offset` to continue.
+ *
+ * Both edges are snapped off the middle of a surrogate pair. JS string indices
+ * are UTF-16 code units, so a naive slice through an emoji leaves a LONE
+ * SURROGATE — which `protocol.ts` refuses to sign, turning the whole read into
+ * `unserialisable_result`. On a chat SPA, the exact thing this tool is for,
+ * that is not a rare boundary. Snapping costs at most one code unit per edge.
+ *
+ * A page is never returned empty while more text remains: with `maxChars: 1`
+ * landing on a pair, the pair is taken whole rather than emitting
+ * `{text:'', nextOffset: offset}`, which a paging agent would loop on forever.
+ * Pure, so all of this is testable without chrome. */
+export function capText(text: string, maxChars: number, offset = 0): CappedText {
+  const total = text.length;
+  let start = Math.min(offset, total);
+  // A low surrogate at `start` means the previous read stopped mid-pair (or the
+  // caller invented the offset) — step past the orphan rather than emitting it.
+  if (start > 0 && start < total && isLowSurrogate(text.charCodeAt(start))) {
+    if (isHighSurrogate(text.charCodeAt(start - 1))) start += 1;
+  }
+  let end = Math.min(start + maxChars, total);
+  if (
+    end < total &&
+    isHighSurrogate(text.charCodeAt(end - 1)) &&
+    isLowSurrogate(text.charCodeAt(end))
+  ) {
+    end -= 1;
+    // …unless that would make this page empty, which would stall a paging loop.
+    if (end <= start) end = Math.min(start + 2, total);
+  }
+  const slice = text.slice(start, end);
+  const out: CappedText = { text: slice };
+  if (start > 0) out.offset = start;
+  if (end < total) {
+    out.truncated = true;
+    out.totalChars = total;
+    out.nextOffset = end;
+  } else if (start > 0) {
+    // Reached the end on a continuation read — say how long the whole thing was
+    // so the agent can tell "done" from "maybe more".
+    out.totalChars = total;
+  }
+  return out;
 }
 
 export const readText: Tool = async (args) => {
   const maxChars = parseMaxChars(args.maxChars);
+  const offset = parseOffset(args.offset);
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
@@ -483,7 +712,7 @@ export const readText: Tool = async (args) => {
       functionDeclaration: READ_TEXT_FN,
       returnByValue: true,
     });
-    return { tabId: tab.id, url: tab.url, data: capText(out.result.value ?? '', maxChars) };
+    return { tabId: tab.id, url: tab.url, data: capText(out.result.value ?? '', maxChars, offset) };
   }
 
   const doc = await cdp<{ root: { nodeId: number } }>(tab.id!, 'DOM.getDocument', { depth: 0 });
@@ -503,5 +732,5 @@ export const readText: Tool = async (args) => {
     functionDeclaration: READ_TEXT_FN,
     returnByValue: true,
   });
-  return { tabId: tab.id, url: tab.url, data: capText(out.result.value ?? '', maxChars) };
+  return { tabId: tab.id, url: tab.url, data: capText(out.result.value ?? '', maxChars, offset) };
 };

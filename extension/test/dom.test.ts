@@ -17,6 +17,12 @@ import { beforeAll, describe, expect, it } from 'vitest';
 let attributesIndicatePassword: (attrs: readonly string[] | null | undefined) => boolean;
 let ensureFocusLanded: (focused: boolean | undefined) => void;
 let CLICK_FN: string;
+let FILL_READBACK_FN: string;
+let DEEPEST_ACTIVE_ELEMENT_EXPR: string;
+let classifyApplied: typeof import('../src/tools/dom.js').classifyApplied;
+let capText: typeof import('../src/tools/dom.js').capText;
+let parseMaxChars: typeof import('../src/tools/dom.js').parseMaxChars;
+let parseOffset: typeof import('../src/tools/dom.js').parseOffset;
 let click: (a: Record<string, unknown>, c?: unknown) => Promise<unknown>;
 
 beforeAll(async () => {
@@ -24,13 +30,29 @@ beforeAll(async () => {
     tabs: { onRemoved: { addListener() {} } },
     debugger: { onDetach: { addListener() {} } },
   };
-  ({ attributesIndicatePassword, ensureFocusLanded, CLICK_FN, click } =
-    (await import('../src/tools/dom.js')) as unknown as {
-      attributesIndicatePassword: typeof attributesIndicatePassword;
-      ensureFocusLanded: typeof ensureFocusLanded;
-      CLICK_FN: string;
-      click: typeof click;
-    });
+  ({
+    attributesIndicatePassword,
+    ensureFocusLanded,
+    CLICK_FN,
+    click,
+    FILL_READBACK_FN,
+    DEEPEST_ACTIVE_ELEMENT_EXPR,
+    classifyApplied,
+    capText,
+    parseMaxChars,
+    parseOffset,
+  } = (await import('../src/tools/dom.js')) as unknown as {
+    attributesIndicatePassword: typeof attributesIndicatePassword;
+    ensureFocusLanded: typeof ensureFocusLanded;
+    CLICK_FN: string;
+    click: typeof click;
+    FILL_READBACK_FN: string;
+    DEEPEST_ACTIVE_ELEMENT_EXPR: string;
+    classifyApplied: typeof classifyApplied;
+    capText: typeof capText;
+    parseMaxChars: typeof parseMaxChars;
+    parseOffset: typeof parseOffset;
+  });
 });
 
 describe('attributesIndicatePassword', () => {
@@ -91,6 +113,64 @@ describe('ensureFocusLanded', () => {
       expect(code).toBe('not_focusable');
       expect(message).toMatch(/did not take focus/);
     }
+  });
+});
+
+/**
+ * The password gate's focus walk. `fill` gates the RESOLVED node up front, then
+ * re-gates the node `Input.insertText` will actually reach. Two structures move
+ * that node away from the resolved one, and both must be followed or the gate
+ * inspects a wrapper while the write lands on a credential field.
+ */
+describe('DEEPEST_ACTIVE_ELEMENT_EXPR (password-gate focus walk)', () => {
+  const walk = (doc: unknown) =>
+    new Function('document', `return ${DEEPEST_ACTIVE_ELEMENT_EXPR};`)(doc) as {
+      tagName?: string;
+      name?: string;
+    };
+
+  it('descends a delegatesFocus shadow host to the control that really has focus', () => {
+    const inner = { tagName: 'INPUT', name: 'inner' };
+    const host = { tagName: 'X-FIELD', shadowRoot: { activeElement: inner } };
+    expect(walk({ activeElement: host })).toBe(inner);
+  });
+
+  it('descends a same-origin iframe — the gate used to stop at the frame element', () => {
+    // fill(selector='iframe.login') resolves to the FRAME, which is not a
+    // password field, so the up-front gate passes; focus() then moves inside and
+    // insertText lands on whatever is focused there. Stopping at the frame let a
+    // write reach an <input type=password> the gate never inspected.
+    const pw = { tagName: 'INPUT', name: 'password' };
+    const frame = { tagName: 'IFRAME', contentDocument: { activeElement: pw } };
+    expect(walk({ activeElement: frame })).toBe(pw);
+  });
+
+  it('stops at a cross-origin frame instead of throwing', () => {
+    const frame = {
+      tagName: 'IFRAME',
+      get contentDocument(): unknown {
+        throw new Error('cross-origin');
+      },
+    };
+    expect(walk({ activeElement: frame })).toBe(frame);
+  });
+
+  it('interleaves both descents', () => {
+    const leaf = { tagName: 'INPUT', name: 'leaf' };
+    const innerHost = { tagName: 'X-F', shadowRoot: { activeElement: leaf } };
+    const frame = { tagName: 'IFRAME', contentDocument: { activeElement: innerHost } };
+    const outerHost = { tagName: 'X-OUT', shadowRoot: { activeElement: frame } };
+    expect(walk({ activeElement: outerHost })).toBe(leaf);
+  });
+
+  it('cannot spin on a focus cycle', () => {
+    const a: Record<string, unknown> = { tagName: 'X-A' };
+    a.shadowRoot = { activeElement: a };
+    expect(() => walk({ activeElement: a })).not.toThrow();
+  });
+
+  it('returns null when nothing is focused', () => {
+    expect(walk({ activeElement: null })).toBeNull();
   });
 });
 
@@ -263,5 +343,244 @@ describe('click refusals', () => {
       data: { ok: boolean; hidden?: boolean };
     };
     expect(out.data).toMatchObject({ ok: true, hidden: true });
+  });
+});
+
+/**
+ * read_text's window. The cut was always REPORTED but never resumable: reading
+ * past character 20 000 meant re-reading from zero with a bigger cap, paying
+ * for the same characters twice and leaving both copies in the context.
+ */
+describe('capText / parseMaxChars / parseOffset (read_text)', () => {
+  const text = 'abcdefghij'; // 10 chars
+
+  it('returns the whole thing untouched when it fits', () => {
+    expect(capText(text, 100)).toEqual({ text });
+  });
+
+  it('marks a cut and hands back where to continue', () => {
+    expect(capText(text, 4)).toEqual({
+      text: 'abcd',
+      truncated: true,
+      totalChars: 10,
+      nextOffset: 4,
+    });
+  });
+
+  it('nextOffset walks the whole string exactly once, with no overlap or gap', () => {
+    let offset = 0;
+    let assembled = '';
+    for (let guard = 0; guard < 10; guard += 1) {
+      const page = capText(text, 3, offset);
+      assembled += page.text;
+      if (page.nextOffset === undefined) break;
+      offset = page.nextOffset;
+    }
+    expect(assembled).toBe(text);
+  });
+
+  it('reports the total on the final continuation page, so "done" is distinguishable', () => {
+    const last = capText(text, 5, 5);
+    expect(last).toEqual({ text: 'fghij', offset: 5, totalChars: 10 });
+    expect(last.truncated).toBeUndefined();
+  });
+
+  it('an offset past the end is empty, not an error — a poll loop must not throw', () => {
+    expect(capText(text, 5, 999)).toEqual({ text: '', offset: 10, totalChars: 10 });
+  });
+
+  it('never splits a surrogate pair — a lone half is unsignable (protocol.ts) and fails the whole read', () => {
+    const emoji = '\u{1F600}'; // 2 UTF-16 code units
+    const t = `ab${emoji}cd`; // length 6
+    // maxChars 3 would cut between the pair's halves; the cut moves back.
+    const page = capText(t, 3);
+    expect(page.text).toBe('ab');
+    expect(page.nextOffset).toBe(2);
+    // Resuming from there yields the whole emoji, never an orphan half.
+    const rest = capText(t, 3, page.nextOffset!);
+    expect(rest.text).toBe(`${emoji}c`);
+    expect(page.text + rest.text).toBe('ab' + emoji + 'c');
+    for (const s of [page.text, rest.text]) {
+      expect([...s].every((ch) => ch.codePointAt(0)! < 0xd800 || ch.codePointAt(0)! > 0xdfff)).toBe(
+        true,
+      );
+    }
+  });
+
+  it('takes a whole pair rather than emitting an empty page a paging loop would spin on', () => {
+    const t = `\u{1F600}tail`;
+    const page = capText(t, 1);
+    expect(page.text).toBe('\u{1F600}');
+    expect(page.nextOffset).toBe(2);
+  });
+
+  it('steps past an orphaned low surrogate when the caller resumes mid-pair', () => {
+    const t = `ab\u{1F600}cd`;
+    // offset 3 lands INSIDE the pair — an invented or stale offset.
+    const page = capText(t, 10, 3);
+    expect(page.text).toBe('cd');
+    expect(page.offset).toBe(4);
+  });
+
+  it('reassembles an emoji-dense string exactly, one code unit at a time', () => {
+    const t = '🙂a🙃b😀c';
+    let offset = 0;
+    let assembled = '';
+    for (let guard = 0; guard < 50; guard += 1) {
+      const page = capText(t, 1, offset);
+      assembled += page.text;
+      if (page.nextOffset === undefined) break;
+      expect(page.nextOffset).toBeGreaterThan(offset);
+      offset = page.nextOffset;
+    }
+    expect(assembled).toBe(t);
+  });
+
+  it('caps maxChars so one call cannot dump an unbounded page into the context', () => {
+    expect(parseMaxChars(undefined)).toBe(20_000);
+    expect(parseMaxChars(500)).toBe(500);
+    expect(parseMaxChars(500_000)).toBe(200_000);
+    expect(() => parseMaxChars(0)).toThrowError(/maxChars/);
+    expect(() => parseMaxChars(-1)).toThrowError(/maxChars/);
+    expect(() => parseMaxChars(1.5)).toThrowError(/maxChars/);
+  });
+
+  it('validates offset without coercing nonsense to 0', () => {
+    expect(parseOffset(undefined)).toBe(0);
+    expect(parseOffset(0)).toBe(0);
+    expect(parseOffset(4000)).toBe(4000);
+    expect(() => parseOffset(-1)).toThrowError(/offset/);
+    expect(() => parseOffset(2.5)).toThrowError(/offset/);
+    expect(() => parseOffset('lots')).toThrowError(/offset/);
+  });
+});
+
+/**
+ * fill's insertText read-back. method:'value' was already hardened against
+ * silently no-opping; its remedy is to fall through to insertText, which
+ * verified nothing. The probe must report WHETHER the text landed without ever
+ * carrying the text back (invariant #5).
+ */
+describe('FILL_READBACK_FN (serialised in-page probe)', () => {
+  const run = () =>
+    new Function(`return (${FILL_READBACK_FN});`)() as (
+      this: unknown,
+      expected: string,
+    ) => { len: number; matched: boolean };
+
+  // The probe consults `this` AND the deepest focused leaf. A bare fake with no
+  // ownerDocument exercises the `this`-only path (globalThis.document is
+  // undefined under vitest, and the probe tolerates that).
+  const doc = (activeElement: unknown) => ({ activeElement });
+
+  it('confirms a value that landed', () => {
+    expect(run().call({ value: 'hello', isContentEditable: false }, 'hello')).toEqual({
+      len: 5,
+      matched: true,
+    });
+  });
+
+  it('finds the text through a delegatesFocus shadow host, where `this` is not the field', () => {
+    // The host has no value of its own; insertText went to the inner control.
+    const inner = { value: 'hello', isContentEditable: false };
+    const host = {
+      isContentEditable: false,
+      shadowRoot: { activeElement: inner },
+      ownerDocument: doc(undefined),
+    };
+    // activeElement retargets to the host, and the walk descends from there.
+    (host.ownerDocument as { activeElement: unknown }).activeElement = host;
+    expect(run().call(host, 'hello')).toEqual({ len: 5, matched: true });
+  });
+
+  it('does NOT report a successful fill inside a same-origin iframe as a failure', () => {
+    // Regression: reading only the main frame's focused leaf gets the <iframe>
+    // ELEMENT, which has no value — a successful write read as "nothing landed".
+    // Starting from the node's OWN document makes the field its own activeElement.
+    const field = { value: 'hello', isContentEditable: false, ownerDocument: doc(undefined) };
+    (field.ownerDocument as { activeElement: unknown }).activeElement = field;
+    expect(run().call(field, 'hello')).toEqual({ len: 5, matched: true });
+  });
+
+  it('descends into a same-origin iframe when the walk lands on one', () => {
+    const inner = { value: 'hello', isContentEditable: false };
+    const iframe = { tagName: 'IFRAME', isContentEditable: false, contentDocument: doc(inner) };
+    const wrapper = { isContentEditable: false, ownerDocument: doc(iframe) };
+    expect(run().call(wrapper, 'hello')).toEqual({ len: 5, matched: true });
+  });
+
+  it('stops at a cross-origin iframe instead of throwing', () => {
+    const iframe = {
+      tagName: 'IFRAME',
+      isContentEditable: false,
+      get contentDocument(): unknown {
+        throw new Error('cross-origin');
+      },
+    };
+    const field = { value: 'hello', isContentEditable: false, ownerDocument: doc(iframe) };
+    // Falls back to `this`, which IS the field here.
+    expect(run().call(field, 'hello')).toEqual({ len: 5, matched: true });
+  });
+
+  it('runs with no ownerDocument at all — the literal must be self-contained', () => {
+    expect(run().call({ value: 'hello', isContentEditable: false }, 'hello')).toEqual({
+      len: 5,
+      matched: true,
+    });
+  });
+
+  it('cannot spin on a self-referential focus chain', () => {
+    const loop: Record<string, unknown> = { isContentEditable: false };
+    loop.shadowRoot = { activeElement: loop };
+    const field = { value: '', isContentEditable: false, ownerDocument: doc(loop) };
+    expect(run().call(field, 'x')).toEqual({ len: 0, matched: false });
+  });
+
+  it('reports a maxlength truncation as not-applied WITH the length that tells you why', () => {
+    expect(run().call({ value: 'hello wo', isContentEditable: false }, 'hello world')).toEqual({
+      len: 8,
+      matched: false,
+    });
+  });
+
+  it('reports a write that did not land at all', () => {
+    expect(run().call({ value: '', isContentEditable: false }, 'hello')).toEqual({
+      len: 0,
+      matched: false,
+    });
+  });
+
+  it('accepts a field the editor concatenated into, matching on containment', () => {
+    expect(run().call({ value: 'draft: hello', isContentEditable: false }, 'hello')).toEqual({
+      len: 12,
+      matched: true,
+    });
+  });
+
+  it('reads contenteditable through innerText', () => {
+    expect(
+      run().call({ isContentEditable: true, innerText: 'typed', textContent: 'x' }, 'typed'),
+    ).toEqual({ len: 5, matched: true });
+  });
+
+  it('handles a node with no value at all without throwing', () => {
+    expect(run().call({ isContentEditable: false }, 'x')).toEqual({ len: 0, matched: false });
+  });
+
+  it('classifies the three outcomes a read-back can honestly reach', () => {
+    expect(classifyApplied(true, 5)).toBe('yes');
+    // Empty field: nothing landed, and saying so is safe.
+    expect(classifyApplied(false, 0)).toBe('no');
+    // Non-empty but not literally our text — a mask, a normaliser, or a
+    // maxlength cut. Calling this a failure would be a WRONG verdict on a fill
+    // that worked, which is worse than admitting the ambiguity.
+    expect(classifyApplied(false, 14)).toBe('unclear'); // "+7 (912) 345-67" mask
+    expect(classifyApplied(false, 3)).toBe('unclear'); // maxlength truncation
+  });
+
+  it('never returns the field contents — only a boolean and a length', () => {
+    const out = run().call({ value: 'sup3rs3cret', isContentEditable: false }, 'sup3rs3cret');
+    expect(Object.keys(out).sort()).toEqual(['len', 'matched']);
+    expect(JSON.stringify(out)).not.toContain('sup3rs3cret');
   });
 });

@@ -6,6 +6,75 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-08-12
+
+### Added
+
+- **`fetch_in_page` takes `saveAs`**, writing the response body straight into
+  the download sandbox instead of returning it. The tool exists to pull assets
+  out of a logged-in page, and those are routinely images or archives: base64
+  inflates them by a third and every byte then sat in the model's context,
+  re-read on every later turn, for a payload it cannot look at anyway. The
+  result becomes `{status, contentType, mode, path, size, filename}`. It also
+  replaces the `fetch_in_page` → `save_to_file` pair with one call. Same
+  sandbox guards as `save_to_file` (invariant #10), refused **before** the
+  browser round-trip when the name is unusable — there is no point downloading
+  five megabytes only to decline to write them. It defaults `returnAs` to
+  `base64`, because a body destined for a file must not go through the text
+  path: that UTF-8-decodes the bytes and replaces every invalid sequence with
+  U+FFFD, silently and irreversibly.
+- **`read_text` takes `offset` and reports `nextOffset`.** The cut was always
+  reported but never resumable: reading past character 20 000 meant re-reading
+  from zero with a bigger cap, paying for the same characters twice and leaving
+  both copies in the context. `maxChars` now also has a ceiling (200 000), so
+  one call can no longer put an unbounded page in the window permanently.
+
+### Fixed
+
+- **`fill(method:'insertText')` reports whether the text actually landed.**
+  `method:'value'` was already hardened against silently no-opping, and its
+  remedy is to fall through to `insertText` — which verified nothing at all, so
+  a `maxlength`, an input mask or an editor swallowing the composition gave the
+  same false `ok:true`. Both insertText paths now read back and report
+  `applied` plus `len` (the field's length after the write, **never** its
+  contents); skipped when `allowPassword` is set, i.e. on the only nodes where
+  a length could describe a credential.
+- **`fetch_in_page` now has a payload ceiling** (`fetch_too_large`). It was the
+  one bulk-payload tool without one, and an oversize result does not fail the
+  call — it trips the daemon's frame cap, which 1009-closes the **shared**
+  extension leg and takes every concurrent session's in-flight call with it.
+  `not_connected` is retryable, so a well-behaved agent would then reconnect and
+  do it again. `print_to_pdf` and `screenshot` already self-policed; this is the
+  third. The authoritative check is **extension-side** and measures the
+  *serialised* size — canonical JSON escapes a control character to six bytes,
+  so a text body well under any decoded-byte ceiling can still blow the frame —
+  with a cheap in-page check kept only as an early-out, because nothing
+  load-bearing may rest on a number the page reports. `saveAs` does not raise the
+  ceiling: the bytes still cross the bridge before the daemon writes them, and
+  the error says so.
+- **The password gate follows focus into a same-origin frame.** `fill` gates the
+  resolved node, then re-gates the node `Input.insertText` will actually reach —
+  but that walk only descended shadow roots. `fill(selector='iframe.login')`
+  resolves to the frame *element*, which is not a password field, so the gate
+  passed; `focus()` then moved into the frame and the write landed on whatever
+  was focused there, which can be an `<input type=password>` the gate never
+  inspected. The walk now steps through same-origin frames too (a cross-origin
+  one stops at the frame, which is the honest answer) and re-gates the leaf.
+- **`fill`'s read-back asks both plausible write targets.** Reading only the
+  resolved node misses a `delegatesFocus` shadow host; reading only the focused
+  leaf misses a field inside a frame, where the main document's `activeElement`
+  is the frame element and a perfectly successful fill reads as "nothing
+  landed". It now reads the node and the true focused leaf and reports the
+  answer that found the text. `applied` is `yes`/`no`/`unclear`, where `unclear`
+  means unverified rather than failed: `len` below what was sent means
+  characters were dropped, `len` at or above it means the field most likely
+  reformatted the input in place — an input mask, where the fill did work.
+- **`read_text` no longer cuts through a surrogate pair.** JS string indices are
+  UTF-16 code units, so a slice landing inside an emoji left a lone surrogate —
+  which the wire protocol refuses to sign, failing the entire read as
+  `unserialisable_result`. On a chat SPA, the exact thing this tool is for, that
+  is not a rare boundary.
+
 ## [0.20.0] — 2026-08-12
 
 ### Build
@@ -2174,7 +2243,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/ginkida/sallyport/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/ginkida/sallyport/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/ginkida/sallyport/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/ginkida/sallyport/compare/v0.18.0...v0.18.1

@@ -59,6 +59,11 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "page first (smaller scale, print stylesheet) or capture the needed region "
             "with screenshot instead."
         ),
+        "fetch_too_large": (
+            "retryable=no; the response body exceeds the bridge frame cap, and saveAs "
+            "does not help — the bytes still cross the wire before the daemon writes "
+            "them. Fetch a smaller asset, or pull it in pieces with a Range header."
+        ),
         "screenshot_too_large": (
             "retryable=no as-is; the capture exceeds the bridge frame cap — retry WITH "
             "maxWidth or region to shrink it, or format=jpeg; if you emulated a device, "

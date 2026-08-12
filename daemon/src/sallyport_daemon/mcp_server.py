@@ -257,9 +257,12 @@ TOOLS: list[Tool] = [
         description=(
             "Read the text content of the page, or of a specific element if ref is given. "
             "No arbitrary JS — uses CDP's Runtime.callFunctionOn with a fixed function. "
-            "Output is capped at 20000 chars by default (override with maxChars); a cut "
-            "result carries truncated=true + totalChars. Prefer ref / a scoped target "
-            "over whole-page reads on chat-style SPAs."
+            "Output is capped at 20000 chars by default (override with maxChars, max "
+            "200000); a cut result carries truncated=true, totalChars and nextOffset. "
+            "To read on past the cut, call again with offset=<nextOffset> — do NOT "
+            "re-read from zero with a bigger maxChars, that pays for the same "
+            "characters twice and leaves both copies in your context. Prefer ref / a "
+            "scoped target over whole-page reads on chat-style SPAs."
         ),
         inputSchema={
             "type": "object",
@@ -268,8 +271,18 @@ TOOLS: list[Tool] = [
                 "maxChars": {
                     "type": "integer",
                     "minimum": 1,
+                    "maximum": 200000,
                     "default": 20000,
                     "description": "Cap on returned characters",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": (
+                        "Start reading at this character — pass the previous call's "
+                        "nextOffset to continue where it stopped"
+                    ),
                 },
                 "tabId": _TAB_ID_SCHEMA,
             },
@@ -610,7 +623,19 @@ TOOLS: list[Tool] = [
             "fallbackFrom='value'. method='insertText' clears the field and types "
             "through CDP Input.insertText with real input events — force it when "
             "the app ignores programmatic values or concatenates text (SPA "
-            "editors: Telegram, Slack, draft.js)."
+            "editors: Telegram, Slack, draft.js). Both insertText paths read the "
+            "field back afterwards and report applied plus len (the field's length "
+            "after the write, never its contents): 'yes' = your text is in there; "
+            "'no' = the field is EMPTY, nothing landed, so retry differently; "
+            "'unclear' = UNVERIFIED — the field has content that isn't literally "
+            "your text, and len says which way to read that. len < what you sent "
+            "means characters were DROPPED (a maxlength or a filter) — treat it as "
+            "a failure and check with get_state/read_text. len >= what you sent "
+            "means it was most likely reformatted in place (an input mask like "
+            "'+7 (912) 345-67-89'), where the fill did work — confirm before "
+            "relying on it, but do not blindly retype. The read-back is skipped "
+            "when allowPassword=true or the value is empty, and absent entirely if "
+            "the probe could not run."
         ),
         inputSchema={
             "type": "object",
@@ -1163,7 +1188,21 @@ TOOLS: list[Tool] = [
             "be in the allowlist; does NOT require the per-domain evaluate flag "
             "because the function body is fixed (only URL/method/headers/body are "
             "interpolated). Returns {status, contentType, headers, mode, data} where "
-            "mode is 'text' for text/json/html/xml content-types or 'base64' otherwise."
+            "mode is 'text' for text/json/html/xml content-types or 'base64' otherwise. "
+            "Pass saveAs=<filename> to write the body straight into the download "
+            "sandbox (~/Downloads/sallyport/) instead: the result becomes "
+            "{status, contentType, mode, path, size, filename} with NO data field, so "
+            "a multi-MB image or archive never enters your context — where it would "
+            "cost you tokens on every later turn for bytes you cannot read anyway. "
+            "Use saveAs whenever the body is binary or you only need the file (to "
+            "`upload` it, or to hand the user a path); it also replaces the old "
+            "fetch_in_page → save_to_file pair with one call, and it defaults "
+            "returnAs to 'base64' so the bytes reach disk unchanged (the text path "
+            "would UTF-8-decode them, which is lossy for anything binary). Omit it "
+            "when you actually need to READ the response (JSON, HTML). Bodies over "
+            "9 MiB fail with fetch_too_large — saveAs does NOT raise that ceiling, "
+            "because the body still crosses the bridge before the daemon writes it; "
+            "fetch a smaller asset or use a Range header."
         ),
         inputSchema={
             "type": "object",
@@ -1173,6 +1212,13 @@ TOOLS: list[Tool] = [
                 "headers": {"type": "object", "additionalProperties": {"type": "string"}},
                 "body": {"type": "string"},
                 "returnAs": {"type": "string", "enum": ["auto", "text", "base64"]},
+                "saveAs": {
+                    "type": "string",
+                    "description": (
+                        "Filename (single name, no path) under ~/Downloads/sallyport/ to "
+                        "write the body to instead of returning it"
+                    ),
+                },
                 "tabId": _TAB_ID_SCHEMA,
             },
             "required": ["url"],
@@ -1192,7 +1238,9 @@ TOOLS: list[Tool] = [
             "save_to_file writes to). Paths outside the sandbox fail with "
             "unsafe_path; symlink escapes are caught by Path.resolve(). "
             "Non-file-input targets fail with wrong_element. Typical flow: "
-            "fetch_in_page → save_to_file → upload from ~/Downloads/sallyport/."
+            "fetch_in_page with saveAs=<filename> → upload from "
+            "~/Downloads/sallyport/ (saveAs keeps the bytes out of your context; "
+            "the older fetch_in_page → save_to_file pair still works)."
         ),
         inputSchema={
             "type": "object",
@@ -1217,7 +1265,9 @@ TOOLS: list[Tool] = [
             "entirely in the daemon (no extension round-trip), sandboxed: filename "
             "must be a single component with no path separators or leading dot. "
             "Override the download directory with SALLYPORT_DOWNLOAD_DIR. Returns "
-            "{path, size}. Typical pairing: fetch_in_page → save_to_file."
+            "{path, size}. Use it for a blob you already hold; to download one, "
+            "prefer fetch_in_page with saveAs, which writes it without the bytes "
+            "ever passing through your context."
         ),
         inputSchema={
             "type": "object",

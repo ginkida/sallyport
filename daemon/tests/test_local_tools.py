@@ -10,7 +10,9 @@ import pytest
 from sallyport_daemon.bridge import ToolError
 from sallyport_daemon.local_tools import (
     PRE_CALL_VALIDATORS,
+    _fetch_in_page_result,
     _print_to_pdf_result,
+    _validate_fetch_filename,
     save_to_file,
     validate_upload_paths,
 )
@@ -324,3 +326,99 @@ def test_print_to_pdf_validator_rejects_bad_filename() -> None:
     # Absent filename and a plain name both pass.
     validator({})
     validator({"filename": "ok.pdf"})
+
+
+# ------------------------------------------------------------- fetch_in_page saveAs
+# `fetch_in_page` exists to pull assets from a logged-in page, and those are
+# routinely images or archives. Base64 inflates them by a third and every byte
+# then sits in the model's context, re-read on every later turn, for a payload
+# the agent cannot read anyway. `saveAs` diverts the body to disk instead — and
+# replaces the old fetch_in_page → save_to_file pair with one call.
+
+
+@pytest.mark.asyncio
+async def test_fetch_saveas_writes_decoded_base64(sandbox: Path) -> None:
+    raw = b"\x89PNG\r\n\x1a\n binary payload"
+    result = await _fetch_in_page_result(
+        {"saveAs": "shot.png"},
+        {
+            "status": 200,
+            "contentType": "image/png",
+            "headers": [["content-type", "image/png"]],
+            "mode": "base64",
+            "data": base64.b64encode(raw).decode(),
+        },
+    )
+    assert (sandbox / "shot.png").read_bytes() == raw
+    assert result["size"] == len(raw)
+    assert result["filename"] == "shot.png"
+    # The metadata that lets the agent branch survives…
+    assert result["status"] == 200
+    assert result["contentType"] == "image/png"
+    assert result["mode"] == "base64"
+    # …and the payload itself does NOT come back, which is the entire point.
+    assert "data" not in result
+    assert "headers" not in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_saveas_writes_text_as_utf8(sandbox: Path) -> None:
+    result = await _fetch_in_page_result(
+        {"saveAs": "export.json"},
+        {"status": 200, "contentType": "application/json", "mode": "text", "data": '{"k":"тест"}'},
+    )
+    assert (sandbox / "export.json").read_bytes() == '{"k":"тест"}'.encode()
+    assert result["filename"] == "export.json"
+    assert "data" not in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_without_saveas_is_returned_untouched(sandbox: Path) -> None:
+    payload = {"status": 200, "contentType": "text/html", "mode": "text", "data": "<html>"}
+    result = await _fetch_in_page_result({}, payload)
+    assert result is payload  # byte-for-byte the old behaviour
+    assert not list(sandbox.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_fetch_saveas_rejects_a_path_escape(sandbox: Path) -> None:
+    with pytest.raises(ToolError) as exc:
+        await _fetch_in_page_result(
+            {"saveAs": "../escape.png"},
+            {"status": 200, "mode": "base64", "data": base64.b64encode(b"x").decode()},
+        )
+    assert exc.value.code == "unsafe_path"
+    assert not (sandbox.parent / "escape.png").exists()
+
+
+@pytest.mark.asyncio
+async def test_fetch_saveas_rejects_a_body_that_is_not_base64(sandbox: Path) -> None:
+    with pytest.raises(ToolError) as exc:
+        await _fetch_in_page_result(
+            {"saveAs": "x.bin"}, {"status": 200, "mode": "base64", "data": "not!base64!"}
+        )
+    assert exc.value.code == "error"
+
+
+@pytest.mark.asyncio
+async def test_fetch_saveas_reports_a_response_with_no_body(sandbox: Path) -> None:
+    with pytest.raises(ToolError) as exc:
+        await _fetch_in_page_result({"saveAs": "x.bin"}, {"status": 204, "mode": "base64"})
+    assert exc.value.code == "error"
+
+
+def test_validate_fetch_filename_fails_before_the_browser_round_trip() -> None:
+    # The point of the pre-call validator: do not download a multi-MiB asset
+    # through the page only to refuse to write it.
+    with pytest.raises(ToolError) as exc:
+        _validate_fetch_filename({"saveAs": "../../etc/passwd"})
+    assert exc.value.code == "unsafe_path"
+    with pytest.raises(ToolError) as exc:
+        _validate_fetch_filename({"saveAs": ".hidden"})
+    assert exc.value.code == "unsafe_path"
+    with pytest.raises(ToolError) as exc:
+        _validate_fetch_filename({"saveAs": 42})
+    assert exc.value.code == "bad_args"
+    # Absent saveAs is the ordinary case and must not raise.
+    _validate_fetch_filename({})
+    _validate_fetch_filename({"saveAs": "ok.png"})
