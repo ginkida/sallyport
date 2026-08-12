@@ -3,6 +3,7 @@ through the daemon as a whole; these unit tests pin the pure helpers."""
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -24,6 +25,33 @@ def test_format_result_dict_is_pretty_json() -> None:
     # Pretty-printed JSON with 2-space indent.
     assert '"a": 1' in out
     assert "\n" in out  # multi-line
+
+
+def test_format_result_small_dict_stays_pretty_for_readability() -> None:
+    """The size threshold must not minify the everyday small result. Pretty
+    costs a rounding error in tokens there, and a misread result costs a whole
+    round-trip — which would swamp any saving."""
+    out = _format_result({"tabId": 7, "url": "https://example.com/"})
+    assert '"tabId": 7' in out
+    assert "\n" in out
+
+
+def test_format_result_large_payload_is_minified() -> None:
+    """A snapshot tree is nothing but nested nodes, so indentation is paid per
+    node per key — and the result is re-read on every later turn of the task.
+    Past the threshold the bytes are the whole cost, so drop them."""
+    tree = [
+        {"role": "button", "name": f"Item {i}", "ref": f"@e{i}", "children": []} for i in range(400)
+    ]
+    payload = {"source": "a11y", "tree": tree}
+    out = _format_result(payload)
+    assert "\n" not in out  # single compact line
+    assert ", " not in out  # compact item separator
+    assert ": " not in out  # compact key separator
+    # Same content, materially fewer bytes than the pretty form.
+    pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+    assert len(out) < len(pretty) * 0.7
+    assert json.loads(out) == json.loads(pretty)
 
 
 def test_format_result_unicode_passthrough() -> None:

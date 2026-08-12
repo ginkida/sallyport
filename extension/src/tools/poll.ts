@@ -8,8 +8,8 @@
  * import cycle dom.ts ↔ wait.ts (this module imports neither).
  */
 
-import { cdp } from './cdp.js';
-import { BridgeError } from './errors.js';
+import { cdp, looksLikeMissingNodeError, looksLikeSelectorSyntaxError } from './cdp.js';
+import { BridgeError, staleRefError } from './errors.js';
 import { getRef, isRef } from './refs.js';
 
 const POLL_MS = 250;
@@ -60,10 +60,7 @@ export type WaitOutcome = {
  * everything unrecognised stays the generic 'error'. */
 export function classifyWaitError(e: unknown): Exclude<WaitReason, 'timeout'> {
   if (e instanceof BridgeError && e.code === 'bad_ref') return 'bad_ref';
-  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
-  if (msg.includes('selector') || msg.includes('while querying') || msg.includes('dom error')) {
-    return 'invalid_selector';
-  }
+  if (looksLikeSelectorSyntaxError(e)) return 'invalid_selector';
   return 'error';
 }
 
@@ -158,10 +155,43 @@ async function textPresent(tabId: number, text: string): Promise<boolean> {
   return (out.result.value ?? '').includes(text);
 }
 
+/** Is the node behind a `@eN` still in the document?
+ *
+ * `selectorVisible` cannot tell "destroyed" from "laid out with no box": both
+ * end in the `catch { return false }` that means keep waiting. For a node the
+ * page has DESTROYED that is a lie the agent pays for twice — the wait burns its
+ * whole budget (up to the 30 s cap) and then reports `reason:'timeout'`, whose
+ * documented meaning is "retrying longer may help". One `DOM.describeNode`
+ * before the loop settles it: a detached-but-alive node still describes fine, so
+ * a genuine wait-for-it-to-render is untouched.
+ *
+ * Fail-OPEN on anything else: an unrecognised rejection falls through to the
+ * poll loop exactly as before, rather than being relabelled a stale ref. */
+async function ensureRefStillExists(tabId: number, ref: string): Promise<void> {
+  const r = getRef(tabId, ref);
+  if (!r) {
+    throw new BridgeError(
+      'bad_ref',
+      `wait: unknown ref "${ref}" for tab ${tabId} — run snapshot first`,
+    );
+  }
+  try {
+    await cdp(tabId, 'DOM.describeNode', { backendNodeId: r.backendDOMNodeId });
+  } catch (e) {
+    if (looksLikeMissingNodeError(e)) throw staleRefError('wait', ref);
+  }
+}
+
 /** Poll until the spec holds (AND across given conditions; `absent` inverts
  * both). A timeout is NOT an error: returns {found:false, elapsedMs} so the
  * caller decides what to do next. */
 export async function pollFor(tabId: number, spec: WaitSpec): Promise<WaitOutcome> {
+  // Only for the PRESENT condition. Under `absent:true` a destroyed node is
+  // precisely what is being waited for, and the loop below already reports it
+  // as found — turning it into an error there would break the tool.
+  if (!spec.absent && spec.selector !== null && isRef(spec.selector)) {
+    await ensureRefStillExists(tabId, spec.selector);
+  }
   const start = Date.now();
   for (;;) {
     let ok: boolean;
@@ -231,9 +261,16 @@ export type SettleSpec = { stableMs: number; timeoutMs: number };
 export type SettleOutcome = { settled: boolean; elapsedMs: number };
 
 export type Signal = { n: number; len: number };
-export type SettleState = { prev: Signal | null; stableSince: number | null };
+export type SettleState = {
+  prev: Signal | null;
+  /** When `prev` was sampled — the point the stability window is BACKDATED to,
+   * because two equal readings prove the DOM was unchanged across the whole
+   * interval between them, not merely at the second one. */
+  prevAt: number | null;
+  stableSince: number | null;
+};
 
-export const INITIAL_SETTLE_STATE: SettleState = { prev: null, stableSince: null };
+export const INITIAL_SETTLE_STATE: SettleState = { prev: null, prevAt: null, stableSince: null };
 
 /** Pure per-tick advance of the settle state machine, split out from settleFor
  * so the decision logic is unit-testable without chrome.
@@ -254,11 +291,20 @@ export function advanceSettle(
   if (sig === null) return { state: INITIAL_SETTLE_STATE, settled: false };
   const { prev } = state;
   if (prev && sig.n === prev.n && sig.len === prev.len) {
-    const stableSince = state.stableSince ?? now;
-    return { state: { prev: sig, stableSince }, settled: now - stableSince >= stableMs };
+    // Backdate the window to the EARLIER of the two equal readings. Anchoring it
+    // to `now` instead charged every settle one guaranteed extra POLL_MS tick —
+    // an already-static page needed three samples (t=0, 250, 500, 750) to prove
+    // a 500 ms window it had in fact demonstrated by t=500. Nothing about the
+    // strictness changes: two genuinely equal readings are still required, and
+    // the `sig === null` restart above still refuses to settle on a blind tick.
+    const stableSince = state.stableSince ?? state.prevAt ?? now;
+    return {
+      state: { prev: sig, prevAt: now, stableSince },
+      settled: now - stableSince >= stableMs,
+    };
   }
   // changed (or first reading) — (re)start the stability window
-  return { state: { prev: sig, stableSince: null }, settled: false };
+  return { state: { prev: sig, prevAt: now, stableSince: null }, settled: false };
 }
 
 /** Wait until the DOM stops changing for `stableMs` — the adaptive replacement

@@ -13,6 +13,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   closeTab,
   isBlankTarget,
+  landedElsewhere,
   listTabs,
   navigate,
   reload,
@@ -40,7 +41,14 @@ type Calls = {
   debuggerAttach: number[];
 };
 
-function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls {
+function installChromeMock(opts: {
+  active?: MockTab;
+  tabs?: MockTab[];
+  /** Where the browser ACTUALLY ends up, whatever URL it was sent to — the
+   * SSO bounce / consent wall / shortener case navigate must now report. */
+  redirectTo?: string;
+}): Calls {
+  const land = (url: string): string => opts.redirectTo ?? url;
   const store = new Map<string, unknown>();
   const calls: Calls = {
     update: [],
@@ -111,7 +119,7 @@ function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls 
         if (info.muted !== undefined) calls.muted.push({ tabId, muted: info.muted });
         const cur = getTab(tabId);
         // A url update completes the load (as before); other fields merge.
-        const next = { ...cur, ...(info.url !== undefined ? { url: info.url } : {}) };
+        const next = { ...cur, ...(info.url !== undefined ? { url: land(info.url) } : {}) };
         next.status = 'complete';
         byId.set(tabId, next);
         return Promise.resolve(next);
@@ -119,8 +127,10 @@ function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls 
       reload(tabId: number, _info?: { bypassCache?: boolean }) {
         // Real Chrome flips status to 'loading' then back to 'complete'; the
         // mock only needs the end state so waitForLoad's fast path resolves.
+        // `land` models a reload that does NOT come back to the same page —
+        // the expired-session bounce to /login.
         const cur = getTab(tabId);
-        byId.set(tabId, { ...cur, status: 'complete' });
+        byId.set(tabId, { ...cur, url: land(cur.url), status: 'complete' });
         return Promise.resolve();
       },
       create(info: { url: string; windowId?: number; active?: boolean }) {
@@ -129,7 +139,7 @@ function installChromeMock(opts: { active?: MockTab; tabs?: MockTab[] }): Calls 
         const id = nextTabId++;
         const next: MockTab = {
           id,
-          url: info.url,
+          url: land(info.url),
           status: 'complete',
           windowId: info.windowId,
         };
@@ -546,5 +556,86 @@ describe('vanished tab fast-fails with tab_gone (#12)', () => {
     installChromeMock({ tabs: [{ id: 7, url: 'https://live.example/' }] });
     const tab = await resolveTab({ tabId: 7 });
     expect(tab.id).toBe(7);
+  });
+});
+
+/**
+ * navigate/reload used to echo the URL they were ASKED for. An SSO bounce, a
+ * consent wall, a shortener or an expired session all land somewhere else, and
+ * that was invisible until a later call surprised the agent — and the wrong URL
+ * went into the audit row too. `landedElsewhere` decides when to say so, and its
+ * whole job is to not cry wolf about the browser's own normalisation.
+ */
+describe('landedElsewhere', () => {
+  it('is quiet about the browser normalising the URL it was given', () => {
+    expect(landedElsewhere('https://example.com', 'https://example.com/')).toBe(false);
+    expect(landedElsewhere('https://EXAMPLE.com/a', 'https://example.com/a')).toBe(false);
+    expect(landedElsewhere('https://example.com/a', 'https://example.com/a')).toBe(false);
+  });
+
+  it('reports a real redirect', () => {
+    expect(landedElsewhere('https://example.com/app', 'https://example.com/login')).toBe(true);
+    expect(landedElsewhere('https://sho.rt/x', 'https://example.com/article')).toBe(true);
+    expect(landedElsewhere('https://example.com/a', 'https://example.com/a?ref=1')).toBe(true);
+  });
+
+  it('says nothing when the landed URL is unknown — a closed tab is not a redirect', () => {
+    expect(landedElsewhere('https://example.com/', undefined)).toBe(false);
+    expect(landedElsewhere('https://example.com/', '')).toBe(false);
+  });
+
+  it('falls back to a string compare rather than claiming no redirect on unparseable input', () => {
+    expect(landedElsewhere('not a url', 'not a url')).toBe(false);
+    expect(landedElsewhere('not a url', 'https://example.com/')).toBe(true);
+  });
+});
+
+describe('navigate / reload report where the tab ACTUALLY landed', () => {
+  it('navigate returns the landed url and flags the redirect it followed', async () => {
+    installChromeMock({
+      active: { id: 1, url: 'about:blank', status: 'complete' },
+      redirectTo: 'https://app.example.com/login?next=%2Fdash',
+    });
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+    const out = (await navigate({ url: 'https://app.example.com/dash' }, undefined)) as {
+      data: { url: string; redirectedFrom?: string };
+    };
+    expect(out.data.url).toBe('https://app.example.com/login?next=%2Fdash');
+    expect(out.data.redirectedFrom).toBe('https://app.example.com/dash');
+  });
+
+  it('says nothing about a redirect when the tab landed where it was sent', async () => {
+    installChromeMock({ active: { id: 1, url: 'about:blank', status: 'complete' } });
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+    const out = (await navigate({ url: 'https://app.example.com/dash' }, undefined)) as {
+      data: { url: string; redirectedFrom?: string };
+    };
+    expect(out.data.url).toBe('https://app.example.com/dash');
+    expect(out.data).not.toHaveProperty('redirectedFrom');
+  });
+
+  it('reload flags the expired-session bounce instead of echoing the page it reloaded', async () => {
+    installChromeMock({
+      active: { id: 1, url: 'https://app.example.com/dash', status: 'complete' },
+      redirectTo: 'https://app.example.com/login',
+    });
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+    const out = (await reload({ tabId: 1 }, undefined)) as {
+      data: { url: string; redirectedFrom?: string };
+    };
+    expect(out.data.url).toBe('https://app.example.com/login');
+    expect(out.data.redirectedFrom).toBe('https://app.example.com/dash');
+  });
+
+  it('reload echoes nothing extra on an ordinary reload', async () => {
+    installChromeMock({
+      active: { id: 1, url: 'https://app.example.com/dash', status: 'complete' },
+    });
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+    const out = (await reload({ tabId: 1 }, undefined)) as {
+      data: { url: string; redirectedFrom?: string };
+    };
+    expect(out.data.url).toBe('https://app.example.com/dash');
+    expect(out.data).not.toHaveProperty('redirectedFrom');
   });
 });

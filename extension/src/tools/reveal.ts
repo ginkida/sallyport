@@ -1,9 +1,10 @@
 import { collectInteractive } from './axtree.js';
 import { attach, cdp } from './cdp.js';
-import { resolveSelectorOrRef } from './dom.js';
+import { resolveBackendNode, resolveSelectorOrRef } from './dom.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { matchElements, parsePredicate } from './match.js';
+import { getRef, isRef, refWatermark } from './refs.js';
 import {
   parseMaxSteps,
   parseTimeoutMs,
@@ -43,12 +44,36 @@ export const reveal: Tool = async (args) => {
   await ensureAllowed(tab.url);
   await attach(tab.id!);
 
+  // PIN an @eN container before the loop starts.
+  //
+  // Refs are monotonic per tab, and this tool re-snapshots on every pass — so by
+  // the time the loop resolves the container the ref map has already been wiped
+  // and re-minted above the caller's id, and `@e12` would resolve to nothing.
+  // (It only ever worked because the counter used to restart at e1 and the walk
+  // is deterministic, i.e. by accident.) The backendNodeId is the browser's own
+  // identity for that node and is unaffected by our numbering, so read it once
+  // while the ref is still live and resolve THAT each pass — which keeps the
+  // per-pass re-resolve virtualised lists need.
+  const containerBackendNodeId = isRef(container)
+    ? (getRef(tab.id!, container)?.backendDOMNodeId ?? null)
+    : null;
+  if (isRef(container) && containerBackendNodeId === null) {
+    throw new BridgeError(
+      'bad_ref',
+      `reveal: unknown ref "${container}" for tab ${tab.id} — run snapshot first`,
+    );
+  }
+  // One mark for the WHOLE loop: every pass but the last is discarded, and
+  // those refs never leave the extension, so they must not push the agent's ids
+  // up by up to 40 snapshots' worth.
+  const mark = refWatermark(tab.id!);
+
   const start = Date.now();
   let prevAfter: number | null = null;
   for (let step = 0; step <= maxSteps; step++) {
     // Snapshot + match first, so step 0 catches an already-visible target and
     // the refs returned are from the final (matching) snapshot.
-    const { tree, source } = await buildSnapshotTree(tab.id!, mode);
+    const { tree, source } = await buildSnapshotTree(tab.id!, mode, mark);
     const matches = matchElements(collectInteractive(tree), pred);
     if (matches.length) {
       return { tabId: tab.id, url: tab.url, data: { found: true, matches, steps: step, source } };
@@ -70,9 +95,14 @@ export const reveal: Tool = async (args) => {
       };
     }
     // Re-resolve the container each pass — virtualised lists recycle nodes, so
-    // a held objectId can go stale. A CSS selector re-queries fresh; a missing
-    // container surfaces as a real error (bad_ref/not_found), not a silent miss.
-    const objectId = await resolveSelectorOrRef(tab.id!, container, 'reveal');
+    // a held objectId can go stale. A CSS selector re-queries fresh; a pinned
+    // @eN resolves by its browser-owned backendNodeId (see above). A container
+    // that has genuinely gone surfaces as a real error (bad_ref/not_found), not
+    // a silent miss.
+    const objectId =
+      containerBackendNodeId !== null
+        ? await resolveBackendNode(tab.id!, containerBackendNodeId, container, 'reveal')
+        : await resolveSelectorOrRef(tab.id!, container, 'reveal');
     const scrollRes = await cdp<{ result: { value?: { before: number; after: number } } }>(
       tab.id!,
       'Runtime.callFunctionOn',

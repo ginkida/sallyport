@@ -884,8 +884,29 @@ def _print_exec_content(blocks: list[dict[str, Any]]) -> bool:
         if isinstance(text, str):
             if text.startswith("Error"):
                 failed = True
-            print(text)
+            print(_reindent_for_humans(text))
     return failed
+
+
+def _reindent_for_humans(text: str) -> str:
+    """Undo the MCP layer's size-based JSON minification for CLI output.
+
+    `_format_result` serialises a large result compactly because every byte is
+    re-read by the model on every later turn. A person running `exec` has the
+    opposite need and none of that cost, so put the indentation back.
+
+    Deliberately does NOT re-check that size threshold — duplicating the
+    constant here would let the two drift apart silently. Re-indenting a result
+    that was already pretty-printed reproduces it byte for byte, so applying
+    this unconditionally to anything that parses as a JSON object or array is
+    both correct and self-maintaining. Everything else (a read_text page dump,
+    an error line, prose) is printed exactly as it arrived."""
+    if text[:1] not in "{[":
+        return text
+    try:
+        return json.dumps(json.loads(text), ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        return text
 
 
 async def _run_exec_via_broker(args: argparse.Namespace, secret: bytes, sock_path: Path) -> int:
@@ -1539,9 +1560,7 @@ async def amain(args: argparse.Namespace) -> int:
             # Watch the WS task too: if the browser leg dies mid-life, the broker
             # is useless and must exit loudly rather than keep serving sessions
             # that can never reach a browser.
-            ended, _ = await asyncio.wait(
-                {ws_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
-            )
+            ended, _ = await asyncio.wait({ws_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
             for task in (idle_task, stop_task):
                 task.cancel()
             await asyncio.gather(idle_task, stop_task, return_exceptions=True)

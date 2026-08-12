@@ -1,5 +1,5 @@
-import { attach, cdp } from './cdp.js';
-import { BridgeError } from './errors.js';
+import { attach, cdp, looksLikeMissingNodeError, looksLikeSelectorSyntaxError } from './cdp.js';
+import { BridgeError, invalidSelectorError, staleRefError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { parseWaitFor, runEmbeddedWait, READ_TEXT_FN } from './poll.js';
 import { getRef, isRef } from './refs.js';
@@ -27,6 +27,34 @@ export function ensureFocusLanded(focused: boolean | undefined): void {
   }
 }
 
+/** Resolve a browser-owned backendNodeId to a live page objectId.
+ *
+ * Split out of `resolveSelectorOrRef` for callers that have PINNED a node up
+ * front and can no longer go through the ref map — `reveal`, whose own loop
+ * re-snapshots on every pass and therefore renumbers the tab's refs out from
+ * under the container it was handed. A backendNodeId is the browser's own
+ * identity for the node and survives that. `label` is only for the error text. */
+export async function resolveBackendNode(
+  tabId: number,
+  backendNodeId: number,
+  label: string,
+  tool: string,
+): Promise<string> {
+  let resolved: { object: { objectId?: string } };
+  try {
+    resolved = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
+      backendNodeId,
+    });
+  } catch (e) {
+    if (looksLikeMissingNodeError(e)) throw staleRefError(tool, label);
+    throw e;
+  }
+  if (!resolved.object.objectId) {
+    throw new BridgeError('bad_ref', `${tool}: could not resolve ref to DOM`);
+  }
+  return resolved.object.objectId;
+}
+
 export async function resolveSelectorOrRef(
   tabId: number,
   selector: string,
@@ -40,19 +68,19 @@ export async function resolveSelectorOrRef(
         `${tool}: unknown ref "${selector}" for tab ${tabId} — run snapshot first`,
       );
     }
-    const resolved = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
-      backendNodeId: r.backendDOMNodeId,
-    });
-    if (!resolved.object.objectId) {
-      throw new BridgeError('bad_ref', `${tool}: could not resolve ref to DOM`);
-    }
-    return resolved.object.objectId;
+    return resolveBackendNode(tabId, r.backendDOMNodeId, selector, tool);
   }
   const doc = await cdp<{ root: { nodeId: number } }>(tabId, 'DOM.getDocument', { depth: 0 });
-  const q = await cdp<{ nodeId: number }>(tabId, 'DOM.querySelector', {
-    nodeId: doc.root.nodeId,
-    selector,
-  });
+  let q: { nodeId: number };
+  try {
+    q = await cdp<{ nodeId: number }>(tabId, 'DOM.querySelector', {
+      nodeId: doc.root.nodeId,
+      selector,
+    });
+  } catch (e) {
+    if (looksLikeSelectorSyntaxError(e)) throw invalidSelectorError(tool, selector);
+    throw e;
+  }
   if (!q.nodeId) {
     throw new BridgeError('not_found', `${tool}: element not found: ${selector}`);
   }
@@ -142,6 +170,46 @@ async function ensureFocusedLeafNotPassword(tabId: number, allowPassword: boolea
   }
 }
 
+/** Click the node — unless the click is guaranteed to do nothing, in which case
+ * say so instead of pretending.
+ *
+ * Two cases the browser silently swallows: a form control with the HTML
+ * `disabled` attribute (Chrome dispatches no click event at all) and a node the
+ * page has detached (`.click()` fires into a document nobody is watching).
+ * Both used to return `{ok:true}` — the most expensive kind of wrong answer,
+ * since the agent then spends turns hunting for why the page did not react, and
+ * an embedded `waitFor` cannot rescue it either: it just times out.
+ *
+ * Deliberately NOT refused: a zero-size element. A synthetic `.click()` on a
+ * `display:none` node works and is a legitimate, common pattern — a hidden
+ * `<input type=file>` behind a styled label is exactly how upload flows are
+ * built. Geometry is `mouse_click`'s business, because it dispatches real
+ * coordinates; `click` does not. The zero rect is REPORTED (`hidden`) rather
+ * than acted on.
+ *
+ * `this.disabled` is page-readable and therefore page-spoofable, which is fine
+ * under invariant #4's rule that a probe may report anything so long as nothing
+ * load-bearing rests on it: the worst a lying page achieves is refusing a click
+ * that would have been the no-op we are reporting anyway. It cannot cause an
+ * action, only decline one. FIXED literal, no agent interpolation. */
+export const CLICK_FN = `function() {
+  if (this.disabled === true) return { tag: this.tagName, blocked: 'disabled' };
+  if (this.isConnected === false) return { tag: this.tagName, blocked: 'detached' };
+  this.scrollIntoView({ block: 'center' });
+  this.click();
+  const r = this.getBoundingClientRect();
+  const out = { tag: this.tagName, text: (this.textContent || '').slice(0, 100) };
+  if (r.width === 0 && r.height === 0) out.hidden = true;
+  return out;
+}`;
+
+type ClickProbe = {
+  tag?: string;
+  text?: string;
+  hidden?: true;
+  blocked?: 'disabled' | 'detached';
+};
+
 export const click: Tool = async (args) => {
   const selector = String(args.selector || '');
   if (!selector) throw new BridgeError('bad_args', 'click: selector required');
@@ -150,22 +218,36 @@ export const click: Tool = async (args) => {
   await ensureAllowed(tab.url);
   await attach(tab.id!);
   const objectId = await resolveSelectorOrRef(tab.id!, selector, 'click');
-  const out = await cdp<{ result: { value?: { tag: string; text: string } } }>(
-    tab.id!,
-    'Runtime.callFunctionOn',
-    {
-      objectId,
-      functionDeclaration:
-        "function() { this.scrollIntoView({ block: 'center' }); this.click(); " +
-        "return { tag: this.tagName, text: (this.textContent || '').slice(0, 100) }; }",
-      returnByValue: true,
-    },
-  );
+  const out = await cdp<{ result: { value?: ClickProbe } }>(tab.id!, 'Runtime.callFunctionOn', {
+    objectId,
+    functionDeclaration: CLICK_FN,
+    returnByValue: true,
+  });
+  const probe = out.result.value ?? {};
+  if (probe.blocked === 'disabled') {
+    throw new BridgeError(
+      'element_disabled',
+      `click: ${probe.tag ?? 'the element'} is disabled, so the browser dispatches no click — ` +
+        `satisfy whatever enables it (fill the form, wait_for it to become enabled), then retry`,
+    );
+  }
+  if (probe.blocked === 'detached') {
+    // Route by how the target was NAMED, not by how it failed: telling an agent
+    // that passed a CSS selector to "re-snapshot for a fresh ref" points at a
+    // ref it never held. (DOM.querySelector only returns connected nodes, so
+    // this branch means the page detached it between the query and the click.)
+    if (isRef(selector)) throw staleRefError('click', selector);
+    throw new BridgeError(
+      'not_found',
+      `click: ${selector} was detached from the document before the click landed — ` +
+        `re-locate it (find/wait_for) and retry`,
+    );
+  }
   const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
   return {
     tabId: tab.id,
     url: tab.url,
-    data: { ok: true, ...(out.result.value ?? {}), ...(wait ? { wait } : {}) },
+    data: { ok: true, ...probe, ...(wait ? { wait } : {}) },
   };
 };
 
@@ -384,9 +466,15 @@ export const readText: Tool = async (args) => {
         `unknown ref "${args.ref}" for tab ${tab.id} — run snapshot first`,
       );
     }
-    const resolved = await cdp<{ object: { objectId?: string } }>(tab.id!, 'DOM.resolveNode', {
-      backendNodeId: r.backendDOMNodeId,
-    });
+    let resolved: { object: { objectId?: string } };
+    try {
+      resolved = await cdp<{ object: { objectId?: string } }>(tab.id!, 'DOM.resolveNode', {
+        backendNodeId: r.backendDOMNodeId,
+      });
+    } catch (e) {
+      if (looksLikeMissingNodeError(e)) throw staleRefError('read_text', args.ref);
+      throw e;
+    }
     if (!resolved.object.objectId) {
       throw new BridgeError('bad_ref', 'could not resolve ref to a DOM node');
     }

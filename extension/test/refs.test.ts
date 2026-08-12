@@ -7,7 +7,14 @@
  */
 
 import { beforeEach, describe, expect, it } from 'vitest';
-import { clearRefsForTab, getRef, isRef, newRef, resetRefsForTab } from '../src/tools/refs.js';
+import {
+  clearRefsForTab,
+  getRef,
+  isRef,
+  newRef,
+  refWatermark,
+  resetRefsForTab,
+} from '../src/tools/refs.js';
 
 // Each test gets a clean slate — refs.ts uses module-level Maps.
 beforeEach(() => {
@@ -88,11 +95,61 @@ describe('clearRefsForTab / resetRefsForTab', () => {
     expect(newRef(1, 200, 'button', '')).toBe('e1');
   });
 
-  it('resetRefsForTab wipes refs but otherwise behaves like clear', () => {
+  it('resetRefsForTab wipes refs but keeps counting — ids never rebind', () => {
+    // The whole point: after a re-snapshot of the SAME page, a ref the agent
+    // still holds must MISS (→ bad_ref, recoverable) rather than resolve to
+    // whatever element now occupies that slot.
     newRef(1, 100, 'button', '');
     resetRefsForTab(1);
     expect(getRef(1, 'e1')).toBeNull();
+    expect(newRef(1, 200, 'button', '')).toBe('e2');
+  });
+
+  it('never reissues an id across repeated resets', () => {
+    const seen = new Set<string>();
+    for (let round = 0; round < 5; round += 1) {
+      resetRefsForTab(1);
+      for (let i = 0; i < 3; i += 1) {
+        const id = newRef(1, 1000 + round * 10 + i, 'button', '');
+        expect(seen.has(id)).toBe(false);
+        seen.add(id);
+      }
+    }
+    expect(seen.size).toBe(15);
+  });
+
+  it('clearRefsForTab restarts numbering — a navigation makes the old ids meaningless', () => {
+    newRef(1, 100, 'button', '');
+    newRef(1, 101, 'button', '');
+    clearRefsForTab(1);
     expect(newRef(1, 200, 'button', '')).toBe('e1');
+  });
+
+  it('rewinds to a watermark, so a snapshot’s discarded internal passes cost no ids', () => {
+    // buildSnapshotTree mints for the a11y attempt, discards it, re-mints for
+    // the DOM cross-check. Only the surviving pass may advance the counter.
+    expect(newRef(1, 100, 'button', '')).toBe('e1');
+    const mark = refWatermark(1);
+    expect(mark).toBe(1);
+
+    resetRefsForTab(1, mark); // start of the snapshot
+    expect(newRef(1, 200, 'button', '')).toBe('e2'); // a11y attempt
+    resetRefsForTab(1, mark); // discarded — rewind
+    expect(newRef(1, 300, 'button', '')).toBe('e2'); // DOM pass reuses the number
+    expect(getRef(1, 'e2')).toEqual({ backendDOMNodeId: 300, role: 'button', name: '' });
+    // …and the ref that was actually handed out earlier is still gone, not aliased.
+    expect(getRef(1, 'e1')).toBeNull();
+  });
+
+  it('refWatermark is per tab and survives a reset', () => {
+    newRef(1, 100, 'button', '');
+    newRef(1, 101, 'button', '');
+    expect(refWatermark(1)).toBe(2);
+    expect(refWatermark(2)).toBe(0);
+    resetRefsForTab(1);
+    expect(refWatermark(1)).toBe(2);
+    clearRefsForTab(1);
+    expect(refWatermark(1)).toBe(0);
   });
 
   it('clearing one tab does not affect another', () => {

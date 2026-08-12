@@ -70,6 +70,43 @@ export function classifyAttachError(msg: string): BridgeError {
   return new BridgeError(code, `attach failed: ${detail}`);
 }
 
+function messageOf(e: unknown): string {
+  return (e instanceof Error ? e.message : String(e)).toLowerCase();
+}
+
+/** Does this CDP rejection look like Chrome refusing a malformed CSS selector?
+ *
+ * `DOM.querySelector` rejects on bad syntax, and the model reaches for
+ * Playwright-isms (`:has-text()`, `:contains()`, `text=`) often enough that
+ * this is a routine failure, not an exotic one. It matters which way it is
+ * classified: a syntax error is PERMANENT (`bad_args`, "don't retry") while
+ * every other querySelector rejection — a document node that went away
+ * mid-navigation, say — is transient. So this is deliberately narrow and the
+ * unmatched case keeps whatever code it already had, exactly like
+ * `classifyAttachError`'s always-present fallback. Pure / chrome-free. */
+export function looksLikeSelectorSyntaxError(e: unknown): boolean {
+  const msg = messageOf(e);
+  return msg.includes('selector') || msg.includes('while querying') || msg.includes('dom error');
+}
+
+/** Does this CDP rejection mean "that node is not in the document any more"?
+ *
+ * The stale-`@eN` case: `DOM.resolveNode {backendNodeId}` rejects once the node
+ * an earlier snapshot recorded has been destroyed by a re-render. Same
+ * discipline as above — narrow match, unmatched rejections (a detached debugger,
+ * a wedged renderer) keep their own classification rather than being mislabelled
+ * as a stale ref. Pure / chrome-free. */
+export function looksLikeMissingNodeError(e: unknown): boolean {
+  const msg = messageOf(e);
+  if (!msg.includes('node')) return false;
+  return (
+    msg.includes('no node') ||
+    msg.includes('not found') ||
+    msg.includes('could not find') ||
+    msg.includes('does not belong')
+  );
+}
+
 /** One CDP attachment per tab. Detach happens when the tab closes or the
  * user clicks "Cancel" on the debugger banner — we listen for both so the
  * set stays accurate without polling. */

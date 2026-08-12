@@ -4,7 +4,7 @@ import { resolveSelectorOrRef } from './dom.js';
 import { collectDomTree, type DomTreeNode, type DomTreeResult } from './domtree.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
-import { newRef, resetRefsForTab } from './refs.js';
+import { newRef, refWatermark, resetRefsForTab } from './refs.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
@@ -135,8 +135,20 @@ export type SnapshotResult = { tree: TreeNode[]; source: 'a11y' | 'dom'; truncat
 export async function buildSnapshotTree(
   tabId: number,
   mode: 'auto' | 'a11y' | 'dom',
+  watermark?: number,
 ): Promise<SnapshotResult> {
-  resetRefsForTab(tabId);
+  // Refs are monotonic per tab (refs.ts), so a ref from the PREVIOUS snapshot
+  // fails as `bad_ref` instead of rebinding to whatever is now in that slot.
+  // Within THIS call, though, the a11y attempt / DOM cross-check / a11y rebuild
+  // below mint refs that are then discarded, and those never reach the agent —
+  // so each retry rewinds to the mark taken here and only the surviving walk's
+  // ids advance the counter.
+  // A caller that snapshots REPEATEDLY inside one tool call (reveal, once per
+  // scroll step) passes its own mark so every discarded pass rewinds to the
+  // same point — otherwise 40 steps of never-returned refs push the agent's
+  // ids up by 40 snapshots' worth for no reason.
+  const mark = watermark ?? refWatermark(tabId);
+  resetRefsForTab(tabId, mark);
   const makeRef = (backendDOMNodeId: number, role: string, name: string): string =>
     newRef(tabId, backendDOMNodeId, role, name);
 
@@ -156,7 +168,7 @@ export async function buildSnapshotTree(
   }
   const axCount = collectInteractive(tree).length;
   if (mode === 'dom' || (mode === 'auto' && axCount < MIN_TRUSTED_AX_REFS)) {
-    resetRefsForTab(tabId); // drop the a11y refs; the DOM pass reallocates from @e1
+    resetRefsForTab(tabId, mark); // drop the a11y attempt's refs; the DOM pass re-mints
     let dom: { tree: TreeNode[]; truncated: boolean } | null = null;
     try {
       dom = await domSnapshot(tabId);
@@ -170,7 +182,7 @@ export async function buildSnapshotTree(
       truncated = dom.truncated;
     } else {
       // a11y stays authoritative — rebuild it so its refs are valid again.
-      resetRefsForTab(tabId);
+      resetRefsForTab(tabId, mark);
       tree = buildTree(axNodes, makeRef);
     }
   }

@@ -22,7 +22,7 @@
  *    that died mid-call can never masquerade as visible.
  */
 
-import { attach, cdp } from './cdp.js';
+import { attach, cdp, looksLikeSelectorSyntaxError } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { getRef, isRef, type RefInfo } from './refs.js';
@@ -35,6 +35,48 @@ import type { Tool } from './types.js';
 // target is <body>.
 const DEFAULT_STATE_MAX_CHARS = 2_000;
 const MAX_STATE_MAX_CHARS = 20_000;
+
+// A post-action check is rarely one assertion — "the dialog is gone AND the row
+// appeared AND Save is enabled" is three, and one per call meant three model
+// turns to verify a single click. Batching them is the cheapest round-trip
+// saving in the toolset. Capped because each entry is its own CDP resolve+probe
+// pair and the result has to stay small enough to be worth reading.
+const MAX_STATE_SELECTORS = 10;
+
+/** Parse get_state's `selector`: one CSS selector / @eN, or a batch of up to
+ * MAX_STATE_SELECTORS of them. Returns the list plus whether the caller asked
+ * in the scalar form, because the two answer shapes differ (a single state
+ * object vs `{elements:[…]}`) and the scalar one must stay byte-compatible.
+ * Pure, so the validation is unit-testable without chrome. */
+export function parseStateSelectors(raw: unknown): { selectors: string[]; batch: boolean } {
+  if (typeof raw === 'string') {
+    if (!raw) throw new BridgeError('bad_args', 'get_state: selector required');
+    return { selectors: [raw], batch: false };
+  }
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) {
+      throw new BridgeError('bad_args', 'get_state: selector array must not be empty');
+    }
+    if (raw.length > MAX_STATE_SELECTORS) {
+      throw new BridgeError(
+        'bad_args',
+        `get_state: at most ${MAX_STATE_SELECTORS} selectors per call (got ${raw.length})`,
+      );
+    }
+    const selectors = raw.map((s, i) => {
+      if (typeof s !== 'string' || s === '') {
+        throw new BridgeError('bad_args', `get_state: selector[${i}] must be a non-empty string`);
+      }
+      return s;
+    });
+    return { selectors, batch: true };
+  }
+  throw new BridgeError(
+    'bad_args',
+    'get_state: selector required — a CSS selector or @eN, or an array of up to ' +
+      `${MAX_STATE_SELECTORS} of them`,
+  );
+}
 
 /** Parse + validate get_state's `maxChars` (capped at MAX_STATE_MAX_CHARS).
  * Pure, so the cap and rejections are unit-testable without chrome — mirrors
@@ -142,6 +184,7 @@ async function resolveForState(
   selector: string,
   ref: string | undefined,
   refInfo: RefInfo | null,
+  documentRoot: () => Promise<number>,
 ): Promise<{ objectId: string } | AbsentState> {
   if (isRef(selector)) {
     if (!refInfo) return { exists: false, reason: 'unknown_ref', ref };
@@ -157,16 +200,23 @@ async function resolveForState(
     return objectId ? { objectId } : { exists: false, reason: 'detached', ref };
   }
 
-  const doc = await cdp<{ root: { nodeId: number } }>(tabId, 'DOM.getDocument', { depth: 0 });
+  const root = await documentRoot();
   let nodeId = 0;
   try {
-    const q = await cdp<{ nodeId: number }>(tabId, 'DOM.querySelector', {
-      nodeId: doc.root.nodeId,
-      selector,
-    });
+    const q = await cdp<{ nodeId: number }>(tabId, 'DOM.querySelector', { nodeId: root, selector });
     nodeId = q.nodeId;
-  } catch {
-    throw new BridgeError('bad_args', `get_state: invalid selector: ${selector}`);
+  } catch (e) {
+    // Only genuinely malformed CSS is the agent's permanent mistake. This used
+    // to be a blanket catch, which relabelled every transient CDP rejection —
+    // a wedged renderer, a node binding that went away — as `bad_args`
+    // (retryable=no), telling the agent to rewrite a selector that was fine.
+    if (looksLikeSelectorSyntaxError(e)) {
+      throw new BridgeError('bad_args', `get_state: invalid selector: ${selector}`);
+    }
+    // Anything else: we have no answer, so say so rather than inventing one.
+    // {exists:false} would be a positive claim — and "is the modal gone? yes"
+    // is exactly the wrong way to be wrong here.
+    throw e;
   }
   if (!nodeId) return { exists: false, reason: 'not_found' };
   let objectId: string | null = null;
@@ -181,24 +231,22 @@ async function resolveForState(
   return objectId ? { objectId } : { exists: false, reason: 'detached' };
 }
 
-export const getState: Tool = async (args) => {
-  const selector = String(args.selector || '');
-  if (!selector) throw new BridgeError('bad_args', 'get_state: selector required');
-  const maxChars = parseStateMaxChars(args.maxChars);
-  const tab = await resolveTab(args);
-  await ensureAllowed(tab.url);
-  await attach(tab.id!);
-  const tabId = tab.id!;
-
+/** Everything `get_state` reports about ONE selector. Never throws for an
+ * absent node (that is the tool's whole point); an invalid CSS selector is the
+ * one exception, and it is a permanent agent mistake rather than a page state. */
+async function probeOne(
+  tabId: number,
+  selector: string,
+  maxChars: number,
+  documentRoot: () => Promise<number>,
+): Promise<Record<string, unknown>> {
   const ref = isRef(selector)
     ? '@' + (selector.startsWith('@') ? selector.slice(1) : selector)
     : undefined;
   const refInfo = isRef(selector) ? getRef(tabId, selector) : null;
 
-  const resolved = await resolveForState(tabId, selector, ref, refInfo);
-  if ('exists' in resolved) {
-    return { tabId, url: tab.url, data: resolved };
-  }
+  const resolved = await resolveForState(tabId, selector, ref, refInfo, documentRoot);
+  if ('exists' in resolved) return resolved;
 
   // Probe the live node. A failure here means it died between resolve and call
   // (SPA re-render) — fail closed to {exists:false}, never report visible.
@@ -218,21 +266,62 @@ export const getState: Tool = async (args) => {
   } catch {
     raw = null;
   }
-  if (!raw) {
-    return {
-      tabId,
-      url: tab.url,
-      data: { exists: false, reason: 'detached', ...(ref ? { ref } : {}) },
-    };
-  }
+  if (!raw) return { exists: false, reason: 'detached', ...(ref ? { ref } : {}) };
 
   return {
-    tabId,
-    url: tab.url,
-    data: {
-      ...shapeElementState(raw),
-      ...(ref ? { ref } : {}),
-      ...(refInfo ? { role: refInfo.role, name: refInfo.name } : {}),
-    },
+    ...shapeElementState(raw),
+    ...(ref ? { ref } : {}),
+    ...(refInfo ? { role: refInfo.role, name: refInfo.name } : {}),
   };
+}
+
+/** The tab's document root, fetched at most ONCE per get_state call and shared
+ * by every selector in a batch.
+ *
+ * Load-bearing, not a micro-optimisation. Chromium's
+ * `InspectorDOMAgent::getDocument` calls `DiscardFrontendBindings()`, which
+ * throws away every nodeId the agent has handed out so far — that is why
+ * Puppeteer and Playwright cache the document rather than re-fetching it. Each
+ * probe fetching its own root would therefore invalidate the roots (and the
+ * queried nodeIds) of the probes around it, and the failure surfaces as
+ * "Could not find node with given id" on a selector that was perfectly valid.
+ *
+ * Lazily memoised so an all-@eN call issues no `DOM.getDocument` at all: refs
+ * resolve by browser-owned backendNodeId and never touch the nodeId map. */
+function documentRootOnce(tabId: number): () => Promise<number> {
+  let pending: Promise<number> | null = null;
+  return () => {
+    pending ??= cdp<{ root: { nodeId: number } }>(tabId, 'DOM.getDocument', { depth: 0 }).then(
+      (d) => d.root.nodeId,
+    );
+    return pending;
+  };
+}
+
+export const getState: Tool = async (args) => {
+  const { selectors, batch } = parseStateSelectors(args.selector);
+  const maxChars = parseStateMaxChars(args.maxChars);
+  const tab = await resolveTab(args);
+  await ensureAllowed(tab.url);
+  await attach(tab.id!);
+  const tabId = tab.id!;
+  const documentRoot = documentRootOnce(tabId);
+
+  if (!batch) {
+    const data = await probeOne(tabId, selectors[0], maxChars, documentRoot);
+    return { tabId, url: tab.url, data };
+  }
+  // SEQUENTIALLY, deliberately. What the batch buys is the one MCP call it
+  // replaces — a whole model turn. Running the probes concurrently on top of
+  // that would save tens of milliseconds of CDP latency while interleaving
+  // commands against one tab's shared DOM-agent state, which is precisely what
+  // invariant #8's per-tab serialisation exists to prevent; no other tool in
+  // this codebase does it, and nothing here can test it (the chrome-bound paths
+  // are outside vitest). The shared document root above already removes the
+  // bulk of the round-trips a naive loop would spend.
+  const elements: Array<Record<string, unknown>> = [];
+  for (const selector of selectors) {
+    elements.push({ selector, ...(await probeOne(tabId, selector, maxChars, documentRoot)) });
+  }
+  return { tabId, url: tab.url, data: { elements } };
 };

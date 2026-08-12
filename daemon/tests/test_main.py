@@ -22,6 +22,7 @@ import websockets
 
 from sallyport_daemon.__main__ import (
     _parse_kv,
+    _reindent_for_humans,
     amain,
     find_sallyport_processes,
     parse_args,
@@ -1667,3 +1668,40 @@ async def test_concurrent_sessions_spawn_exactly_one_broker(
     results = await asyncio.gather(*(attach_or_start_broker(args, short_tmp_dir) for _ in range(4)))
     assert results == [None, None, None, None]
     assert spawns == 1
+
+
+class TestExecReindent:
+    """`exec` prints for a human; the MCP layer serialises for a model.
+
+    `_format_result` minifies a large result because every byte is re-read on
+    every later turn of a task. A person running `exec` has the opposite need
+    and none of that cost, so the CLI puts the indentation back — and only
+    there, so the model's copy stays small.
+    """
+
+    def test_large_json_block_is_reindented(self) -> None:
+        payload = {"tree": [{"role": "button", "name": f"n{i}"} for i in range(300)]}
+        compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        out = _reindent_for_humans(compact)
+        assert "\n" in out
+        assert json.loads(out) == payload
+
+    def test_already_pretty_json_is_reproduced_byte_for_byte(self) -> None:
+        # Why it is safe to skip re-checking _format_result's size threshold
+        # here: re-indenting an already-indented result is the identity.
+        pretty = json.dumps(
+            {"tabId": 7, "url": "https://example.com/"}, ensure_ascii=False, indent=2
+        )
+        assert _reindent_for_humans(pretty) == pretty
+
+    def test_non_json_text_is_untouched(self) -> None:
+        # A read_text page dump or an error line must survive verbatim, however
+        # long — re-indentation applies to JSON results, not to prose.
+        prose = 'Error [bad_ref]: click: ref "@e12" no longer resolves'
+        assert _reindent_for_humans(prose) == prose
+        long_prose = "x" * 9000
+        assert _reindent_for_humans(long_prose) == long_prose
+
+    def test_long_but_unparseable_json_like_text_is_untouched(self) -> None:
+        broken = "{" + "y" * 9000
+        assert _reindent_for_humans(broken) == broken

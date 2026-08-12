@@ -6,6 +6,82 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-08-12
+
+An efficiency pass on what it costs an agent to drive the bridge. Three costs,
+in order of what they actually cost: a round-trip (a whole model turn — seconds
+of latency plus a full context re-read), a token in a tool result (re-read on
+every later turn of the task), and wall-clock inside one call. Nothing here
+touches a security invariant; several items make a silent wrong answer into a
+loud, branchable one, which is the same saving by another route.
+
+### Added
+
+- **`get_state` accepts up to 10 selectors at once.** Verifying an action is
+  rarely one assertion — "the dialog is gone AND the row appeared AND Save is
+  enabled" is three, and one selector per call meant three model turns to check
+  one click. With an array the answer is `{elements:[{selector, …}]}` in the
+  order asked. The single-selector form answers exactly as before. The probes
+  run sequentially over one shared document handle: what the batch buys is the
+  MCP call it replaces, and interleaving CDP commands against one tab is what
+  the per-tab serialisation exists to prevent.
+- **Embedded `waitFor` on `reload`, `scroll`, `key_type` and `send_keys`**, the
+  four action tools that lacked it. `send_keys 'Enter'` is the submit of most
+  search and login flows, and `reload`'s own contract says the previous
+  snapshot's refs are dead — so both were *guaranteed* to be followed by a
+  `wait_for`. `scroll` + `waitFor` halves a lazy-load harvest loop.
+- **`redirectedFrom`** on `navigate` and `reload` when the tab did not end up
+  where it was sent.
+
+### Changed
+
+- **`navigate` and `reload` report the URL the tab ACTUALLY landed on**, not the
+  one they were asked for. An SSO bounce, a consent wall, a shortener or an
+  expired session was previously invisible until some later call surprised the
+  agent — and the wrong URL went into the audit row too.
+- **Large tool results serialise compactly** (past ~4 KB), which measured 40–45 %
+  fewer tokens on a realistic snapshot tree for byte-identical content. It is a
+  threshold rather than a blanket switch because the two costs point opposite
+  ways at different sizes: on a small result the saving is a rounding error
+  while a misread costs a whole round-trip. `sallyport-daemon exec` re-indents
+  on the way out, so the CLI is unaffected.
+- **`key_type` and `send_keys` now say what they target.** Both type into
+  whatever currently has focus and take no selector; the descriptions said
+  neither, so they were picked for named-field writes that `fill` should own —
+  a wrong-tool call that ends in a `focus_probe_failed` reading like an internal
+  bug.
+- **`settle` no longer costs a guaranteed extra poll tick.** Its stability
+  window is backdated to the earlier of the two equal readings, since their
+  being equal is what proves the DOM held still *across* that interval. An
+  already-static page proved a 500 ms window by t=500 but was only told so at
+  t=750 — paid again on every one of `reveal`'s up-to-40 scroll steps. Two
+  genuinely equal readings are still required.
+
+### Fixed
+
+- **`@eN` refs are monotonic per tab.** `snapshot` → `find` → `click @e5` used
+  to silently rebind: the second walk restarted numbering at `e1`, so the ref
+  still resolved — to a *different* element, in the human's own logged-in
+  profile, reported as success. Ids now keep counting, so a stale ref MISSES and
+  fails as `bad_ref`, whose recovery hint already says "re-snapshot". Numbering
+  still restarts on a real navigation, and a snapshot's own discarded internal
+  passes cost no ids.
+- **A destroyed `@eN` fails as `bad_ref`, malformed CSS as `bad_args`.** Both
+  used to escape as the raw CDP rejection, i.e. code `error`, whose hint says
+  "if it recurs identically, treat it as non-retryable" — the exact opposite of
+  what a stale ref needs. The selector message names `:has-text()`, `:contains()`
+  and `text=` as Playwright syntax and points at `find`.
+- **`wait_for` on a ref whose node is gone fails immediately** instead of
+  burning the whole timeout (up to 30 s) and then blaming `reason:'timeout'`,
+  which tells the agent to wait longer. `absent:true` is untouched — there a
+  destroyed node is precisely the condition being waited for.
+- **`click` refuses a disabled or detached target** with `element_disabled`
+  instead of reporting a guaranteed no-op as `{ok:true}`. Chrome dispatches no
+  click at all on a `disabled` control, and an embedded `waitFor` cannot rescue
+  it — it just times out. A zero-size element is still clicked and merely
+  flagged: a synthetic `.click()` on a hidden `<input type=file>` is how upload
+  flows are built.
+
 ## [0.19.0] — 2026-07-31
 
 ### Added
@@ -2090,7 +2166,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/ginkida/sallyport/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/ginkida/sallyport/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/ginkida/sallyport/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/ginkida/sallyport/compare/v0.17.0...v0.18.0

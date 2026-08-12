@@ -27,7 +27,10 @@ log = logging.getLogger("sallyport.mcp")
 MAX_DETAIL_JSON = 4000
 
 
-# Embedded post-action wait, shared by navigate/click/mouse_click/fill.
+# Embedded post-action wait, shared by every tool whose action is normally
+# followed by "…and now wait for the page to react": navigate, reload,
+# history_go, click, mouse_click, hover, fill, select_option, key_type,
+# send_keys and scroll.
 _WAIT_FOR_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -96,7 +99,10 @@ TOOLS: list[Tool] = [
             "(else tab_not_owned). waitFor polls after the "
             "load until a selector/text shows up — on SPAs 'loaded' rarely means "
             "'rendered', so prefer navigate+waitFor over navigate then wait_for. "
-            "Returns {tabId, url, wait?}."
+            "Returns {tabId, url, wait?} where url is where the tab ACTUALLY "
+            "landed, not the URL you asked for — plus redirectedFrom carrying "
+            "your requested URL when they differ, which is how an SSO bounce, a "
+            "consent wall, a shortener or an expired session announces itself."
         ),
         inputSchema={
             "type": "object",
@@ -133,13 +139,19 @@ TOOLS: list[Tool] = [
             "Reload a tab. Pass bypassCache=true to force a hard reload that "
             "skips the HTTP cache (equivalent to Ctrl/Cmd+Shift+R). The "
             "destination must already be in the allowlist; refs from the "
-            "previous snapshot are invalidated."
+            "previous snapshot are invalidated, so pass waitFor to poll for the "
+            "reloaded page's content in the same call rather than spending a "
+            "second one on wait_for. Returns {tabId, url, bypassCache} where url "
+            "is where the tab ACTUALLY ended up — plus redirectedFrom when that "
+            "differs from the page you reloaded, which is the usual tell that the "
+            "session expired and the app bounced you to a login page."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "tabId": _TAB_ID_SCHEMA,
                 "bypassCache": {"type": "boolean", "default": False},
+                "waitFor": _WAIT_FOR_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -267,9 +279,15 @@ TOOLS: list[Tool] = [
     Tool(
         name="get_state",
         description=(
-            "Cheap single-element probe — answer 'is this still here / visible / "
+            "Cheap element probe — answer 'is this still here / visible / "
             "where / what does it say' WITHOUT a full snapshot. selector is a CSS "
-            "selector or an @eN ref. Use it to verify an action's effect or "
+            "selector or an @eN ref, OR an array of up to 10 of them: a "
+            "post-action check is usually several assertions at once ('the dialog "
+            "is gone AND the row appeared AND Save is enabled'), and batching "
+            "them costs one round-trip instead of one each. With an array the "
+            "result is {elements:[{selector, …the same per-element shape}]}, in "
+            "the order you asked; a malformed CSS selector anywhere in the batch "
+            "fails the whole call with bad_args. Use it to verify an action's effect or "
             "re-check a ref after navigation in one tiny round-trip instead of "
             "re-snapshotting the whole page. It NEVER errors on a missing element: "
             "a vanished node returns {exists:false, reason} (reason is "
@@ -289,13 +307,27 @@ TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
-                "selector": {"type": "string", "description": "CSS selector or @eN ref"},
+                "selector": {
+                    "description": (
+                        "CSS selector or @eN ref — or an array of up to 10 of them to "
+                        "check several conditions in one call"
+                    ),
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 10,
+                        },
+                    ],
+                },
                 "maxChars": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 20000,
                     "default": 2000,
-                    "description": "Cap on returned text characters",
+                    "description": "Cap on returned text characters (per element)",
                 },
                 "tabId": _TAB_ID_SCHEMA,
             },
@@ -450,7 +482,15 @@ TOOLS: list[Tool] = [
             "@eN ref from snapshot. Refs are more reliable on SPAs. Try this "
             "first for buttons/links; if the click doesn't register (SPA "
             "pointer-event routers, canvas or drag-and-drop UIs), escalate to "
-            "mouse_click, which fires a real pointer sequence. waitFor "
+            "mouse_click, which fires a real pointer sequence. Refuses rather "
+            "than reporting a no-op as success when the target cannot receive "
+            "the click at all: element_disabled for a control carrying the HTML "
+            "disabled attribute (Chrome dispatches nothing there — satisfy "
+            "whatever enables it, e.g. wait_for it to become enabled, then "
+            "retry), and bad_ref/not_found for a node detached from the "
+            "document. A zero-size element IS still clicked (a hidden "
+            "<input type=file> is a normal upload pattern) and merely comes "
+            "back flagged hidden:true. waitFor "
             "polls for the click's effect (panel opened, item selected) in the "
             "same call."
         ),
@@ -648,10 +688,17 @@ TOOLS: list[Tool] = [
     Tool(
         name="key_type",
         description=(
-            "Insert raw text via CDP Input.insertText (no key events). Refuses "
-            "when focus is on <input type=password> — pass allowPassword=true "
-            "to override (mirrors `fill`'s gate, since keystrokes would "
-            "otherwise bypass it once the password field has focus)."
+            "Types into whatever element currently HAS FOCUS — it takes no "
+            "selector and does not move focus. To put text in a named field use "
+            "`fill`, which targets the element and checks its type first; reach "
+            "for key_type only for an editor you have already focused (a click, "
+            "or a fill that landed there). Inserts raw text via CDP "
+            "Input.insertText, so no key events fire — use send_keys for "
+            "Enter/Escape/shortcuts. Refuses when focus is on <input "
+            "type=password> — pass allowPassword=true to override (mirrors "
+            "`fill`'s gate, since keystrokes would otherwise bypass it once the "
+            "password field has focus). waitFor polls for the typing's effect "
+            "(an autocomplete list, a validation message) in the same call."
         ),
         inputSchema={
             "type": "object",
@@ -659,6 +706,7 @@ TOOLS: list[Tool] = [
                 "text": {"type": "string"},
                 "allowPassword": {"type": "boolean", "default": False},
                 "tabId": _TAB_ID_SCHEMA,
+                "waitFor": _WAIT_FOR_SCHEMA,
             },
             "required": ["text"],
             "additionalProperties": False,
@@ -667,10 +715,16 @@ TOOLS: list[Tool] = [
     Tool(
         name="send_keys",
         description=(
-            "Dispatch key events. Examples: 'Enter', 'Escape', 'Mod+A' (Cmd on macOS, "
-            "Ctrl elsewhere), 'Shift+Tab', 'Enter Escape' (multiple, space-separated). "
-            "Refuses when focus is on <input type=password> — pass "
-            "allowPassword=true to override."
+            "Dispatch key events to whatever element currently HAS FOCUS — it "
+            "takes no selector. Use it for keystrokes with no element target: "
+            "Enter to submit, Escape to dismiss, Tab to move on, shortcuts. To "
+            "write text into a named field use `fill` instead. Examples: "
+            "'Enter', 'Escape', 'Mod+A' (Cmd on macOS, Ctrl elsewhere), "
+            "'Shift+Tab', 'Enter Escape' (multiple, space-separated). Refuses "
+            "when focus is on <input type=password> — pass allowPassword=true to "
+            "override. waitFor polls for what the keystroke triggered (search "
+            "results, a submitted form's next page) in the same call — prefer it "
+            "over following send_keys with a separate wait_for."
         ),
         inputSchema={
             "type": "object",
@@ -678,6 +732,7 @@ TOOLS: list[Tool] = [
                 "keys": {"type": "string"},
                 "allowPassword": {"type": "boolean", "default": False},
                 "tabId": _TAB_ID_SCHEMA,
+                "waitFor": _WAIT_FOR_SCHEMA,
             },
             "required": ["keys"],
             "additionalProperties": False,
@@ -978,7 +1033,9 @@ TOOLS: list[Tool] = [
             "edge (don't combine to with dx/dy). Use it to trigger lazy-load / "
             "infinite-scroll feeds (page down repeatedly) — the result "
             "{mode, x, y, scrollHeight, atBottom} tells you when you've "
-            "bottomed out so the loop can stop. Structured CDP only (fixed "
+            "bottomed out so the loop can stop, and waitFor polls for the newly "
+            "loaded content in the same call so a harvest loop costs one call "
+            "per screenful instead of two. Structured CDP only (fixed "
             "scroll probe), no evaluate flag. Domain must be in allowlist."
         ),
         inputSchema={
@@ -996,6 +1053,7 @@ TOOLS: list[Tool] = [
                     "description": "Jump to an edge instead of a delta",
                 },
                 "tabId": _TAB_ID_SCHEMA,
+                "waitFor": _WAIT_FOR_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -1289,15 +1347,39 @@ def build_server(
     return server
 
 
+# Above this much compact JSON, a result is served minified.
+#
+# Indentation is paid per node per key, and a snapshot tree is nothing but
+# nested nodes: on a realistic heavy-SPA a11y tree the pretty form measured
+# ~40-45 % more tokens than the compact one for byte-identical content. That is
+# not a one-off cost — the result sits in the transcript and is re-read on every
+# subsequent turn of the task, so it compounds.
+#
+# It is a threshold rather than a blanket switch because the two costs point in
+# opposite directions at different sizes. On a small result (navigate, status, a
+# single get_state) the token saving is a rounding error while the readability
+# loss is real, and a misread result costs a whole round-trip — which would
+# swamp any saving. On a large one the reverse holds: nobody reads a 900-node
+# tree by eye anyway, and the tokens are the entire cost. Human `exec` output is
+# re-indented on the way out (__main__.py) so the CLI is unaffected either way.
+_PRETTY_JSON_MAX_BYTES = 4096
+
+
 def _format_result(data: Any) -> str:
     if data is None:
         return "ok"
     if isinstance(data, str):
         return data
     try:
-        return json.dumps(data, ensure_ascii=False, indent=2)
+        compact = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
         return repr(data)
+    if len(compact) > _PRETTY_JSON_MAX_BYTES:
+        return compact
+    try:
+        return json.dumps(data, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):  # pragma: no cover - compact already succeeded
+        return compact
 
 
 async def run_stdio(bridge: Bridge) -> None:

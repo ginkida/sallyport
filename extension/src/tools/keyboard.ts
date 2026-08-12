@@ -2,6 +2,7 @@ import { attach, cdp, cdpSession } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { collectFrameIds, domNodeIsPassword, focusedBackendNodeIds } from './focus.js';
 import { ensureAllowed } from './gates.js';
+import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
@@ -282,22 +283,34 @@ export async function ensureNotPasswordField(
 export const keyType: Tool = async (args) => {
   const text = String(args.text ?? '');
   if (!text) throw new BridgeError('bad_args', 'key_type: text required');
+  const waitSpec = parseWaitFor(args.waitFor, 'key_type');
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
   await ensureNotPasswordField(tab.id!, args.allowPassword === true, 'key_type');
   await cdp(tab.id!, 'Input.insertText', { text });
-  return { tabId: tab.id, url: tab.url, data: { ok: true, length: text.length } };
+  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+  return {
+    tabId: tab.id,
+    url: tab.url,
+    data: { ok: true, length: text.length, ...(wait ? { wait } : {}) },
+  };
 };
 
 export const sendKeys: Tool = async (args) => {
   const keys = String(args.keys || '');
   if (!keys.trim()) throw new BridgeError('bad_args', 'send_keys: keys required');
+  const waitSpec = parseWaitFor(args.waitFor, 'send_keys');
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
   const allowPassword = args.allowPassword === true;
   await ensureNotPasswordField(tab.id!, allowPassword, 'send_keys');
   await dispatchKeys(tab.id!, keys, allowPassword);
-  return { tabId: tab.id, url: tab.url, data: { ok: true } };
+  // `send_keys 'Enter'` IS the submit of most search/login flows, so it was the
+  // one action tool guaranteed to be followed by a wait_for. Same shared engine
+  // as click/fill; a failure inside the wait stays non-fatal, so the keystrokes
+  // the page already received are never retracted by a bad selector.
+  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+  return { tabId: tab.id, url: tab.url, data: { ok: true, ...(wait ? { wait } : {}) } };
 };

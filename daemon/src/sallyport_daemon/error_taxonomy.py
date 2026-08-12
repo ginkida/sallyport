@@ -82,6 +82,12 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "retryable=yes; no element matched — confirm it has rendered with find or "
             "wait_for, then retry with a fresh selector/@eN."
         ),
+        "element_disabled": (
+            "retryable=no as-is; the control carries the HTML disabled attribute, so the "
+            "browser dispatches no click at all — satisfy whatever enables it (fill the "
+            "required fields, dismiss the blocking state) and wait_for it to become "
+            "enabled, then retry; an identical immediate retry does nothing."
+        ),
         "wrong_element": (
             "retryable=no; the target isn't the expected element type (e.g. select_option "
             "on a custom combobox) — open it with click/mouse_click and pick the option "

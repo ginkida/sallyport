@@ -20,7 +20,7 @@ import { attach, cdp } from './cdp.js';
 import { resolveSelectorOrRef } from './dom.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
-import { SCROLL_BY_PROBE, SCROLL_INTO_VIEW_PROBE } from './poll.js';
+import { parseWaitFor, runEmbeddedWait, SCROLL_BY_PROBE, SCROLL_INTO_VIEW_PROBE } from './poll.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
@@ -92,6 +92,9 @@ type ScrollByResult = { x: number; y: number; scrollHeight: number; clientHeight
 
 export const scroll: Tool = async (args) => {
   const spec = parseScrollSpec(args);
+  // Lazy-load harvesting is scroll → wait-for-new-content → read, repeated. The
+  // embedded wait folds the middle step in, halving the calls per screenful.
+  const waitSpec = parseWaitFor(args.waitFor, 'scroll');
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
@@ -105,10 +108,17 @@ export const scroll: Tool = async (args) => {
       { objectId, functionDeclaration: SCROLL_INTO_VIEW_PROBE, returnByValue: true },
     );
     const v = out.result.value ?? { x: 0, y: 0 };
+    const intoViewWait = waitSpec ? await runEmbeddedWait(tabId, waitSpec) : null;
     return {
       tabId,
       url: tab.url,
-      data: { ok: true, mode: 'into_view', x: Math.round(v.x), y: Math.round(v.y) },
+      data: {
+        ok: true,
+        mode: 'into_view',
+        x: Math.round(v.x),
+        y: Math.round(v.y),
+        ...(intoViewWait ? { wait: intoViewWait } : {}),
+      },
     };
   }
 
@@ -137,6 +147,7 @@ export const scroll: Tool = async (args) => {
   const v = out.result.value ?? { x: 0, y: 0, scrollHeight: 0, clientHeight: 0 };
   // Whether we bottomed out — the signal a lazy-load loop needs to stop.
   const atBottom = v.y + v.clientHeight >= v.scrollHeight - 1;
+  const wait = waitSpec ? await runEmbeddedWait(tabId, waitSpec) : null;
   return {
     tabId,
     url: tab.url,
@@ -147,6 +158,7 @@ export const scroll: Tool = async (args) => {
       y: Math.round(v.y),
       scrollHeight: Math.round(v.scrollHeight),
       atBottom,
+      ...(wait ? { wait } : {}),
     },
   };
 };

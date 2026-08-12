@@ -59,6 +59,38 @@ async function bestEffortAttach(tabId: number): Promise<void> {
   }
 }
 
+/** Where the tab is NOW, best-effort.
+ *
+ * Deliberately non-throwing, unlike `getTabOrGone`: this runs at the very end of
+ * a navigate/reload that has already succeeded, purely to report where the tab
+ * actually ended up. A tab closed in that last instant is not a reason to turn a
+ * completed navigation into an error — the caller falls back to the URL it
+ * asked for, which is what it used to report unconditionally. */
+async function currentUrl(tabId: number): Promise<string | undefined> {
+  try {
+    return (await chrome.tabs.get(tabId)).url;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Did the tab end up somewhere other than where it was sent?
+ *
+ * Compares PARSED urls, so the browser's own normalisation — adding the empty
+ * path to `https://example.com`, lower-casing the host — does not read as a
+ * redirect and cry wolf on every second navigate. Unparseable input (which
+ * `navigate` rejects up front anyway) falls back to a string compare rather
+ * than claiming no redirect happened. Pure, so the normalisation is testable
+ * without chrome. */
+export function landedElsewhere(requested: string, landed: string | undefined): boolean {
+  if (!landed) return false;
+  try {
+    return new URL(requested).href !== new URL(landed).href;
+  } catch {
+    return requested !== landed;
+  }
+}
+
 /** Resolve which tab a tool should operate on.
  *
  * Stateless across calls — no "last touched tab" memo. Callers must either
@@ -241,10 +273,23 @@ export const navigate: Tool = async (args, ctx) => {
     // will surface that on their own (same as if attach() had never run).
     wait = await runEmbeddedWait(tab.id!, waitSpec);
   }
+  // Report where the tab ACTUALLY is, not the URL we were handed. An SSO bounce,
+  // a consent wall, a shortener or an expired session all land somewhere else,
+  // and echoing the request made that invisible until some later call surprised
+  // the agent — and wrote the wrong URL into the audit row. Read after the
+  // embedded wait so the answer describes the tab as the call returns it.
+  const landed = await currentUrl(tab.id!);
+  const finalUrl = landed ?? url;
   return {
     tabId: tab.id,
-    url,
-    data: { tabId: tab.id, url, ...(epoch ? { epoch } : {}), ...(wait ? { wait } : {}) },
+    url: finalUrl,
+    data: {
+      tabId: tab.id,
+      url: finalUrl,
+      ...(landedElsewhere(url, landed) ? { redirectedFrom: url } : {}),
+      ...(epoch ? { epoch } : {}),
+      ...(wait ? { wait } : {}),
+    },
   };
 };
 
@@ -275,11 +320,13 @@ export const closeTab: Tool = async (args) => {
 };
 
 export const reload: Tool = async (args) => {
+  const waitSpec = parseWaitFor(args.waitFor, 'reload');
   const tab = await resolveTab(args);
   // Allowlist gate: reloading the page exposes whatever it loads to our
   // subsequent tools, so apply the same domain check as snapshot/read_text.
   await ensureAllowed(tab.url);
   const bypassCache = args.bypassCache === true;
+  const before = tab.url ?? '';
   // Attach BEFORE reloading (not lazily on some later call) so any opted-in
   // capture — dialog handling above all, since an unhandled dialog freezes
   // the reloaded page — is live before the reloaded page's scripts run.
@@ -292,9 +339,26 @@ export const reload: Tool = async (args) => {
   // pending dialog arm (see the identical note in navigate).
   clearRefsForTab(tab.id!);
   clearArmedDialog(tab.id!);
+  // Same reason navigate carries one: "reloaded" rarely means "rendered" on an
+  // SPA, and reload's own contract says the previous snapshot's refs are dead —
+  // so a reload was ALWAYS followed by a wait and/or a re-snapshot. Folding the
+  // wait in removes that second call. Errors inside it stay non-fatal
+  // (runEmbeddedWait), so a bad selector can't retroactively fail the reload.
+  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
+  const landed = await currentUrl(tab.id!);
+  const finalUrl = landed ?? before;
   return {
     tabId: tab.id,
-    url: tab.url,
-    data: { tabId: tab.id, url: tab.url, bypassCache },
+    url: finalUrl,
+    data: {
+      tabId: tab.id,
+      url: finalUrl,
+      bypassCache,
+      // A reload that lands elsewhere is the expired-session tell (the page
+      // bounces to /login). Previously invisible: the pre-reload URL was
+      // reported back as though nothing had moved.
+      ...(landedElsewhere(before, landed) ? { redirectedFrom: before } : {}),
+      ...(wait ? { wait } : {}),
+    },
   };
 };

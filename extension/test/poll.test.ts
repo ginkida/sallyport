@@ -133,12 +133,35 @@ describe('advanceSettle (settle state machine)', () => {
     let s = advanceSettle(INITIAL_SETTLE_STATE, sig(10, 100), 1000, 500);
     expect(s.settled).toBe(false); // first reading: steadiness not yet confirmable
     s = advanceSettle(s.state, sig(10, 100), 1300, 500);
-    expect(s.settled).toBe(false); // window opens here (first confirmed-equal reading)
-    expect(s.state.stableSince).toBe(1300);
-    s = advanceSettle(s.state, sig(10, 100), 1799, 500);
+    expect(s.settled).toBe(false);
+    // The window is BACKDATED to the earlier of the two equal readings: they
+    // being equal is evidence the DOM held still across the whole interval,
+    // not merely at the instant of the second sample.
+    expect(s.state.stableSince).toBe(1000);
+    s = advanceSettle(s.state, sig(10, 100), 1499, 500);
     expect(s.settled).toBe(false); // 499 ms < 500 ms window
-    s = advanceSettle(s.state, sig(10, 100), 1800, 500);
+    s = advanceSettle(s.state, sig(10, 100), 1500, 500);
     expect(s.settled).toBe(true); // 500 ms elapsed since the window opened
+  });
+
+  it('costs no extra tick on an already-static page (regression: window anchored to `now`)', () => {
+    // Anchoring the window to the second sample charged every settle one
+    // guaranteed extra POLL_MS: a static page proved a 500 ms window by t=500
+    // but was only told so at t=750 — paid again on every reveal scroll step.
+    const POLL = 250;
+    let s = advanceSettle(INITIAL_SETTLE_STATE, sig(7, 70), 0, 500);
+    s = advanceSettle(s.state, sig(7, 70), POLL, 500);
+    expect(s.settled).toBe(false);
+    s = advanceSettle(s.state, sig(7, 70), POLL * 2, 500);
+    expect(s.settled).toBe(true); // t=500, not t=750
+  });
+
+  it('still refuses to settle on a single reading, however long the gap', () => {
+    // The saving must not weaken the rule that two genuinely equal samples are
+    // required — a long first tick is not evidence of anything.
+    const s = advanceSettle(INITIAL_SETTLE_STATE, sig(4, 4), 10_000, 500);
+    expect(s.settled).toBe(false);
+    expect(s.state.stableSince).toBeNull();
   });
 
   it('restarts the window when either signal changes', () => {
