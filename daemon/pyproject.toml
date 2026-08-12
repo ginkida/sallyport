@@ -111,7 +111,19 @@ module = "sallyport_daemon.mcp_server"
 disallow_untyped_decorators = false
 
 [build-system]
-requires = ["hatchling"]
+# Pinned below 1.32 because that release started stamping wheels
+# `Metadata-Version: 2.5`, which the twine bundled inside the SHA-pinned
+# pypa/gh-action-pypi-publish still rejects outright:
+#   InvalidDistribution: Invalid distribution metadata: '2.5' is not a valid
+#   metadata version
+# It fails at UPLOAD time, after the tag and the GitHub Release already exist —
+# and publish.yml's own `twine check` step does not catch it, because that step
+# installs the newest twine, which accepts 2.5 quite happily. So the two twines
+# disagree and only the one we do not control gets a veto. 2.4 is the floor this
+# project actually needs (PEP 639 `license`/`license-files`), so nothing is lost
+# by staying there. Lift the pin once the pinned action ships a twine that knows
+# 2.5 — and verify by publishing, not by the local `twine check`.
+requires = ["hatchling<1.32"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

@@ -8,6 +8,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [0.20.0] — 2026-08-12
 
+### Build
+
+- The build backend is pinned to `hatchling<1.32`: 1.32 stamps wheels
+  `Metadata-Version: 2.5`, which the twine inside the SHA-pinned publish action
+  rejects at upload time — after the tag and GitHub Release already exist. The
+  workflow's own `twine check` does not catch it, because it installs the newest
+  twine, which accepts 2.5. 2.4 is all this project needs.
+
 An efficiency pass on what it costs an agent to drive the bridge. Three costs,
 in order of what they actually cost: a round-trip (a whole model turn — seconds
 of latency plus a full context re-read), a token in a tool result (re-read on
