@@ -36,7 +36,7 @@ dependencies = [
     # Upper-bounded at the next major: the MCP SDK churns its API across the
     # 1.x line, so an unbounded floor would let a fresh install pull a future
     # release that breaks startup. Tested against mcp 1.26.0 / websockets 16.0.
-    "mcp>=1.0.0,<2.0.0",
+    "mcp>=1.0.0,<3.0.0",
     "websockets>=13.0,<17.0",
 ]
 
