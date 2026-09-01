@@ -75,11 +75,13 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "or wait_for the load, then retry set_viewport."
         ),
         "not_visible": (
-            "retryable=yes; the target either has zero size / isn't laid out yet, OR it is "
-            "laid out but sits outside the viewport (the message says which, and the "
-            "browser discards events aimed off-screen). Scrolled away → scroll or reveal "
-            "it into view, then retry; not rendered yet → wait_for (or settle) until it "
-            "does, or re-snapshot to pick a visible element."
+            "retryable=maybe; the target either has zero size / isn't laid out yet, OR it "
+            "is laid out but measures outside the viewport AFTER mouse_click/hover already "
+            "scrolled to it (the message says which, and the browser discards events aimed "
+            "off-screen). Not rendered yet → wait_for (or settle) until it is, or "
+            "re-snapshot to pick a visible element. Still off-viewport → plain scrolling "
+            "will not fix it: open whatever reveals the element (a drawer/menu toggle), or "
+            "reveal a virtualised container."
         ),
         "bad_ref": (
             "retryable=yes; the @eN ref is stale (the page re-rendered or navigated) — run "
@@ -136,6 +138,16 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
         "unserialisable_result": (
             "retryable=no; the result couldn't be serialised for the wire — narrow the "
             "request (scope a snapshot, lower maxChars) so the payload is smaller/plainer."
+        ),
+        "no_editable_focus": (
+            "retryable=no; key_type inserts into whatever holds focus and nothing there can "
+            "take text (after a navigate that is <body>) — click the field first, or use "
+            "fill(selector, value), which focuses it for you."
+        ),
+        "result_too_large": (
+            "retryable=no; the result was too big to send and was refused before it could "
+            "drop the shared browser connection — ask for less: snapshot(compact:true) or "
+            "selector, read_text(maxChars), screenshot(maxWidth/region), fetch_in_page(saveAs)."
         ),
         "tab_required": (
             "retryable=yes; broker mode has no active-tab fallback — pass an explicit tabId "

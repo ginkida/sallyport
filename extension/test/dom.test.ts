@@ -466,3 +466,111 @@ describe('FILL_READBACK_FN (serialised in-page probe)', () => {
     expect(JSON.stringify(out)).not.toContain('sup3rs3cret');
   });
 });
+
+describe('read_text says what it could not see', () => {
+  const TAB2 = 31;
+
+  /** A page whose body text is `text`, with the frame tree the browser reports.
+   * `frameTree: null` models a browser that refuses the command. */
+  function installChrome(text: string, frameTree: unknown): void {
+    const store = new Map<string, unknown>();
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      storage: {
+        local: {
+          async get(keys: string | string[]) {
+            const out: Record<string, unknown> = {};
+            for (const k of Array.isArray(keys) ? keys : [keys])
+              if (store.has(k)) out[k] = store.get(k);
+            return out;
+          },
+          async set(obj: Record<string, unknown>) {
+            for (const [k, v] of Object.entries(obj)) store.set(k, v);
+          },
+          async remove() {},
+        },
+        session: {
+          async get() {
+            return {};
+          },
+          async set() {},
+        },
+      },
+      tabs: {
+        async get() {
+          return { id: TAB2, url: 'https://shop.example/pay', title: 'pay' };
+        },
+        onRemoved: { addListener() {} },
+      },
+      debugger: {
+        async attach() {},
+        async sendCommand(_t: unknown, method: string) {
+          if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
+          if (method === 'DOM.querySelector') return { nodeId: 7 };
+          if (method === 'DOM.resolveNode') return { object: { objectId: 'body' } };
+          if (method === 'Runtime.callFunctionOn') return { result: { value: text } };
+          if (method === 'Page.getFrameTree') {
+            if (!frameTree) throw new Error('not available');
+            return frameTree;
+          }
+          return {};
+        },
+        onEvent: { addListener() {} },
+        onDetach: { addListener() {} },
+      },
+    };
+  }
+
+  const payFrames = {
+    frameTree: {
+      frame: { url: 'https://shop.example/pay' },
+      childFrames: [{ frame: { url: 'https://pay.example/card?token=secret' } }],
+    },
+  };
+
+  async function load() {
+    const { readText } = await import('../src/tools/dom.js');
+    const { setAllowlist } = await import('../src/storage.js');
+    const { resetAttachedTabs } = await import('../src/tools/cdp.js');
+    resetAttachedTabs();
+    await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+    return readText;
+  }
+
+  it('reports the frames whose text is NOT in the answer', async () => {
+    // The body probe does not cross a frame boundary, so a checkout page reads
+    // as its shell. Without this the agent sees a short string and no reason.
+    installChrome('Complete your purchase', payFrames);
+    const readText = await load();
+    const out = (await readText({ tabId: TAB2 }, undefined)) as {
+      data: { text: string; frames?: string[] };
+    };
+    expect(out.data.text).toBe('Complete your purchase');
+    expect(out.data.frames).toEqual(['https://pay.example']); // origin only, no token
+  });
+
+  it('reports them on an EMPTY read too — where the silence is worst', async () => {
+    installChrome('', payFrames);
+    const readText = await load();
+    const out = (await readText({ tabId: TAB2 }, undefined)) as {
+      data: { text: string; frames?: string[] };
+    };
+    expect(out.data).toMatchObject({ text: '', frames: ['https://pay.example'] });
+  });
+
+  it('says nothing when the page has no frames', async () => {
+    installChrome('plain page', { frameTree: { frame: { url: 'https://shop.example/pay' } } });
+    const readText = await load();
+    const out = (await readText({ tabId: TAB2 }, undefined)) as { data: { frames?: unknown } };
+    expect(out.data.frames).toBeUndefined();
+  });
+
+  it('still returns the text when the browser will not answer about frames', async () => {
+    installChrome('plain page', null);
+    const readText = await load();
+    const out = (await readText({ tabId: TAB2 }, undefined)) as {
+      data: { text: string; frames?: unknown };
+    };
+    expect(out.data.text).toBe('plain page');
+    expect(out.data.frames).toBeUndefined();
+  });
+});

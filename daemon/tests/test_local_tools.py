@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import base64
+import builtins
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from sallyport_daemon.bridge import ToolError
 from sallyport_daemon.local_tools import (
+    MAX_FILENAME_CHARS,
     PRE_CALL_VALIDATORS,
+    UNIQUE_SUFFIX_LIMIT,
     _fetch_in_page_result,
     _print_to_pdf_result,
     _validate_fetch_filename,
     save_to_file,
+    unique_filename_candidates,
     validate_upload_paths,
 )
 
@@ -84,11 +89,33 @@ async def test_rejects_bad_base64(sandbox: Path) -> None:
     assert exc_info.value.code == "bad_args"
 
 
-async def test_overwrites_existing_file(sandbox: Path) -> None:
-    p = sandbox / "out.bin"
-    p.write_bytes(b"old")
-    await save_to_file({"data": base64.b64encode(b"new").decode(), "filename": "out.bin"})
-    assert p.read_bytes() == b"new"
+async def test_never_overwrites_an_existing_file(sandbox: Path) -> None:
+    """Agents reuse names — report.pdf, page.html, data.json — and a silent
+    overwrite destroyed the earlier artefact while both calls reported success.
+    A taken name yields a numbered variant instead, and the result says which
+    one, so nothing is lost and nothing is misreported."""
+    existing = sandbox / "out.bin"
+    existing.write_bytes(b"old")
+
+    out = await save_to_file({"data": base64.b64encode(b"new").decode(), "filename": "out.bin"})
+
+    assert existing.read_bytes() == b"old"  # untouched
+    assert out["filename"] == "out-1.bin"
+    assert out["renamedFrom"] == "out.bin"
+    assert (sandbox / "out-1.bin").read_bytes() == b"new"
+
+
+async def test_keeps_counting_past_the_first_collision(sandbox: Path) -> None:
+    (sandbox / "a.txt").write_bytes(b"0")
+    (sandbox / "a-1.txt").write_bytes(b"1")
+    out = await save_to_file({"data": base64.b64encode(b"2").decode(), "filename": "a.txt"})
+    assert out["filename"] == "a-2.txt"
+
+
+async def test_a_free_name_is_used_verbatim_with_no_note(sandbox: Path) -> None:
+    out = await save_to_file({"data": base64.b64encode(b"x").decode(), "filename": "fresh.txt"})
+    assert out["filename"] == "fresh.txt"
+    assert "renamedFrom" not in out
 
 
 async def test_write_oserror_becomes_tool_error(
@@ -98,10 +125,16 @@ async def test_write_oserror_becomes_tool_error(
     surface as a ToolError with code `filesystem_error`, never an uncaught
     OSError that would crash the MCP dispatch loop and hang the caller."""
 
-    def boom(self: Path, _data: bytes) -> int:
-        raise OSError(28, "No space left on device")
+    real_open = builtins.open
 
-    monkeypatch.setattr(Path, "write_bytes", boom)
+    def boom(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        # Only the sandbox writer's exclusive create — everything else in the
+        # process (pytest's own IO included) must keep working.
+        if "x" in mode:
+            raise OSError(28, "No space left on device")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", boom)
     with pytest.raises(ToolError) as exc_info:
         await save_to_file({"data": base64.b64encode(b"x").decode(), "filename": "x.bin"})
     assert exc_info.value.code == "filesystem_error"
@@ -422,3 +455,51 @@ def test_validate_fetch_filename_fails_before_the_browser_round_trip() -> None:
     # Absent saveAs is the ordinary case and must not raise.
     _validate_fetch_filename({})
     _validate_fetch_filename({"saveAs": "ok.png"})
+
+
+# --- collision-free naming -------------------------------------------------
+
+
+def test_candidates_start_with_the_requested_name() -> None:
+    it = unique_filename_candidates("report.pdf")
+    assert [next(it) for _ in range(3)] == ["report.pdf", "report-1.pdf", "report-2.pdf"]
+
+
+def test_candidates_keep_the_extension_when_trimming_to_the_length_cap() -> None:
+    """`_sanitise_filename` caps a name at 255 chars, so a suffix has to come out
+    of the STEM — a `.pdf` trimmed to `.pd` would stop opening."""
+    long_name = "x" * (MAX_FILENAME_CHARS - 4) + ".pdf"
+    assert len(long_name) == MAX_FILENAME_CHARS
+    it = unique_filename_candidates(long_name)
+    next(it)  # the requested name itself
+    first = next(it)
+    assert first.endswith("-1.pdf")
+    assert len(first) <= MAX_FILENAME_CHARS
+
+
+def test_candidates_handle_a_name_with_no_extension() -> None:
+    it = unique_filename_candidates("notes")
+    next(it)
+    assert next(it) == "notes-1"
+
+
+def test_candidates_are_bounded() -> None:
+    """A caller that has filled 200 slots under one name is looping; failing
+    loudly beats writing report-8143.pdf for the rest of the session."""
+    names = list(unique_filename_candidates("a.txt"))
+    assert len(names) == UNIQUE_SUFFIX_LIMIT + 1
+    assert names[-1] == f"a-{UNIQUE_SUFFIX_LIMIT}.txt"
+
+
+async def test_a_saturated_name_fails_loudly_rather_than_clobbering(
+    sandbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sallyport_daemon.local_tools.UNIQUE_SUFFIX_LIMIT", 2)
+    for name in ("full.txt", "full-1.txt", "full-2.txt"):
+        (sandbox / name).write_bytes(b"taken")
+
+    with pytest.raises(ToolError) as exc_info:
+        await save_to_file({"data": base64.b64encode(b"x").decode(), "filename": "full.txt"})
+
+    assert exc_info.value.code == "filesystem_error"
+    assert (sandbox / "full.txt").read_bytes() == b"taken"  # nothing was clobbered

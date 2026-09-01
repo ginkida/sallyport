@@ -1,7 +1,12 @@
 /** Pure response parsing behind the CDP-level keystroke password gate. */
 
 import { describe, expect, it } from 'vitest';
-import { collectFrameIds, domNodeIsPassword, focusedBackendNodeIds } from '../src/tools/focus.js';
+import {
+  collectFrameIds,
+  domNodeAcceptsText,
+  domNodeIsPassword,
+  focusedBackendNodeIds,
+} from '../src/tools/focus.js';
 
 const focused = (backendDOMNodeId?: number): Record<string, unknown> => ({
   ...(backendDOMNodeId === undefined ? {} : { backendDOMNodeId }),
@@ -76,5 +81,50 @@ describe('domNodeIsPassword', () => {
     expect(domNodeIsPassword({ nodeName: 7, attributes: [] })).toBeNull();
     expect(domNodeIsPassword({ nodeName: 'INPUT' })).toBeNull();
     expect(domNodeIsPassword({ nodeName: 'INPUT', attributes: ['type', 7] })).toBeNull();
+  });
+});
+
+describe('domNodeAcceptsText — can Input.insertText land here at all?', () => {
+  const node = (nodeName: string, attributes: string[] = []) => ({ nodeName, attributes });
+
+  it('accepts the ordinary text targets', () => {
+    expect(domNodeAcceptsText(node('TEXTAREA'))).toBe(true);
+    expect(domNodeAcceptsText(node('INPUT', ['type', 'text']))).toBe(true);
+    expect(domNodeAcceptsText(node('INPUT', ['type', 'search']))).toBe(true);
+    expect(domNodeAcceptsText(node('INPUT', []))).toBe(true); // no type = text
+  });
+
+  it('accepts a contenteditable host — every rich composer is one', () => {
+    expect(domNodeAcceptsText(node('DIV', ['contenteditable', 'true']))).toBe(true);
+    expect(domNodeAcceptsText(node('DIV', ['contenteditable', '']))).toBe(true); // "" means true
+    expect(domNodeAcceptsText(node('DIV', ['contenteditable', 'false']))).toBe(false);
+  });
+
+  it('refuses what an insert cannot reach', () => {
+    // The common case: after a navigate nothing is focused, so focus sits on
+    // <body> — not a password field, so the password gate waved it through
+    // while the insert went nowhere and the tool answered ok:true.
+    expect(domNodeAcceptsText(node('BODY'))).toBe(false);
+    expect(domNodeAcceptsText(node('INPUT', ['type', 'checkbox']))).toBe(false);
+    expect(domNodeAcceptsText(node('INPUT', ['type', 'file']))).toBe(false);
+    expect(domNodeAcceptsText(node('INPUT', ['type', 'submit']))).toBe(false);
+    // A div with a key handler receives NOTHING from insertText (no key events
+    // are dispatched), so refusing it is correct, not merely cautious.
+    expect(domNodeAcceptsText(node('DIV', ['tabindex', '0']))).toBe(false);
+  });
+
+  it('lets an unusual input type try rather than refusing a call that would work', () => {
+    expect(domNodeAcceptsText(node('INPUT', ['type', 'date']))).toBe(true);
+    expect(domNodeAcceptsText(node('INPUT', ['type', 'number']))).toBe(true);
+  });
+
+  it('is unclassifiable rather than false on a malformed node', () => {
+    // Fail-closed, same convention as domNodeIsPassword: the caller turns this
+    // into focus_probe_failed rather than guessing.
+    expect(domNodeAcceptsText(null)).toBeNull();
+    expect(domNodeAcceptsText({})).toBeNull();
+    expect(domNodeAcceptsText({ nodeName: 'INPUT', attributes: 'nope' })).toBeNull();
+    expect(domNodeAcceptsText({ nodeName: 'INPUT' })).toBeNull();
+    expect(domNodeAcceptsText({ nodeName: 'INPUT', attributes: ['type', 5] })).toBeNull();
   });
 });

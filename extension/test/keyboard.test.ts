@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { ensureNotPasswordField, segmentTypesText } from '../src/tools/keyboard.js';
+import {
+  ensureFocusUsable,
+  ensureNotPasswordField,
+  segmentTypesText,
+} from '../src/tools/keyboard.js';
 
 // The password gate on send_keys re-probes before every character-typing segment
 // (after the first), so a `<focus-mover> secret` sequence can't land the
@@ -199,5 +203,71 @@ describe('ensureNotPasswordField — CDP focus walk', () => {
       throw new Error('must not be called');
     });
     await expect(ensureNotPasswordField(1, true, 'key_type')).resolves.toBeUndefined();
+  });
+});
+
+describe('key_type needs somewhere for the text to LAND', () => {
+  /** One frame, one focused node, whatever DOM node the test names. */
+  function focusOn(node: Record<string, unknown>): void {
+    installCdpResponder((method, params) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'top' } } };
+      if (method === 'Accessibility.getFullAXTree') return { nodes: [focusedAxNode(10)] };
+      if (method === 'DOM.describeNode') return { node };
+      throw new Error(`unexpected command: ${method} ${JSON.stringify(params)}`);
+    });
+  }
+
+  it('refuses when focus sits on <body> — the state right after a navigate', () => {
+    // Input.insertText goes to whatever holds focus; body is not a password
+    // field, so the gate passed it and the insert went nowhere while key_type
+    // answered ok:true with the length it thought it had typed.
+    focusOn({ nodeName: 'BODY', attributes: [] });
+    return expect(
+      ensureFocusUsable(1, { allowPassword: false, requireTypable: true }, 'key_type'),
+    ).rejects.toMatchObject({ code: 'no_editable_focus' });
+  });
+
+  it('names what IS focused, because the fix is a click and not a retry', async () => {
+    focusOn({ nodeName: 'BODY', attributes: [] });
+    await expect(
+      ensureFocusUsable(1, { allowPassword: false, requireTypable: true }, 'key_type'),
+    ).rejects.toThrow(/<body>.*click the field first/s);
+  });
+
+  it('passes for a real text field', async () => {
+    focusOn({ nodeName: 'INPUT', attributes: ['type', 'search'] });
+    await expect(
+      ensureFocusUsable(1, { allowPassword: false, requireTypable: true }, 'key_type'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('still refuses a password field first, before the typable question', async () => {
+    focusOn({ nodeName: 'INPUT', attributes: ['type', 'password'] });
+    await expect(
+      ensureFocusUsable(1, { allowPassword: false, requireTypable: true }, 'key_type'),
+    ).rejects.toMatchObject({ code: 'password_field' });
+  });
+
+  it('checks typability even when the caller opted into password fields', async () => {
+    // allowPassword used to skip the whole walk; the silent no-op it hides is
+    // the same one either way.
+    focusOn({ nodeName: 'BODY', attributes: [] });
+    await expect(
+      ensureFocusUsable(1, { allowPassword: true, requireTypable: true }, 'key_type'),
+    ).rejects.toMatchObject({ code: 'no_editable_focus' });
+  });
+
+  it('send_keys is NOT held to it — a keystroke means something with nothing focused', async () => {
+    // Escape, arrow navigation and a site's own single-key shortcuts all work
+    // against the document; requiring an editable target would break them.
+    focusOn({ nodeName: 'BODY', attributes: [] });
+    await expect(ensureNotPasswordField(1, false, 'send_keys')).resolves.toBeUndefined();
+  });
+
+  it('an unclassifiable node is still a probe failure, not a refusal to type', async () => {
+    focusOn({ nodeName: 'INPUT', attributes: 'malformed' as unknown as string[] });
+    await expect(
+      ensureFocusUsable(1, { allowPassword: false, requireTypable: true }, 'key_type'),
+    ).rejects.toMatchObject({ code: 'focus_probe_failed' });
   });
 });

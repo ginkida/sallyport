@@ -1,4 +1,5 @@
 import { attach, cdp } from './cdp.js';
+import { pageFrameOrigins } from './frames.js';
 import { BridgeError, staleRefError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { parseObserve, runObserve } from './observe.js';
@@ -534,6 +535,15 @@ export const fill: Tool = async (args) => {
   };
 };
 
+/** An empty whole-page read, with the frames that might explain it.
+ *
+ * `text: ''` on its own is the least informative answer the tool can give, and
+ * it is exactly what a framed page produces. */
+async function emptyRead(tab: chrome.tabs.Tab): Promise<Record<string, unknown>> {
+  const frames = await pageFrameOrigins(tab.id!);
+  return { text: '', ...(frames.length ? { frames } : {}) };
+}
+
 export const readText: Tool = async (args) => {
   const maxChars = parseMaxChars(args.maxChars);
   const offset = parseOffset(args.offset);
@@ -565,17 +575,31 @@ export const readText: Tool = async (args) => {
     nodeId: doc.root.nodeId,
     selector: 'body',
   });
-  if (!bodyQ.nodeId) return { tabId: tab.id, url: tab.url, data: { text: '' } };
+  if (!bodyQ.nodeId) return { tabId: tab.id, url: tab.url, data: await emptyRead(tab) };
   const resolved = await cdp<{ object: { objectId?: string } }>(tab.id!, 'DOM.resolveNode', {
     nodeId: bodyQ.nodeId,
   });
   if (!resolved.object.objectId) {
-    return { tabId: tab.id, url: tab.url, data: { text: '' } };
+    return { tabId: tab.id, url: tab.url, data: await emptyRead(tab) };
   }
   const out = await cdp<{ result: { value?: string } }>(tab.id!, 'Runtime.callFunctionOn', {
     objectId: resolved.object.objectId,
     functionDeclaration: READ_TEXT_FN,
     returnByValue: true,
   });
-  return { tabId: tab.id, url: tab.url, data: capText(out.result.value ?? '', maxChars, offset) };
+  // What this read could NOT see. The body probe does not cross a frame
+  // boundary, so a page whose real content is framed — a checkout, an SSO step,
+  // an embedded dashboard — comes back as the shell's text, or as nothing at
+  // all, with no reason given. `snapshot` learned to say so; this is the tool an
+  // agent reaches for FIRST, so the silence was more expensive here.
+  // Whole-page reads only: a `ref` read is explicitly about one node.
+  const frames = await pageFrameOrigins(tab.id!);
+  return {
+    tabId: tab.id,
+    url: tab.url,
+    data: {
+      ...capText(out.result.value ?? '', maxChars, offset),
+      ...(frames.length ? { frames } : {}),
+    },
+  };
 };

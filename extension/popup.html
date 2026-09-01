@@ -149,6 +149,19 @@
             navigated. No effect without a broker (--no-broker), and skipped while paused or while
             the extension is disconnected.
           </div>
+          <label class="muted small" for="max-agent-tabs">Max agent tabs at once</label>
+          <div class="row">
+            <input type="number" id="max-agent-tabs" min="0" max="200" step="1" />
+          </div>
+          <div class="muted small hint">
+            A ceiling on how many tabs agents may have open at once (default 20; 0 turns it off).
+            When a new one would cross it, the oldest agent tabs are closed first — tabs left behind
+            by sessions that have already finished, then the creating session's own
+            least-recently-used ones. Never a tab you have looked at (activated in a focused window,
+            or dragged into one of your own), and never another running session's. Without this an
+            agent that visits twenty pages leaves twenty tabs, every finished session adds more, and
+            nothing ever bounds the total.
+          </div>
         </details>
 
         <details id="status-agents" class="disclosure">

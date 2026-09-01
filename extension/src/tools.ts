@@ -12,6 +12,8 @@ import {
   confirmEpoch,
   EXPECTED_EPOCH_ARG,
   stripBrokerArgs,
+  takeAdoptedTabs,
+  touchTab,
 } from './tools/ownership.js';
 import { releaseTabs } from './tools/release.js';
 import { evaluate } from './tools/evaluate.js';
@@ -147,7 +149,14 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
   // serialisation that used to make it roughly chronological per session
   // removes even that weak proxy.
   if (client !== undefined) audit.client = client;
-  if (typeof callArgs.tabId === 'number') audit.tabId = callArgs.tabId;
+  if (typeof callArgs.tabId === 'number') {
+    audit.tabId = callArgs.tabId;
+    // Keep the reaper's LRU honest: a call that names a tab counts as using it
+    // even if the call goes on to fail, and a tool that only READS (snapshot,
+    // read_text) is as much "in use" as one that acts. No-op off broker mode,
+    // where nothing is owned.
+    touchTab(callArgs.tabId);
+  }
 
   try {
     if (expectedEpoch !== undefined && typeof callArgs.tabId === 'number') {
@@ -158,7 +167,23 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
       () => tool(callArgs, { client }),
     );
     audit.ok = true;
-    if (result.tabId !== undefined) audit.tabId = result.tabId;
+    if (result.tabId !== undefined) {
+      audit.tabId = result.tabId;
+      // A create-own navigate has no tabId in its args — this is the only place
+      // the new tab's id is known, and a just-created tab must not read as the
+      // least-recently-used one.
+      touchTab(result.tabId);
+    }
+    // Did the page open a tab while this call ran? Reported CENTRALLY rather
+    // than per tool: a click is the usual cause, but a keypress, a select or a
+    // script the page runs on any interaction can do it too, and a list of
+    // "tools that might trigger a popup" would be wrong the day it was written.
+    // Read AFTER the tool returns, so an embedded waitFor has already given the
+    // page its time to open one.
+    const openedTabs = typeof result.tabId === 'number' ? takeAdoptedTabs(result.tabId) : [];
+    if (openedTabs.length && result.data && typeof result.data === 'object') {
+      (result.data as Record<string, unknown>).openedTabs = openedTabs;
+    }
     if (result.url !== undefined) audit.url = result.url;
     await appendAudit(audit);
     return result.data;

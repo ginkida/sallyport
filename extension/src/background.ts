@@ -18,9 +18,17 @@ import {
 } from './storage.js';
 import { badgeFromStatus } from './badge.js';
 import { extractHostname } from './format.js';
-import { agentTabIds, dropEpoch, setBrokerMode } from './tools/ownership.js';
+import {
+  adoptOpenedTab,
+  agentTabIds,
+  dropEpoch,
+  getEpoch,
+  markHumanTab,
+  setBrokerMode,
+  tabIsOrphaned,
+} from './tools/ownership.js';
 import { loadEpochs, persistEpochs, reconcileWithLiveTabs } from './tools/ownership-store.js';
-import { sessionOfWindow } from './tools/agent-window.js';
+import { sessionOfWindow, wasJustCreated } from './tools/agent-window.js';
 import { releaseKeepAwakeEverywhere } from './tools/cdp.js';
 
 async function updateBadge(snapshot: StatusSnapshot): Promise<void> {
@@ -134,6 +142,82 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (dropEpoch(tabId)) void persistEpochs();
 });
 
+// A tab the PAGE opened — a target="_blank" link, a window.open, an OAuth
+// popup. The browser makes it, so it has no epoch of ours, and without this it
+// was a stranger to everything: owner-scoped `list_tabs` filtered it out, the
+// daemon answered `tab_not_owned`, the popup's "Agent tabs" sweep never listed
+// it and the reaper never counted it. A tab spawned BY a tab the caller owns is
+// theirs — the call that spawned it had already passed the ownership gate on
+// the opener — so it is adopted here and reported in that call's result.
+chrome.tabs.onCreated.addListener((tab) => {
+  if (tab.id === undefined) return;
+  if (adoptOpenedTab(tab.id, tab.openerTabId)) void persistEpochs();
+});
+
+// -------------------------------------------------------------------------
+// "The human looked at this one" — the tab reaper's stop sign.
+//
+// `maxAgentTabs` lets the reaper close agent tabs to keep the browser from
+// filling up (ownership.ts:planEviction). The one thing it must never do is
+// close a tab a person is actually using, and the browser already tells us
+// which those are: a tab the human ACTIVATED in a window they have in front of
+// them, or one they dragged into a window of their own. The mark is one-way —
+// nothing ever clears it — because "I looked at this once" is a permanent fact
+// about that tab, and being wrong in this direction only costs one tab.
+//
+// The focused-window condition is what makes this usable rather than noise:
+// `screenshot` makes an agent tab active INSIDE its own unfocused window (that
+// is why it costs no focus), which fires exactly the same event. Without the
+// check, the agent would immortalise its own tabs by screenshotting them.
+// -------------------------------------------------------------------------
+
+/** How long after we create an agent window a focus event on it is discounted
+ * (see agent-window.ts:wasJustCreated). */
+const HUMAN_FOCUS_GRACE_MS = 2000;
+
+function noteHumanInterest(tabId: number | undefined): void {
+  if (typeof tabId !== 'number') return;
+  if (markHumanTab(tabId)) void persistEpochs();
+}
+
+async function windowIsFocused(windowId: number): Promise<boolean> {
+  try {
+    return (await chrome.windows.get(windowId))?.focused === true;
+  } catch {
+    return false; // window gone — nothing to conclude
+  }
+}
+
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  // Cheap synchronous bail FIRST. This fires on every tab switch the human
+  // makes, all day, and in standalone the owned set is always empty — asking
+  // the browser about the window before asking our own map would put a chrome
+  // round-trip on a hot path that answers "not ours" essentially every time.
+  if (getEpoch(tabId) === undefined) return;
+  void (async () => {
+    if (await windowIsFocused(windowId)) noteHumanInterest(tabId);
+  })();
+});
+
+// Dragged out of the agent window into one of the human's own — an unambiguous
+// "this is mine now", and the reason ownership never keys on windowId.
+chrome.tabs.onAttached.addListener((tabId) => noteHumanInterest(tabId));
+
+chrome.windows?.onFocusChanged.addListener((windowId) => {
+  // WINDOW_ID_NONE: focus left Chrome entirely.
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  if (agentTabIds().size === 0) return; // nothing of ours to mark (standalone)
+  if (wasJustCreated(windowId, HUMAN_FOCUS_GRACE_MS)) return;
+  void (async () => {
+    try {
+      const [active] = await chrome.tabs.query({ active: true, windowId });
+      noteHumanInterest(active?.id);
+    } catch {
+      // window/tab gone between the event and the query
+    }
+  })();
+});
+
 chrome.runtime.onStartup.addListener(() => void bootBridge());
 chrome.runtime.onInstalled.addListener(() => void bootBridge());
 // Service worker wakes on demand — kick off immediately on first script load.
@@ -201,7 +285,16 @@ type PopupMessage =
   | { type: 'CLOSE_AGENT_TABS' }
   | { type: 'KEEP_AWAKE_OFF' };
 
-export type AgentTabRow = { tabId: number; title: string; url: string; session?: string };
+export type AgentTabRow = {
+  tabId: number;
+  title: string;
+  url: string;
+  session?: string;
+  /** Its session has ended — nothing will drive this tab again. The popup
+   * says so, because "which of these is still in use" is the only question a
+   * human sweeping this list actually has. */
+  orphaned: boolean;
+};
 
 /** The tabs agents currently own, for the popup's "Agent tabs" list.
  *
@@ -220,6 +313,7 @@ async function listAgentTabs(): Promise<AgentTabRow[]> {
       title: tab.title ?? '',
       url: tab.url ?? '',
       session: await sessionOfWindow(tab.windowId),
+      orphaned: tabIsOrphaned(tab.id),
     });
   }
   return rows;

@@ -14,7 +14,7 @@ import asyncio
 import base64
 import os
 import secrets as _secrets
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -83,6 +83,30 @@ async def save_to_file(args: dict[str, Any]) -> dict[str, Any]:
     return await _write_blob_async(filename, raw, tool="save_to_file")
 
 
+MAX_FILENAME_CHARS = 255
+# How many `-N` variants to try before giving up. A caller that has genuinely
+# filled 200 slots under one name is looping, and failing loudly beats writing
+# `report-8143.pdf` for the rest of the session.
+UNIQUE_SUFFIX_LIMIT = 200
+
+
+def unique_filename_candidates(filename: str) -> Iterator[str]:
+    """The requested name, then `stem-1.ext`, `stem-2.ext`, … — the order the
+    sandbox writer tries when a name is already taken.
+
+    Pure and separately tested: the interesting part is not the loop but the
+    length arithmetic, since `_sanitise_filename` caps a name at 255 characters
+    and a suffix must not push it past that. The stem is trimmed to make room,
+    never the extension — a `.pdf` that became `.pd` would stop opening.
+    """
+    yield filename
+    root, ext = os.path.splitext(filename)
+    for n in range(1, UNIQUE_SUFFIX_LIMIT + 1):
+        suffix = f"-{n}"
+        room = max(1, MAX_FILENAME_CHARS - len(ext) - len(suffix))
+        yield f"{root[:room]}{suffix}{ext}"
+
+
 def _write_sandbox_blob(filename: str, raw: bytes, *, tool: str) -> dict[str, Any]:
     """Write bytes into the download sandbox; return {"path", "size"}.
 
@@ -106,26 +130,50 @@ def _write_sandbox_blob(filename: str, raw: bytes, *, tool: str) -> dict[str, An
             f"{tool}: cannot create download dir {download_dir}: {exc}",
             code="filesystem_error",
         ) from exc
-    target = download_dir / filename
-    # Defense in depth: resolve() and check it really lives under download_dir.
-    resolved = target.resolve()
     sandbox = download_dir.resolve()
-    try:
-        resolved.relative_to(sandbox)
-    except ValueError as exc:
-        raise ToolError(
-            f"{tool}: resolved path {resolved} escaped sandbox {sandbox}",
-            code="unsafe_path",
-        ) from exc
-
-    try:
-        resolved.write_bytes(raw)
-    except OSError as exc:
-        raise ToolError(
-            f"{tool}: write failed ({exc.__class__.__name__}): {exc}",
-            code="filesystem_error",
-        ) from exc
-    return {"path": str(resolved), "size": len(raw)}
+    for candidate in unique_filename_candidates(filename):
+        target = download_dir / candidate
+        # Defense in depth: resolve() and check it really lives under download_dir.
+        resolved = target.resolve()
+        try:
+            resolved.relative_to(sandbox)
+        except ValueError as exc:
+            raise ToolError(
+                f"{tool}: resolved path {resolved} escaped sandbox {sandbox}",
+                code="unsafe_path",
+            ) from exc
+        try:
+            # EXCLUSIVE create: never clobber a file that is already there.
+            # Agents reuse names — `report.pdf`, `page.html`, `data.json` — and
+            # `write_bytes` silently replaced the previous artefact while both
+            # calls reported success, so a five-page sweep left one file and no
+            # error anywhere. `x` also settles the check-then-write race for
+            # free: two clients racing the same name cannot both win it.
+            with open(resolved, "xb") as handle:
+                handle.write(raw)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise ToolError(
+                f"{tool}: write failed ({exc.__class__.__name__}): {exc}",
+                code="filesystem_error",
+            ) from exc
+        # The name that was actually USED — never the requested one, or the
+        # answer becomes a different lie than the one this replaced. The note
+        # lives here rather than in the three callers: one of them would
+        # eventually forget it, and forgetting is exactly the failure mode.
+        out: dict[str, Any] = {"path": str(resolved), "size": len(raw), "filename": candidate}
+        if candidate != filename:
+            # Same shape, and the same reason, as navigate's `redirectedFrom`:
+            # an agent holding the requested string learns it is not the name to
+            # look for.
+            out["renamedFrom"] = filename
+        return out
+    raise ToolError(
+        f"{tool}: {filename} and {UNIQUE_SUFFIX_LIMIT} numbered variants of it already exist "
+        f"in the download dir — pick a different name",
+        code="filesystem_error",
+    )
 
 
 async def _write_blob_async(filename: str, raw: bytes, *, tool: str) -> dict[str, Any]:
@@ -241,7 +289,10 @@ async def _print_to_pdf_result(args: dict[str, Any], result: Any) -> dict[str, A
             f"print_to_pdf: extension payload not valid base64: {exc}", code="error"
         ) from exc
     written = await _write_blob_async(filename, raw, tool="print_to_pdf")
-    return {**written, "filename": filename}
+    # `written` already carries the name that was actually used, which may be a
+    # numbered variant when the requested one was taken. Say so when they differ
+    # — the same shape as navigate's `redirectedFrom`.
+    return written
 
 
 def _validate_fetch_filename(args: dict[str, Any]) -> None:
@@ -310,7 +361,7 @@ async def _fetch_in_page_result(args: dict[str, Any], result: Any) -> dict[str, 
 
     written = await _write_blob_async(filename, raw, tool="fetch_in_page")
     saved = {k: v for k, v in result.items() if k not in ("data", "headers")}
-    return {**saved, **written, "filename": filename}
+    return {**saved, **written}
 
 
 def _default_pdf_filename() -> str:

@@ -1,6 +1,17 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildTree, collectInteractive, type AXNode, type MakeRef } from '../src/tools/axtree.js';
+import {
+  buildTree,
+  capElements,
+  capName,
+  capTree,
+  collectInteractive,
+  isFrameRole,
+  SNAPSHOT_MAX_TEXT,
+  type AXNode,
+  type MakeRef,
+  type TreeNode,
+} from '../src/tools/axtree.js';
 
 /** Deterministic ref allocator standing in for refs.ts's newRef. */
 function counterRef(): MakeRef {
@@ -188,5 +199,119 @@ describe('collectInteractive', () => {
       { ref: '@e1', role: 'textbox', name: 'Password', type: 'password' },
       { ref: '@e2', role: 'textbox', name: 'Email', type: 'email' },
     ]);
+  });
+});
+
+describe('emission caps (the a11y path was the unbounded one)', () => {
+  const node = (over: Partial<TreeNode> = {}): TreeNode => ({ role: 'button', ...over });
+
+  it('keeps a small tree byte-identical', () => {
+    const tree = [node({ name: 'Send' }), node({ name: 'Cancel' })];
+    const out = capTree(tree, 10, 100);
+    expect(out.truncated).toBe(false);
+    expect(out.tree).toEqual(tree);
+  });
+
+  it('stops at the node budget and says so', () => {
+    const tree = [node({ name: 'a' }), node({ name: 'b' }), node({ name: 'c' })];
+    const out = capTree(tree, 2, 100);
+    expect(out.truncated).toBe(true);
+    expect(out.tree.map((n) => n.name)).toEqual(['a', 'b']);
+  });
+
+  it('counts nested nodes against the same budget, in document order', () => {
+    const tree = [
+      node({
+        role: 'list',
+        name: 'items',
+        children: [node({ name: 'one' }), node({ name: 'two' })],
+      }),
+      node({ name: 'after' }),
+    ];
+    const out = capTree(tree, 2, 100);
+    expect(out.truncated).toBe(true);
+    // The parent and its first child fit; the second child and the sibling do
+    // not. The parent KEEPS its row — an ancestor without its subtree is still
+    // true, while dropping it would move survivors up a level.
+    expect(out.tree).toEqual([
+      { role: 'list', name: 'items', children: [{ role: 'button', name: 'one' }] },
+    ]);
+  });
+
+  it('caps a long name without splitting a surrogate pair', () => {
+    // A lone half is unsignable, and it would not fail the name — it discards
+    // the WHOLE tool result as unserialisable_result.
+    const name = 'a'.repeat(SNAPSHOT_MAX_TEXT - 1) + '🙂';
+    const out = capTree([node({ name })], 10);
+    // A trimmed string is NOT a truncation: the DOM walk has always cut names
+    // silently with the ellipsis as the signal, and `truncated` means "there is
+    // more of the page than this". Flagging here would fire on almost every
+    // snapshot — and twice over on the DOM path, whose names arrive trimmed.
+    expect(out.truncated).toBe(false);
+    const got = out.tree[0].name as string;
+    expect(got.endsWith('…')).toBe(true);
+    expect([...got].every((ch) => ch.codePointAt(0)! < 0xd800 || ch.codePointAt(0)! > 0xdfff)).toBe(
+      true,
+    );
+  });
+
+  it('caps a string value but leaves a non-string one alone', () => {
+    const out = capTree([node({ value: 'y'.repeat(20) }), node({ value: 42 })], 10, 5);
+    expect(out.tree[0].value).toBe('yyyyy…');
+    expect(out.tree[1].value).toBe(42);
+  });
+
+  it('capName is a no-op below the limit', () => {
+    expect(capName('short', 10)).toBe('short');
+  });
+
+  it('caps the compact list by element count as well as text', () => {
+    const els = [1, 2, 3].map((i) => ({ ref: `@e${i}`, role: 'button', name: 'x'.repeat(10) }));
+    const out = capElements(els, 2, 4);
+    expect(out.truncated).toBe(true); // an element was DROPPED — that is the flag
+    expect(out.elements).toEqual([
+      { ref: '@e1', role: 'button', name: 'xxxx…' },
+      { ref: '@e2', role: 'button', name: 'xxxx…' },
+    ]);
+  });
+
+  it('a compact list inside the caps is untouched and not flagged', () => {
+    const els = [{ ref: '@e1', role: 'link', name: 'Home' }];
+    expect(capElements(els, 5, 100)).toEqual({ elements: els, truncated: false });
+  });
+
+  it('trimming every name in a full-but-not-overflowing list raises no flag', () => {
+    const els = [{ ref: '@e1', role: 'link', name: 'x'.repeat(50) }];
+    expect(capElements(els, 5, 4).truncated).toBe(false);
+  });
+});
+
+describe('frame nodes survive the empty-leaf pruning', () => {
+  const ref: MakeRef = (id) => `e${id}`;
+
+  it('keeps a nameless Iframe node — it is the only evidence of the gap', () => {
+    // A frame's document is NOT in this tree, so pruning the host as an empty
+    // leaf deleted the one thing telling the agent that the page's real content
+    // is somewhere the snapshot cannot reach.
+    const nodes: AXNode[] = [
+      { nodeId: '1', role: { value: 'RootWebArea' }, childIds: ['2'] },
+      { nodeId: '2', role: { value: 'Iframe' } },
+    ];
+    expect(buildTree(nodes, ref)).toEqual([{ role: 'Iframe' }]);
+  });
+
+  it('still prunes ordinary empty leaves', () => {
+    const nodes: AXNode[] = [
+      { nodeId: '1', role: { value: 'RootWebArea' }, childIds: ['2'] },
+      { nodeId: '2', role: { value: 'StaticText' } },
+    ];
+    expect(buildTree(nodes, ref)).toEqual([]);
+  });
+
+  it('isFrameRole covers the roles Chrome actually uses', () => {
+    expect(isFrameRole('Iframe')).toBe(true);
+    expect(isFrameRole('IframePresentational')).toBe(true);
+    expect(isFrameRole('button')).toBe(false);
+    expect(isFrameRole(undefined)).toBe(false);
   });
 });

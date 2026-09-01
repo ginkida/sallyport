@@ -34,6 +34,19 @@ export const INTERACTIVE_ROLES = new Set([
   'treeitem',
 ]);
 
+/** Roles Chrome gives a frame host (`<iframe>`/`<frame>`). Kept even when the
+ * node is otherwise empty: a frame's CONTENT is not in this tree (a separate
+ * document, and for a cross-origin one a separate process), so the empty-leaf
+ * pruning below used to delete the only evidence that the page's real content
+ * was somewhere the snapshot cannot reach. An agent then read a checkout, an
+ * SSO step or an embedded dashboard as a blank shell with nothing to click and
+ * no reason given. */
+const FRAME_ROLES = new Set(['Iframe', 'IframePresentational', 'iframe', 'frame']);
+
+export function isFrameRole(role: string | undefined): boolean {
+  return role !== undefined && FRAME_ROLES.has(role);
+}
+
 export type AXNode = {
   nodeId: string;
   role?: { value: string };
@@ -129,8 +142,17 @@ export function buildTree(nodes: AXNode[], makeRef: MakeRef): TreeNode[] {
       if (kids.length > 0) out.children = kids;
     }
     // A leaf that names nothing, holds no value and is not actionable
-    // carries no information for the agent (empty StaticText et al.).
-    if (!out.name && out.value === undefined && !out.description && !out.ref && !out.children) {
+    // carries no information for the agent (empty StaticText et al.) — unless
+    // it is a FRAME, where "there is content here that this tree does not
+    // contain" is the single most useful thing the snapshot can say.
+    if (
+      !out.name &&
+      out.value === undefined &&
+      !out.description &&
+      !out.ref &&
+      !out.children &&
+      !isFrameRole(role)
+    ) {
       return null;
     }
     return out;
@@ -167,4 +189,122 @@ export function collectInteractive(nodes: TreeNode[]): CompactElement[] {
   };
   walk(nodes);
   return out;
+}
+
+// --- emission caps ----------------------------------------------------------
+//
+// `buildTree` walks whatever `Accessibility.getFullAXTree` returns, and that is
+// unbounded: a long feed, a big table or a docs page can be tens of thousands of
+// nodes with paragraph-sized names. The DOM fallback has had hard bounds since
+// it was written ("keep the probe's output well under the 16 MiB frame cap even
+// on pathological pages", domtree.ts) — the PRIMARY path never got them, and it
+// is the one that runs on nearly every snapshot.
+//
+// Two things go wrong without a bound, in ascending order of damage. The tree
+// lands in the agent's context whole, which is the token equivalent of
+// `read_text` with no `maxChars` (it caps at 20k for exactly this reason). And
+// past 16 MiB the tool_result frame is refused by the daemon with a 1009 close
+// — which does not fail one call, it drops the SINGLE shared extension leg
+// (invariant #8) and takes every concurrent session's in-flight work with it.
+//
+// The caps apply to what is EMITTED, not to what is walked: `find` and `reveal`
+// match over the full tree and return at most `limit` matches, so bounding the
+// walk would make a target beyond the cap unfindable — a real regression for the
+// long lists `reveal` exists to serve. Only the shapes that ship the tree itself
+// (`snapshot`, and the `observe` folded into an action) are capped.
+
+/** Nodes a snapshot may emit. Same value as the DOM walk's `MAX_NODES`, so the
+ * two paths stay comparable — `buildSnapshotTree` picks between them by ref
+ * count, and a cap that differed would bias that choice. */
+export const SNAPSHOT_MAX_NODES = 2000;
+/** Characters per emitted name/description/string value (DOM walk parity). */
+export const SNAPSHOT_MAX_TEXT = 200;
+/** Actionable elements the compact form may emit (DOM walk parity: `MAX_ELS`).
+ * Higher than any page an agent can usefully act on in one pass — past this,
+ * `find` with a predicate is the right tool, not a longer list. */
+export const SNAPSHOT_MAX_ELEMENTS = 400;
+
+/** Cap one emitted string, stepping back off a surrogate pair.
+ *
+ * A lone half is unsignable (protocol.ts), and it would not fail the one name —
+ * it discards the WHOLE tool result as `unserialisable_result`. Same reasoning,
+ * and same two lines, as the DOM walker's own `cap`. */
+export function capName(s: string, max: number = SNAPSHOT_MAX_TEXT): string {
+  if (s.length <= max) return s;
+  let end = max;
+  const c = s.charCodeAt(end - 1);
+  if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+  return s.slice(0, end) + '…';
+}
+
+/** Copy a tree, keeping at most `maxNodes` nodes in document order and capping
+ * every emitted string. Returns `truncated` when NODES were dropped, so the
+ * caller can tell the agent to narrow the walk (`selector`, `compact`, or
+ * `find`) rather than believe it is looking at the whole page.
+ *
+ * A cut STRING does not raise that flag: the DOM walk has always trimmed names
+ * silently, with the trailing ellipsis as the visible signal, and `truncated`
+ * has always meant "there is more of the page than this". Flagging a trimmed
+ * name too would raise it on almost every real snapshot — and would fire twice
+ * over on the DOM path, whose names arrive already trimmed.
+ *
+ * A parent kept with its children dropped keeps its own row — an ancestor
+ * without its subtree is still true, while dropping it would silently move its
+ * surviving siblings up a level and misdescribe the page's structure. */
+export function capTree(
+  nodes: TreeNode[],
+  maxNodes: number = SNAPSHOT_MAX_NODES,
+  maxText: number = SNAPSHOT_MAX_TEXT,
+): { tree: TreeNode[]; truncated: boolean } {
+  let budget = maxNodes;
+  let truncated = false;
+
+  const copy = (list: TreeNode[]): TreeNode[] => {
+    const out: TreeNode[] = [];
+    for (const n of list) {
+      if (budget <= 0) {
+        truncated = true;
+        break;
+      }
+      budget -= 1;
+      const next: TreeNode = { role: n.role };
+      if (n.name !== undefined) next.name = capName(n.name, maxText);
+      if (n.value !== undefined) {
+        next.value = typeof n.value === 'string' ? capName(n.value, maxText) : n.value;
+      }
+      if (n.description !== undefined) next.description = capName(n.description, maxText);
+      if (n.type !== undefined) next.type = n.type;
+      if (n.ref !== undefined) next.ref = n.ref;
+      if (n.children?.length) {
+        const kids = copy(n.children);
+        if (kids.length) next.children = kids;
+      }
+      out.push(next);
+    }
+    return out;
+  };
+
+  return { tree: copy(nodes), truncated };
+}
+
+/** The compact form's cap: at most `max` elements, every string capped. Refs
+ * already minted for dropped elements stay valid — they are simply not
+ * reported, which is what `truncated` tells the agent. As in `capTree`, a
+ * trimmed string is not itself a truncation. */
+export function capElements(
+  els: CompactElement[],
+  max: number,
+  maxText: number = SNAPSHOT_MAX_TEXT,
+): { elements: CompactElement[]; truncated: boolean } {
+  const kept = els.slice(0, max);
+  const elements = kept.map((e) => {
+    const next: CompactElement = { ref: e.ref, role: e.role };
+    if (e.name !== undefined) next.name = capName(e.name, maxText);
+    if (e.value !== undefined) {
+      next.value = typeof e.value === 'string' ? capName(e.value, maxText) : e.value;
+    }
+    if (e.type !== undefined) next.type = e.type;
+    return next;
+  });
+  return { elements, truncated: kept.length < els.length };
 }

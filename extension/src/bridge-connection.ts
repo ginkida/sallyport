@@ -79,6 +79,35 @@ const KEEPALIVE_ALARM_PERIOD_MIN = 0.5;
 
 const DEFAULT_SERVER_URL = 'ws://127.0.0.1:10086/ws';
 
+/** Thrown by `sendSigned` when the signed frame would be refused by the
+ * daemon. A marker class rather than a code string so the degrade path can tell
+ * it apart from a signing failure without matching on message text. */
+class OversizeFrameError extends Error {
+  constructor(readonly chars: number) {
+    super(`tool result is too large to send (${chars} characters)`);
+  }
+}
+
+/** Ceiling on an outgoing frame, a megabyte under the daemon's own 16 MiB
+ * (`bridge.py:MAX_FRAME_BYTES`).
+ *
+ * Being one byte over does not fail one call: `websockets` refuses the frame
+ * with a 1009 close, so the daemon drops the SINGLE shared extension client
+ * (invariant #8) and every concurrent session loses its in-flight work and
+ * reconnects. Being a megabyte under costs nothing, so the slack is free. */
+export const MAX_RESULT_FRAME_BYTES = 15 * 1024 * 1024;
+
+/** Would this frame be refused? Exact when it matters, free when it doesn't.
+ *
+ * UTF-8 never spends more than 3 bytes per UTF-16 code unit (a surrogate pair
+ * is 2 units and 4 bytes), so a string short enough for that bound is provably
+ * fine and the encode — which would copy up to 16 MB on every tool result — is
+ * skipped. Pure, so the arithmetic is unit-tested rather than trusted. */
+export function exceedsFrameLimit(text: string, limit: number): boolean {
+  if (text.length * 3 <= limit) return false;
+  return new TextEncoder().encode(text).length > limit;
+}
+
 export class BridgeConnection {
   private ws: WebSocket | null = null;
   private signer: Signer;
@@ -542,13 +571,30 @@ export class BridgeConnection {
       // surrogate — e.g. `evaluate` returning page-controlled data) must
       // not strand the daemon waiting out its request timeout. Degrade to
       // a signed error result; its body is plain strings, so it signs.
+      //
+      // An OVERSIZE result degrades the same way, and for a stronger reason:
+      // unsent it strands one call, sent it takes down the shared connection.
+      // The tools that ship bulk payloads cap themselves (screenshot, pdf,
+      // fetch_in_page, snapshot); this is the backstop for the one that does
+      // not yet, or the page that finds a new way to be enormous.
+      const oversize = e instanceof OversizeFrameError;
       await this.sendSigned(
         'tool_result',
-        {
-          ok: false,
-          error: 'tool result is not wire-serialisable: ' + (e as Error).message,
-          code: 'unserialisable_result',
-        },
+        oversize
+          ? {
+              ok: false,
+              error:
+                'tool result is too large for the wire (over ' +
+                Math.floor(MAX_RESULT_FRAME_BYTES / (1024 * 1024)) +
+                ' MiB) — narrow it: snapshot(compact:true) or a selector scope, ' +
+                'read_text(maxChars), screenshot(maxWidth/region), fetch_in_page(saveAs)',
+              code: 'result_too_large',
+            }
+          : {
+              ok: false,
+              error: 'tool result is not wire-serialisable: ' + (e as Error).message,
+              code: 'unserialisable_result',
+            },
         id,
       );
     }
@@ -558,7 +604,13 @@ export class BridgeConnection {
     if (!this.ws || this.ws.readyState !== this.deps.WebSocket.OPEN) return;
     if (!this.signer.hasSecret()) return;
     const env = await this.signer.sign(type, body, id);
-    this.ws.send(JSON.stringify(env));
+    const text = JSON.stringify(env);
+    if (exceedsFrameLimit(text, MAX_RESULT_FRAME_BYTES)) {
+      // Refuse it OURSELVES. Handing it to the socket is what costs the shared
+      // leg; the caller degrades this to a signed error the daemon can read.
+      throw new OversizeFrameError(text.length);
+    }
+    this.ws.send(text);
   }
 
   private pushStatus(): void {

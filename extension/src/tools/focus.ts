@@ -88,3 +88,67 @@ export function domNodeIsPassword(raw: unknown): boolean | null {
   }
   return false;
 }
+
+/** Input types that cannot hold typed text at all. Everything else — including
+ * the date/time family, whose behaviour varies — is treated as text-accepting,
+ * because refusing a call that WOULD have worked is worse than letting an
+ * unusual field try. Same direction as the aim probe's fail-open. */
+const NON_TEXT_INPUT_TYPES = new Set([
+  'button',
+  'checkbox',
+  'color',
+  'file',
+  'hidden',
+  'image',
+  'radio',
+  'range',
+  'reset',
+  'submit',
+]);
+
+/** Can `Input.insertText` actually put text into this node?
+ *
+ * `key_type` inserts into whatever holds focus, and when nothing editable does,
+ * focus sits on `<body>` — which is not a password field, so the password gate
+ * waved it through and the insert went nowhere while the tool answered
+ * `ok:true, length:N`. That is the silent no-op this project treats as its worst
+ * outcome: the agent believes it typed, and only discovers otherwise several
+ * steps later, if at all.
+ *
+ * The classification is deliberately aligned with what `insertText` can do,
+ * which is narrower than "the element has a key handler": a `<div tabindex=0>`
+ * listening for keydown receives NOTHING from an insert (no key events are
+ * dispatched), so refusing it is correct rather than conservative.
+ *
+ * `null` for an unclassifiable node, the same fail-closed convention as
+ * `domNodeIsPassword` — the caller turns that into `focus_probe_failed`. */
+export function domNodeAcceptsText(raw: unknown): boolean | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const node = raw as DOMNode;
+  if (typeof node.nodeName !== 'string') return null;
+  if (node.attributes !== undefined && !Array.isArray(node.attributes)) return null;
+  const tag = node.nodeName.toUpperCase();
+
+  let type: string | null = null;
+  let editable: string | null = null;
+  if (Array.isArray(node.attributes)) {
+    for (let i = 0; i + 1 < node.attributes.length; i += 2) {
+      const name = node.attributes[i];
+      const value = node.attributes[i + 1];
+      if (typeof name !== 'string' || typeof value !== 'string') return null;
+      const lower = name.toLowerCase();
+      if (lower === 'type') type = value.trim().toLowerCase();
+      if (lower === 'contenteditable') editable = value.trim().toLowerCase();
+    }
+  }
+
+  // contenteditable is how every rich composer works (Slack, Notion, Gmail,
+  // ProseMirror/Slate editors) — and `contenteditable=""` means true.
+  if (editable !== null && editable !== 'false') return true;
+  if (tag === 'TEXTAREA') return true;
+  if (tag === 'INPUT') {
+    if (node.attributes === undefined) return null;
+    return type === null || !NON_TEXT_INPUT_TYPES.has(type);
+  }
+  return false;
+}

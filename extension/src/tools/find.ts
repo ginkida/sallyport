@@ -1,7 +1,7 @@
 import { collectInteractive } from './axtree.js';
 import { attach } from './cdp.js';
 import { BridgeError } from './errors.js';
-import { ensureAllowed } from './gates.js';
+import { ensureAllowed, ensureStillAllowed } from './gates.js';
 import { matchElements, parseLimit, parsePredicate, type Match, type Predicate } from './match.js';
 import { refWatermark } from './refs.js';
 import { buildSnapshotTree } from './snapshot.js';
@@ -128,9 +128,7 @@ export const find: Tool = async (args) => {
     // walk read whatever the tab drifted onto (invariant #3). Also gives us the
     // URL actually read, so the result and the audit row describe the same page
     // rather than the one the call started on.
-    const cur = await resolveTab({ tabId: tab.id });
-    await ensureAllowed(cur.url);
-    readUrl = cur.url;
+    readUrl = await ensureStillAllowed(tab.id!);
     const built = await buildSnapshotTree(tab.id!, mode, mark);
     source = built.source;
     truncated = built.truncated;

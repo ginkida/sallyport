@@ -521,8 +521,10 @@ class Bridge:
             CREATE_CAPABLE,
             ensure_owns,
             record_close,
+            record_opened_tabs,
             record_result,
             scope_list_tabs,
+            strip_opened_tab_epochs,
         )
 
         started = time.monotonic()
@@ -576,7 +578,14 @@ class Bridge:
                     # Record a freshly-created owned tab, evict a just-closed one,
                     # then owner-scope a list_tabs result (fail-closed) before it
                     # leaves the daemon.
-                    record_result(self._ownership, client_id, name, result, opened_at=time.time())
+                    now = time.time()
+                    record_result(self._ownership, client_id, name, result, opened_at=now)
+                    # Tabs the PAGE opened during the call (target=_blank,
+                    # window.open, an OAuth popup). The extension adopts them for
+                    # the tab that spawned them; without recording it here they
+                    # would be owned browser-side and nameless to every client.
+                    record_opened_tabs(self._ownership, client_id, result, opened_at=now)
+                    result = strip_opened_tab_epochs(result)
                     if name in CREATE_CAPABLE and isinstance(result, dict) and "epoch" in result:
                         # `epoch` is internal ownership-registry bookkeeping
                         # (invariant #13, confirmed extension-side in

@@ -34,7 +34,7 @@ vi.mock('../src/tools/keyboard.js', () => ({
 
 import { runTool, BridgeError } from '../src/tools.js';
 import { appendAudit, redactAuditArgs } from '../src/storage.js';
-import { clearAllEpochs, mintEpoch } from '../src/tools/ownership.js';
+import { adoptOpenedTab, clearAllEpochs, mintEpoch } from '../src/tools/ownership.js';
 import { keyType } from '../src/tools/keyboard.js';
 
 beforeEach(() => {
@@ -135,5 +135,52 @@ describe('runTool — force-redacts attempted secrets on password-probe failures
       .mocked(redactAuditArgs)
       .mock.calls.find(([, , opts]) => opts?.force === true);
     expect(forceCall).toBeUndefined();
+  });
+});
+
+describe('runTool reports tabs the PAGE opened', () => {
+  it('folds an adopted popup into the result so the daemon can record it', async () => {
+    // Until the daemon records it, the tab is ours browser-side and nameless to
+    // every client: owner-scoped list_tabs hides it and any call naming it is
+    // refused. The result is the same route navigate's own create takes.
+    const epoch = mintEpoch(5, 'writer');
+    clickStub.mockImplementation(async () => {
+      // The page opens a tab while the click is running — this is what the
+      // chrome.tabs.onCreated listener does in background.ts.
+      adoptOpenedTab(6, 5);
+      return { tabId: 5, data: { ok: true } };
+    });
+
+    const out = (await runTool('click', { tabId: 5, expectedEpoch: epoch })) as {
+      openedTabs?: Array<{ tabId: number; epoch: string }>;
+    };
+
+    expect(out.openedTabs).toEqual([{ tabId: 6, epoch: expect.any(String) }]);
+  });
+
+  it('says nothing when the page opened nothing', async () => {
+    const epoch = mintEpoch(5, 'writer');
+    const out = (await runTool('click', { tabId: 5, expectedEpoch: epoch })) as {
+      openedTabs?: unknown;
+    };
+    expect(out.openedTabs).toBeUndefined();
+  });
+
+  it('reports an adoption once, not on every later call', async () => {
+    const epoch = mintEpoch(5, 'writer');
+    clickStub.mockImplementationOnce(async () => {
+      adoptOpenedTab(6, 5);
+      return { tabId: 5, data: { ok: true } };
+    });
+    clickStub.mockImplementation(async () => ({ tabId: 5, data: { ok: true } }));
+
+    const first = (await runTool('click', { tabId: 5, expectedEpoch: epoch })) as {
+      openedTabs?: unknown[];
+    };
+    const second = (await runTool('click', { tabId: 5, expectedEpoch: epoch })) as {
+      openedTabs?: unknown[];
+    };
+    expect(first.openedTabs).toHaveLength(1);
+    expect(second.openedTabs).toBeUndefined();
   });
 });

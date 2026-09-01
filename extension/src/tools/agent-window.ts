@@ -31,6 +31,13 @@ import { BridgeError } from './errors.js';
 const WIN_KEY = 'sallyport_agent_windows';
 /** Session label → window id. The empty string is the unlabelled/shared slot. */
 let windowBySession = new Map<string, number>();
+/** Window id → when we created it. Memory-only and deliberately so: it exists
+ * to discount a focus event caused by our OWN create, and after a service
+ * worker restart no window is newly created any more. */
+const createdAt = new Map<number, number>();
+/** How long a creation timestamp is worth keeping. Comfortably longer than the
+ * grace any caller asks `wasJustCreated` for. */
+const CREATED_AT_TTL_MS = 60_000;
 /** In-flight load of the persisted map, memoised. A boolean `loaded` flag set
  * BEFORE its own await would let a second concurrent caller skip the load and
  * read an empty map — which, with concurrent calls, means two windows. */
@@ -102,6 +109,12 @@ async function createWindowFor(session: string, url: string): Promise<chrome.win
   }
   if (win.id !== undefined) {
     windowBySession.set(session, win.id);
+    // Prune first: entries are only consulted for a couple of seconds after a
+    // create (`wasJustCreated`), so anything older is dead weight in a worker
+    // that may run for hours.
+    const now = Date.now();
+    for (const [id, at] of createdAt) if (now - at > CREATED_AT_TTL_MS) createdAt.delete(id);
+    createdAt.set(win.id, now);
     await persistWindows();
   }
   return win;
@@ -190,6 +203,20 @@ export async function sessionOfWindow(windowId: number | undefined): Promise<str
   return undefined;
 }
 
+/** Did WE create this window in the last `graceMs`?
+ *
+ * `chrome.windows.create({focused:false})` is a request, not a guarantee —
+ * macOS in particular has a history of activating a new window anyway, which is
+ * why `createWindowFor` restores the human's window afterwards. That brief
+ * flash still fires `windows.onFocusChanged` for the agent window, and the
+ * listener that reads focus as "the human is looking at this tab" would take it
+ * at face value and make the session's first tab permanently un-reapable. A
+ * window the human deliberately raised is never one we made a moment ago. */
+export function wasJustCreated(windowId: number, graceMs: number): boolean {
+  const at = createdAt.get(windowId);
+  return at !== undefined && Date.now() - at < graceMs;
+}
+
 /** Whether `windowId` is one of ours. `screenshot` uses this to decide whether
  * activating a tab is free: making a tab active inside a window that is NOT
  * focused costs the human nothing, but doing it in one of THEIR windows would
@@ -204,4 +231,5 @@ export function resetAgentWindow(): void {
   windowBySession = new Map();
   loading = null;
   creating.clear();
+  createdAt.clear();
 }

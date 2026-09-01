@@ -62,7 +62,7 @@ Other deliberate choices:
 
 - No content-script injection, no `<all_urls>` content scripts. Permissions
   are only what the debugger API (and a popup-pin context-menu entry) need
-  (`tabs`, `activeTab`, `debugger`, `storage`, `alarms`, `contextMenus`).
+  (`tabs`, `debugger`, `storage`, `alarms`, `contextMenus`).
 - Per-tab accessibility refs (`@e1`, `@e2`). Snapshotting tab A cannot
   invalidate refs for tab B, and a ref scoped to A cannot resolve to a node
   in B.
@@ -396,7 +396,7 @@ Claude Code, and ask it to do anything web-shaped. Watch the popup's
 | `tab_not_visible` (from `screenshot`) | The tab produced no frame within 8s. `screenshot` already activates an agent tab inside its own un-focused window, so this means the window is **fully** occluded or minimised, or the display is asleep (macOS reports every window occluded once displays sleep). Keep a sliver of the agent window visible, or use `snapshot`/`read_text` (no frame needed) or `print_to_pdf` (renders a hidden tab). Check **keep automated tabs awake** is on — turning it off also stops the tab painting. `bringToFront=true` works in standalone and steals focus; it's refused in broker mode. |
 | Several sessions feel slower than one | They share one browser: up to 8 calls run at once, then calls queue. A call that waits out the queue fails `busy` (safe to retry — it was never sent). Back off exponentially: `maxConcurrentCalls` is a constant, and there is deliberately no per-caller contention signal (it would be a live read on how busy the other sessions are). |
 | A session lost its browser tools mid-run | Its broker went away. The session says so and exits non-zero; start it again (a new one starts a fresh broker). `sallyport-daemon doctor` shows the current state. |
-| Agents left tabs everywhere | Popup → **Agent tabs**: lists what each session opened, with **Close all agent tabs**. Tabs survive the session that made them by default — closing an agent's half-finished work is the loss `close_tab`'s gate exists to prevent. For dispatched/one-shot agents, whose tabs pile up, tick **close a session's tabs when it disconnects** in the popup; note it applies to EVERY session, including your own interactive one. |
+| Agents left tabs everywhere | There is a ceiling: **Max agent tabs at once** (popup → Settings, default 20). Past it, opening a new agent tab closes the least valuable ones first — tabs left by sessions that have already finished, then the creating session's own least-recently-used — never one you have looked at, and never another running session's. Set it to 0 to turn that off. Popup → **Agent tabs** lists what each session opened (marking the ones whose session has ended), with **Close all agent tabs**. Tabs otherwise survive the session that made them by default — closing an agent's half-finished work is the loss `close_tab`'s gate exists to prevent. For dispatched/one-shot agents, tick **close a session's tabs when it disconnects** in the popup; note it applies to EVERY session, including your own interactive one. |
 | `bad_ref` | An `@eN` ref is stale (snapshot expired) or addressed at the wrong tab. Re-`snapshot` the right tab. Refs are per-tab and per-snapshot. |
 | `mac mismatch` (in popup) | Secret in `~/.config/sallyport/secret` no longer matches the one paired in the popup. Run `sallyport-daemon --show-secret`, copy, **Unpair** → paste → **Pair**. |
 | `timestamp skew` | Clocks are >30 s apart. Check NTP. |

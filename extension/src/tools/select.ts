@@ -80,7 +80,10 @@ type ApplyResult =
       ok: true;
       tag: string;
       multiple: boolean;
+      /** What the element actually holds after the change events — or, when
+       * `applied` is 'unclear', the plan, since nothing could be read back. */
       selected: { index: number; value: string; label: string }[];
+      applied: 'yes' | 'no' | 'unclear';
     }
   | SelectFailure;
 
@@ -181,11 +184,36 @@ const SELECT_APPLY_PROBE = `function(spec) {
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
   var selected = [];
-  for (var m = 0; m < plan.indices.length; m++) {
-    var ix = plan.indices[m];
-    selected.push({ index: ix, value: input.options[ix].value, label: input.options[ix].label });
+  var applied = 'unclear';
+  try {
+    if (el.isConnected === false) {
+      applied = 'unclear';
+    } else {
+      for (var m = 0; m < el.options.length; m++) {
+        if (el.options[m].selected) {
+          var got = el.options[m];
+          selected.push({ index: m, value: got.value, label: (got.label || got.text || '').trim() });
+        }
+      }
+      var same = selected.length === plan.indices.length;
+      if (same) {
+        for (var n = 0; n < plan.indices.length; n++) {
+          if (selected[n].index !== plan.indices[n]) { same = false; break; }
+        }
+      }
+      applied = same ? 'yes' : 'no';
+    }
+  } catch (e) {
+    applied = 'unclear';
   }
-  return { ok: true, tag: 'SELECT', multiple: input.multiple, selected: selected };
+  if (applied === 'unclear') {
+    selected = [];
+    for (var q = 0; q < plan.indices.length; q++) {
+      var ix = plan.indices[q];
+      selected.push({ index: ix, value: input.options[ix].value, label: input.options[ix].label });
+    }
+  }
+  return { ok: true, tag: 'SELECT', multiple: input.multiple, selected: selected, applied: applied };
 }`;
 
 // Exported only so the self-containment vitest can assert the probe carries no
@@ -319,7 +347,9 @@ export const selectOption: Tool = async (args) => {
       ok: true,
       tag: r.tag,
       multiple: r.multiple,
+      // What the element HOLDS, not what was asked for — see SELECT_APPLY_PROBE.
       selected: r.selected,
+      applied: r.applied,
       ...(wait ? { wait } : {}),
       ...(observed ? { observed } : {}),
     },

@@ -306,6 +306,35 @@ function remintHitTarget(
   );
 }
 
+/** What to say when the aimed point lands outside the viewport.
+ *
+ * The old text told the agent to "scroll it into view (scroll/reveal) and
+ * retry" — advice the tool had ALREADY taken: `findClickPoint` scrolls the
+ * element into view (instantly, so the rect it measures is the post-scroll one)
+ * before measuring anything. So the one situation this fires in is the one
+ * where scrolling did not help, and the suggested remedy was a loop: scroll,
+ * retry, get the same refusal, scroll again.
+ *
+ * What is actually true when a scrolled-to element still measures outside: it
+ * is positioned or transformed off-canvas, it lives in a region clipped by
+ * `overflow:hidden` (a closed drawer, an off-screen menu panel), or it is in a
+ * virtualised list whose own container has to be paged. Those want a different
+ * action — open whatever reveals it, or `reveal` the container — never another
+ * `scroll`. */
+function offViewportMessage(
+  tool: string,
+  p: { tag: string; x: number; y: number; vw: number; vh: number },
+): string {
+  return (
+    `${tool}: ${p.tag} was scrolled into view and still measures at (${Math.round(p.x)}, ` +
+    `${Math.round(p.y)}) of ${p.vw}x${p.vh}, outside the viewport — the browser would discard ` +
+    `the event. Scrolling again will not change this: the element is likely positioned or ` +
+    `transformed off-canvas, or inside a region clipped by overflow:hidden (a closed drawer or ` +
+    `menu panel). Open whatever reveals it, use reveal for a virtualised container, or pick a ` +
+    `different element.`
+  );
+}
+
 export const mouseClick: Tool = async (args) => {
   const target = parsePointerTarget(args, 'mouse_click');
 
@@ -363,16 +392,8 @@ export const mouseClick: Tool = async (args) => {
   if (!point.visible) {
     throw new BridgeError('not_visible', `mouse_click: element ${point.tag} has zero size`);
   }
-  // Size is not position: an element scrolled out of view, translated
-  // off-canvas or clipped by an overflow container is "visible" by the check
-  // above while CDP silently drops the event we are about to dispatch.
   if (pointOutsideViewport(point)) {
-    throw new BridgeError(
-      'not_visible',
-      `mouse_click: ${point.tag} sits outside the viewport at (${Math.round(point.x)}, ` +
-        `${Math.round(point.y)}) of ${point.vw}x${point.vh} — the browser would discard the ` +
-        `event; scroll it into view (scroll/reveal) and retry`,
-    );
+    throw new BridgeError('not_visible', offViewportMessage('mouse_click', point));
   }
 
   await dispatchClick(tab.id!, point.x, point.y, button, clickCount);
@@ -456,16 +477,8 @@ export const hover: Tool = async (args) => {
   if (!point.visible) {
     throw new BridgeError('not_visible', `hover: element ${point.tag} has zero size`);
   }
-  // Size is not position: an element scrolled out of view, translated
-  // off-canvas or clipped by an overflow container is "visible" by the check
-  // above while CDP silently drops the event we are about to dispatch.
   if (pointOutsideViewport(point)) {
-    throw new BridgeError(
-      'not_visible',
-      `hover: ${point.tag} sits outside the viewport at (${Math.round(point.x)}, ` +
-        `${Math.round(point.y)}) of ${point.vw}x${point.vh} — the browser would discard the ` +
-        `event; scroll it into view (scroll/reveal) and retry`,
-    );
+    throw new BridgeError('not_visible', offViewportMessage('hover', point));
   }
 
   await dispatchHover(tab.id!, point.x, point.y);

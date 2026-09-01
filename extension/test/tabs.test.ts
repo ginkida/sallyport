@@ -20,8 +20,14 @@ import {
   resolveTab,
   waitForLoad,
 } from '../src/tools/tabs.js';
-import { setAllowlist } from '../src/storage.js';
-import { clearAllEpochs, getEpoch, mintEpoch, setBrokerMode } from '../src/tools/ownership.js';
+import { setAllowlist, setSettings } from '../src/storage.js';
+import {
+  agentTabIds,
+  clearAllEpochs,
+  getEpoch,
+  mintEpoch,
+  setBrokerMode,
+} from '../src/tools/ownership.js';
 import { resetAgentWindow } from '../src/tools/agent-window.js';
 import { resetAttachedTabs } from '../src/tools/cdp.js';
 
@@ -39,6 +45,7 @@ type Calls = {
   // unconditionally (not just when a waitFor is given) so opted-in capture
   // (dialog handling above all) is live for the page's own load.
   debuggerAttach: number[];
+  removed: number[];
 };
 
 function installChromeMock(opts: {
@@ -58,6 +65,7 @@ function installChromeMock(opts: {
     muted: [],
     windowsFocus: [],
     debuggerAttach: [],
+    removed: [],
   };
   const byId = new Map<number, MockTab>();
   const windows = new Set<number>();
@@ -123,6 +131,11 @@ function installChromeMock(opts: {
         next.status = 'complete';
         byId.set(tabId, next);
         return Promise.resolve(next);
+      },
+      remove(tabId: number) {
+        calls.removed.push(tabId);
+        byId.delete(tabId);
+        return Promise.resolve();
       },
       reload(tabId: number, _info?: { bypassCache?: boolean }) {
         // Real Chrome flips status to 'loading' then back to 'complete'; the
@@ -709,5 +722,68 @@ describe('observe re-gates the page it is about to read', () => {
     expect(out.data.observed).toEqual({ skipped: 'domain_not_allowed' });
     expect(out.data.observed).not.toHaveProperty('text');
     expect(out.data.observed).not.toHaveProperty('elements');
+  });
+});
+
+describe('navigate — the tab reaper (maxAgentTabs)', () => {
+  const ALLOWED = [{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }];
+
+  beforeEach(() => {
+    clearAllEpochs();
+    resetAgentWindow();
+    resetAttachedTabs();
+  });
+
+  /** The mock owns the storage, so the allowlist and settings have to be
+   * written AFTER it is installed — installing one wipes the store. */
+  async function primed(mockOpts: Parameters<typeof installChromeMock>[0], cap: number) {
+    const calls = installChromeMock(mockOpts);
+    await setAllowlist(ALLOWED);
+    await setSettings({ maxAgentTabs: cap });
+    return calls;
+  }
+
+  it('retires the session own least recently used tab when a create crosses the cap', async () => {
+    // The complaint this whole mechanism exists for: in broker mode every
+    // tabId-less navigate CREATES a tab, so an agent working through pages
+    // leaves one behind per step and nothing ever bounded the total.
+    const calls = await primed({}, 2);
+    setBrokerMode(true);
+
+    await navigate({ url: ALLOW }, { client: 'alpha' }); // 999
+    await navigate({ url: ALLOW }, { client: 'alpha' }); // 1000
+    expect(calls.removed).toEqual([]); // still room
+    await navigate({ url: ALLOW }, { client: 'alpha' }); // 1001, and 999 must go
+
+    expect(calls.removed).toEqual([999]);
+    expect(agentTabIds()).toEqual(new Set([1000, 1001]));
+  });
+
+  it('never retires a tab a DIFFERENT live session owns', async () => {
+    const calls = await primed({}, 1);
+    setBrokerMode(true);
+
+    await navigate({ url: ALLOW }, { client: 'beta' }); // beta is mid-task
+    await navigate({ url: ALLOW }, { client: 'alpha' }); // alpha needs room
+
+    // Breaking another agent mid-task is worse than one tab over the cap.
+    expect(calls.removed).toEqual([]);
+    expect(agentTabIds().size).toBe(2);
+  });
+
+  it('is off entirely at cap 0, and in standalone', async () => {
+    const calls = await primed({}, 0);
+    setBrokerMode(true);
+    for (let i = 0; i < 3; i++) await navigate({ url: ALLOW }, { client: 'alpha' });
+    expect(calls.removed).toEqual([]);
+
+    // Standalone owns no tabs at all, so there is nothing to reap — and the
+    // active-tab fallback means it does not create one per navigate either.
+    clearAllEpochs();
+    setBrokerMode(false);
+    const solo = await primed({ active: { id: 3, url: ALLOW } }, 1);
+    await navigate({ url: ALLOW });
+    await navigate({ url: ALLOW });
+    expect(solo.removed).toEqual([]);
   });
 });

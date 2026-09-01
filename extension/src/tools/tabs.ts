@@ -12,16 +12,22 @@ import { parseObserve, runObserve } from './observe.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { clearRefsForTab } from './refs.js';
 import { agentTabIds, filterTabsToOwned, getEpoch, isBrokerMode, mintEpoch } from './ownership.js';
-import { persistEpochs } from './ownership-store.js';
+import { persistEpochs, reapAgentTabs } from './ownership-store.js';
 import { createAgentTab } from './agent-window.js';
 import type { Tool } from './types.js';
 
 /** Open a fresh tab loading `url`. In broker mode it goes into the calling
  * session's dedicated, non-focused agent window (no focus theft, kept out of
  * the human's windows, one window per session so it stays legible with several
- * agents running); standalone opens it active in the current window, as today. */
+ * agents running); standalone opens it active in the current window, as today.
+ *
+ * Broker mode reaps first (`maxAgentTabs`): this is the ONE path that grows the
+ * agent-tab population, so it is where the bound belongs. Standalone creates no
+ * owned tabs at all, so there is nothing there to reap. */
 async function openTab(url: string, session?: string): Promise<chrome.tabs.Tab> {
-  return isBrokerMode() ? createAgentTab(url, session) : chrome.tabs.create({ url, active: true });
+  if (!isBrokerMode()) return chrome.tabs.create({ url, active: true });
+  await reapAgentTabs(session);
+  return createAgentTab(url, session);
 }
 
 /** `attach()`, but a failure (most commonly `attach_debugger_conflict` — the
@@ -228,7 +234,7 @@ export const navigate: Tool = async (args, ctx) => {
   // one. The daemon ignores `epoch` in standalone, so we don't mint there.
   let epoch: string | undefined;
   if (isBrokerMode()) {
-    epoch = created ? mintEpoch(tab.id!) : getEpoch(tab.id!);
+    epoch = created ? mintEpoch(tab.id!, ctx?.client) : getEpoch(tab.id!);
     if (created) await persistEpochs();
   }
   let wait = null;

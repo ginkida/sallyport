@@ -62,7 +62,43 @@ export type Settings = {
    * observable CDP footprint) and answers dialogs the human might have
    * wanted to see, so it is opt-in. */
   handleDialogs: boolean;
+  /** Ceiling on how many agent-created tabs may exist at once. When a create
+   * would cross it, the tab reaper closes the least valuable ones first
+   * (`ownership.ts:planEviction`): orphans from finished sessions, then the
+   * creating session's own least-recently-used tabs. Never a tab the human
+   * engaged with, never a live OTHER session's.
+   *
+   * On by default, unlike every other behaviour that closes a tab — because
+   * the thing it prevents is not hypothetical: in broker mode a `navigate`
+   * with no tabId creates a tab, a finished session hands its tabs back rather
+   * than closing them, and nothing else bounds the total. What it can destroy
+   * is bounded by construction (an agent tab nobody looked at, whose session
+   * is gone or which its own session stopped using), and the agent-facing
+   * failure is the already-handled `tab_gone`.
+   *
+   * 0 disables the reaper entirely — every agent tab then lives until someone
+   * closes it. */
+  maxAgentTabs: number;
 };
+
+/** Default ceiling for `maxAgentTabs`. Deliberately generous: a research sweep
+ * legitimately wants a dozen pages open at once, and the reaper is a bound on
+ * accumulation, not a workflow constraint. */
+export const DEFAULT_MAX_AGENT_TABS = 20;
+/** Anything above this is almost certainly a typo, and every agent tab costs
+ * the human a real browser tab. */
+export const MAX_AGENT_TABS_CEILING = 200;
+
+/** Read a stored/entered agent-tab cap, clamped. Anything unusable (a string, a
+ * float, a negative) falls back to the default rather than silently disabling
+ * the reaper — 0 must be an explicit choice, not what a corrupt value decays
+ * to. */
+export function normaliseMaxAgentTabs(raw: unknown): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return DEFAULT_MAX_AGENT_TABS;
+  const n = Math.floor(raw);
+  if (n < 0) return DEFAULT_MAX_AGENT_TABS;
+  return Math.min(n, MAX_AGENT_TABS_CEILING);
+}
 
 export const DEFAULT_SERVER_URL = 'ws://127.0.0.1:10086/ws';
 export const AUDIT_LIMIT = 500;
@@ -132,6 +168,7 @@ export async function getSettings(): Promise<Settings> {
     captureNetwork: !!v?.captureNetwork, // default off (opt-in)
     handleDialogs: !!v?.handleDialogs, // default off (opt-in)
     closeAgentTabsOnDisconnect: !!v?.closeAgentTabsOnDisconnect, // default off (destructive)
+    maxAgentTabs: normaliseMaxAgentTabs(v?.maxAgentTabs),
   };
 }
 

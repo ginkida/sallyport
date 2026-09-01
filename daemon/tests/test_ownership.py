@@ -19,8 +19,10 @@ from sallyport_daemon.ownership import (
     OwnershipRegistry,
     ensure_owns,
     record_close,
+    record_opened_tabs,
     record_result,
     scope_list_tabs,
+    strip_opened_tab_epochs,
 )
 
 SECRET = bytes(32)
@@ -429,3 +431,72 @@ async def test_status_standalone_keeps_full_view() -> None:
     # Standalone: the single-client view is unscoped and untagged.
     assert [e["tool"] for e in status["lastCalls"]] == ["click"]
     assert all("client" not in e for e in status["lastCalls"])
+
+
+# --- tabs the PAGE opened --------------------------------------------------
+
+
+def test_record_opened_tabs_records_each_entry() -> None:
+    reg = OwnershipRegistry()
+    record_opened_tabs(
+        reg,
+        "A",
+        {"openedTabs": [{"tabId": 7, "epoch": "e7"}, {"tabId": 8, "epoch": "e8"}]},
+        opened_at=1.0,
+    )
+    assert reg.owns("A", 7)
+    assert reg.owns("A", 8)
+    assert reg.epoch_for("A", 7) == "e7"
+
+
+def test_record_opened_tabs_is_a_noop_in_standalone_and_on_junk() -> None:
+    reg = OwnershipRegistry()
+    record_opened_tabs(reg, None, {"openedTabs": [{"tabId": 7, "epoch": "e"}]}, opened_at=1.0)
+    assert reg.owns("A", 7) is False
+    # Malformed shapes record nothing rather than raising on a hot path.
+    for junk in ({"openedTabs": "nope"}, {"openedTabs": [None, 5]}, {}, "not a dict"):
+        record_opened_tabs(reg, "A", junk, opened_at=1.0)
+    assert reg.owns("A", 7) is False
+
+
+def test_strip_opened_tab_epochs_keeps_the_ids() -> None:
+    """The epoch is registry bookkeeping; the tab ID is the whole point — without
+    it the agent knows a tab opened but cannot name it."""
+    out = strip_opened_tab_epochs({"ok": True, "openedTabs": [{"tabId": 7, "epoch": "e7"}]})
+    assert out == {"ok": True, "openedTabs": [{"tabId": 7}]}
+    # Nothing to strip is left exactly as it came.
+    assert strip_opened_tab_epochs({"ok": True}) == {"ok": True}
+    assert strip_opened_tab_epochs("x") == "x"
+
+
+async def test_call_tool_adopts_a_tab_the_page_opened() -> None:
+    """A target=_blank link, a window.open, an OAuth popup: the browser makes
+    the tab, so it has no epoch of ours. The extension adopts it for the tab
+    that spawned it — which this client already owns, since the call passed the
+    gate — and the daemon records it here. Without this the tab is nameless to
+    every client and invisible to owner-scoped list_tabs."""
+    b = _StubBridge()
+    b.responses["navigate"] = {"tabId": 5, "epoch": "e1", "url": "https://x"}
+    b.responses["click"] = {"tabId": 5, "openedTabs": [{"tabId": 6, "epoch": "e6"}]}
+    await b.call_tool("navigate", {"url": "https://x"}, client_id="A")
+
+    out = await b.call_tool("click", {"tabId": 5, "selector": "a"}, client_id="A")
+
+    # The new tab is owned, so the agent can drive it...
+    assert b._ownership.owns("A", 6)
+    assert b._ownership.epoch_for("A", 6) == "e6"
+    # ...it is told the id...
+    assert out == {"tabId": 5, "openedTabs": [{"tabId": 6}]}
+    # ...and the epoch never reaches it.
+    await b.call_tool("snapshot", {"tabId": 6}, client_id="A")
+    assert b.seen[-1] == ("snapshot", {"tabId": 6, EPOCH_ARG: "e6"})
+
+
+async def test_call_tool_adoption_does_not_cross_clients() -> None:
+    b = _StubBridge()
+    b.responses["navigate"] = {"tabId": 5, "epoch": "e1", "url": "https://x"}
+    b.responses["click"] = {"tabId": 5, "openedTabs": [{"tabId": 6, "epoch": "e6"}]}
+    await b.call_tool("navigate", {"url": "https://x"}, client_id="A")
+    await b.call_tool("click", {"tabId": 5, "selector": "a"}, client_id="A")
+
+    assert b._ownership.owns("B", 6) is False

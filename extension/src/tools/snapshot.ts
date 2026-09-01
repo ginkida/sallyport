@@ -1,5 +1,14 @@
-import { buildTree, collectInteractive, type AXNode, type TreeNode } from './axtree.js';
+import {
+  buildTree,
+  capElements,
+  capTree,
+  collectInteractive,
+  SNAPSHOT_MAX_ELEMENTS,
+  type AXNode,
+  type TreeNode,
+} from './axtree.js';
 import { attach, cdp } from './cdp.js';
+import { pageFrameOrigins } from './frames.js';
 import { resolveSelectorOrRef } from './resolve.js';
 import { collectDomTree, type DomTreeNode, type DomTreeResult } from './domtree.js';
 import { BridgeError } from './errors.js';
@@ -226,6 +235,26 @@ export async function buildSnapshotTree(
   return { tree, source, truncated };
 }
 
+/** Turn a built tree into what the call actually ships, under the emission
+ * caps (`axtree.ts`). Both snapshot shapes go through here so neither can grow
+ * an unbounded payload again: the a11y walk is unbounded by nature, and a tree
+ * over the frame cap does not fail one call — it 1009-closes the one shared
+ * extension leg for every session (invariant #8).
+ *
+ * `compact` is the flat actionable-element list, for when the agent needs
+ * something to click rather than the page's whole text content. */
+function shapeSnapshot(
+  tree: TreeNode[],
+  compact: boolean,
+): { payload: Record<string, unknown>; truncated: boolean } {
+  if (compact) {
+    const { elements, truncated } = capElements(collectInteractive(tree), SNAPSHOT_MAX_ELEMENTS);
+    return { payload: { elements }, truncated };
+  }
+  const capped = capTree(tree);
+  return { payload: { tree: capped.tree }, truncated: capped.truncated };
+}
+
 export const snapshot: Tool = async (args) => {
   const mode = args.mode === 'a11y' || args.mode === 'dom' ? args.mode : 'auto';
   const compact = args.compact === true;
@@ -247,6 +276,8 @@ export const snapshot: Tool = async (args) => {
     const rootObjectId = await resolveSelectorOrRef(tab.id!, scope, 'snapshot');
     resetRefsForTab(tab.id!);
     const dom = await domSnapshot(tab.id!, rootObjectId);
+    const shaped = shapeSnapshot(dom.tree, compact);
+    const frames = await pageFrameOrigins(tab.id!);
     return {
       tabId: tab.id,
       url: tab.url,
@@ -255,13 +286,20 @@ export const snapshot: Tool = async (args) => {
         title: tab.title,
         source: 'dom' as const,
         scope,
-        ...(compact ? { elements: collectInteractive(dom.tree) } : { tree: dom.tree }),
-        ...(dom.truncated ? { truncated: true } : {}),
+        ...shaped.payload,
+        ...(frames.length ? { frames } : {}),
+        ...(dom.truncated || shaped.truncated ? { truncated: true } : {}),
       },
     };
   }
 
   const { tree, source, truncated } = await buildSnapshotTree(tab.id!, mode);
+  const shaped = shapeSnapshot(tree, compact);
+  // What this snapshot CANNOT see. A frame's document is a separate one (a
+  // separate process, cross-origin), so neither walk descends into it — and
+  // without saying so, a page whose real content is framed reads as an empty
+  // shell for no stated reason.
+  const frames = await pageFrameOrigins(tab.id!);
   return {
     tabId: tab.id,
     url: tab.url,
@@ -269,10 +307,9 @@ export const snapshot: Tool = async (args) => {
       url: tab.url,
       title: tab.title,
       source,
-      // compact: just the actionable elements, flat — for when the agent
-      // needs something to click, not the page's whole text content.
-      ...(compact ? { elements: collectInteractive(tree) } : { tree }),
-      ...(truncated ? { truncated: true } : {}),
+      ...shaped.payload,
+      ...(frames.length ? { frames } : {}),
+      ...(truncated || shaped.truncated ? { truncated: true } : {}),
     },
   };
 };

@@ -6,6 +6,7 @@ import {
   getSettings,
   setSettings,
   DEFAULT_SERVER_URL,
+  normaliseMaxAgentTabs,
   type AllowEntry,
   type AuditEntry,
 } from './storage.js';
@@ -420,6 +421,7 @@ $('#status-settings').addEventListener('toggle', async () => {
   ($('#capture-network') as HTMLInputElement).checked = s.captureNetwork;
   ($('#handle-dialogs') as HTMLInputElement).checked = s.handleDialogs;
   ($('#close-agent-tabs') as HTMLInputElement).checked = s.closeAgentTabsOnDisconnect;
+  ($('#max-agent-tabs') as HTMLInputElement).value = String(s.maxAgentTabs);
 });
 
 $('#status-advanced').addEventListener('toggle', async () => {
@@ -471,7 +473,11 @@ async function renderAgentTabs(): Promise<void> {
   for (const row of rows) {
     const li = document.createElement('li');
     const who = row.session ? `[${row.session}] ` : '';
-    li.textContent = `${who}${row.title || row.url}`;
+    // An orphan's session has exited: nothing will drive it again, and it is
+    // what the tab reaper takes first. Saying so turns this list from "tabs
+    // that exist" into "tabs you can close without interrupting anything".
+    const state = row.orphaned ? ' — session ended' : '';
+    li.textContent = `${who}${row.title || row.url}${state}`;
     li.title = row.url;
     ul.appendChild(li);
   }
@@ -512,6 +518,19 @@ $('#close-agent-tabs').addEventListener('change', async () => {
   await setSettings({
     closeAgentTabsOnDisconnect: ($('#close-agent-tabs') as HTMLInputElement).checked,
   });
+});
+
+$('#max-agent-tabs').addEventListener('change', async () => {
+  // Read on the create-own path, so a change applies to the next agent tab
+  // opened. Normalised through the same clamp the stored value goes through, so
+  // a pasted "9999" or an emptied field lands somewhere sane rather than
+  // silently disabling the reaper — and the field is written back with what was
+  // actually stored, so the number shown is never a lie.
+  const field = $('#max-agent-tabs') as HTMLInputElement;
+  const raw = field.value.trim();
+  const maxAgentTabs = normaliseMaxAgentTabs(raw === '' ? undefined : Number(raw));
+  await setSettings({ maxAgentTabs });
+  field.value = String(maxAgentTabs);
 });
 
 $('#settings-save').addEventListener('click', async () => {

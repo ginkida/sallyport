@@ -6,6 +6,348 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-09-01
+
+### Added
+
+- **A ceiling on how many tabs the agents may leave lying around**
+  (`maxAgentTabs`, popup → Settings, default 20; 0 turns it off). Running this
+  for real, the loudest thing wrong with it was mundane: nothing ever bounded
+  the number of agent tabs. In broker mode a `navigate` with no `tabId` CREATES
+  a tab, so an agent working through twenty pages leaves twenty of them; a
+  finished session hands its tabs back rather than closing them (deliberately —
+  they are usually the result you wanted to see); and no later session can even
+  name them, because tabs are owner-scoped. After a day the human has a browser
+  full of tabs nobody will ever touch again.
+
+  So the create path now reaps before it creates. The policy
+  (`ownership.ts:planEviction`, pure and unit-tested) is written to never be the
+  thing that loses work:
+
+  - a tab the HUMAN engaged with is never a candidate, at any pressure — the
+    browser tells us which those are (activated in a window they had in front of
+    them, or dragged into one of their own windows), and the mark is one-way;
+  - a live OTHER session's tabs are never candidates: this runs on someone
+    else's create, and evicting them would break an agent mid-task;
+  - orphans go first — a tab whose session has exited can never be named again
+    — and only then the creating session's own least-recently-used tabs, which
+    is the one case where the loser is the caller itself;
+  - it frees exactly enough room to land at the cap, never more — and of tabs
+    that are still in play it retires at most ONE per create. The cap is global
+    while a session only controls its own tabs, so with several agents running
+    the excess can be far larger than anything this caller caused; taking all of
+    it would make a session that opens one more page destroy its whole working
+    set to satisfy a number two other sessions filled up. One per create is
+    self-correcting: a single session settles exactly at the cap, and a browser
+    already over it stops growing rather than collapsing.
+
+  The focused-window condition is what makes the "human looked at it" signal
+  usable rather than noise: `screenshot` makes an agent tab active INSIDE its
+  own unfocused window (that is why it costs no focus) and fires the very same
+  event, so without the check an agent would immortalise its own tabs by
+  screenshotting them. A focus event on a window we created a moment ago is
+  discounted too — `windows.create({focused:false})` is a request rather than a
+  guarantee, and the flash before we restore the human's window would otherwise
+  read as interest.
+
+  An evicted tab leaves the daemon's registry stale, which is an already-handled
+  case: the next call naming it fails `confirmEpoch` with `tab_gone`, whose
+  recovery hint is "open a fresh one". Bounded and best-effort throughout —
+  `chrome.tabs.remove` resolves only once the tab is GONE, and a page with a
+  `beforeunload` handler can hold that open indefinitely, so a doomed tab that
+  will not die costs one extra tab rather than hanging the agent's navigate
+  behind it.
+
+- **The popup says which agent tabs are dead.** "Agent tabs" now marks the ones
+  whose session has ended (`— session ended`). "Which of these is still in use"
+  is the only question a human sweeping that list actually has, and the list
+  could not answer it.
+
+### Fixed
+
+- **`upload` reported the paths it SENT, not the files the input took.**
+  `DOM.setFileInputFiles` dispatches `input` and `change`, which is the point —
+  the page reacts as if a human had picked the file. It also means the page's
+  own handler gets to reject it (wrong type, too large, over a quota) and clear
+  the input in the same tick, and the result still came back `ok:true` with the
+  file listed. The agent then submitted a form with nothing attached, which
+  fails somewhere else entirely, several steps later.
+
+  It now reads the element back and reports what it HOLDS (`accepted`) with an
+  `applied` verdict — `yes`, `no` (the page took something else, or nothing), or
+  `unclear` (the input was replaced right after the write, so nothing is
+  claimed). Names only, never content: the agent supplied the paths, so nothing
+  new is disclosed. Synchronous, for the reason `fill` and `select_option` give
+  — rAF and timers are throttled in a background tab, so waiting for a later
+  reading would hang a driven tab in an unfocused agent window.
+
+- **`upload` half-attached to a single-file input.** Several paths against an
+  `<input type=file>` with no `multiple` attribute now fail with `bad_args`
+  naming the count, instead of sending them all and reporting success for
+  whatever the browser decided to keep. The same refusal, for the same reason,
+  as `select_option`'s `not_multiple`.
+
+- **The download sandbox silently overwrote whatever was already there.** Every
+  write went through `Path.write_bytes`, so a second `save_to_file`,
+  `print_to_pdf` or `fetch_in_page(saveAs)` under a name already taken replaced
+  the earlier artefact — and both calls reported success. Agents reuse names
+  (`report.pdf`, `page.html`, `data.json`) the way anyone does, so a five-page
+  sweep could leave one file, with no error anywhere and nothing in the result
+  hinting that four others had existed.
+
+  Nothing is overwritten now: the writer creates the file EXCLUSIVELY and, when
+  the name is taken, moves on to `report-1.pdf`, `report-2.pdf` and so on. That
+  also settles the check-then-write race for free — two clients racing the same
+  name cannot both win it, which a stat-then-write would not have guaranteed.
+  The result reports the name actually written, plus `renamedFrom` when it
+  differs, in the same shape and for the same reason as `navigate`'s
+  `redirectedFrom`: an agent holding the requested string needs to learn it is
+  not the name to look for. The note is produced by the writer rather than its
+  three callers — one of them would eventually forget, and forgetting is exactly
+  the failure being fixed.
+
+  The trade is deliberate: a caller that MEANT to replace a file now gets a
+  second one. In a download directory a human sweeps that is cheap, while a
+  destroyed artefact is not, and the numbered-variant behaviour is what a
+  browser's own downloads do — which is the mental model this directory already
+  borrows. A name whose 200 numbered variants are all taken fails loudly rather
+  than inventing a 201st.
+
+- **`read_text` was the one reading tool still silent about frames.** `snapshot`
+  learned to report them, but the tool an agent reaches for FIRST did not: on a
+  checkout, an SSO step or an embedded dashboard it returned the shell's text —
+  or `text: ''` — with no reason given, and an empty string is the least
+  informative answer the tool can produce. A whole-page read now carries the
+  same `frames` list (origins only, for the reasons the snapshot change gives),
+  including on both empty-read paths, where the silence was worst. A `ref` read
+  is left alone: it is explicitly about one node.
+
+  The frame lookup moved into its own leaf module (`tools/frames.ts`) so
+  `snapshot.ts` and `dom.ts` can share it without the graph growing an edge
+  between them — `imports.test.ts` keeps that honest.
+
+- **`mouse_click`/`hover` told the agent to do the thing they had just done.**
+  When the aimed point lands outside the viewport they refuse, because the
+  browser discards an event aimed off-screen — and the refusal said "scroll it
+  into view (scroll/reveal) and retry". But `findClickPoint` already scrolls the
+  element into view (instantly, so the rect it measures is the post-scroll one)
+  before measuring anything. So the one case this fires in is the case where
+  scrolling did NOT help, and the advice was a loop: scroll, retry, same
+  refusal, scroll again.
+
+  The message now says what is actually true — the element was scrolled to and
+  still measures outside — and names the situations that produce it: positioned
+  or transformed off-canvas, or inside a region clipped by `overflow:hidden` (a
+  closed drawer, an off-screen menu panel), or a virtualised container that has
+  to be paged. Those want a different action: open whatever reveals it, or
+  `reveal`, never another `scroll`. The `not_visible` recovery hint in the error
+  taxonomy carried the same wrong advice and now matches.
+
+- **`key_type` reported success for text that went nowhere.** It inserts into
+  whatever holds focus, and when nothing editable does — the state right after
+  a navigate, or after clicking something that is not a field — focus sits on
+  `<body>`. Which is not an `<input type=password>`, so the keystroke gate waved
+  it through, `Input.insertText` landed nowhere, and the tool answered
+  `ok:true, length:N`. The agent believed it had typed and found out several
+  steps later, if at all.
+
+  The gate now also asks whether the focused node can hold text at all, and
+  refuses with `no_editable_focus` naming what IS focused — because the fix is a
+  click (or `fill`, which focuses the field itself), not a retry. The
+  classification is aligned with what `insertText` can actually do rather than
+  with "the element looks interactive": a `<div tabindex=0>` listening for
+  keydown receives nothing from an insert, since no key events are dispatched,
+  so refusing it is correct rather than cautious. It leans the other way on
+  genuinely unusual fields — an unrecognised `<input type>` is allowed to try,
+  because refusing a call that would have worked is the worse error.
+
+  `send_keys` is deliberately NOT held to the same rule: Escape, arrow
+  navigation and a site's own single-key shortcuts are all meaningful with
+  nothing editable focused. And the check now runs even under
+  `allowPassword=true`, which used to skip the whole walk — the silent no-op it
+  hides is the same either way.
+
+- **`select_option` reported the option it MEANT to select, not the one the
+  element ended up holding.** It set the value, fired `input` + `change`, and
+  then built its `selected` answer out of the plan — the option list it had read
+  before the write. So a page that resets the value in its own `change` handler,
+  a `<select>` whose value setter is intercepted, or one the handler replaces
+  outright all came back as `ok:true` naming the option you asked for, while the
+  page showed the old one. That is the silent-wrong-answer shape `fill`'s
+  readback was built to kill, in the tool where the page is most likely to have
+  opinions about what you picked.
+
+  It now reads the element back after the events and reports what it actually
+  holds, plus `applied`: `'yes'` (it holds the plan), `'no'` (it holds something
+  else — `selected` says what, so the agent can re-check its assumption instead
+  of retrying blindly) or `'unclear'` (the node was detached right after the
+  write, so nothing is claimed and the request is echoed).
+
+  Synchronous, deliberately. A `requestAnimationFrame` or a timer would also
+  catch a framework that reverts a tick later, but rAF does not fire in a
+  background tab and timers are throttled there — so a driven tab sitting in an
+  unfocused agent window would hang instead of answering. An async revert
+  therefore surfaces on the agent's next read, which the tool description now
+  says outright; it is the same limit `fill`'s readback has.
+
+- **A tab the PAGE opened belonged to nobody.** A `target="_blank"` link, a
+  `window.open`, an OAuth popup — the browser makes that tab, not the extension,
+  so it carried no ownership epoch, and everything downstream treated it as a
+  stranger. Owner-scoped `list_tabs` filtered it out at both layers, the daemon
+  answered `tab_not_owned` for it, the popup's "Agent tabs" sweep never listed
+  it and the tab reaper never counted it. The agent was left looking at a result
+  it could not follow up on, and the human got a tab that nothing in the system
+  tracked — the accumulation the reaper was built to bound, arriving by the one
+  door it does not watch.
+
+  Such a tab is now ADOPTED for the session that owns the opener and reported
+  back as `openedTabs: [{tabId}]` on the call that triggered it, which is the
+  same route `navigate`'s own create takes into the daemon's registry — nothing
+  new is trusted. The reasoning that makes it safe is about where the ids come
+  from rather than which tool reported them: the extension adopts only when the
+  OPENER is one of its own agent tabs, and that call had already passed
+  `ensure_owns` on the opener. So the only ownership this can grant is of a tab
+  spawned by a tab the client already owned.
+
+  Reported centrally in `runTool` rather than per tool: a click is the usual
+  cause, but a keypress, a select, or a script the page runs on any interaction
+  can do it too, and a list of "tools that might open a tab" would have been
+  wrong the day it was written. It is read after the tool returns, so an
+  embedded `waitFor` has already given the page its time to open one. The epoch
+  is stripped before the agent sees the list — the tab ID is the point, and
+  without it the agent knows a tab opened but cannot name it.
+
+- **A page whose content lives in an iframe read as an empty shell, with
+  nothing saying why.** Both walks stop at a frame boundary — the document
+  behind it is a separate one, and for a cross-origin frame a separate process —
+  and both then erased the evidence: the DOM walk had `IFRAME` in its skip list,
+  and the a11y builder pruned the frame host as an empty leaf (no name, no
+  children, not actionable). So on a checkout, an SSO step, an embedded
+  dashboard or a CMS editor the agent got a snapshot with nothing to click and
+  no stated reason, and went looking for a bug in its own selectors.
+
+  Frames are now visible in three places, each best-effort and independent: the
+  DOM walk emits an `iframe` leaf named by the `src` (no ref — nothing here can
+  act on it); the a11y builder keeps a frame host even when it is otherwise
+  empty; and `snapshot` reports the page's child-frame **origins** in `frames`.
+  Origins, not urls: a frame's current location routinely carries a token or an
+  account identifier (an OAuth step lands on one), and the parent document —
+  which the caller may already read in full — can only see the `src` it set, not
+  where the frame navigated itself. The `src` still rides along in the DOM
+  walk's leaf, where it is exactly the parent's own attribute and no more.
+
+  The tool description now says what cannot be reached and what to do instead
+  (open the frame URL in its own tab, allowlisted in its own right). Reaching
+  INTO frames is a bigger change — refs would have to carry a frame identity and
+  every resolve would have to target the right session, the way `focus.ts`
+  already does for the password gate — and is deliberately not attempted here.
+  `Page.getFrameTree` is one browser-side call per explicit `snapshot`, never
+  inside `buildSnapshotTree`, which `find` and `reveal` run in a loop.
+
+- **`snapshot`'s primary path had no size bound at all — and an oversize result
+  does not fail one call, it drops the shared browser connection.** The DOM
+  fallback has been bounded since it was written (400 elements, 2000 nodes, 200
+  chars per name — "keep the probe's output well under the 16 MiB frame cap even
+  on pathological pages"). The a11y walk, which runs on nearly every snapshot,
+  emitted whatever `Accessibility.getFullAXTree` returned. On a long feed, a big
+  table or a docs page that is tens of thousands of nodes with paragraph-sized
+  names.
+
+  The cheap half of the damage is the agent's context: an unbounded tree is
+  `read_text` with no `maxChars`, and `read_text` caps at 20k for exactly this
+  reason. The expensive half is that past 16 MiB the `tool_result` frame is
+  refused by the daemon with a 1009 close — which does not fail the call, it
+  drops the SINGLE shared extension client (invariant #8) and takes every
+  concurrent session's in-flight work with it.
+
+  `snapshot` and the `observe` folded into an action now emit under the same
+  caps as the DOM walk, setting `truncated: true` (a flag both shapes already
+  carried) when nodes or elements are dropped — a trimmed name does not raise
+  it, because the DOM walk has always cut names silently with the ellipsis as
+  the signal, and flagging that would fire on nearly every snapshot. The caps apply to what is EMITTED, never to what is
+  walked: `find` and `reveal` match over the whole tree and return at most
+  `limit` matches, so bounding the walk would have made a target past the cap
+  unfindable — a real regression for the long lists `reveal` exists to serve.
+  Strings are cut off a surrogate pair, because a lone half does not fail one
+  name, it discards the whole result as `unserialisable_result`.
+
+- **The extension now refuses to SEND a frame the daemon would refuse.** The
+  per-tool caps (screenshot, print_to_pdf, fetch_in_page, and now snapshot) each
+  guard one known payload; nothing guarded the wire itself, so any tool finding
+  a new way to be enormous still cost everyone the shared connection. An
+  outgoing `tool_result` over 15 MiB is now degraded — before it reaches the
+  socket — to a signed `result_too_large` error naming the knobs that make it
+  smaller, exactly as an unsignable result already degraded to
+  `unserialisable_result`. The daemon is answered either way, so no caller waits
+  out its 60 s timeout. The size test is exact only when it has to be: UTF-8
+  never spends more than three bytes per UTF-16 code unit, so a short-enough
+  string skips the encode that would otherwise copy megabytes on every result.
+
+### Security
+
+- **The long-running loops now re-check the allowlist on every tick, not once at
+  entry.** `find` already did, with the reasoning written next to it: a poll can
+  run for thirty seconds, the page is free to navigate under it, and one entry
+  check would otherwise license reading whatever the tab drifted onto
+  (invariant #3). The other three loops never got the same treatment —
+  `wait_for` and every embedded `waitFor` (eleven tools), `settle`, and
+  `reveal`.
+
+  `reveal` was the sharp one: it scrolls and re-snapshots up to forty times and
+  RETURNS what it reads — roles and names out of each pass — so a page that
+  moved mid-scroll had its content read and reported under a check made forty
+  scrolls earlier. The waits leak less (a boolean per tick), but the drift is
+  routine rather than exotic: the click a `waitFor` follows is often the thing
+  that takes the tab off-site, and an SSO bounce or a consent wall mid-wait is
+  ordinary.
+
+  All four now share one helper (`gates.ts:ensureStillAllowed`) so they cannot
+  drift apart again. A page that leaves the allowlist mid-loop stops the loop
+  with `domain_not_allowed`; for an embedded `waitFor` that folds into
+  `wait.reason` as a new named value rather than the generic `error`, because
+  "the tab is somewhere it should not be" is a different instruction to the
+  agent than "not true yet". A vanished tab now answers `tab_gone` there too,
+  instead of a raw CDP error. It costs one `chrome.tabs.get` plus one allowlist
+  read per tick — the price `find` has always paid.
+
+- **`reveal` reports the url it actually read.** It returned the url the call
+  STARTED on, which after forty scrolls and up to thirty seconds could describe
+  a page it had left — and wrote that stale url into the audit row. `find`
+  already reported what it read.
+
+### Changed
+
+- **`_release_tabs` no longer releases a session's tabs one at a time.** Each
+  tab costs a bounded-but-real wait — `detach` alone gives the renderer up to
+  two seconds to answer the viewport-emulation clear — so serially, a session
+  with forty tabs could outrun the daemon's 60 s request timeout. The session
+  that opened the most tabs was therefore exactly the one whose release got
+  dropped, and every one of its tabs kept its debugger session, its disabled
+  bfcache and its focus emulation. Now released in bounded parallel batches
+  (8 at a time — these are CDP round-trips to one browser, not free).
+
+- **A handed-back tab is now marked an orphan** rather than just keeping its
+  epoch. Same visible behaviour (it stays open, it stays in the popup's sweep),
+  but the fact that its session has exited is now recorded — which is what lets
+  the reaper take it first and the popup say so. Not a close: the human may
+  still want it, and if they so much as look at it, it stops being a candidate
+  for good.
+
+- **`navigate` and `close_tab` now tell the model to clean up after itself.**
+  `navigate` says to pass back the `tabId` it was given when continuing on the
+  same page instead of opening another tab for every step, and that the tab
+  ceiling exists; `close_tab` says to call it as soon as a tab is done with,
+  because what an agent leaves open is what a human has to sweep up. The tool
+  descriptions are the only instructions the model reliably reads.
+
+- **Dropped the `activeTab` permission.** It grants temporary host access to
+  the tab the user just acted on, and the extension already holds
+  `<all_urls>` host permissions plus `tabs` — so it never granted anything
+  that wasn't already granted, and the context-menu handler reads
+  `info.pageUrl`/`info.linkUrl` (which come with the menu event) rather than
+  leaning on it. A permission that buys nothing is pure surface: it widens
+  what the install prompt claims and what a reader has to reason about.
+
 ## [0.22.0] — 2026-08-12
 
 ### Added
@@ -2354,7 +2696,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/ginkida/sallyport/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/ginkida/sallyport/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/ginkida/sallyport/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/ginkida/sallyport/compare/v0.19.0...v0.20.0

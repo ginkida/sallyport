@@ -1,6 +1,11 @@
 import { attach, cdp, cdpSession } from './cdp.js';
 import { BridgeError } from './errors.js';
-import { collectFrameIds, domNodeIsPassword, focusedBackendNodeIds } from './focus.js';
+import {
+  collectFrameIds,
+  domNodeAcceptsText,
+  domNodeIsPassword,
+  focusedBackendNodeIds,
+} from './focus.js';
 import { ensureAllowed } from './gates.js';
 import { parseObserve, runObserve } from './observe.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
@@ -179,12 +184,20 @@ async function dispatchKeys(tabId: number, keysStr: string, allowPassword: boole
  * (including closed shadow descendants); DOM.describeNode reads the real tag
  * and attributes. Any missing/malformed frame, focus, backend id, or DOM node
  * fails closed as focus_probe_failed rather than pretending typing is safe. */
-export async function ensureNotPasswordField(
+export async function ensureFocusUsable(
   tabId: number,
-  allowPassword: boolean,
+  opts: { allowPassword: boolean; requireTypable: boolean },
   tool: string,
 ): Promise<void> {
-  if (allowPassword) return;
+  const { allowPassword, requireTypable } = opts;
+  // Nothing to establish: the caller opted into password fields and the tool
+  // does not need an editable target (send_keys drives global hotkeys too).
+  if (allowPassword && !requireTypable) return;
+  let sawTypable = false;
+  // A holder rather than a `let`: the only assignment happens inside a nested
+  // function, which control-flow analysis cannot see, so a plain binding would
+  // narrow to `null` at the throw below.
+  const focused: { tag: string | null } = { tag: null };
   const fail = (): never => {
     throw new BridgeError(
       'focus_probe_failed',
@@ -206,13 +219,22 @@ export async function ensureNotPasswordField(
       const described = sessionId
         ? await cdpSession<{ node?: unknown }>(tabId, sessionId, 'DOM.describeNode', params)
         : await cdp<{ node?: unknown }>(tabId, 'DOM.describeNode', params);
-      const password = domNodeIsPassword(described.node);
-      if (password === null) return fail();
-      if (password) {
-        throw new BridgeError(
-          'password_field',
-          `${tool}: focus is on <input type=password>; pass allowPassword=true to override`,
-        );
+      if (!allowPassword) {
+        const password = domNodeIsPassword(described.node);
+        if (password === null) return fail();
+        if (password) {
+          throw new BridgeError(
+            'password_field',
+            `${tool}: focus is on <input type=password>; pass allowPassword=true to override`,
+          );
+        }
+      }
+      if (requireTypable) {
+        const node = described.node as { nodeName?: unknown } | undefined;
+        if (typeof node?.nodeName === 'string') focused.tag = node.nodeName;
+        const typable = domNodeAcceptsText(described.node);
+        if (typable === null) return fail();
+        if (typable) sawTypable = true;
       }
     }
     return { sawFocus: backendIds.length > 0 };
@@ -275,10 +297,34 @@ export async function ensureNotPasswordField(
       if (result.sawFocus) sawFocusedNode = true;
     }
     if (!sawFocusedNode) fail();
+    if (requireTypable && !sawTypable) {
+      // Not a probe failure — the walk worked and answered. `Input.insertText`
+      // goes to whatever holds focus, and nothing holding it can take text, so
+      // the insert would land nowhere and the tool would report success for a
+      // no-op. Say what is focused: after a navigate that is `BODY`, and the
+      // fix is a click, not a retry.
+      throw new BridgeError(
+        'no_editable_focus',
+        `${tool}: nothing that accepts text is focused` +
+          (focused.tag ? ` (focus is on <${focused.tag.toLowerCase()}>)` : '') +
+          ' — click the field first, or use fill(selector, value), which focuses it for you',
+      );
+    }
   } catch (error) {
     if (error instanceof BridgeError) throw error;
     fail();
   }
+}
+
+/** The password half on its own — what `send_keys` needs, since a keystroke is
+ * meaningful with nothing editable focused (Escape, arrow navigation, a site's
+ * own single-key shortcuts). */
+export async function ensureNotPasswordField(
+  tabId: number,
+  allowPassword: boolean,
+  tool: string,
+): Promise<void> {
+  await ensureFocusUsable(tabId, { allowPassword, requireTypable: false }, tool);
 }
 
 export const keyType: Tool = async (args) => {
@@ -289,7 +335,11 @@ export const keyType: Tool = async (args) => {
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
-  await ensureNotPasswordField(tab.id!, args.allowPassword === true, 'key_type');
+  await ensureFocusUsable(
+    tab.id!,
+    { allowPassword: args.allowPassword === true, requireTypable: true },
+    'key_type',
+  );
   await cdp(tab.id!, 'Input.insertText', { text });
   const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
   const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;

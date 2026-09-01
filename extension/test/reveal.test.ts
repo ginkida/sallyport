@@ -49,10 +49,11 @@ function axNodes(withTarget: boolean) {
 
 /** Install a CDP channel that answers exactly what reveal issues. `foundAtStep`
  * is the pass on which the target finally appears. */
-function installChrome(opts: { foundAtStep: number }): Cmd[] {
+function installChrome(opts: { foundAtStep: number; urls?: string[] }): Cmd[] {
   const sent: Cmd[] = [];
   let axCalls = 0;
   let scrollTop = 0;
+  let tabGets = 0;
   const store = new Map<string, unknown>();
   (globalThis as unknown as { chrome: unknown }).chrome = {
     storage: {
@@ -78,7 +79,11 @@ function installChrome(opts: { foundAtStep: number }): Cmd[] {
     },
     tabs: {
       async get() {
-        return { id: TAB, url: 'https://chat.example.com/', title: 'chat' };
+        // `urls` lets a test move the page under the loop: each call answers the
+        // next entry, the last one repeating.
+        const urls = opts.urls ?? ['https://chat.example.com/'];
+        const url = urls[Math.min(tabGets++, urls.length - 1)];
+        return { id: TAB, url, title: 'chat' };
       },
       onRemoved: { addListener() {} },
     },
@@ -177,5 +182,43 @@ describe('reveal with an @eN container', () => {
     for (const m of out.data.matches) {
       expect(Number(m.ref.replace('@e', ''))).toBeGreaterThan(before);
     }
+  });
+});
+
+describe('reveal — the page must stay allowlisted for the WHOLE scroll (invariant #3)', () => {
+  it('stops when the page navigates off the allowlist mid-loop', async () => {
+    // reveal scrolls and re-snapshots up to forty times, returning roles and
+    // names out of each pass. Gating only at entry meant one check licensed
+    // every later read — including of a page the tab drifted onto seconds
+    // later (an SSO bounce, a consent wall, the site's own redirect).
+    const chat = 'https://chat.example.com/';
+    const sent = installChrome({
+      // Never found, so only the drift can end the loop; the tab moves on the
+      // THIRD pass, proving the check runs every pass and not just at entry.
+      foundAtStep: 99,
+      urls: [chat, chat, chat, chat, 'https://elsewhere.example/inbox'],
+    });
+    await allowChat();
+    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages');
+
+    await expect(
+      reveal({ container, role: 'button', name: 'Older', tabId: TAB }, undefined),
+    ).rejects.toMatchObject({ code: 'domain_not_allowed' });
+    // It really was mid-loop: passes had already run and scrolled the list.
+    expect(sent.filter((c) => c.method === 'Runtime.callFunctionOn').length).toBeGreaterThan(0);
+  });
+
+  it('keeps going while the page stays put, and reports the url it read', async () => {
+    installChrome({ foundAtStep: 2 });
+    await allowChat();
+    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages');
+
+    const res = await reveal({ container, role: 'button', name: 'Older', tabId: TAB }, undefined);
+    const data = res.data as { found: boolean; steps: number };
+    expect(data.found).toBe(true);
+    expect(data.steps).toBe(2);
+    // The url is re-read each pass now, so it describes the page the result
+    // came off rather than the one the call started on.
+    expect(res.url).toBe('https://chat.example.com/');
   });
 });

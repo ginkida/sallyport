@@ -282,3 +282,120 @@ describe('BridgeError detail (by construction)', () => {
     expect(new BridgeError('not_found', 'x', { available: [] }).detail).toEqual({ available: [] });
   });
 });
+
+describe('SELECT_APPLY_PROBE — the result must describe the ELEMENT, not the plan', () => {
+  type Opt = {
+    value: string;
+    label?: string;
+    text?: string;
+    selected: boolean;
+    disabled?: boolean;
+  };
+
+  /** A `<select>` faithful enough for the probe: options that record their own
+   * `selected` flag, a prototype value setter, and event dispatch a test can
+   * hook to simulate a page that fights back. */
+  function fakeSelect(
+    opts: Array<Partial<Opt> & { value: string }>,
+    over: Record<string, unknown> = {},
+  ) {
+    const options = opts.map((o) => ({
+      label: o.value,
+      text: o.value,
+      selected: false,
+      disabled: false,
+      ...o,
+    }));
+    const el: Record<string, unknown> = {
+      tagName: 'SELECT',
+      disabled: false,
+      multiple: false,
+      isConnected: true,
+      options,
+      get value() {
+        const sel = options.find((o) => o.selected);
+        return sel ? sel.value : '';
+      },
+      dispatchEvent: () => true,
+      ...over,
+    };
+    return { el, options };
+  }
+
+  /** Run the probe against a fake element, with the globals it reaches for. */
+  function runProbe(el: unknown, spec: unknown): Record<string, unknown> {
+    const setValue = function (this: { options: Opt[] }, v: string) {
+      for (const o of this.options) o.selected = o.value === v;
+    };
+    const win = {
+      HTMLSelectElement: { prototype: {} },
+    } as unknown as { HTMLSelectElement: { prototype: Record<string, unknown> } };
+    Object.defineProperty(win.HTMLSelectElement.prototype, 'value', {
+      set: setValue,
+      configurable: true,
+    });
+    const fn = new Function('window', 'Event', `return (${SELECT_APPLY_PROBE});`)(
+      win,
+      class {
+        constructor(readonly type: string) {}
+      },
+    ) as (this: unknown, spec: unknown) => Record<string, unknown>;
+    return fn.call(el, spec);
+  }
+
+  it('reports applied:yes and the element own selection on a normal change', () => {
+    const { el } = fakeSelect([{ value: 'UA' }, { value: 'PL' }]);
+    const out = runProbe(el, { by: 'value', values: ['PL'] });
+    expect(out).toMatchObject({
+      ok: true,
+      applied: 'yes',
+      selected: [{ index: 1, value: 'PL' }],
+    });
+  });
+
+  it('catches a page that resets the value in its own change handler', () => {
+    // The failure this exists for: the old result echoed the PLAN, so a select
+    // that snapped back still answered ok:true with the option you asked for
+    // while the page showed the old one.
+    const { el, options } = fakeSelect([{ value: 'UA' }, { value: 'PL' }]);
+    (el as { dispatchEvent: () => boolean }).dispatchEvent = () => {
+      for (const o of options) o.selected = o.value === 'UA'; // the page says no
+      return true;
+    };
+    const out = runProbe(el, { by: 'value', values: ['PL'] });
+    expect(out.applied).toBe('no');
+    // ...and it says what is actually selected now, which is the useful fact.
+    expect(out.selected).toEqual([{ index: 0, value: 'UA', label: 'UA' }]);
+  });
+
+  it('claims nothing when the node was detached by the change handler', () => {
+    const { el } = fakeSelect([{ value: 'UA' }, { value: 'PL' }]);
+    (el as { dispatchEvent: () => boolean }).dispatchEvent = () => {
+      (el as { isConnected: boolean }).isConnected = false; // re-rendered away
+      return true;
+    };
+    const out = runProbe(el, { by: 'value', values: ['PL'] });
+    // 'unclear' means UNVERIFIED, not failed: the write may well have landed on
+    // a node the page has since replaced. The plan is echoed, nothing claimed.
+    expect(out.applied).toBe('unclear');
+    expect(out.selected).toEqual([{ index: 1, value: 'PL', label: 'PL' }]);
+  });
+
+  it('reads a multi-select back as a set, not as the plan', () => {
+    const { el, options } = fakeSelect([{ value: 'A' }, { value: 'B' }, { value: 'C' }], {
+      multiple: true,
+    });
+    (el as { dispatchEvent: () => boolean }).dispatchEvent = () => {
+      options[2].selected = true; // the page adds one of its own
+      return true;
+    };
+    const out = runProbe(el, { by: 'value', values: ['A', 'B'] });
+    expect(out.applied).toBe('no');
+    expect((out.selected as Array<{ value: string }>).map((o) => o.value)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('still refuses a non-select before touching anything', () => {
+    const out = runProbe({ tagName: 'DIV' }, { by: 'value', values: ['x'] });
+    expect(out).toMatchObject({ ok: false, code: 'wrong_element' });
+  });
+});

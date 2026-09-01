@@ -192,18 +192,62 @@ describe('collectDomTree — snapshot DOM fallback', () => {
     expect(tree).toEqual([{ role: 'text', name: 'visible' }]);
   });
 
-  it('skips script/style/template/svg/iframe subtrees', () => {
+  it('skips script/style/template/svg subtrees', () => {
     const d = doc(
       el('BODY', {}, [
         el('SCRIPT', {}, [text('var x = 1;')]),
         el('STYLE', {}, [text('.a{}')]),
         el('TEMPLATE', {}, [text('tpl')]),
         el('SVG', {}, [text('icon path')]),
-        el('IFRAME', {}, [text('inner doc')]),
         text('real'),
       ]),
     );
     expect(collectDomTree(d).tree).toEqual([{ role: 'text', name: 'real' }]);
+  });
+
+  describe('iframes are named, not swallowed', () => {
+    it('emits a leaf carrying the src the parent document already exposes', () => {
+      // Skipping them outright made the page's most important region vanish:
+      // on a checkout or an SSO step the agent got an empty shell and nothing
+      // saying the content lives in a frame it cannot reach.
+      const d = doc(
+        el('BODY', {}, [
+          el('IFRAME', { src: 'https://pay.example/checkout?x=1' }, [text('inner doc')]),
+          text('real'),
+        ]),
+      );
+      expect(collectDomTree(d).tree).toEqual([
+        { role: 'iframe', name: 'https://pay.example/checkout?x=1' },
+        { role: 'text', name: 'real' },
+      ]);
+    });
+
+    it('prefers a human label, keeping the src beside it', () => {
+      const d = doc(
+        el('BODY', {}, [el('IFRAME', { title: 'Card details', src: 'https://pay.example/f' })]),
+      );
+      expect(collectDomTree(d).tree).toEqual([
+        { role: 'iframe', name: 'Card details — https://pay.example/f' },
+      ]);
+    });
+
+    it('never descends into the frame, and hands out no ref for it', () => {
+      // The document behind it is a separate one (a separate process, cross
+      // origin): nothing here can read or act on it, so a ref would be a lie.
+      const d = doc(el('BODY', {}, [el('IFRAME', {}, [el('BUTTON', {}, [text('Pay')])])]));
+      const { tree, els } = collectDomTree(d);
+      expect(tree).toEqual([{ role: 'iframe' }]);
+      expect(els).toEqual([]);
+    });
+
+    it('respects hidden-ness like any other element', () => {
+      const d = doc(
+        el('BODY', {}, [
+          el('IFRAME', { src: 'https://ads.example/' }, [], { style: { display: 'none' } }),
+        ]),
+      );
+      expect(collectDomTree(d).tree).toEqual([]);
+    });
   });
 
   it('descends OPEN shadow roots in place of the light DOM', () => {

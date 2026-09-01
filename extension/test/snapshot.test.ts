@@ -39,7 +39,7 @@ function fixtureTree(n: number) {
 }
 
 /** A channel that answers describes in REVERSE completion order. */
-function installChrome(nodeCount: number): { describeOrder: number[] } {
+function installChrome(nodeCount: number, frameTree?: unknown): { describeOrder: number[] } {
   const describeOrder: number[] = [];
   const store = new Map<string, unknown>();
   const tree = fixtureTree(nodeCount);
@@ -87,6 +87,10 @@ function installChrome(nodeCount: number): { describeOrder: number[] } {
               value: { objectId: `el${i}` },
             })),
           };
+        }
+        if (method === 'Page.getFrameTree') {
+          if (!frameTree) throw new Error('Page.getFrameTree is not available');
+          return frameTree;
         }
         if (method === 'DOM.describeNode') {
           const i = Number(String(params?.objectId).replace('el', ''));
@@ -170,5 +174,45 @@ describe('DOM-path ref minting', () => {
     // keep contiguous ids in document order.
     expect(out.data.elements.map((e) => e.name)).toEqual(['btn0', 'btn1', 'btn3', 'btn4', 'btn5']);
     expect(out.data.elements.map((e) => e.ref)).toEqual(['@e1', '@e2', '@e3', '@e4', '@e5']);
+  });
+});
+
+describe('frames — what the snapshot cannot see', () => {
+  it('reports child-frame ORIGINS, never their full urls', async () => {
+    // A frame's current location routinely carries a token or an account id (an
+    // OAuth step lands on one), and the parent document — which the caller may
+    // read in full — can only see the `src` it set, not where the frame went.
+    // The origin names the gap without shipping any of that.
+    installChrome(4, {
+      frameTree: {
+        frame: { url: 'https://app.example.com/' },
+        childFrames: [
+          { frame: { url: 'https://pay.example/checkout?session=secret-token' } },
+          { frame: { url: 'about:blank' } },
+        ],
+      },
+    });
+    resetAttachedTabs();
+    clearRefsForTab(TAB);
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+
+    const out = (await snapshot({ mode: 'dom', compact: true, tabId: TAB }, undefined)) as {
+      data: { frames?: string[] };
+    };
+    expect(out.data.frames).toEqual(['https://pay.example']);
+  });
+
+  it('says nothing when the browser will not answer, rather than failing', async () => {
+    // Best-effort: the tree's own iframe nodes still mark the gap.
+    installChrome(4); // Page.getFrameTree throws in this mock
+    resetAttachedTabs();
+    clearRefsForTab(TAB);
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+
+    const out = (await snapshot({ mode: 'dom', compact: true, tabId: TAB }, undefined)) as {
+      data: { frames?: string[]; elements: unknown[] };
+    };
+    expect(out.data.frames).toBeUndefined();
+    expect(out.data.elements).toHaveLength(4); // the snapshot itself is unaffected
   });
 });

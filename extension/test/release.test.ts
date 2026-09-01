@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { mayClose, parseReleaseEntries, releaseAction, releaseTabs } from '../src/tools/release.js';
-import { clearAllEpochs, getEpoch, mintEpoch } from '../src/tools/ownership.js';
+import { agentTabInfo, clearAllEpochs, getEpoch, mintEpoch } from '../src/tools/ownership.js';
 import { resetAttachedTabs } from '../src/tools/cdp.js';
 import { setSettings } from '../src/storage.js';
 
@@ -131,6 +131,31 @@ describe('releaseTabs — the destructive path', () => {
     // "Agent tabs" list, which is the documented way to sweep up orphans.
     expect(getEpoch(11)).toBe(e1);
     expect(getEpoch(12)).toBe(e2);
+    // ...and both are now ORPHANS: their session is gone, so no client can name
+    // them again, which is what makes them the reaper's first candidates.
+    expect(agentTabInfo().map((t) => [t.tabId, t.orphaned])).toEqual([
+      [11, true],
+      [12, true],
+    ]);
+  });
+
+  it('releases a big session in bounded parallel batches, not one at a time', async () => {
+    // Serially, every tab costs its own detach round-trip (bounded by the
+    // renderer, up to 2 s each in cdp.ts) — so the session that opened the most
+    // tabs was exactly the one whose release outran the daemon's 60 s request
+    // timeout and got dropped, leaving every one of its tabs attached.
+    const calls = installChromeMock();
+    const entries = [];
+    for (let tabId = 1; tabId <= 20; tabId++) {
+      entries.push({ tabId, epoch: mintEpoch(tabId) });
+    }
+    await setSettings({ closeAgentTabsOnDisconnect: false });
+
+    const res = await releaseTabs({ tabs: entries });
+
+    expect(res.data).toEqual({ released: 20, closed: 0 });
+    expect(calls.detached.length).toBe(20);
+    expect(new Set(calls.detached)).toEqual(new Set(entries.map((e) => e.tabId)));
   });
 
   it('closes the tabs when the human opted in, and forgets them', async () => {

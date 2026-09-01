@@ -21,6 +21,8 @@ import { createHmac } from 'node:crypto';
 import {
   ALARM_KEEPALIVE,
   BridgeConnection,
+  exceedsFrameLimit,
+  MAX_RESULT_FRAME_BYTES,
   RECONNECT_MAX_MS,
   type Deps,
   type StatusSnapshot,
@@ -267,6 +269,37 @@ describe('BridgeConnection — connection lifecycle', () => {
     expect(out.type).toBe('tool_result');
     expect(out.id).toBe('r1');
     expect(out.body).toEqual({ ok: true, data: { tabs: [] } });
+  });
+
+  it('refuses to SEND an oversize result, answering result_too_large instead', async () => {
+    // The failure this prevents is not "one call returns nothing". An oversize
+    // frame is refused by the daemon with a 1009 close, which drops the single
+    // shared extension client — so one enormous snapshot would take every
+    // concurrent session's in-flight work down with it (invariant #8).
+    const huge = 'x'.repeat(MAX_RESULT_FRAME_BYTES + 1);
+    const runTool = vi.fn().mockResolvedValue({ ok: true, data: { text: huge } });
+    const { deps } = makeDeps({ runTool });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.simulateOpen();
+    await until(() => ws.sent.length === 1);
+    ws.sent = [];
+
+    ws.simulateMessage(
+      JSON.stringify(signEnvelope('tool_call', { name: 'read_text', args: {} }, { id: 'r9' })),
+    );
+    await until(() => ws.sent.length === 1);
+
+    const out = JSON.parse(ws.sent[0]);
+    expect(out.type).toBe('tool_result');
+    expect(out.id).toBe('r9'); // the daemon is answered, not left to time out
+    expect(out.body.ok).toBe(false);
+    expect(out.body.code).toBe('result_too_large');
+    // The recovery advice has to name the knobs, or the agent just retries.
+    expect(out.body.error).toContain('compact');
+    // ...and the payload itself never reached the socket.
+    expect(ws.sent[0].length).toBeLessThan(4096);
   });
 
   it('a rejecting runTool surfaces as lastError, not an unhandled rejection', async () => {
@@ -1001,5 +1034,35 @@ describe('broker-mode signal (hello_ack body)', () => {
 
     releaseSlow?.();
     await until(() => ws.sent.some((raw) => JSON.parse(raw).id === 'r1'));
+  });
+});
+
+describe('exceedsFrameLimit', () => {
+  it('takes the cheap way out when the string cannot possibly be over', () => {
+    // UTF-8 spends at most 3 bytes per UTF-16 code unit, so this is provably
+    // under without encoding 15 MB to find out.
+    expect(exceedsFrameLimit('x'.repeat(1000), 3000)).toBe(false);
+  });
+
+  it('is exact once the cheap bound is inconclusive', () => {
+    // 4 ASCII bytes vs a limit of 3: the cheap bound (12 > 3) cannot decide, so
+    // it must actually measure.
+    expect(exceedsFrameLimit('abcd', 3)).toBe(true);
+    expect(exceedsFrameLimit('abc', 3)).toBe(false);
+  });
+
+  it('counts BYTES, not characters', () => {
+    // Three code units, seven UTF-8 bytes: a limit of 6 must refuse it even
+    // though a naive length check would pass.
+    const s = 'é€';
+    expect(new TextEncoder().encode(s).length).toBe(5);
+    expect(exceedsFrameLimit(s, 4)).toBe(true);
+    expect(exceedsFrameLimit(s, 5)).toBe(false);
+  });
+
+  it('an emoji-heavy string is measured, not estimated', () => {
+    const s = '🙂'.repeat(10); // 20 code units, 40 bytes
+    expect(exceedsFrameLimit(s, 39)).toBe(true);
+    expect(exceedsFrameLimit(s, 40)).toBe(false);
   });
 });

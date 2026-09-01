@@ -10,6 +10,7 @@
 
 import { cdp, looksLikeMissingNodeError, looksLikeSelectorSyntaxError } from './cdp.js';
 import { BridgeError, staleRefError } from './errors.js';
+import { ensureStillAllowed } from './gates.js';
 import { getRef, isRef } from './refs.js';
 import { READ_TEXT_FN } from './text.js';
 
@@ -30,12 +31,16 @@ export type WaitSpec = {
 };
 
 // Why a wait ended unsatisfied — present only on the not-found path, so the
-// agent can branch instead of collapsing three very different situations into
+// agent can branch instead of collapsing very different situations into
 // one identical {found:false}: 'timeout' (the condition was simply not true
 // yet — retrying longer may help), 'bad_ref' (a stale @eN after a re-render —
 // re-snapshot), 'invalid_selector' (a malformed CSS selector the agent itself
-// typed — a PERMANENT error, retrying never helps), 'error' (anything else).
-export type WaitReason = 'invalid_selector' | 'bad_ref' | 'timeout' | 'error';
+// typed — a PERMANENT error, retrying never helps), 'domain_not_allowed' (the
+// page navigated off the allowlist WHILE waiting — the wait stopped rather than
+// keep reading it, and the answer is about where the tab went, not about the
+// condition), 'error' (anything else).
+export type WaitReason =
+  'invalid_selector' | 'bad_ref' | 'timeout' | 'domain_not_allowed' | 'error';
 
 export type WaitOutcome = {
   found: boolean;
@@ -57,6 +62,10 @@ export type WaitOutcome = {
  * everything unrecognised stays the generic 'error'. */
 export function classifyWaitError(e: unknown): Exclude<WaitReason, 'timeout'> {
   if (e instanceof BridgeError && e.code === 'bad_ref') return 'bad_ref';
+  // The page left the allowlist mid-wait. Folded like any other wait failure
+  // (the action it followed still happened), but named — "the tab is somewhere
+  // it should not be" is a different instruction to the agent than "not yet".
+  if (e instanceof BridgeError && e.code === 'domain_not_allowed') return 'domain_not_allowed';
   if (looksLikeSelectorSyntaxError(e)) return 'invalid_selector';
   return 'error';
 }
@@ -191,6 +200,12 @@ export async function pollFor(tabId: number, spec: WaitSpec): Promise<WaitOutcom
   }
   const start = Date.now();
   for (;;) {
+    // Re-gate BEFORE every probe. A wait runs for up to 30 s and the page is
+    // free to navigate under it — most ordinarily because the click that
+    // preceded this wait followed a link off-site. One entry check must not
+    // license half a minute of reading whatever the tab drifted onto
+    // (invariant #3); `find` already worked this way.
+    await ensureStillAllowed(tabId);
     let ok: boolean;
     if (spec.absent) {
       // Gone-condition: selector invisible/detached AND text not on page.
@@ -314,6 +329,9 @@ export async function settleFor(tabId: number, spec: SettleSpec): Promise<Settle
   const start = Date.now();
   let state = INITIAL_SETTLE_STATE;
   for (;;) {
+    // Same re-gate as pollFor: settle reads the live DOM (element count, body
+    // size) once per tick for up to 30 s, so it must keep asking whether it may.
+    await ensureStillAllowed(tabId);
     const out = await cdp<{ result: { value?: Signal } }>(tabId, 'Runtime.evaluate', {
       expression: QUIESCENCE_PROBE,
       returnByValue: true,

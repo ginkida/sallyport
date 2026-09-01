@@ -78,8 +78,14 @@ export function collectDomTree(doc: DomDocumentLike, root?: DomNodeLike | null):
     META: 1,
     LINK: 1,
     SVG: 1, // icon noise; the host element's aria-label/title carries the name
-    IFRAME: 1, // separate document — unreachable from this probe
   };
+  // IFRAME is deliberately NOT in SKIP. Its document is unreachable from this
+  // probe (a separate document, and for a cross-origin one a separate process),
+  // but skipping it outright made the page's most important region VANISH: on a
+  // checkout, an SSO step or an embedded dashboard the agent got a snapshot of
+  // an empty shell with nothing saying the content lives in a frame. It is
+  // emitted as a NAMED LEAF instead — no ref, because nothing here can act on
+  // it, and the name carries the `src` the parent document already exposes.
   // Mirrors INTERACTIVE_ROLES in snapshot.ts so a11y and DOM snapshots
   // hand out refs for the same kinds of elements.
   const ARIA_ROLES: Record<string, number> = {
@@ -212,7 +218,26 @@ export function collectDomTree(doc: DomDocumentLike, root?: DomNodeLike | null):
   function walkElement(el: DomNodeLike): DomTreeNode[] {
     if (truncated) return [];
     if (el.nodeType !== 1) return [];
-    if (SKIP[(el.tagName || '').toUpperCase()] || hidden(el)) return [];
+    const tag = (el.tagName || '').toUpperCase();
+    if (SKIP[tag] || hidden(el)) return [];
+
+    if (tag === 'IFRAME' || tag === 'FRAME') {
+      if (nodeCount >= MAX_NODES) {
+        truncated = true;
+        return [];
+      }
+      nodeCount++;
+      // `src` is what the PARENT document set and can read back, cross-origin
+      // or not — no more than the page itself exposes. The frame's CURRENT url
+      // (which it may have navigated to on its own) is deliberately not read
+      // here; `snapshot` reports those as bare origins for the same reason.
+      const src = attr(el, 'src');
+      const label = attr(el, 'title') || attr(el, 'name') || '';
+      const name = label && src ? label + ' — ' + src : label || src;
+      const node: DomTreeNode = { role: 'iframe' };
+      if (name) node.name = cap(name);
+      return [node];
+    }
 
     const role = roleFor(el);
     // Inside an interactive element the subtree text IS the name —
@@ -233,7 +258,7 @@ export function collectDomTree(doc: DomDocumentLike, root?: DomNodeLike | null):
     if (name) out.name = name;
     // Surface the real input type (esp. password) so a textbox-looking field
     // that is actually <input type=password> is visible to the agent.
-    if ((el.tagName || '').toUpperCase() === 'INPUT') {
+    if (tag === 'INPUT') {
       const t = (attr(el, 'type') || 'text').toLowerCase();
       if (t) out.type = t;
     }

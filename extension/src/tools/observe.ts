@@ -38,7 +38,14 @@
  * the one per-tab call chain (#8).
  */
 
-import { collectInteractive, type TreeNode, type CompactElement } from './axtree.js';
+import {
+  capElements,
+  capTree,
+  collectInteractive,
+  SNAPSHOT_MAX_ELEMENTS,
+  type TreeNode,
+  type CompactElement,
+} from './axtree.js';
 import { cdp } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
@@ -173,11 +180,23 @@ export async function runObserve(tabId: number, spec: ObserveSpec): Promise<Obse
     if (spec.snapshot) {
       const { tree, source, truncated } = await buildSnapshotTree(tabId, 'auto');
       out.source = source;
-      if (spec.snapshot === 'compact') out.elements = collectInteractive(tree);
-      else out.tree = tree;
+      // Under the same emission caps as `snapshot` itself (axtree.ts). This
+      // path needs them at least as much: it rides along on an action's result,
+      // so an unbounded tree here does not merely bloat one read — it can push
+      // an ordinary click's answer past the frame cap.
+      let capTruncated = false;
+      if (spec.snapshot === 'compact') {
+        const shaped = capElements(collectInteractive(tree), SNAPSHOT_MAX_ELEMENTS);
+        out.elements = shaped.elements;
+        capTruncated = shaped.truncated;
+      } else {
+        const shaped = capTree(tree);
+        out.tree = shaped.tree;
+        capTruncated = shaped.truncated;
+      }
       // A walker that hit its caps returns a PARTIAL tree. Dropping that flag
       // would present the cut list as the whole page.
-      if (truncated) out.snapshotTruncated = true;
+      if (truncated || capTruncated) out.snapshotTruncated = true;
     }
     if (spec.text) {
       const capped = await pageText(tabId, spec.maxChars);

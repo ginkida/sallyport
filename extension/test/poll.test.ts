@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 
 import {
   advanceSettle,
@@ -13,8 +13,12 @@ import {
   SCROLL_INTO_VIEW_PROBE,
   SCROLL_STEP_PROBE,
   scrollStalled,
+  pollFor,
+  settleFor,
 } from '../src/tools/poll.js';
 import { BridgeError } from '../src/tools/errors.js';
+import { setAllowlist } from '../src/storage.js';
+import { resetAttachedTabs } from '../src/tools/cdp.js';
 
 describe('parseTimeoutMs', () => {
   it('defaults when undefined', () => {
@@ -283,7 +287,17 @@ describe('classifyWaitError (embedded waitFor)', () => {
   });
 
   it('does not treat other BridgeError codes as bad_ref', () => {
-    expect(classifyWaitError(new BridgeError('domain_not_allowed', 'nope'))).toBe('error');
+    expect(classifyWaitError(new BridgeError('not_found', 'nope'))).toBe('error');
+  });
+
+  it('names a mid-wait drift off the allowlist rather than folding it into error', () => {
+    // The wait polls for up to 30 s and re-gates every tick, so the page can
+    // leave the allowlist under it — most ordinarily because the click this
+    // wait follows went off-site. "The tab is somewhere it should not be" is a
+    // different instruction to the agent than "not true yet".
+    expect(classifyWaitError(new BridgeError('domain_not_allowed', 'nope'))).toBe(
+      'domain_not_allowed',
+    );
   });
 
   it('maps a malformed-CSS query rejection to invalid_selector', () => {
@@ -322,5 +336,128 @@ describe('scrollStalled (reveal)', () => {
 
   it('is not stalled on the first step (no prevAfter yet)', () => {
     expect(scrollStalled({ before: 0, after: 180 }, null)).toBe(false);
+  });
+});
+
+// -------------------------------------------------------------------------
+// The waits re-gate the page they keep reading (invariant #3)
+// -------------------------------------------------------------------------
+
+const TAB = 42;
+
+/** A chrome just big enough for pollFor/settleFor: the allowlist store, a
+ * `tabs.get` whose answer a test can move over successive calls, and a CDP
+ * channel whose selector answer never changes — so the wait can only end on the
+ * timeout or on the gate, never on the condition coming true. `present` picks
+ * which of the two conditions stays unsatisfiable: `false` starves a
+ * wait-for-it-to-appear, `true` starves a wait-for-it-to-vanish. */
+function installChrome(urls: string[], present = false): { tabGets: () => number } {
+  const store = new Map<string, unknown>();
+  let tabGets = 0;
+  (globalThis as unknown as { chrome: unknown }).chrome = {
+    storage: {
+      local: {
+        async get(keys: string | string[]) {
+          const out: Record<string, unknown> = {};
+          for (const k of Array.isArray(keys) ? keys : [keys]) {
+            if (store.has(k)) out[k] = store.get(k);
+          }
+          return out;
+        },
+        async set(obj: Record<string, unknown>) {
+          for (const [k, v] of Object.entries(obj)) store.set(k, v);
+        },
+        async remove() {},
+      },
+      session: {
+        async get() {
+          return {};
+        },
+        async set() {},
+      },
+    },
+    tabs: {
+      async get() {
+        const url = urls[Math.min(tabGets++, urls.length - 1)];
+        return { id: TAB, url, title: 'shop' };
+      },
+      onRemoved: { addListener() {} },
+    },
+    debugger: {
+      async attach() {},
+      async sendCommand(_t: unknown, method: string) {
+        if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
+        if (method === 'DOM.querySelector') return { nodeId: present ? 5 : 0 };
+        if (method === 'DOM.getBoxModel') return { model: { width: 10, height: 10 } };
+        if (method === 'Runtime.evaluate') return { result: { value: { n: 1, len: 1 } } };
+        return {};
+      },
+      onEvent: { addListener() {} },
+      onDetach: { addListener() {} },
+    },
+  };
+  return { tabGets: () => tabGets };
+}
+
+describe('pollFor / settleFor re-gate every tick', () => {
+  const SHOP = 'https://shop.example/cart';
+
+  beforeEach(async () => {
+    installChrome([SHOP]);
+    resetAttachedTabs();
+    await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+  });
+
+  it('stops a wait the moment the page leaves the allowlist', async () => {
+    // The ordinary way this happens: the click this wait follows went off-site,
+    // or the page bounced to an SSO host. Waiting on for 30 s meant probing a
+    // page nobody approved on the strength of a check made before the click.
+    installChrome([SHOP, SHOP, 'https://tracker.example/pixel']);
+    await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+
+    await expect(
+      pollFor(TAB, { selector: '#done', text: null, timeoutMs: 5000, absent: false }),
+    ).rejects.toMatchObject({ code: 'domain_not_allowed' });
+  });
+
+  it('still times out normally while the page stays put', async () => {
+    const out = await pollFor(TAB, {
+      selector: '#done',
+      text: null,
+      timeoutMs: 400,
+      absent: false,
+    });
+    expect(out).toMatchObject({ found: false, reason: 'timeout' });
+  });
+
+  it('applies to the absent-condition too — a drift is not proof of absence', async () => {
+    // Waiting for something to VANISH must not be satisfied by the page having
+    // navigated somewhere we may not read.
+    // The spinner stays visible, so only the drift can end this wait.
+    installChrome([SHOP, SHOP, 'https://tracker.example/pixel'], true);
+    await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+
+    await expect(
+      pollFor(TAB, { selector: '#spinner', text: null, timeoutMs: 5000, absent: true }),
+    ).rejects.toMatchObject({ code: 'domain_not_allowed' });
+  });
+
+  it('settle stops on a drift as well', async () => {
+    installChrome([SHOP, SHOP, 'https://tracker.example/pixel']);
+    await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+
+    await expect(settleFor(TAB, { stableMs: 5000, timeoutMs: 5000 })).rejects.toMatchObject({
+      code: 'domain_not_allowed',
+    });
+  });
+
+  it('a vanished tab is named, not left to a CDP error', async () => {
+    (globalThis as unknown as { chrome: { tabs: { get: () => Promise<never> } } }).chrome.tabs.get =
+      async () => {
+        throw new Error('No tab with id: 42');
+      };
+    await expect(
+      pollFor(TAB, { selector: '#done', text: null, timeoutMs: 5000, absent: false }),
+    ).rejects.toMatchObject({ code: 'tab_gone' });
   });
 });

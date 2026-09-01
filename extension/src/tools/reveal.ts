@@ -2,7 +2,7 @@ import { collectInteractive } from './axtree.js';
 import { attach, cdp } from './cdp.js';
 import { resolveBackendNode, resolveSelectorOrRef } from './resolve.js';
 import { BridgeError } from './errors.js';
-import { ensureAllowed } from './gates.js';
+import { ensureAllowed, ensureStillAllowed } from './gates.js';
 import { matchElements, parsePredicate } from './match.js';
 import { getRef, isRef, refWatermark } from './refs.js';
 import {
@@ -70,18 +70,28 @@ export const reveal: Tool = async (args) => {
 
   const start = Date.now();
   let prevAfter: number | null = null;
+  // The url actually read, refreshed each pass. reveal scrolls and re-snapshots
+  // up to 40 times, so reporting the url the call STARTED on described a page
+  // it may have left several seconds earlier — and wrote that stale url into the
+  // audit row (`find` already reports what it read).
+  let readUrl = tab.url;
   for (let step = 0; step <= maxSteps; step++) {
+    // Re-gate every pass. This loop READS the page — it returns roles and names
+    // out of each snapshot — so a page that navigates mid-reveal would be read
+    // and reported under an entry check made up to 30 s and forty scrolls ago
+    // (invariant #3).
+    readUrl = await ensureStillAllowed(tab.id!);
     // Snapshot + match first, so step 0 catches an already-visible target and
     // the refs returned are from the final (matching) snapshot.
     const { tree, source } = await buildSnapshotTree(tab.id!, mode, mark);
     const matches = matchElements(collectInteractive(tree), pred);
     if (matches.length) {
-      return { tabId: tab.id, url: tab.url, data: { found: true, matches, steps: step, source } };
+      return { tabId: tab.id, url: readUrl, data: { found: true, matches, steps: step, source } };
     }
     if (step === maxSteps) {
       return {
         tabId: tab.id,
-        url: tab.url,
+        url: readUrl,
         data: { found: false, reason: 'max_steps', steps: step },
       };
     }
@@ -90,7 +100,7 @@ export const reveal: Tool = async (args) => {
     if (Date.now() - start + STEP_SETTLE_TIMEOUT_MS > timeoutMs) {
       return {
         tabId: tab.id,
-        url: tab.url,
+        url: readUrl,
         data: { found: false, reason: 'timeout', steps: step },
       };
     }
@@ -116,7 +126,7 @@ export const reveal: Tool = async (args) => {
     const sc = scrollRes.result.value ?? { before: 0, after: 0 };
     if (scrollStalled(sc, prevAfter)) {
       // scrollTop didn't move (or bounced back) — we've hit the end.
-      return { tabId: tab.id, url: tab.url, data: { found: false, reason: 'stall', steps: step } };
+      return { tabId: tab.id, url: readUrl, data: { found: false, reason: 'stall', steps: step } };
     }
     prevAfter = sc.after;
     await settleFor(tab.id!, { stableMs: STEP_STABLE_MS, timeoutMs: STEP_SETTLE_TIMEOUT_MS });
@@ -124,7 +134,7 @@ export const reveal: Tool = async (args) => {
   // The loop always returns; this satisfies the type checker.
   return {
     tabId: tab.id,
-    url: tab.url,
+    url: readUrl,
     data: { found: false, reason: 'max_steps', steps: maxSteps },
   };
 };

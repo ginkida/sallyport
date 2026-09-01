@@ -109,3 +109,134 @@ describe('CLICK_POINT_BY_VALUE (the probe result projection)', () => {
     for (const k of CLICK_POINT_KEYS) expect(CLICK_POINT_BY_VALUE).toContain(`${k}: this.${k}`);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The off-viewport refusal (chrome-mocked)
+// ---------------------------------------------------------------------------
+
+const TAB = 7;
+
+type Cmd = { method: string; fn?: string };
+
+/** A CDP channel for the aim path. `point` is what the aim probe reports back
+ * — remembering that the probe has ALREADY scrolled the element into view
+ * before measuring (aim.ts:findClickPoint), which is exactly what makes the
+ * refusal below meaningful. */
+function installChrome(point: Record<string, unknown>): Cmd[] {
+  const sent: Cmd[] = [];
+  const store = new Map<string, unknown>();
+  (globalThis as unknown as { chrome: unknown }).chrome = {
+    storage: {
+      local: {
+        async get(keys: string | string[]) {
+          const out: Record<string, unknown> = {};
+          for (const k of Array.isArray(keys) ? keys : [keys])
+            if (store.has(k)) out[k] = store.get(k);
+          return out;
+        },
+        async set(obj: Record<string, unknown>) {
+          for (const [k, v] of Object.entries(obj)) store.set(k, v);
+        },
+        async remove() {},
+      },
+      session: {
+        async get() {
+          return {};
+        },
+        async set() {},
+      },
+    },
+    tabs: {
+      async get() {
+        return { id: TAB, url: 'https://shop.example/list', title: 'list' };
+      },
+      onRemoved: { addListener() {} },
+    },
+    debugger: {
+      async attach() {},
+      async sendCommand(_t: unknown, method: string, params?: Record<string, unknown>) {
+        const fn = String(params?.functionDeclaration ?? '');
+        sent.push({ method, fn: fn.slice(0, 60) });
+        if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
+        if (method === 'DOM.querySelector') return { nodeId: 2 };
+        if (method === 'DOM.resolveNode') return { object: { objectId: 'el' } };
+        if (method === 'Runtime.callFunctionOn') {
+          // The BY_VALUE projection is the only call that returns the measured
+          // point; the aim probe itself hands back a handle.
+          if (fn.includes('x: this.x')) return { result: { value: point } };
+          return { result: { objectId: 'point' } };
+        }
+        return {};
+      },
+      onEvent: { addListener() {} },
+      onDetach: { addListener() {} },
+    },
+  };
+  return sent;
+}
+
+const offCanvas = {
+  x: 200,
+  y: 1400,
+  vw: 1280,
+  vh: 800,
+  visible: true,
+  tag: 'button',
+  covered: false,
+};
+const inView = { x: 200, y: 400, vw: 1280, vh: 800, visible: true, tag: 'button', covered: false };
+
+async function load() {
+  const { mouseClick, hover } = await import('../src/tools/mouse.js');
+  const { setAllowlist } = await import('../src/storage.js');
+  const { resetAttachedTabs } = await import('../src/tools/cdp.js');
+  resetAttachedTabs();
+  await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+  return { mouseClick, hover };
+}
+
+describe('an element that is off-viewport AFTER the aim probe scrolled to it', () => {
+  it('refuses without dispatching, and does not tell the agent to scroll again', async () => {
+    // findClickPoint scrolls the element into view before measuring, so this
+    // refusal only fires where scrolling did NOT help — and the old message
+    // ("scroll it into view and retry") sent the agent round a loop that could
+    // not terminate.
+    const sent = installChrome(offCanvas);
+    const { mouseClick } = await load();
+
+    await expect(mouseClick({ tabId: TAB, selector: '#buy' }, undefined)).rejects.toMatchObject({
+      code: 'not_visible',
+    });
+    await expect(mouseClick({ tabId: TAB, selector: '#buy' }, undefined)).rejects.toThrow(
+      /Scrolling again will not change this/,
+    );
+    // No event is dispatched — the browser would have discarded it anyway.
+    expect(sent.some((c) => c.method === 'Input.dispatchMouseEvent')).toBe(false);
+  });
+
+  it('names what would actually help', async () => {
+    installChrome(offCanvas);
+    const { mouseClick } = await load();
+    await expect(mouseClick({ tabId: TAB, selector: '#buy' }, undefined)).rejects.toThrow(
+      /overflow:hidden|reveal/,
+    );
+  });
+
+  it('clicks normally when the aim lands inside the viewport', async () => {
+    const sent = installChrome(inView);
+    const { mouseClick } = await load();
+    const out = (await mouseClick({ tabId: TAB, selector: '#buy' }, undefined)) as {
+      data: { ok: boolean; y: number };
+    };
+    expect(out.data).toMatchObject({ ok: true, y: 400 });
+    expect(sent.some((c) => c.method === 'Input.dispatchMouseEvent')).toBe(true);
+  });
+
+  it('hover refuses on the same terms', async () => {
+    installChrome(offCanvas);
+    const { hover } = await load();
+    await expect(hover({ tabId: TAB, selector: '#menu' }, undefined)).rejects.toThrow(
+      /hover: button was scrolled into view and still measures/,
+    );
+  });
+});

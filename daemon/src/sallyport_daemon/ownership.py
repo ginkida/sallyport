@@ -208,6 +208,62 @@ def record_result(
     )
 
 
+def record_opened_tabs(
+    registry: OwnershipRegistry,
+    client_id: str | None,
+    result: Any,
+    *,
+    opened_at: float,
+) -> None:
+    """Record tabs the PAGE opened during a call — a ``target="_blank"`` link, a
+    ``window.open``, an OAuth popup — which the extension adopted for the tab
+    that spawned them (``ownership.ts:adoptOpenedTab``).
+
+    Not gated on ``CREATE_CAPABLE``: the trigger is the page reacting to an
+    interaction, and any tool that touches a page can be that interaction. A
+    fixed list of "tools that might open a tab" would be wrong the day it was
+    written.
+
+    That is safe because of where the ids come from, not because of which tool
+    reported them: the extension adopts a tab only when its OPENER is one of its
+    own agent tabs, and this call had already passed ``ensure_owns`` on that
+    opener before it ran. So the only ownership this can grant is of a tab
+    spawned by a tab the client already owned. A malformed or empty list records
+    nothing."""
+    if client_id is None or not isinstance(result, dict):
+        return
+    opened = result.get("openedTabs")
+    if not isinstance(opened, list):
+        return
+    for entry in opened:
+        if not isinstance(entry, dict):
+            continue
+        registry.record_create(
+            client_id,
+            entry.get("tabId"),
+            entry.get("epoch"),
+            opened_at=opened_at,
+        )
+
+
+def strip_opened_tab_epochs(result: Any) -> Any:
+    """Drop the ownership epochs from an ``openedTabs`` list before the agent
+    sees it — same reasoning as the ``epoch`` stripped off a ``navigate``
+    result: it is registry bookkeeping with no meaning to the caller. The tab
+    IDS stay, and they are the point: without them the agent knows a tab opened
+    but cannot name it."""
+    if not isinstance(result, dict):
+        return result
+    opened = result.get("openedTabs")
+    if not isinstance(opened, list):
+        return result
+    cleaned = [
+        {k: v for k, v in entry.items() if k != "epoch"} if isinstance(entry, dict) else entry
+        for entry in opened
+    ]
+    return {**result, "openedTabs": cleaned}
+
+
 def record_close(
     registry: OwnershipRegistry,
     client_id: str | None,
