@@ -54,3 +54,6 @@ GOKIN.local.md
 .gokin/task-output/
 .gokin/checkpoints/
 .gokin/learning.yaml
+
+# Internal (Russian) review write-ups, same category as ANALYSIS.md — not for redistribution.
+/docs/code-review-*.md

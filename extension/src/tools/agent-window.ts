@@ -192,17 +192,6 @@ export async function agentWindowIds(): Promise<Set<number>> {
   return new Set(windowBySession.values());
 }
 
-/** Which session a given agent window belongs to (''/undefined for the shared
- * unlabelled one). Used by the popup to group what it lists. */
-export async function sessionOfWindow(windowId: number | undefined): Promise<string | undefined> {
-  if (typeof windowId !== 'number') return undefined;
-  await loadWindows();
-  for (const [session, id] of windowBySession) {
-    if (id === windowId) return session || undefined;
-  }
-  return undefined;
-}
-
 /** Did WE create this window in the last `graceMs`?
  *
  * `chrome.windows.create({focused:false})` is a request, not a guarantee —

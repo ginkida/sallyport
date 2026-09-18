@@ -7,7 +7,8 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'html'],
-      // Coverage is gated only on the chrome-API-free units below. The
+      // Coverage is gated on the units below, including capture lifecycles
+      // exercised by the deterministic chrome harness. The remaining
       // chrome-bound tool implementations (tools/dom.ts, fetch.ts,
       // evaluate.ts, keyboard.ts, upload.ts, …), background.ts, and
       // popup.ts need a chrome mock to test, so they sit outside this gate.
@@ -28,8 +29,36 @@ export default defineConfig({
         'src/tools/gates.ts',
         'src/tools/errors.ts',
         'src/tools/ownership.ts',
+        'src/tools/console-capture.ts',
+        'src/tools/network-capture.ts',
+        'src/tools/capture-settings.ts',
+        'src/tools/network-body-cache.ts',
       ],
       thresholds: {
+        'src/tools/network-body-cache.ts': {
+          lines: 95,
+          statements: 95,
+          functions: 100,
+          branches: 90,
+        },
+        'src/tools/console-capture.ts': {
+          lines: 90,
+          branches: 80,
+          functions: 90,
+          statements: 90,
+        },
+        'src/tools/network-capture.ts': {
+          lines: 90,
+          branches: 75,
+          functions: 90,
+          statements: 90,
+        },
+        'src/tools/capture-settings.ts': {
+          lines: 100,
+          branches: 90,
+          functions: 100,
+          statements: 100,
+        },
         'src/protocol.ts': {
           lines: 95,
           branches: 95,

@@ -25,11 +25,19 @@ import {
   getEpoch,
   markHumanTab,
   setBrokerMode,
-  tabIsOrphaned,
 } from './tools/ownership.js';
 import { loadEpochs, persistEpochs, reconcileWithLiveTabs } from './tools/ownership-store.js';
-import { sessionOfWindow, wasJustCreated } from './tools/agent-window.js';
+import { wasJustCreated } from './tools/agent-window.js';
+import { closeAgentTabs, listAgentTabs } from './agent-tabs.js';
 import { releaseKeepAwakeEverywhere } from './tools/cdp.js';
+import { installCaptureSettingsListener } from './tools/capture-settings.js';
+
+// Capture opt-out must reach idle tabs, not just the next driven one — so the
+// settings listener is wired here, at worker load, alongside the other
+// chrome.* registrations. Named import on purpose: imports.test.ts only sees
+// `from '…'` edges, so a bare side-effect import would hide this from the
+// acyclicity gate.
+installCaptureSettingsListener();
 
 async function updateBadge(snapshot: StatusSnapshot): Promise<void> {
   const { paused } = await getSettings();
@@ -282,56 +290,8 @@ type PopupMessage =
   | { type: 'RECONNECT' }
   | { type: 'LIST_TOOLS' }
   | { type: 'AGENT_TABS' }
-  | { type: 'CLOSE_AGENT_TABS' }
+  | { type: 'CLOSE_AGENT_TABS'; scope?: 'all' | 'finished' }
   | { type: 'KEEP_AWAKE_OFF' };
-
-export type AgentTabRow = {
-  tabId: number;
-  title: string;
-  url: string;
-  session?: string;
-  /** Its session has ended — nothing will drive this tab again. The popup
-   * says so, because "which of these is still in use" is the only question a
-   * human sweeping this list actually has. */
-  orphaned: boolean;
-};
-
-/** The tabs agents currently own, for the popup's "Agent tabs" list.
- *
- * Read from the extension's own epoch map rather than by scanning windows: a
- * tab the human dragged out of an agent window is still an agent tab, and a
- * tab they dragged IN is still theirs. Runs in the worker because the popup has
- * no access to that state. */
-async function listAgentTabs(): Promise<AgentTabRow[]> {
-  const owned = agentTabIds();
-  if (owned.size === 0) return [];
-  const rows: AgentTabRow[] = [];
-  for (const tab of await chrome.tabs.query({})) {
-    if (tab.id === undefined || !owned.has(tab.id)) continue;
-    rows.push({
-      tabId: tab.id,
-      title: tab.title ?? '',
-      url: tab.url ?? '',
-      session: await sessionOfWindow(tab.windowId),
-      orphaned: tabIsOrphaned(tab.id),
-    });
-  }
-  return rows;
-}
-
-/** Close every agent-owned tab. The human's own tabs are never touched: the
- * set comes from the epoch map, which only ever holds tabs an agent created. */
-async function closeAgentTabs(): Promise<number> {
-  const rows = await listAgentTabs();
-  for (const row of rows) {
-    try {
-      await chrome.tabs.remove(row.tabId);
-    } catch {
-      // already gone — nothing to close
-    }
-  }
-  return rows.length;
-}
 
 chrome.runtime.onMessage.addListener((msg: PopupMessage, sender, sendResponse) => {
   // Fail-closed: only the extension's own popup may drive PAIR/UNPAIR/PAUSE/etc.
@@ -374,7 +334,10 @@ chrome.runtime.onMessage.addListener((msg: PopupMessage, sender, sendResponse) =
           sendResponse({ ok: true, tabs: await listAgentTabs() });
           break;
         case 'CLOSE_AGENT_TABS':
-          sendResponse({ ok: true, closed: await closeAgentTabs() });
+          if (msg.scope !== undefined && msg.scope !== 'all' && msg.scope !== 'finished') {
+            throw new Error('Invalid tab cleanup scope');
+          }
+          sendResponse({ ok: true, ...(await closeAgentTabs(msg.scope ?? 'all')) });
           break;
         case 'KEEP_AWAKE_OFF':
           // The per-tab attach path only reaches a tab the next time something

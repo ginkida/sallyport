@@ -7,9 +7,16 @@ import json
 from typing import Any
 
 import pytest
+from mcp.types import CallToolRequest, CallToolRequestParams
 
 from sallyport_daemon.bridge import ExtensionNotConnected, ToolError
-from sallyport_daemon.mcp_server import TOOLS, _dispatch_call, _format_result, build_server
+from sallyport_daemon.mcp_server import (
+    TOOLS,
+    ToolExecutionError,
+    _dispatch_call,
+    _format_result,
+    build_server,
+)
 
 
 def test_format_result_none() -> None:
@@ -482,6 +489,27 @@ async def test_dispatch_call_happy_path_formats_result() -> None:
     assert bridge.calls == [("snapshot", {"tabId": 7})]
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [None, ExtensionNotConnected("offline"), ToolError("blocked", code="password_field")],
+)
+async def test_sdk_marks_tool_failures_without_misclassifying_page_text(
+    failure: Exception | None,
+) -> None:
+    bridge: Any = _FakeBridge(result="Error: this is page content", raises=failure)
+    server = build_server(bridge)
+    request = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name="click", arguments={"selector": "@e1"}),
+    )
+    result = await server.request_handlers[CallToolRequest](request)
+    assert result.root.isError is (failure is not None)
+    if failure is None:
+        assert result.root.content[0].text == "Error: this is page content"
+    else:
+        assert "Error [" in result.root.content[0].text
+
+
 @pytest.mark.asyncio
 async def test_dispatch_call_threads_client_id() -> None:
     """In broker mode the dispatcher forwards the per-connection client_id to
@@ -514,12 +542,12 @@ async def test_dispatch_call_normalises_none_arguments_to_empty_dict() -> None:
 @pytest.mark.asyncio
 async def test_dispatch_call_extension_not_connected_returns_error_text() -> None:
     bridge: Any = _FakeBridge(raises=ExtensionNotConnected("extension is not connected"))
-    out = await _dispatch_call(bridge, "snapshot", {})
-    assert len(out) == 1
+    with pytest.raises(ToolExecutionError) as error:
+        await _dispatch_call(bridge, "snapshot", {})
     # Tagged with the stable [not_connected] code and carrying a retryable hint,
     # so a looping agent can poll status instead of burning the tool timeout.
-    assert out[0].text.startswith("Error [not_connected]: extension is not connected")
-    assert "\nhint: retryable=yes;" in out[0].text
+    assert str(error.value).startswith("Error [not_connected]: extension is not connected")
+    assert "\nhint: retryable=yes;" in str(error.value)
 
 
 @pytest.mark.asyncio
@@ -527,9 +555,10 @@ async def test_dispatch_call_tool_error_with_code_tags_the_code() -> None:
     bridge: Any = _FakeBridge(
         raises=ToolError("foo.example not allowed", code="domain_not_allowed")
     )
-    out = await _dispatch_call(bridge, "navigate", {"url": "https://foo.example"})
+    with pytest.raises(ToolExecutionError) as error:
+        await _dispatch_call(bridge, "navigate", {"url": "https://foo.example"})
     # The human error line is byte-identical; a recovery hint is appended below.
-    lines = out[0].text.split("\n")
+    lines = str(error.value).split("\n")
     assert lines[0] == "Error [domain_not_allowed]: foo.example not allowed"
     assert lines[1].startswith("hint: ")
 
@@ -539,16 +568,18 @@ async def test_dispatch_call_unknown_code_appends_no_hint() -> None:
     """A code with no taxonomy entry leaves the error a single line — the hint
     is strictly additive, never invented."""
     bridge: Any = _FakeBridge(raises=ToolError("weird", code="some_unmapped_code"))
-    out = await _dispatch_call(bridge, "click", {"selector": "@e1"})
-    assert out[0].text == "Error [some_unmapped_code]: weird"
-    assert "\n" not in out[0].text
+    with pytest.raises(ToolExecutionError) as error:
+        await _dispatch_call(bridge, "click", {"selector": "@e1"})
+    assert str(error.value) == "Error [some_unmapped_code]: weird"
+    assert "\n" not in str(error.value)
 
 
 @pytest.mark.asyncio
 async def test_dispatch_call_tool_error_without_code_omits_brackets() -> None:
     bridge: Any = _FakeBridge(raises=ToolError("something went wrong"))
-    out = await _dispatch_call(bridge, "click", {"selector": "@e1"})
-    assert out[0].text == "Error: something went wrong"
+    with pytest.raises(ToolExecutionError) as error:
+        await _dispatch_call(bridge, "click", {"selector": "@e1"})
+    assert str(error.value) == "Error: something went wrong"
 
 
 @pytest.mark.asyncio
@@ -565,8 +596,9 @@ async def test_dispatch_call_appends_structured_detail_json() -> None:
             detail={"missing": ["x"], "available": [{"value": "a", "label": "A"}]},
         )
     )
-    out = await _dispatch_call(bridge, "select_option", {"selector": "#s", "value": "x"})
-    lines = out[0].text.split("\n")
+    with pytest.raises(ToolExecutionError) as error:
+        await _dispatch_call(bridge, "select_option", {"selector": "#s", "value": "x"})
+    lines = str(error.value).split("\n")
     assert lines[0] == "Error [not_found]: no <option> matched"
     detail_lines = [ln for ln in lines if ln.startswith("detail: ")]
     assert len(detail_lines) == 1
@@ -579,8 +611,9 @@ async def test_dispatch_call_appends_structured_detail_json() -> None:
 async def test_dispatch_call_omits_detail_line_when_absent() -> None:
     """No detail → no detail line. The feature is strictly additive."""
     bridge: Any = _FakeBridge(raises=ToolError("no <option> matched", code="not_found"))
-    out = await _dispatch_call(bridge, "select_option", {"selector": "#s"})
-    assert "detail:" not in out[0].text
+    with pytest.raises(ToolExecutionError) as error:
+        await _dispatch_call(bridge, "select_option", {"selector": "#s"})
+    assert "detail:" not in str(error.value)
 
 
 @pytest.mark.asyncio
@@ -594,8 +627,9 @@ async def test_dispatch_call_drops_oversized_detail_rather_than_truncating() -> 
             detail={"available": [{"value": str(i), "label": "x" * 50} for i in range(500)]},
         )
     )
-    out = await _dispatch_call(bridge, "select_option", {"selector": "#s"})
-    assert "detail:" not in out[0].text
+    with pytest.raises(ToolExecutionError) as error:
+        await _dispatch_call(bridge, "select_option", {"selector": "#s"})
+    assert "detail:" not in str(error.value)
 
 
 @pytest.mark.asyncio

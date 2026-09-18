@@ -14,6 +14,15 @@
   box-sizing: border-box;
 }
 
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   padding: 0;
@@ -588,4 +597,20 @@ ul {
   padding: 2px 0;
   font-family: ui-monospace, monospace;
   font-size: 11px;
+}
+
+.agent-session {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.agent-tab-row {
+  padding: 6px 0;
+  overflow-wrap: anywhere;
+}
+.agent-tab-row span {
+  display: block;
+}
+#agent-tabs-feedback {
+  margin-top: 8px;
 }

@@ -10,6 +10,7 @@ import socket
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import anyio
 import pytest
@@ -808,9 +809,7 @@ async def test_call_tool_via_broker_maps_a_silent_broker_to_brokererror(sock_pat
     BrokerError, not a raw traceback."""
     from sallyport_daemon.broker import call_tool_via_broker
 
-    async def _ack_then_silence(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def _ack_then_silence(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         signer = Signer(SECRET)
         raw = await read_frame(reader)
         assert raw is not None
@@ -844,3 +843,47 @@ def test_broker_supported_reflects_the_platform() -> None:
         broker_mod.release_broker_lock(3)  # must not touch a real fd
     finally:
         broker_mod.fcntl = original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_error", [True, False, None])
+async def test_call_tool_via_broker_returns_the_iserror_flag(
+    sock_path: Path, is_error: bool | None
+) -> None:
+    """`exec` keys its exit code off the MCP result's `isError`; the one-shot
+    client must therefore hand it back beside the content instead of dropping
+    it (which forced the caller into a text-prefix guess)."""
+    from sallyport_daemon.broker import call_tool_via_broker
+
+    async def _fake_broker(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        signer = Signer(SECRET)
+        raw = await read_frame(reader)
+        assert raw is not None
+        await write_frame(writer, _dump_json(signer.sign(Envelope(type="hello_ack", body={}))))
+        while (raw := await read_frame(reader)) is not None:
+            env = signer.verify(_parse_json(raw))
+            body = env.body
+            assert isinstance(body, dict)
+            if "id" not in body:
+                continue  # notifications/initialized
+            result: dict[str, Any]
+            if body["method"] == "initialize":
+                result = {"protocolVersion": "2024-11-05", "capabilities": {}}
+            else:
+                result = {"content": [{"type": "text", "text": "Error 404 — a PAGE"}]}
+                if is_error is not None:
+                    result["isError"] = is_error
+            reply = {"jsonrpc": "2.0", "id": body["id"], "result": result}
+            await write_frame(writer, _dump_json(signer.sign(Envelope(type="mcp", body=reply))))
+
+    server = await asyncio.start_unix_server(_fake_broker, path=str(sock_path))
+    try:
+        blocks, flagged = await call_tool_via_broker(
+            sock_path, SECRET, "read_text", {"tabId": 1}, call_timeout=5
+        )
+        assert blocks == [{"type": "text", "text": "Error 404 — a PAGE"}]
+        assert flagged is (is_error is True)
+    finally:
+        server.close()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(server.wait_closed(), timeout=2)

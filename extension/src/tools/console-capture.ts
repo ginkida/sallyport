@@ -160,10 +160,31 @@ export function parseConsoleLimit(raw: unknown): number {
 // --- chrome-bound state + wiring -------------------------------------------
 
 const buffers = new Map<number, ConsoleEntry[]>();
-const enabledTabs = new Set<number>();
+// A fresh token per attachment keeps a late enable failure from clearing a
+// newer capture on the same tab after detach/re-attach.
+const enabledTabs = new Map<number, symbol>();
+// attach() checks persisted settings before enabling. This additional latch
+// rejects an attach already in progress when the setting is switched off.
+let captureAllowed = true;
 
+export function setConsoleCaptureAllowed(allowed: boolean): void {
+  captureAllowed = allowed;
+  if (!allowed) {
+    for (const tabId of enabledTabs.keys()) clearConsole(tabId);
+  }
+}
+
+// Only a tab with an ACTIVE capture records events. That is what makes
+// clear-then-ignore (opt-out, detach, tab close) mean what it says. The cost
+// is a known narrow window: an MV3 worker restart drops `enabledTabs` while
+// the debugger session — and Runtime.enable — survive it, so events arriving
+// before the next tool call re-runs ensureConsoleCapture are discarded. Not
+// re-seeded from chrome.debugger.getTargets on wake on purpose: `attached`
+// there is true for DevTools too, and a tab we then believed enabled would
+// never get its Runtime.enable. "Capture starts at first attach" therefore
+// means first attach per worker lifetime.
 function onDebuggerEvent(source: { tabId?: number }, method: string, params?: unknown): void {
-  if (source.tabId === undefined) return;
+  if (source.tabId === undefined || !enabledTabs.has(source.tabId)) return;
   if (method !== 'Runtime.consoleAPICalled' && method !== 'Runtime.exceptionThrown') return;
   const entry = shapeConsoleEntry(method, (params ?? {}) as ConsoleEventParams, Date.now());
   if (!entry) return;
@@ -185,12 +206,13 @@ if (typeof chrome !== 'undefined' && chrome.debugger?.onEvent) {
  * cdp.ts. Best-effort: a failure drops the flag so a later attach retries and
  * never breaks the tool call. */
 export async function ensureConsoleCapture(tabId: number): Promise<void> {
-  if (enabledTabs.has(tabId)) return;
-  enabledTabs.add(tabId);
+  if (!captureAllowed || enabledTabs.has(tabId)) return;
+  const generation = Symbol();
+  enabledTabs.set(tabId, generation);
   try {
     await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable');
   } catch {
-    enabledTabs.delete(tabId);
+    if (enabledTabs.get(tabId) === generation) clearConsole(tabId);
   }
 }
 

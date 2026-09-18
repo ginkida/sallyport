@@ -6,6 +6,81 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-09-18
+
+### Added
+
+- `npm run test:e2e` adds the full MCP stdio → daemon → HMAC WebSocket → Chrome
+  route to the browser test, using an isolated daemon and test secret. Covers
+  tool discovery, authentication, form actions, allowlist/password refusals and
+  audit redaction.
+
+- Accessible popup section navigation: labelled tabs and panels, selected
+  states, one Tab stop, ArrowLeft/ArrowRight cycling and Home/End navigation,
+  with visible keyboard focus. Long session names wrap within the popup.
+  The browser smoke test verifies focus, selection, hidden panels and overflow.
+
+- Agent tabs are grouped by their creating session in the popup, with active,
+  finished, and human-viewed states. A separate **Close finished sessions’ tabs**
+  action preserves active sessions and tabs the human viewed. Cleanup rechecks
+  ownership epochs and human interest before each removal; partial failures
+  and skipped tabs are reported separately instead of counting every candidate
+  as closed. The browser smoke test exercises this flow through the real popup.
+
+- A real-browser capture smoke test (`CHROME_BIN=... npm run test:browser` in
+  `extension/`, Node 22+). Uses an isolated temporary Chromium profile and a
+  localhost fixture to verify console/network capture, opt-out, re-enable,
+  and debugger detach/re-attach.
+
+### Changed
+
+- Network capture now bounds retained body payloads across tabs: 10 MiB per
+  tab and 40 MiB total, measured in the same wire bytes as the existing
+  per-result budget and derived from it (a tab retains at most what one
+  `network_tail` result can carry, so the budget stays the one authority on
+  body size and the cache is purely the cross-tab memory bound). It prefers
+  newer responses within the same tab and never evicts another tab's bodies.
+  Metadata survives with `bodyOmissionReason: "cache_limit"` and a truncated
+  result. Cleanup and ring eviction release capacity; late reads cannot
+  repopulate evicted entries.
+
+- Switching console or network capture off now clears all capture buffers
+  immediately, including idle tabs and pending body reads. Enabling still
+  starts capture on the next tool call.
+- Network capture limits body reads *in flight* to 4 per tab and 32 globally,
+  including reads still pending from previous attachments. Reads past that wait
+  in a per-tab FIFO (bounded by the ring size) and drain as slots free up, so a
+  dashboard's burst of simultaneous widget requests still yields every body.
+  Only an overflowing queue answers `bodyOmitted: true`,
+  `bodyOmissionReason: "capture_busy"` and marks the tool result `truncated`.
+  `bodyPending: true` distinguishes a queued or unfinished read from an omitted
+  body. Entries stay in response-completion order even when body reads finish
+  out of order; returned snapshots stay fixed.
+
+### Fixed
+
+- MCP tool failures now set `isError: true` through the SDK's error handling.
+  Previously a domain/password refusal or disconnected extension returned
+  ordinary successful text content. Stable error codes, recovery hints and
+  structured details are preserved; successful page text beginning with
+  "Error" remains a successful result. `sallyport-daemon exec` keys its exit
+  code (5 = tool error) off that same flag, carried back from the broker,
+  instead of guessing from whether the text starts with "Error".
+
+- The popup's agent-tab cleanup no longer reports a tab that had already been
+  closed (by you, or by the tab reaper) as "could not be closed"; it counts as
+  skipped, like any other candidate whose state changed under the sweep.
+
+- Explicit debugger detach now clears refs, capture buffers, dialog state and
+  tracked viewport scale. Chrome does not emit `onDetach` for the extension's
+  own detach call; relying on that event left stale state across re-attachment.
+
+- Console and network capture now ignore events for tabs without an active
+  capture. Late network body reads cannot repopulate cleared buffers after
+  detach or contaminate a subsequent attachment. Failed capture setup clears
+  partial data, and a late failure from an old attachment cannot reset a newer
+  capture. Regression tests cover opt-in, cleanup, setup failure, and re-attach.
+
 ## [0.23.0] — 2026-09-01
 
 ### Added
@@ -2696,7 +2771,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/ginkida/sallyport/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/ginkida/sallyport/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/ginkida/sallyport/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/ginkida/sallyport/compare/v0.20.0...v0.21.0

@@ -14,7 +14,7 @@ import { matchAllowlist, normalizePattern, validatePattern } from './allowlist.j
 import { classifySecretInput, EXPECTED_SECRET_BYTES } from './pairing.js';
 import { extractHostname, formatRelativeTime, matchesAuditFilter } from './format.js';
 import { nextReconnectKick } from './reconnect-kick.js';
-import type { AgentTabRow } from './background.js';
+import type { AgentTabRow, CloseAgentTabsResult } from './agent-tabs.js';
 
 type Status = {
   state: 'disconnected' | 'connecting' | 'connected' | 'no_secret';
@@ -60,16 +60,47 @@ function flash(sel: string, msg: string, kind: 'ok' | 'err' = 'ok'): void {
 // Tab switching
 // -------------------------------------------------------------------------
 
-document.querySelectorAll<HTMLButtonElement>('.tab').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    const id = btn.dataset.tab;
-    if (!id) return;
-    document.querySelectorAll('.tab').forEach((b) => b.classList.remove('active'));
-    btn.classList.add('active');
-    document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));
-    $(`#tab-${id}`)?.classList.add('active');
-    if (id === 'allowlist') renderAllowlist();
-    if (id === 'audit') renderAudit();
+const tabButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('#tabs [role="tab"]'));
+
+function activateTab(button: HTMLButtonElement): void {
+  for (const tab of tabButtons) {
+    const selected = tab === button;
+    tab.classList.toggle('active', selected);
+    tab.setAttribute('aria-selected', String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    const panel = document.getElementById(tab.getAttribute('aria-controls')!);
+    if (panel) {
+      panel.hidden = !selected;
+      panel.classList.toggle('active', selected);
+    }
+  }
+  if (button.dataset.tab === 'allowlist') void renderAllowlist();
+  if (button.dataset.tab === 'audit') void renderAudit();
+}
+
+tabButtons.forEach((button, index) => {
+  button.addEventListener('click', () => activateTab(button));
+  button.addEventListener('keydown', (event) => {
+    let next: number;
+    switch (event.key) {
+      case 'ArrowRight':
+        next = (index + 1) % tabButtons.length;
+        break;
+      case 'ArrowLeft':
+        next = (index + tabButtons.length - 1) % tabButtons.length;
+        break;
+      case 'Home':
+        next = 0;
+        break;
+      case 'End':
+        next = tabButtons.length - 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    activateTab(tabButtons[next]);
+    tabButtons[next].focus();
   });
 });
 
@@ -460,26 +491,68 @@ $('#keep-awake').addEventListener('change', async () => {
 // Agent tabs — what the sessions left in this browser
 // -------------------------------------------------------------------------
 
+let agentTabsBusy = false;
+let agentTabsRenderVersion = 0;
+
+function agentTabButtons(disabled: boolean): void {
+  ($('#agent-tabs-close') as HTMLButtonElement).disabled = disabled;
+  ($('#agent-tabs-finished') as HTMLButtonElement).disabled = disabled;
+}
+
 async function renderAgentTabs(): Promise<void> {
-  const resp = await send<{ ok: boolean; tabs: AgentTabRow[] }>({ type: 'AGENT_TABS' });
-  const rows = resp?.tabs ?? [];
-  ($('#agent-tab-count') as HTMLElement).textContent = String(rows.length);
+  const version = ++agentTabsRenderVersion;
   const ul = $('#agent-tab-list') as HTMLUListElement;
-  ul.innerHTML = '';
-  if (rows.length === 0) {
-    ul.innerHTML = '<li class="muted small">No agent tabs open.</li>';
+  const resp = await send<{ ok: boolean; tabs?: AgentTabRow[]; error?: string }>({
+    type: 'AGENT_TABS',
+  });
+  if (version !== agentTabsRenderVersion) return;
+  ul.replaceChildren();
+  if (!resp?.ok || !resp.tabs) {
+    $('#agent-tab-count').textContent = '—';
+    ul.textContent = resp?.error || 'Unable to load agent tabs. Try refreshing.';
+    agentTabButtons(true);
     return;
   }
+  const rows = resp.tabs;
+  $('#agent-tab-count').textContent = String(rows.length);
+  // "Close all" needs any agent tab; "finished" needs one nothing will drive
+  // again AND the human never looked at — computed once each, no overwrite.
+  ($('#agent-tabs-close') as HTMLButtonElement).disabled = agentTabsBusy || rows.length === 0;
+  ($('#agent-tabs-finished') as HTMLButtonElement).disabled =
+    agentTabsBusy || !rows.some((row) => row.orphaned && !row.human);
+  if (rows.length === 0) {
+    ul.textContent = 'No agent tabs open.';
+    return;
+  }
+  const groups = new Map<string, AgentTabRow[]>();
   for (const row of rows) {
-    const li = document.createElement('li');
-    const who = row.session ? `[${row.session}] ` : '';
-    // An orphan's session has exited: nothing will drive it again, and it is
-    // what the tab reaper takes first. Saying so turns this list from "tabs
-    // that exist" into "tabs you can close without interrupting anything".
-    const state = row.orphaned ? ' — session ended' : '';
-    li.textContent = `${who}${row.title || row.url}${state}`;
-    li.title = row.url;
-    ul.appendChild(li);
+    const key = row.session ?? '';
+    const group = groups.get(key) ?? [];
+    group.push(row);
+    groups.set(key, group);
+  }
+  for (const [session, tabs] of groups) {
+    const group = document.createElement('li');
+    group.className = 'agent-session';
+    const heading = document.createElement('strong');
+    heading.textContent = `${session || 'Unlabelled session'} (${tabs.length})`;
+    group.appendChild(heading);
+    for (const row of tabs) {
+      const item = document.createElement('div');
+      item.className = 'agent-tab-row';
+      item.textContent = row.title || row.url || `Tab ${row.tabId}`;
+      item.title = row.url;
+      const state = document.createElement('span');
+      state.className = 'muted small';
+      state.textContent = row.human
+        ? 'Kept — you viewed this tab'
+        : row.orphaned
+          ? 'Session ended'
+          : 'Session active';
+      item.appendChild(state);
+      group.appendChild(item);
+    }
+    ul.appendChild(group);
   }
 }
 
@@ -487,22 +560,42 @@ $('#status-agents').addEventListener('toggle', async () => {
   if (!($('#status-agents') as HTMLDetailsElement).open) return;
   await renderAgentTabs();
 });
+$('#agent-tabs-refresh').addEventListener('click', () => void renderAgentTabs());
 
-$('#agent-tabs-close').addEventListener('click', async () => {
-  const resp = await send<{ ok: boolean; closed: number }>({ type: 'CLOSE_AGENT_TABS' });
-  flash('#status-flash', `closed ${resp?.closed ?? 0} agent tab(s)`);
-  await renderAgentTabs();
-});
+async function cleanupAgentTabs(scope: 'all' | 'finished'): Promise<void> {
+  if (agentTabsBusy) return;
+  agentTabsBusy = true;
+  agentTabButtons(true);
+  const feedback = $('#agent-tabs-feedback');
+  feedback.textContent = 'Closing tabs…';
+  try {
+    const resp = await send<CloseAgentTabsResult & { ok: boolean; error?: string }>({
+      type: 'CLOSE_AGENT_TABS',
+      scope,
+    });
+    if (!resp?.ok) throw new Error(resp?.error || 'Unable to close tabs. Try again.');
+    const parts = [`Closed ${resp.closed} tab(s)`];
+    if (resp.failed) parts.push(`${resp.failed} could not be closed`);
+    if (resp.skipped) parts.push(`${resp.skipped} skipped because their state changed`);
+    feedback.textContent = parts.join(' · ');
+  } catch (error) {
+    feedback.textContent = error instanceof Error ? error.message : String(error);
+  } finally {
+    agentTabsBusy = false;
+    await renderAgentTabs();
+  }
+}
+
+$('#agent-tabs-close').addEventListener('click', () => void cleanupAgentTabs('all'));
+$('#agent-tabs-finished').addEventListener('click', () => void cleanupAgentTabs('finished'));
 
 $('#capture-console').addEventListener('change', async () => {
-  // Takes effect on the next tool call — captureConsole is re-read per attach,
-  // which lazily issues Runtime.enable for the driven tab when on.
+  // Starts on the next tool call; switching off clears all captured data now.
   await setSettings({ captureConsole: ($('#capture-console') as HTMLInputElement).checked });
 });
 
 $('#capture-network').addEventListener('change', async () => {
-  // Takes effect on the next tool call — captureNetwork is re-read per attach,
-  // which lazily issues Network.enable for the driven tab when on.
+  // Starts on the next tool call; switching off also invalidates pending reads.
   await setSettings({ captureNetwork: ($('#capture-network') as HTMLInputElement).checked });
 });
 

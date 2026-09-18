@@ -1705,3 +1705,52 @@ class TestExecReindent:
     def test_long_but_unparseable_json_like_text_is_untouched(self) -> None:
         broken = "{" + "y" * 9000
         assert _reindent_for_humans(broken) == broken
+
+
+# ---------------------------------------------------------------------------
+# exec exit code follows the MCP result's isError flag, not the text
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "is_error", "expected_rc"),
+    [
+        ("Error 404 — page not found", False, 0),  # a successful read_text of an error PAGE
+        ("Error [domain_not_allowed]: x", True, 5),
+        ("nothing wrong here", True, 5),  # failure text need not start with 'Error'
+    ],
+)
+async def test_exec_via_broker_exit_code_follows_iserror_not_prose(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    text: str,
+    is_error: bool,
+    expected_rc: int,
+) -> None:
+    """The MCP layer decides failure via `isError`; `exec` used to re-derive it
+    from `text.startswith("Error")`, so a page whose text began "Error 404"
+    exited 5 while a failure phrased otherwise exited 0. The flag is now carried
+    back from the broker and is the ONLY thing the exit code rests on."""
+    import argparse
+
+    from sallyport_daemon import __main__ as main_mod
+
+    async def fake_call(*_args: Any, **_kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
+        return [{"type": "text", "text": text}], is_error
+
+    monkeypatch.setattr(main_mod, "call_tool_via_broker", fake_call)
+    ns = argparse.Namespace(tool="read_text", args=["tabId=7"])
+    rc = await main_mod._run_exec_via_broker(ns, b"s" * 32, tmp_path / "broker.sock")
+    assert rc == expected_rc
+    assert text in capsys.readouterr().out
+
+
+def test_print_exec_content_does_not_classify(capsys: pytest.CaptureFixture[str]) -> None:
+    """Printing is printing: the helper no longer returns a verdict a caller
+    could mistake for the tool outcome."""
+    from sallyport_daemon.__main__ import _print_exec_content
+
+    assert _print_exec_content([{"type": "text", "text": "Error: looks scary"}]) is None
+    assert "Error: looks scary" in capsys.readouterr().out

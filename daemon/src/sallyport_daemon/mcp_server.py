@@ -19,6 +19,15 @@ from .error_taxonomy import format_error_hint
 
 log = logging.getLogger("sallyport.mcp")
 
+
+class ToolExecutionError(Exception):
+    """Formatted tool failure. The SDK maps handler exceptions to isError=true.
+
+    Return successful content normally, even if the page text starts with
+    'Error'. Failure is determined by the bridge outcome, never by its prose.
+    """
+
+
 # Cap on the appended structured-detail JSON line. Producers cap their own
 # detail (select_option bounds `available` to 50 options); this is a defensive
 # ceiling so a future producer can't bloat the tool output — an oversized detail
@@ -471,7 +480,8 @@ TOOLS: list[Tool] = [
             "this surfaces those response bodies so you pull exact figures "
             "instead. Returns {enabled, entries:[{ts, method, url, urlTruncated?, "
             "status, type, contentType, size, origin, body?, bodyTruncated?, "
-            "bodyOmitted?}], truncated?} (oldest→newest; type is 'xhr'|'fetch'; "
+            "bodyOmitted?, bodyPending?, bodyOmissionReason?}], truncated?} "
+            "(oldest→newest; type is 'xhr'|'fetch'; "
             "origin is the response host; body is the response text, omitted for "
             "binary/unavailable; urlTruncated=true means url was clipped to ~4 KiB "
             "(a prefix — don't re-fetch that url)). OPT-IN: capture "
@@ -488,9 +498,14 @@ TOOLS: list[Tool] = [
             "capped (~256 KiB, bodyTruncated=true); if a big result would exceed "
             "the frame budget the OLDEST bodies drop to metadata "
             "(bodyOmitted=true) — so narrow with filter + a small limit to get "
-            "one report's full body, or re-pull it with fetch_in_page on the "
-            "same url (note: a signed same-origin RPC like Metrika's /i-proxy/ "
-            "may not be replayable, so prefer filter+limit). Structured CDP "
+            "the body. bodyPending=true means the response finished but its body "
+            "read is queued or still running (bursts are queued, not dropped); read "
+            "again shortly. bodyOmissionReason='capture_busy' means the tab's body-read "
+            "queue overflowed (>100 waiting) so this body was never read; filtering "
+            "cannot recover it. bodyOmissionReason='cache_limit' means the retained-body "
+            "cache limit was reached; metadata is kept but filtering cannot recover "
+            "it. Re-fetch that URL with fetch_in_page only if appropriate "
+            "(signed or one-shot requests may not be replayable). Structured CDP "
             "event capture only — no JS eval. Domain must be in allowlist."
         ),
         inputSchema={
@@ -1513,7 +1528,7 @@ async def _dispatch_call(
         hint = format_error_hint(exc.code)
         if hint:
             text = f"{text}\n{hint}"
-        return [TextContent(type="text", text=text)]
+        raise ToolExecutionError(text) from exc
     except ToolError as exc:
         tag = f" [{exc.code}]" if exc.code else ""
         text = f"Error{tag}: {exc}"
@@ -1531,7 +1546,7 @@ async def _dispatch_call(
             dumped = json.dumps(detail, ensure_ascii=False, separators=(",", ":"))
             if len(dumped) <= MAX_DETAIL_JSON:
                 text = f"{text}\ndetail: {dumped}"
-        return [TextContent(type="text", text=text)]
+        raise ToolExecutionError(text) from exc
     image = _as_image_content(name, data)
     if image is not None:
         return image

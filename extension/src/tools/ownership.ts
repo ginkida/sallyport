@@ -142,6 +142,13 @@ export function agentTabInfo(): AgentTabInfo[] {
   return [...epochByTab.entries()].map(([tabId, rec]) => ({ tabId, ...rec }));
 }
 
+/** One tab's record, or undefined when it is not an agent tab — the O(1)
+ * re-validation a sweep needs per candidate (see agent-tabs.ts). */
+export function agentTabRecord(tabId: number): AgentTabInfo | undefined {
+  const rec = epochByTab.get(tabId);
+  return rec ? { tabId, ...rec } : undefined;
+}
+
 /** Tabs the PAGE opened, adopted for the session that owns the opener, waiting
  * to be reported back in that call's result. Keyed by opener tab id.
  *

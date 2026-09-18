@@ -51,13 +51,48 @@
 
     <!-- ──────────────── Main UI (shown after pairing) ──────────────── -->
     <div id="main" class="hidden">
-      <nav id="tabs">
-        <button data-tab="status" class="tab active">Status</button>
-        <button data-tab="allowlist" class="tab">Allowlist</button>
-        <button data-tab="audit" class="tab">Audit</button>
+      <nav id="tabs" role="tablist" aria-label="Sallyport sections">
+        <button
+          id="nav-status"
+          data-tab="status"
+          class="tab active"
+          role="tab"
+          aria-controls="tab-status"
+          aria-selected="true"
+        >
+          Status
+        </button>
+        <button
+          id="nav-allowlist"
+          data-tab="allowlist"
+          class="tab"
+          role="tab"
+          aria-controls="tab-allowlist"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          Allowlist
+        </button>
+        <button
+          id="nav-audit"
+          data-tab="audit"
+          class="tab"
+          role="tab"
+          aria-controls="tab-audit"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          Audit
+        </button>
       </nav>
 
-      <section id="tab-status" class="tab-panel active">
+      <section
+        id="tab-status"
+        class="tab-panel active"
+        role="tabpanel"
+        aria-labelledby="nav-status"
+        tabindex="0"
+      >
         <div id="status-card" class="status-card">
           <div class="status-dot"></div>
           <div class="status-text">
@@ -116,15 +151,16 @@
           </label>
           <div class="muted small hint">
             Records console errors/warnings + uncaught exceptions on driven tabs, readable via the
-            console_tail tool. Off by default — it widens the debugger's CDP footprint.
+            console_tail tool. Starts on the next tool call. Turning off clears captured data
+            immediately.
           </div>
           <label class="checkbox">
             <input type="checkbox" id="capture-network" /> capture API responses (canvas dashboards)
           </label>
           <div class="muted small hint">
             Records XHR/fetch JSON responses on driven tabs, readable via the network_tail tool —
-            the data behind canvas charts (e.g. Metrika) without screenshots. Off by default — it
-            reads response bodies and widens the debugger's CDP footprint.
+            the data behind canvas charts (e.g. Metrika) without screenshots. Starts on the next
+            tool call. Turning off stops collection and clears captured data immediately.
           </div>
           <label class="checkbox">
             <input type="checkbox" id="handle-dialogs" /> auto-handle JS dialogs (alert/confirm)
@@ -173,8 +209,15 @@
           </div>
           <ul id="agent-tab-list" class="muted small tool-list"></ul>
           <div class="row">
-            <button id="agent-tabs-close">Close all agent tabs</button>
+            <button id="agent-tabs-finished" disabled>Close finished sessions’ tabs</button>
+            <button id="agent-tabs-refresh">Refresh</button>
           </div>
+          <p class="muted small">
+            Finished-session cleanup keeps tabs you have viewed. Close all also includes active
+            sessions and viewed tabs.
+          </p>
+          <button id="agent-tabs-close" disabled>Close all agent tabs</button>
+          <div id="agent-tabs-feedback" class="muted small" role="status" aria-live="polite"></div>
         </details>
 
         <details id="status-advanced" class="disclosure">
@@ -199,7 +242,14 @@
         <div id="status-flash" class="flash"></div>
       </section>
 
-      <section id="tab-allowlist" class="tab-panel">
+      <section
+        id="tab-allowlist"
+        class="tab-panel"
+        role="tabpanel"
+        aria-labelledby="nav-allowlist"
+        tabindex="0"
+        hidden
+      >
         <p class="muted small">
           Tools only run on domains in this list. Add sites you want the agent to touch.
         </p>
@@ -215,7 +265,14 @@
         <ul id="allow-list"></ul>
       </section>
 
-      <section id="tab-audit" class="tab-panel">
+      <section
+        id="tab-audit"
+        class="tab-panel"
+        role="tabpanel"
+        aria-labelledby="nav-audit"
+        tabindex="0"
+        hidden
+      >
         <div id="audit-summary" class="audit-summary muted small"></div>
         <input type="text" id="audit-filter" placeholder="filter — tool name, url, error text" />
         <div class="row audit-toolbar">

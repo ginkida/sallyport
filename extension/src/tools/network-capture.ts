@@ -24,8 +24,8 @@
  *  - NO auth leak: request/response HEADERS are never captured (so no
  *    Authorization / Cookie / Set-Cookie), only method/url/status/contentType/
  *    size + body;
- *  - BOUNDED: a per-tab ring of ≤NETWORK_MAX_ENTRIES and a capped in-flight
- *    `pending` map, so the tool result stays well under the 16 MiB frame cap (#6);
+ *  - BOUNDED: a per-tab ring, capped pending metadata, and separate per-tab and
+ *    global limits on body reads. Results have their own wire-byte budget (#6);
  *  - PER-TAB + CLEARED on `tabs.onRemoved`/`debugger.onDetach` (#7 untouched —
  *    no refs);
  *  - ORIGIN-TAGGED (response URL origin) + read-time filtered to the allowlist,
@@ -39,8 +39,9 @@
 
 import { pushCapped } from './console-capture.js';
 import { BridgeError } from './errors.js';
+import { NetworkBodyCache, type CapturedBody } from './network-body-cache.js';
 
-export interface NetworkEntry {
+export interface NetworkEntry extends CapturedBody {
   ts: number;
   method: string;
   url: string;
@@ -56,12 +57,6 @@ export interface NetworkEntry {
   /** Response URL origin, or null when it could not be determined — null entries
    * are dropped at read time (fail-closed). */
   origin: string | null;
-  /** Response body text, capped; omitted for binary/compressed/unavailable. */
-  body?: string;
-  bodyTruncated?: boolean;
-  /** Body dropped because the result hit NETWORK_RESPONSE_BUDGET (metadata +
-   * `size` kept). Narrow with `filter` + a small `limit` to get its full body. */
-  bodyOmitted?: boolean;
 }
 
 export const NETWORK_MAX_ENTRIES = 100;
@@ -82,6 +77,27 @@ export const NETWORK_MAX_BODY = 256 * 1024;
 // often can't be replayed with fetch_in_page, so the per-body cap is generous and
 // it is the aggregate wire size that is bounded.
 export const NETWORK_RESPONSE_BUDGET = 10 * 1024 * 1024;
+// Retained-body cache (network-body-cache.ts) — in the SAME unit as the budget
+// above (wire bytes, via bodyWireBytes) and DERIVED from it: a tab retains at
+// most what one result can carry. That keeps the response budget the one
+// authority on "how much body is there", and makes the cache purely the
+// cross-TAB memory bound the per-tab ring never gave (N tabs × 100 entries ×
+// 256 KiB was unbounded in N). Two caps in two units would let the cache
+// silently starve the budget's own body-stripping path — it did, at 4 MiB
+// UTF-16 — so this is one number, not two.
+export const NETWORK_BODY_CACHE_PER_TAB = NETWORK_RESPONSE_BUDGET;
+export const NETWORK_BODY_CACHE_TOTAL = 4 * NETWORK_RESPONSE_BUDGET;
+// Body reads IN FLIGHT to Chrome: a concurrency limit, not admission control.
+// Past it a read WAITS in a per-tab FIFO instead of being dropped — a dashboard
+// fires a dozen widget XHRs whose loadingFinished events all land before the
+// first getResponseBody round-trip returns, and dropping everything past the
+// fourth lost exactly the bodies network_tail exists for (signed same-origin
+// RPCs can't be re-fetched). The queue is bounded by the ring size, since an
+// entry the ring has already evicted is never read; only an overflowing queue
+// answers capture_busy.
+export const NETWORK_MAX_BODY_READS_PER_TAB = 4;
+export const NETWORK_MAX_BODY_READS = 32;
+export const NETWORK_MAX_QUEUED_BODY_READS = NETWORK_MAX_ENTRIES;
 // Per-entry URL cap. Real API urls are well under this; it exists only so a
 // pathological giant query string can't dominate a result's wire size.
 export const NETWORK_MAX_URL = 4 * 1024;
@@ -296,6 +312,11 @@ export function parseNetworkArgs(args: { limit?: unknown; filter?: unknown }): {
 // --- chrome-bound state + wiring -------------------------------------------
 
 const buffers = new Map<number, NetworkEntry[]>();
+const bodyCache = new NetworkBodyCache(
+  NETWORK_BODY_CACHE_PER_TAB,
+  NETWORK_BODY_CACHE_TOTAL,
+  bodyWireBytes,
+);
 // tabId -> (requestId -> in-flight metadata), assembled across
 // requestWillBeSent (method, url, type) and responseReceived (final url,
 // status, mimeType), finalised at loadingFinished. Capped PER TAB: one shared
@@ -314,39 +335,105 @@ function pendingFor(tabId: number): Map<string, NetworkMeta> {
   }
   return forTab;
 }
-const enabledTabs = new Set<number>();
+// Tokens identify capture lifetimes, not just tab IDs: a body read or enable
+// failure from a detached session must never affect a later attachment.
+const enabledTabs = new Map<number, symbol>();
+let captureAllowed = true;
+// In-flight body reads are counted as ACTUAL unresolved CDP calls, including
+// those from a cleared capture — repeated detach/re-enable must not bypass the
+// limit. Reads past it wait in a per-tab FIFO (oldest response first) and drain
+// as slots free up (see NETWORK_MAX_QUEUED_BODY_READS).
+const bodyReadsByTab = new Map<number, number>();
+let bodyReads = 0;
+type QueuedBodyRead = { requestId: string; tabId: number; entry: NetworkEntry; generation: symbol };
+const bodyQueue = new Map<number, QueuedBodyRead[]>();
+
+/** Stop accumulation immediately, including reads started before opt-out.
+ * Enabling only permits future attach calls; it never drives an idle tab. */
+export function setNetworkCaptureAllowed(allowed: boolean): void {
+  captureAllowed = allowed;
+  if (!allowed) {
+    for (const tabId of enabledTabs.keys()) clearNetwork(tabId);
+  }
+}
 
 function normalizeType(t: unknown): string {
   return typeof t === 'string' ? t.toLowerCase() : '';
 }
 
-/** Fetch the response body (only for data content-types) and push the finalised
- * entry. Best-effort: on any failure (body evicted from the CDP buffer, a
- * redirect, target gone) we still record the metadata entry — the URL alone is
- * valuable, since the agent can re-pull it with fetch_in_page. */
-async function captureBody(requestId: string, tabId: number, meta: NetworkMeta): Promise<void> {
-  let bodyText: string | null = null;
-  if (isDataContentType(meta.contentType)) {
-    try {
-      const res = (await chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', {
-        requestId,
-      })) as { body?: string; base64Encoded?: boolean };
-      // Keep decoded text only — a base64Encoded body is binary/compressed, not
-      // the JSON data we are after.
-      if (typeof res.body === 'string' && res.base64Encoded !== true) bodyText = res.body;
-    } catch {
-      // fall through with bodyText = null (metadata-only entry)
-    }
+/** Admit a body read for an already-recorded entry. Recording at
+ * loadingFinished keeps the ring ordered by response completion, even when CDP
+ * returns bodies out of order. An evicted entry may finish, but is never put
+ * back into the ring. */
+function enqueueBodyRead(read: QueuedBodyRead): void {
+  const queue = bodyQueue.get(read.tabId) ?? [];
+  if (queue.length >= NETWORK_MAX_QUEUED_BODY_READS) {
+    read.entry.bodyOmitted = true;
+    read.entry.bodyOmissionReason = 'capture_busy';
+    return;
   }
-  const entry = shapeNetworkEntry(meta, bodyText);
-  const buf = buffers.get(tabId) ?? [];
-  pushCapped(buf, entry, NETWORK_MAX_ENTRIES);
-  buffers.set(tabId, buf);
+  read.entry.bodyPending = true;
+  queue.push(read);
+  bodyQueue.set(read.tabId, queue);
+  drainBodyReads();
+}
+
+/** Start queued reads while slots are free — per tab first, then globally.
+ * Tabs are visited in queue-creation order; the per-tab cap keeps one tab from
+ * holding more than its share of the global slots, so none starves. A read whose
+ * capture ended, or whose entry left the ring while it waited, is dropped. */
+function drainBodyReads(): void {
+  for (const [tabId, queue] of bodyQueue) {
+    if (bodyReads >= NETWORK_MAX_BODY_READS) return;
+    while (
+      queue.length > 0 &&
+      (bodyReadsByTab.get(tabId) ?? 0) < NETWORK_MAX_BODY_READS_PER_TAB &&
+      bodyReads < NETWORK_MAX_BODY_READS
+    ) {
+      const read = queue.shift()!;
+      if (enabledTabs.get(tabId) !== read.generation || !buffers.get(tabId)?.includes(read.entry)) {
+        delete read.entry.bodyPending;
+        continue;
+      }
+      bodyReadsByTab.set(tabId, (bodyReadsByTab.get(tabId) ?? 0) + 1);
+      bodyReads++;
+      void runBodyRead(read);
+    }
+    if (queue.length === 0) bodyQueue.delete(tabId);
+  }
+}
+
+async function runBodyRead({ requestId, tabId, entry, generation }: QueuedBodyRead): Promise<void> {
+  try {
+    const res = (await chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', {
+      requestId,
+    })) as { body?: string; base64Encoded?: boolean };
+    if (enabledTabs.get(tabId) !== generation) return;
+    const buf = buffers.get(tabId);
+    const index = buf?.indexOf(entry) ?? -1;
+    if (!buf || index < 0) return; // already evicted while reading
+    if (typeof res?.body === 'string' && res.base64Encoded !== true) {
+      const clipped = clipBody(res.body);
+      bodyCache.retain(tabId, entry, clipped.body, buf.slice(0, index));
+      if (entry.body !== undefined && clipped.truncated) entry.bodyTruncated = true;
+    }
+  } catch {
+    // Body evicted, target gone, etc. Keep the already-recorded metadata.
+  } finally {
+    delete entry.bodyPending;
+    bodyReads--;
+    const remaining = (bodyReadsByTab.get(tabId) ?? 1) - 1;
+    if (remaining === 0) bodyReadsByTab.delete(tabId);
+    else bodyReadsByTab.set(tabId, remaining);
+    drainBodyReads();
+  }
 }
 
 function onNetworkEvent(source: { tabId?: number }, method: string, params?: unknown): void {
   const tabId = source.tabId;
   if (tabId === undefined) return;
+  const generation = enabledTabs.get(tabId);
+  if (generation === undefined) return;
   const p = (params ?? {}) as {
     requestId?: unknown;
     type?: unknown;
@@ -393,7 +480,13 @@ function onNetworkEvent(source: { tabId?: number }, method: string, params?: unk
   if (method === 'Network.loadingFinished') {
     forTab.delete(requestId);
     if (typeof p.encodedDataLength === 'number') rec.size = p.encodedDataLength;
-    void captureBody(requestId, tabId, rec);
+    const entry = shapeNetworkEntry(rec, null);
+    const buf = buffers.get(tabId) ?? [];
+    if (buf.length === NETWORK_MAX_ENTRIES) bodyCache.release(buf[0]);
+    pushCapped(buf, entry, NETWORK_MAX_ENTRIES);
+    buffers.set(tabId, buf);
+    if (isDataContentType(rec.contentType))
+      enqueueBodyRead({ requestId, tabId, entry, generation });
     return;
   }
 
@@ -415,12 +508,13 @@ if (typeof chrome !== 'undefined' && chrome.debugger?.onEvent) {
  * cdp.ts. Best-effort: a failure drops the flag so a later attach retries and
  * never breaks the tool call. */
 export async function ensureNetworkCapture(tabId: number): Promise<void> {
-  if (enabledTabs.has(tabId)) return;
-  enabledTabs.add(tabId);
+  if (!captureAllowed || enabledTabs.has(tabId)) return;
+  const generation = Symbol();
+  enabledTabs.set(tabId, generation);
   try {
     await chrome.debugger.sendCommand({ tabId }, 'Network.enable');
   } catch {
-    enabledTabs.delete(tabId);
+    if (enabledTabs.get(tabId) === generation) clearNetwork(tabId);
   }
 }
 
@@ -428,6 +522,8 @@ export async function ensureNetworkCapture(tabId: number): Promise<void> {
  * tabs.onRemoved / debugger.onDetach (cdp.ts) so capture state never outlives
  * the tab. */
 export function clearNetwork(tabId: number): void {
+  for (const entry of buffers.get(tabId) ?? []) bodyCache.release(entry);
+  bodyQueue.delete(tabId); // in-flight reads still count until Chrome answers
   buffers.delete(tabId);
   enabledTabs.delete(tabId);
   pending.delete(tabId);
@@ -435,5 +531,7 @@ export function clearNetwork(tabId: number): void {
 
 /** Snapshot a tab's captured entries (a copy, oldest→newest). */
 export function readNetwork(tabId: number): NetworkEntry[] {
-  return [...(buffers.get(tabId) ?? [])];
+  // Body completion must not change a result whose wire budget was already
+  // computed, or add data to a snapshot returned before opt-out.
+  return (buffers.get(tabId) ?? []).map((entry) => ({ ...entry }));
 }

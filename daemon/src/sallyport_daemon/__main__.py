@@ -869,11 +869,12 @@ def _run_doctor_secret_error(secret_path: Path, error: str) -> int:
     return 1
 
 
-def _print_exec_content(blocks: list[dict[str, Any]]) -> bool:
-    """Print an MCP content list the way `exec` prints a tool result. Returns
-    whether it looks like a tool ERROR (the dispatcher's text starts with
-    'Error'), so the caller keeps exec's exit-code contract."""
-    failed = False
+def _print_exec_content(blocks: list[dict[str, Any]]) -> None:
+    """Print an MCP content list the way `exec` prints a tool result.
+
+    Deliberately does NOT infer success or failure from the text: that is the
+    result's `isError` flag (carried back by `call_tool_via_broker`), and a
+    page whose text starts with "Error" is a successful read."""
     for block in blocks:
         if block.get("type") == "image":
             data = block.get("data")
@@ -882,10 +883,7 @@ def _print_exec_content(blocks: list[dict[str, Any]]) -> bool:
             continue
         text = block.get("text")
         if isinstance(text, str):
-            if text.startswith("Error"):
-                failed = True
             print(_reindent_for_humans(text))
-    return failed
 
 
 def _reindent_for_humans(text: str) -> str:
@@ -922,11 +920,12 @@ async def _run_exec_via_broker(args: argparse.Namespace, secret: bytes, sock_pat
         return 2
     print(f"exec: calling {args.tool}({tool_args}) via broker {sock_path}", file=sys.stderr)
     try:
-        blocks = await call_tool_via_broker(sock_path, secret, args.tool, tool_args)
+        blocks, is_error = await call_tool_via_broker(sock_path, secret, args.tool, tool_args)
     except (BrokerError, OSError, ProtocolError) as exc:
         print(f"exec: broker call failed: {exc}", file=sys.stderr)
         return 3
-    return 5 if _print_exec_content(blocks) else 0
+    _print_exec_content(blocks)
+    return 5 if is_error else 0
 
 
 async def _run_exec(

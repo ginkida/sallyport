@@ -11,6 +11,25 @@ import {
   type ConsoleEntry,
 } from '../src/tools/console-capture.js';
 
+it('renders CDP values that JSON cannot represent without losing diagnostic text', () => {
+  const entry = shapeConsoleEntry(
+    'Runtime.consoleAPICalled',
+    {
+      type: 'error',
+      args: [
+        { unserializableValue: 'NaN' },
+        { unserializableValue: '42n' },
+        { description: 'Error: request failed' },
+        { type: 'undefined' },
+        {},
+      ],
+    },
+    1000,
+  );
+  expect(entry?.text).toBe('NaN 42n Error: request failed undefined');
+  expect(entry?.origin).toBeNull();
+});
+
 describe('originFromStackUrl', () => {
   it('extracts the origin from an http(s) script URL', () => {
     expect(originFromStackUrl('https://example.com/app/bundle.js?v=2')).toBe('https://example.com');

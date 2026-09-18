@@ -15,8 +15,8 @@ Claude Code ── MCP/stdio ──▶ daemon ── WS+HMAC ──▶ extension
 
 | Status | Number |
 |---|---|
-| Daemon tests (pytest) | 462 |
-| Extension tests (vitest) | 712 |
+| Daemon tests (pytest) | 538 |
+| Extension tests (vitest) | 1069 |
 | Lint / typecheck (ruff, mypy, eslint, prettier, tsc) | all green |
 
 ## What's in the box
@@ -66,8 +66,9 @@ Other deliberate choices:
 - Per-tab accessibility refs (`@e1`, `@e2`). Snapshotting tab A cannot
   invalidate refs for tab B, and a ref scoped to A cannot resolve to a node
   in B.
-- MCP-side tool calls are serialised by a daemon-side lock so Claude can't
-  accidentally race state on the extension.
+- MCP-side tool calls are serialised per client, with up to 8 clients running
+  concurrently. The extension also serialises calls per tab to protect shared
+  browser state.
 - The daemon shuts down cleanly on stdin EOF (Claude Code closing) or
   SIGINT/SIGTERM: pending calls fail with `ExtensionNotConnected`, the
   client gets a 1001 close, no orphan tasks.
@@ -283,9 +284,26 @@ the full model, including the tab-ownership and MCP-client-auth invariants.
 | `save_to_file` | **Daemon-local** — writes base64 to `~/Downloads/sallyport/<filename>` (override via `SALLYPORT_DOWNLOAD_DIR`). Sandboxed: no path separators or `..`. |
 | `status` | **Daemon-answered** health check: `{connected, mode, version, port, pendingCalls, uptimeS, lastCalls, lastError, lastHandshakeError}`. `mode` is `broker` (explicit owned `tabId` required per call) or `standalone` (active-tab fallback). `lastCalls` is a ring of recent tool **outcomes** (`{tool, ok, ms, code?}` — never the args) and `lastError` the latest failure, so a loop can attribute a stall to a specific tool/code; when `connected` is false, `lastHandshakeError` says why the extension leg failed to attach (wrong secret, clock skew, no hello). No browser round-trip and never queues behind a running call — use it as preflight before browser work. |
 
-All tools accept `tabId` to target a specific tab; otherwise they use the
-active tab in the current window. There is no implicit "last touched tab"
-memo — explicit IDs win, the active tab is the only fallback.
+In broker mode, target an owned tab with an explicit `tabId`; `navigate`
+without one creates an agent tab. Standalone mode supports an active-tab
+fallback for browser tools, except `close_tab`, which always requires `tabId`.
+There is no implicit "last touched tab" memo.
+
+Console/network capture starts on the next tool call after enabling it.
+Switching either setting off immediately clears that capture's buffers on
+all tabs. For `network_tail`, `bodyPending: true` means a body read is queued
+or still running; read again shortly. At most 4 body reads per tab and 32
+globally are in flight at once; the rest wait in a per-tab queue bounded by
+the 100-entry ring, so a burst of simultaneous responses still yields every
+body. Only when that queue overflows does a response keep its metadata but
+carry `bodyOmitted: true` and `bodyOmissionReason: "capture_busy"`, with the
+result marked `truncated`; filtering cannot recover those bodies. Retained
+body payloads are bounded across tabs — 10 MiB per tab and 40 MiB total,
+measured in the same wire bytes as the per-result budget — so older bodies
+within the same tab may be discarded; their metadata remains with
+`bodyOmissionReason: "cache_limit"`, and a tab cannot evict another tab's
+bodies. These limits cover cached body payloads, not Chrome's own buffers,
+transient decoding, metadata or total process memory.
 
 For agents running on a schedule, the cheap iteration shape is: `status`
 (skip everything if the extension is detached) → scoped reads
@@ -430,6 +448,39 @@ mypy
 pytest -q
 sallyport-daemon --verbose < <(sleep 99999)   # smoke-test a long-running daemon
 ```
+
+### Real-browser capture smoke test
+
+With Node 22+ and a Chromium / Chrome for Testing binary that supports unpacked
+extensions, run from `extension/`:
+
+```sh
+CHROME_BIN='/absolute/path/to/chromium' npm run test:browser
+```
+
+The test creates an isolated temporary profile, loads the extension, and uses
+a localhost fixture to exercise real console/network capture, immediate
+opt-out, re-enabling, debugger detach/re-attach, and popup cleanup of finished
+sessions while preserving active, human-viewed and non-agent tabs. It also
+verifies keyboard navigation, accessible tab state and long session names.
+It removes its profile and stops its browser and fixture server when finished.
+It does not use your
+normal browser profile or pairing secret. This is an additional integration
+check; the deterministic unit tests still cover body-read races and overload.
+
+For the complete MCP → daemon → extension → Chrome route, install the daemon
+dependencies in `daemon/.venv` and run:
+
+```sh
+CHROME_BIN='/absolute/path/to/chromium' npm run test:e2e
+```
+
+`SALLYPORT_TEST_PYTHON` can select a different Python interpreter with the daemon
+dependencies installed. This mode starts a standalone daemon on a temporary
+local port with a new test secret, then verifies MCP initialization and tool
+discovery, authenticated pairing, allowlist refusal, form filling and clicking,
+reading the result, password refusal and audit redaction. Both daemon and
+browser are stopped after the test. It does not connect to your usual daemon.
 
 ### Pre-commit
 

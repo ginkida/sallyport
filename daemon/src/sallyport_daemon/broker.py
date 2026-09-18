@@ -671,8 +671,13 @@ async def call_tool_via_broker(
     tool_args: dict[str, Any],
     *,
     call_timeout: float = 90.0,
-) -> list[dict[str, Any]]:
-    """Run ONE tool through a live broker and return its MCP content blocks.
+) -> tuple[list[dict[str, Any]], bool]:
+    """Run ONE tool through a live broker; return its MCP content blocks and
+    the result's ``isError`` flag.
+
+    The flag travels alongside the content on purpose: failure is decided by
+    the bridge outcome (`isError`), never by the prose of the text block. A
+    page whose text begins "Error 404" is a successful read.
 
     This is what keeps ``sallyport-daemon exec`` — the documented shell-level
     debugging layer — working now that a broker is normally running. Without it
@@ -741,11 +746,12 @@ async def call_tool_via_broker(
         await notify("notifications/initialized")
         result = await request(2, "tools/call", {"name": name, "arguments": tool_args})
         content = result.get("content")
-        return (
+        blocks = (
             [item for item in content if isinstance(item, dict)]
             if isinstance(content, list)
             else []
         )
+        return blocks, result.get("isError") is True
     finally:
         await _close_quietly(writer)
 

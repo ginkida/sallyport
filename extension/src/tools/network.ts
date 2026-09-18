@@ -53,7 +53,9 @@ export const networkTail: Tool = async (args) => {
     data: {
       enabled: true,
       entries,
-      ...(total > matched.length || omitted > 0 ? { truncated: true } : {}),
+      ...(total > matched.length || omitted > 0 || entries.some((entry) => entry.bodyOmitted)
+        ? { truncated: true }
+        : {}),
     },
   };
 };

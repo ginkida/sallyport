@@ -181,28 +181,23 @@ export async function releaseKeepAwakeEverywhere(): Promise<void> {
 // module transitively (tabs.ts/poll.ts pull pure helpers) where it doesn't
 // exist at load time — guard the top-level registrations so importing never
 // demands the API surface, only calling does.
+function clearTabState(tabId: number): void {
+  attached.delete(tabId);
+  clearRefsForTab(tabId);
+  clearConsole(tabId);
+  clearNetwork(tabId);
+  clearDialogs(tabId);
+  emulatedDsf.delete(tabId);
+}
+
 if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
-  chrome.tabs.onRemoved.addListener((tabId) => {
-    attached.delete(tabId);
-    clearRefsForTab(tabId);
-    clearConsole(tabId);
-    clearNetwork(tabId);
-    clearDialogs(tabId);
-    emulatedDsf.delete(tabId);
-  });
+  chrome.tabs.onRemoved.addListener(clearTabState);
 }
 
 if (typeof chrome !== 'undefined' && chrome.debugger?.onDetach) {
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId !== undefined) {
-      attached.delete(source.tabId);
-      clearRefsForTab(source.tabId);
-      clearConsole(source.tabId);
-      clearNetwork(source.tabId);
-      clearDialogs(source.tabId);
-      // The emulation dies with the session — and so must our record of it, or
-      // a later capture would size itself against an emulation that is gone.
-      emulatedDsf.delete(source.tabId);
+      clearTabState(source.tabId);
     }
   });
 }
@@ -240,7 +235,9 @@ export async function attach(tabId: number): Promise<void> {
       break;
   }
   if (settings.captureConsole) await ensureConsoleCapture(tabId);
+  else clearConsole(tabId);
   if (settings.captureNetwork) await ensureNetworkCapture(tabId);
+  else clearNetwork(tabId);
   // Dialog handling ACTS on the page (unlike console/network, which only
   // observe), so unlike those two, turning it off must actively stop it —
   // same off-path shape as keep-awake's releaseKeepAwake below.
@@ -385,8 +382,8 @@ export async function releaseViewport(tabId: number, deadlineMs?: number): Promi
  * clears all three — every CDP override ends with the session.
  *
  * Best-effort by construction: a tab that is already gone, or was never
- * attached, is simply not our problem. `chrome.debugger.onDetach` does the
- * bookkeeping (attached set, refs, capture rings). */
+ * attached, is simply not our problem. Explicit detach clears our state too:
+ * Chrome does not emit onDetach for the extension's own detach call. */
 export async function detach(tabId: number): Promise<void> {
   // Drop any viewport emulation FIRST, while there is still a session to send
   // it on. Unlike every other override, this one does not reliably end with the
@@ -410,7 +407,7 @@ export async function detach(tabId: number): Promise<void> {
   } catch {
     // already detached, tab closed, or never ours — nothing to undo
   }
-  attached.delete(tabId);
+  clearTabState(tabId);
 }
 
 export async function cdp<T = unknown>(
