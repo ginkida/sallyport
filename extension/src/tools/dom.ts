@@ -271,7 +271,8 @@ const FILL_CLEAR_FN = `function() {
   let cleared = false;
   try { cleared = doc.execCommand('delete', false); } catch (_) {}
   if (!cleared && !this.isContentEditable && 'value' in this && this.value !== '') {
-    const proto = this.tagName === 'TEXTAREA' ? win.HTMLTextAreaElement : win.HTMLInputElement;
+    // instanceof, not tagName: an XHTML page reports 'textarea' in lower case.
+    const proto = this instanceof win.HTMLTextAreaElement ? win.HTMLTextAreaElement : win.HTMLInputElement;
     const d = proto ? Object.getOwnPropertyDescriptor(proto.prototype, 'value') : null;
     if (d && d.set) d.set.call(this, ''); else this.value = '';
     this.dispatchEvent(new Event('input', { bubbles: true }));
@@ -495,8 +496,18 @@ export const fill: Tool = async (args, ctx) => {
         applied: (this.innerText || this.textContent || ''),
       };
     }
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
-      || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+    // The native setter of THIS element's own class (React-safe): the input
+    // setter called on a <textarea> throws "Illegal invocation", which used to
+    // fail the whole probe and read as a framework revert.
+    // instanceof, not tagName: an XHTML page reports 'textarea' in lower case,
+    // which would pick the <input> setter and lose the React-safe path.
+    const proto = this instanceof window.HTMLTextAreaElement
+      ? window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    // No catch-and-assign: on a non-field (a div, a custom element) that would
+    // plant an expando .value that reads back as "landed". Let it throw — the
+    // insertText fallback then refuses a target that cannot take focus.
     if (setter) setter.call(this, v); else this.value = v;
     this.dispatchEvent(new Event('input', { bubbles: true }));
     this.dispatchEvent(new Event('change', { bubbles: true }));

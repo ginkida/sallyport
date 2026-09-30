@@ -52,6 +52,7 @@ const server = createServer((req, res) => {
         '<svg id="svg-btn" role="button" width="24" height="24" onclick="document.querySelector(\'#result\').textContent = \'svg clicked\'"><rect width="24" height="24"></rect></svg>' +
         '<input id="ro" readonly value="2026-10-01">' +
         '<x-pass id="xpass" type="password"></x-pass>' +
+        '<textarea id="msg"></textarea>' +
         '<select id="multi" multiple><option value="UA">UA</option><option value="PL">PL</option><option value="DE">DE</option></select>' +
         '<select id="dupe"><option value="">— choose —</option><option value="">Other</option></select>' +
         '<div id="list" style="height:150px;overflow:auto;position:relative;scroll-behavior:smooth" onscroll="renderRows()">' +
@@ -602,6 +603,15 @@ try {
     assert.equal(dupe.applied, 'yes', JSON.stringify(dupe));
     assert.equal(dupe.selected[0].label, 'Other');
     console.log('PASS: MCP select_option lands the planned option and reads it back');
+    // method:value on a <textarea> must land by value, not fall back to typing
+    // with an empty tag as if a framework had reverted it.
+    const area = value(
+      await callTool('fill', { selector: '#msg', value: 'multi\nline', method: 'value', tabId }),
+    );
+    assert.equal(area.mode, 'value', JSON.stringify(area));
+    assert.equal(area.tag, 'TEXTAREA');
+    assert.equal(area.fallbackFrom, undefined);
+    console.log('PASS: MCP fill method:value lands on a textarea');
     for (const mode of ['text', 'attribute', 'revert']) {
       value(await callTool('click', { selector: `#churn-${mode}`, tabId }));
       const busy = value(await callTool('settle', { stableMs: 500, timeoutMs: 1000, tabId }));

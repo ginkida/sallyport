@@ -24,6 +24,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `fill` with `method: 'value'` on a `<textarea>` always failed its value
+  write: it called the `<input>` prototype's native setter, which throws on a
+  textarea, so every such fill fell back to typing and answered
+  `mode: 'insertText', fallbackFrom: 'value', tag: ''` — the shape that
+  means "a framework reverted your value". It now uses the element's own
+  class's setter, chosen by `instanceof` rather than the tag name (an XHTML
+  page reports a lowercase `textarea`, which also broke the clear step).
+
 - `wait_for`, `settle`, `reveal` and `find` called on their own still gave
   themselves a fresh timeout of up to 30 s, so one queued behind another call
   on the same tab could run past the daemon's 60 s and come back as
