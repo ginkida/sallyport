@@ -11,6 +11,9 @@ import {
   SCROLL_INTO_VIEW_PROBE,
   SCROLL_STEP_PROBE,
   atScrollEdge,
+  anyMatchVisible,
+  runEmbeddedWait,
+  SELECTOR_VISIBILITY_FN,
   scrollStalled,
   pollFor,
   settleFor,
@@ -373,11 +376,16 @@ function installChrome(urls: string[], present = false): { tabGets: () => number
     },
     debugger: {
       async attach() {},
-      async sendCommand(_t: unknown, method: string) {
+      async sendCommand(_t: unknown, method: string, params?: { functionDeclaration?: string }) {
         if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
-        if (method === 'DOM.querySelector') return { nodeId: present ? 5 : 0 };
         if (method === 'DOM.getBoxModel') return { model: { width: 10, height: 10 } };
         if (method === 'Runtime.evaluate') return { result: { objectId: 'observer' } };
+        if (
+          method === 'Runtime.callFunctionOn' &&
+          params?.functionDeclaration === SELECTOR_VISIBILITY_FN
+        ) {
+          return { result: { value: { visible: present, total: present ? 1 : 0 } } };
+        }
         if (method === 'Runtime.callFunctionOn') return { result: { value: 0 } };
         return {};
       },
@@ -787,5 +795,170 @@ describe('settle observer lifecycle', () => {
     });
     await expect(settleFor(TAB, { stableMs: 500, timeoutMs: 1000 })).rejects.toThrow('detached');
     expectCleanup(send);
+  });
+});
+
+describe('anyMatchVisible / SELECTOR_VISIBILITY_FN (wait_for over EVERY match)', () => {
+  const el = (w: number, h: number) => ({
+    getBoundingClientRect: () => ({ width: w, height: h }) as DOMRect,
+  });
+  const doc = (els: ReturnType<typeof el>[]) => ({ querySelectorAll: () => els });
+
+  it('is visible when ANY match is laid out, not just the first', () => {
+    expect(anyMatchVisible(doc([el(0, 0), el(10, 10)]), '.x')).toEqual({ visible: true, total: 2 });
+  });
+
+  it('is hidden only when no match has area — and says how many it checked', () => {
+    expect(anyMatchVisible(doc([el(0, 0), el(10, 0)]), '.x')).toEqual({ visible: false, total: 2 });
+    expect(anyMatchVisible(doc([]), '.x')).toEqual({ visible: false, total: 0 });
+  });
+
+  it('scans past any fixed cap', () => {
+    const many = Array.from({ length: 5000 }, () => el(0, 0));
+    many.push(el(5, 5));
+    expect(anyMatchVisible(doc(many), '.row')).toEqual({ visible: true, total: 5001 });
+  });
+
+  it('reports a malformed selector instead of throwing in the page', () => {
+    const bad = {
+      querySelectorAll: () => {
+        // What Chrome throws: a DOMException NAMED SyntaxError.
+        throw Object.assign(new Error("'div[' is not a valid selector"), { name: 'SyntaxError' });
+      },
+    };
+    expect(anyMatchVisible(bad, 'div[')).toEqual({ invalid: true });
+  });
+
+  it('does not blame the selector for a page that broke querySelectorAll', () => {
+    const broken = {
+      querySelectorAll: () => {
+        throw new TypeError('polyfill exploded');
+      },
+    };
+    expect(() => anyMatchVisible(broken, '.ok')).toThrow('polyfill exploded');
+  });
+
+  it('is self-contained and takes the selector as an ARGUMENT, never interpolated', () => {
+    const fn = new Function(`return (${SELECTOR_VISIBILITY_FN});`)() as (
+      this: unknown,
+      selector: string,
+    ) => unknown;
+    const seen: string[] = [];
+    const target = {
+      querySelectorAll: (s: string) => {
+        seen.push(s);
+        return [el(3, 3)];
+      },
+    };
+    expect(fn.call(target, '"); alert(1); ("')).toEqual({ visible: true, total: 1 });
+    expect(seen).toEqual(['"); alert(1); ("']);
+    expect(SELECTOR_VISIBILITY_FN).not.toContain('alert');
+  });
+});
+
+describe('pollFor — a CSS selector with several matches', () => {
+  const SHOP = 'https://shop.example/cart';
+
+  /** Answers the page probe with each of `readings` in turn (last one repeats). */
+  function probe(readings: unknown[]) {
+    let i = 0;
+    return vi
+      .spyOn(chrome.debugger, 'sendCommand')
+      .mockImplementation(async (_target, method, params) => {
+        const p = params as { functionDeclaration?: string };
+        if (method === 'Runtime.evaluate') return { result: { objectId: 'doc' } };
+        if (
+          method === 'Runtime.callFunctionOn' &&
+          p.functionDeclaration === SELECTOR_VISIBILITY_FN
+        ) {
+          const r = readings[Math.min(i++, readings.length - 1)];
+          if (r instanceof Error) throw r;
+          if (r === 'throws') return { result: { type: 'object' }, exceptionDetails: {} };
+          return { result: { value: r } };
+        }
+        return {};
+      });
+  }
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    installChrome([SHOP]);
+    await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const wait = (absent: boolean) =>
+    pollFor(TAB, { selector: '.spinner', text: null, timeoutMs: 500, absent });
+
+  it('does not call a selector gone while any match is still visible', async () => {
+    // One spinner per widget hidden by a class as each finishes: the first
+    // going display:none used to answer "gone" with the rest still spinning.
+    probe([{ visible: true, total: 3 }]);
+    const pending = wait(true);
+    await vi.runAllTimersAsync();
+    expect(await pending).toMatchObject({ found: false, reason: 'timeout' });
+  });
+
+  it('reports gone once no match is visible, and releases its handles', async () => {
+    const send = probe([
+      { visible: true, total: 3 },
+      { visible: false, total: 3 },
+    ]);
+    const pending = wait(true);
+    await vi.runAllTimersAsync();
+    expect(await pending).toMatchObject({ found: true });
+    expect(send).toHaveBeenCalledWith({ tabId: TAB }, 'Runtime.callFunctionOn', {
+      objectId: 'doc',
+      functionDeclaration: SELECTOR_VISIBILITY_FN,
+      arguments: [{ value: '.spinner' }],
+      returnByValue: true,
+    });
+    expect(send).toHaveBeenLastCalledWith({ tabId: TAB }, 'Runtime.releaseObjectGroup', {
+      objectGroup: 'sallyport-wait',
+    });
+  });
+
+  it('finds a visible match behind a hidden first copy', async () => {
+    probe([{ visible: true, total: 2 }]);
+    const pending = wait(false);
+    await vi.runAllTimersAsync();
+    expect(await pending).toMatchObject({ found: true });
+  });
+
+  it.each([['throws'], [null], [{ total: 2 }], ['nonsense']])(
+    'never reads an unusable probe answer (%j) as proof of absence',
+    async (reading) => {
+      probe([reading]);
+      const pending = wait(true);
+      await vi.runAllTimersAsync();
+      expect(await pending).toMatchObject({ found: false, reason: 'timeout' });
+    },
+  );
+
+  it('rides out a navigation that takes the document away mid-tick', async () => {
+    probe([new Error('Cannot find context with specified id'), { visible: false, total: 0 }]);
+    const pending = wait(true);
+    await vi.runAllTimersAsync();
+    expect(await pending).toMatchObject({ found: true });
+  });
+
+  it('refuses a malformed selector at once, as bad_args', async () => {
+    probe([{ invalid: true }]);
+    await expect(wait(false)).rejects.toMatchObject({ code: 'bad_args' });
+  });
+
+  it('names a malformed selector invalid_selector in an embedded wait', async () => {
+    probe([{ invalid: true }]);
+    const out = await runEmbeddedWait(TAB, {
+      selector: 'div[',
+      text: null,
+      timeoutMs: 500,
+      absent: false,
+    });
+    expect(out).toMatchObject({ found: false, reason: 'invalid_selector' });
   });
 });

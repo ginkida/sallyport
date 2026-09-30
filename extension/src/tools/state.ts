@@ -137,9 +137,11 @@ export type ElementState = {
  * visible-derivation, box rounding and truncation marker are unit-testable
  * without chrome.
  *
- * `visible` mirrors poll.ts:selectorVisible / wait_for's notion of visible: a
+ * `visible` is wait_for's per-NODE notion of visible (poll.ts:anyMatchVisible): a
  * laid-out box with width AND height > 0 (display:none → zero rect → false;
- * visibility:hidden still occupies layout → true, same as getBoxModel). `box`
+ * visibility:hidden still occupies layout → true, same as getBoxModel). The
+ * two differ in WHICH node a CSS selector names: wait_for weighs every match,
+ * get_state (like click/fill) takes the first. `box`
  * and `inViewport` are reported only when visible — a hidden element has no
  * meaningful geometry. Coordinates are viewport-relative CSS px (the same
  * frame mouse_click's x/y use), rounded to integers. */

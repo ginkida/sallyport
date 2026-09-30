@@ -55,7 +55,9 @@ _WAIT_FOR_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "description": (
         "Post-action wait (same engine as wait_for): poll until selector/text is "
-        "present-and-visible, or gone with absent=true. Saves the follow-up wait_for "
+        "present-and-visible, or gone with absent=true. A CSS selector is present "
+        "if ANY match is laid out and gone only when NONE is (not necessarily the "
+        "first match, which click/fill act on). Saves the follow-up wait_for "
         "call — prefer it over a separate one. Adds wait:{found, elapsedMs, reason?}; "
         "a wait timeout or error never fails the action. On found=false, reason says "
         "why: 'timeout' (not true yet — longer may help), 'bad_ref' (stale @eN after a "
@@ -1073,7 +1075,11 @@ TOOLS: list[Tool] = [
             "and/or until the page's visible text contains a substring — the "
             "replacement for blind sleeps between actions. absent=true inverts "
             "both: wait until the selector/text is GONE (spinner finished, "
-            "modal closed). Polls every 250 ms up to timeoutMs (default 10000, "
+            "modal closed). A CSS selector counts as present if ANY of its matches "
+            "is laid out, and as gone only when NONE is — so found=true does not "
+            "mean the FIRST match (the one click/fill/get_state act on) is "
+            "visible. A malformed selector fails at once with bad_args. Polls "
+            "every 250 ms up to timeoutMs (default 10000, "
             "capped at 30000). At least one of selector/text is required; if "
             "both are given, both must hold. Returns {found, elapsedMs, "
             "reason?}; a timeout returns found=false (reason='timeout') rather "

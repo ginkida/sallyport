@@ -14,7 +14,7 @@ import {
   looksLikeMissingNodeError,
   looksLikeSelectorSyntaxError,
 } from './cdp.js';
-import { BridgeError, staleRefError } from './errors.js';
+import { BridgeError, invalidSelectorError, staleRefError } from './errors.js';
 import { ensureStillAllowed } from './gates.js';
 import { getRef, isRef } from './refs.js';
 import { CREATE_QUIESCENCE_PROBE, OBSERVE_ELEMENT_FN } from './quiescence.js';
@@ -62,8 +62,9 @@ export type WaitOutcome = {
  * (permanent) and a not-yet-present element (retryable) both surfaced as the
  * same {found:false}. Pure, so the mapping is unit-testable without chrome.
  *
- * selectorVisible throws BridgeError('bad_ref') on a stale @eN; DOM.querySelector
- * rejects on malformed CSS with a raw CDP error mentioning the selector / query.
+ * selectorVisibility throws BridgeError('bad_ref') on a stale @eN and
+ * invalidSelectorError on malformed CSS; other CDP rejections that mention the
+ * selector / query (text waits, older paths) still read as invalid_selector.
  * Conservative: only a clear selector-query rejection becomes 'invalid_selector',
  * everything unrecognised stays the generic 'error'. */
 export function classifyWaitError(e: unknown): Exclude<WaitReason, 'timeout'> {
@@ -110,30 +111,48 @@ export function parseWaitFor(raw: unknown, tool: string): WaitSpec | null {
   };
 }
 
-/** Is the selector / @eN ref present AND laid out (has a box model)?
- * Structured CDP only — DOM.querySelector + DOM.getBoxModel, no page JS.
- * An invalid CSS selector makes DOM.querySelector reject, which surfaces
- * immediately as a tool error instead of a silent timeout. */
-async function selectorVisible(tabId: number, selector: string): Promise<boolean> {
-  const params: Record<string, unknown> = {};
-  if (isRef(selector)) {
-    const r = getRef(tabId, selector);
-    if (!r) {
-      throw new BridgeError(
-        'bad_ref',
-        `wait: unknown ref "${selector}" for tab ${tabId} — run snapshot first`,
-      );
-    }
-    params.backendNodeId = r.backendDOMNodeId;
-  } else {
-    const doc = await cdp<{ root: { nodeId: number } }>(tabId, 'DOM.getDocument', { depth: 0 });
-    const q = await cdp<{ nodeId: number }>(tabId, 'DOM.querySelector', {
-      nodeId: doc.root.nodeId,
-      selector,
-    });
-    if (!q.nodeId) return false;
-    params.nodeId = q.nodeId;
+/** `unknown` = no trustworthy reading this tick (the probe threw in the page,
+ * returned nonsense, or a navigation took its document away). A present-wait
+ * keeps waiting on it, and so must an absent-wait: absence was not shown. */
+export type SelectorVisibility = 'visible' | 'hidden' | 'unknown';
+
+/** Page-side half of a CSS-selector wait, over EVERY match: is any of them laid
+ * out? Only `{visible, total}` leaves the page — no node, text or attribute.
+ * Scanning in the page is what makes "every match" affordable: the CDP route
+ * (`DOM.querySelectorAll`) pushes every match's path to the frontend, i.e. most
+ * of a large document at 4 Hz for a selector like `a`. Self-contained: it is
+ * serialised as SELECTOR_VISIBILITY_FN and called on the document with the
+ * selector as a STRUCTURED argument, never interpolated — the trust shape of
+ * get_state's ELEMENT_STATE_FN, so no allowEvaluate. A rect with area is the
+ * same test `DOM.getBoxModel` answered for one node: display:none, detached and
+ * zero-size all read as not visible. */
+export function anyMatchVisible(
+  root: { querySelectorAll: (s: string) => ArrayLike<{ getBoundingClientRect: () => DOMRect }> },
+  selector: string,
+): { visible: boolean; total: number } | { invalid: true } {
+  let list;
+  try {
+    list = root.querySelectorAll(selector);
+  } catch (e) {
+    // Only a SYNTAX error is the caller's selector; anything else (a page that
+    // wrapped or broke querySelectorAll) rethrows and reads as no reading. The
+    // browser throws a DOMException NAMED SyntaxError, not a SyntaxError.
+    if (e && (e as { name?: unknown }).name === 'SyntaxError') return { invalid: true };
+    throw e;
   }
+  for (let i = 0; i < list.length; i++) {
+    const r = list[i].getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) return { visible: true, total: list.length };
+  }
+  return { visible: false, total: list.length };
+}
+
+export const SELECTOR_VISIBILITY_FN =
+  'function(selector) { return (' + anyMatchVisible.toString() + ')(this, selector); }';
+
+const WAIT_GROUP = 'sallyport-wait';
+
+async function nodeHasBox(tabId: number, params: Record<string, unknown>): Promise<boolean> {
   try {
     const box = await cdp<{ model?: { width: number; height: number } }>(
       tabId,
@@ -144,6 +163,62 @@ async function selectorVisible(tabId: number, selector: string): Promise<boolean
   } catch {
     return false; // no box model — display:none / detached; keep waiting
   }
+}
+
+/** Is the selector / @eN ref present AND laid out?
+ *
+ * A CSS selector is judged over EVERY match, not the first: with one `.spinner`
+ * per widget hidden by a class as each finishes, the first match going
+ * `display:none` used to answer "gone" while the rest still spun — a false
+ * success — and a hidden mobile copy ahead of the visible desktop one made a
+ * present-wait time out. A malformed selector fails at once as `bad_args`
+ * (named `invalid_selector` in an embedded wait), never a silent timeout.
+ *
+ * An `@eN` names one node, and is checked browser-side (`DOM.getBoxModel`). */
+async function selectorVisibility(tabId: number, selector: string): Promise<SelectorVisibility> {
+  if (isRef(selector)) {
+    const r = getRef(tabId, selector);
+    if (!r) {
+      throw new BridgeError(
+        'bad_ref',
+        `wait: unknown ref "${selector}" for tab ${tabId} — run snapshot first`,
+      );
+    }
+    return (await nodeHasBox(tabId, { backendNodeId: r.backendDOMNodeId })) ? 'visible' : 'hidden';
+  }
+  let v: unknown;
+  try {
+    const doc = await cdp<{ result: { objectId?: string }; exceptionDetails?: unknown }>(
+      tabId,
+      'Runtime.evaluate',
+      { expression: 'document', objectGroup: WAIT_GROUP },
+    );
+    if (doc.exceptionDetails || !doc.result.objectId) return 'unknown';
+    const out = await cdp<{ result: { value?: unknown }; exceptionDetails?: unknown }>(
+      tabId,
+      'Runtime.callFunctionOn',
+      {
+        objectId: doc.result.objectId,
+        functionDeclaration: SELECTOR_VISIBILITY_FN,
+        arguments: [{ value: selector }],
+        returnByValue: true,
+      },
+    );
+    v = out.exceptionDetails ? undefined : out.result.value;
+  } catch (e) {
+    // A navigation between the two calls: the next tick reads the new page.
+    if (looksLikeLostContextError(e)) return 'unknown';
+    throw e;
+  }
+  // Classified OUTSIDE the catch: the message carries the agent's selector,
+  // which must not be able to pass itself off as a lost context.
+  if (v && typeof v === 'object' && (v as { invalid?: unknown }).invalid === true) {
+    throw invalidSelectorError('wait', selector);
+  }
+  if (v && typeof v === 'object' && typeof (v as { visible?: unknown }).visible === 'boolean') {
+    return (v as { visible: boolean }).visible ? 'visible' : 'hidden';
+  }
+  return 'unknown';
 }
 
 /** Does the page's visible text contain `text`? Re-resolves <body> on every
@@ -169,7 +244,7 @@ async function textPresent(tabId: number, text: string): Promise<boolean> {
 
 /** Is the node behind a `@eN` still in the document?
  *
- * `selectorVisible` cannot tell "destroyed" from "laid out with no box": both
+ * `selectorVisibility` cannot tell "destroyed" from "laid out with no box": both
  * end in the `catch { return false }` that means keep waiting. For a node the
  * page has DESTROYED that is a lie the agent pays for twice — the wait burns its
  * whole budget (up to the 30 s cap) and then reports `reason:'timeout'`, whose
@@ -198,6 +273,20 @@ async function ensureRefStillExists(tabId: number, ref: string): Promise<void> {
  * both). A timeout is NOT an error: returns {found:false, elapsedMs} so the
  * caller decides what to do next. */
 export async function pollFor(tabId: number, spec: WaitSpec): Promise<WaitOutcome> {
+  if (spec.selector === null || isRef(spec.selector)) return pollLoop(tabId, spec);
+  try {
+    return await pollLoop(tabId, spec);
+  } finally {
+    // One `document` handle per tick, all in this group.
+    try {
+      await cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: WAIT_GROUP });
+    } catch {
+      // A closed tab or detached debugger has already released its objects.
+    }
+  }
+}
+
+async function pollLoop(tabId: number, spec: WaitSpec): Promise<WaitOutcome> {
   // Only for the PRESENT condition. Under `absent:true` a destroyed node is
   // precisely what is being waited for, and the loop below already reports it
   // as found — turning it into an error there would break the tool.
@@ -215,11 +304,13 @@ export async function pollFor(tabId: number, spec: WaitSpec): Promise<WaitOutcom
     let ok: boolean;
     if (spec.absent) {
       // Gone-condition: selector invisible/detached AND text not on page.
-      const selGone = spec.selector === null || !(await selectorVisible(tabId, spec.selector));
+      const selGone =
+        spec.selector === null || (await selectorVisibility(tabId, spec.selector)) === 'hidden';
       const textGone = !selGone || spec.text === null || !(await textPresent(tabId, spec.text));
       ok = selGone && textGone;
     } else {
-      const selOk = spec.selector === null || (await selectorVisible(tabId, spec.selector));
+      const selOk =
+        spec.selector === null || (await selectorVisibility(tabId, spec.selector)) === 'visible';
       // Short-circuit: skip the text probe while the selector is failing.
       const textOk = !selOk || spec.text === null || (await textPresent(tabId, spec.text));
       ok = selOk && textOk;

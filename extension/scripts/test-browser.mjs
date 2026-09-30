@@ -47,6 +47,7 @@ const server = createServer((req, res) => {
         '<button id="churn-revert" onclick="startChurn(2)">Revert changes</button>' +
         '<button id="navigate-soon" onclick="setTimeout(() => location.assign(`/?next`), 300)">Navigate</button>' +
         '<button id="start-clock" onclick="startClock()">Start clock</button><span id="clock">0</span>' +
+        '<span class="dup" style="display:none">hidden copy</span><span class="dup">visible copy</span>' +
         '<div id="list" style="height:150px;overflow:auto;position:relative" onscroll="renderRows()">' +
         '<div style="height:900px;position:relative"></div></div>' +
         '<script>function startChurn(mode) {' +
@@ -569,6 +570,24 @@ try {
     assert.equal(moved.settled, true, 'settle must follow a navigation to the new page');
     assert.match(JSON.stringify((await callTool('list_tabs', {})).content), /\?next/);
     console.log('PASS: MCP settle survives a navigation during the wait');
+    // A selector's FIRST match is hidden and its second visible: the selector
+    // is present, and it is not gone.
+    const present = value(await callTool('wait_for', { selector: '.dup', timeoutMs: 1000, tabId }));
+    assert.equal(present.found, true, 'a visible later match makes the selector present');
+    const gone = value(
+      await callTool('wait_for', { selector: '.dup', absent: true, timeoutMs: 600, tabId }),
+    );
+    assert.equal(gone.found, false, 'a visible later match means the selector is not gone');
+    // Chrome's own DOMException must surface as the caller's mistake: a
+    // standalone wait fails bad_args, an embedded one names it.
+    const bad = await callTool('wait_for', { selector: 'div[', timeoutMs: 1000, tabId });
+    assert.equal(bad.isError, true, JSON.stringify(bad));
+    assert.match(bad.content[0].text, /bad_args/);
+    const malformed = value(
+      await callTool('scroll', { to: 'top', waitFor: { selector: 'div[', timeoutMs: 300 }, tabId }),
+    );
+    assert.equal(malformed.wait.reason, 'invalid_selector', JSON.stringify(malformed.wait));
+    console.log('PASS: MCP wait_for weighs every match of a selector');
     // reveal waits between scroll steps on its CONTAINER: a clock ticking
     // elsewhere on the page must not cost every step the full 1.5 s budget.
     value(await callTool('click', { selector: '#start-clock', tabId }));

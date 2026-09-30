@@ -24,6 +24,21 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `wait_for` and every embedded `waitFor` judged a CSS selector by its FIRST
+  match only. With one spinner per widget, hidden by a class as each finished,
+  `absent=true` answered "gone" as soon as the first one hid while the rest
+  still spun; a hidden mobile copy ahead of the visible desktop one made a
+  present-wait time out. A selector is now present when any match is laid out
+  and gone only when none is. The check runs as one fixed in-page probe over
+  every match (the selector passed as a structured argument, only
+  `{visible, total}` coming back), because asking CDP for every match would
+  push most of a large document to the extension four times a second. A
+  malformed selector in a standalone `wait_for` now fails as `bad_args`
+  rather than a generic `error` (embedded waits keep reporting
+  `invalid_selector`), and a navigation between the probe's two calls is
+  ridden out instead of failing the wait. The browser test covers a hidden
+  first match followed by a visible one, and a malformed selector.
+
 - `navigate`, `reload` and `history_go` could report `timeout` after 30 s for
   a page that had loaded in milliseconds. The load watchdog read the tab first
   and subscribed to its updates second; a load that completed in between fired
