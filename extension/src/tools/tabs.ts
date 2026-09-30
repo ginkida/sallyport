@@ -87,19 +87,31 @@ export function landedElsewhere(requested: string, landed: string | undefined): 
  * `timeout` code) retries the right tool. */
 export function waitForLoad(tabId: number, toolName: string, timeoutMs = 30000): Promise<void> {
   return new Promise((resolve, reject) => {
-    const t = setTimeout(() => {
+    let settled = false;
+    const finish = (err?: BridgeError) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
       chrome.tabs.onUpdated.removeListener(listener);
-      reject(new BridgeError('timeout', `${toolName}: page load timeout`));
-    }, timeoutMs);
+      if (err) reject(err);
+      else resolve();
+    };
+    const t = setTimeout(
+      () => finish(new BridgeError('timeout', `${toolName}: page load timeout`)),
+      timeoutMs,
+    );
     const ready = (tab: chrome.tabs.Tab) =>
       tab.status === 'complete' && !!tab.url && tab.url !== 'about:blank';
     const listener = (id: number, info: chrome.tabs.OnUpdatedInfo, tab: chrome.tabs.Tab) => {
-      if (id === tabId && info.status === 'complete' && ready(tab)) {
-        clearTimeout(t);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }
+      if (id === tabId && info.status === 'complete' && ready(tab)) finish();
     };
+    // Subscribe BEFORE reading the tab. Reading first left a window between the
+    // snapshot `tabs.get` took ('loading') and the listener existing: a page that
+    // finished loading inside it fired its one 'complete' to nobody, and the
+    // call hung the full watchdog to report a `timeout` for a page that had
+    // loaded in milliseconds. Now whichever of the two sees 'complete' first
+    // resolves, and the other is a no-op.
+    chrome.tabs.onUpdated.addListener(listener);
     chrome.tabs.get(tabId, (tab) => {
       // A tab closed/recycled in the gap between create/update and this get makes
       // Chrome call back with `tab === undefined` + runtime.lastError (reading it
@@ -108,8 +120,7 @@ export function waitForLoad(tabId: number, toolName: string, timeoutMs = 30000):
       // promise never settles, and the call hangs to the full timeout with a
       // misleading code:'timeout'. Fail fast with the same tab_gone getTabOrGone uses.
       if (chrome.runtime?.lastError || !tab) {
-        clearTimeout(t);
-        reject(
+        finish(
           new BridgeError(
             'tab_gone',
             `tab ${tabId} is gone (closed, or its id was recycled) — ` +
@@ -118,12 +129,7 @@ export function waitForLoad(tabId: number, toolName: string, timeoutMs = 30000):
         );
         return;
       }
-      if (ready(tab)) {
-        clearTimeout(t);
-        resolve();
-      } else {
-        chrome.tabs.onUpdated.addListener(listener);
-      }
+      if (ready(tab)) finish();
     });
   });
 }

@@ -245,6 +245,52 @@ describe('waitForLoad — timeout message names the calling tool', () => {
   });
 });
 
+describe('waitForLoad — a load that finishes while the tab is being read', () => {
+  type Listener = (id: number, info: { status?: string }, tab: unknown) => void;
+  function raceMock(): { listeners: Set<Listener>; removed: () => number } {
+    installChromeMock({});
+    const listeners = new Set<Listener>();
+    let removed = 0;
+    const tabs = (
+      globalThis as unknown as {
+        chrome: {
+          tabs: {
+            get: (id: number, cb: (t?: unknown) => void) => void;
+            onUpdated: {
+              addListener: (l: Listener) => void;
+              removeListener: (l: Listener) => void;
+            };
+          };
+        };
+      }
+    ).chrome.tabs;
+    tabs.onUpdated = {
+      addListener: (l) => void listeners.add(l),
+      removeListener: (l) => {
+        removed++;
+        listeners.delete(l);
+      },
+    };
+    // The snapshot says 'loading', but the page completes BEFORE the callback
+    // runs — its one 'complete' event is delivered in between.
+    tabs.get = (id, cb) => {
+      const done = { status: 'complete', url: 'https://x.example/' };
+      for (const l of [...listeners]) l(id, { status: 'complete' }, done);
+      cb({ status: 'loading', url: 'https://x.example/' });
+    };
+    return { listeners, removed: () => removed };
+  }
+
+  it('still resolves — the listener exists before the tab is read', async () => {
+    // Reading first, subscribing second dropped that event and hung the full
+    // watchdog, reporting `timeout` for a page that had loaded in milliseconds.
+    const { listeners, removed } = raceMock();
+    await expect(waitForLoad(1, 'navigate', 50)).resolves.toBeUndefined();
+    expect(listeners.size).toBe(0);
+    expect(removed()).toBe(1);
+  });
+});
+
 describe('navigate — clobber gate (invariant #12 parity with close_tab)', () => {
   it('refuses to replace a non-allowlisted content tab found via list_tabs', async () => {
     const calls = installChromeMock({ tabs: [{ id: 7, url: 'https://bank.example/account' }] });

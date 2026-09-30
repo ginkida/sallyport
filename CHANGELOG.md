@@ -6,6 +6,15 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `navigate`, `reload` and `history_go` could report `timeout` after 30 s for
+  a page that had loaded in milliseconds. The load watchdog read the tab first
+  and subscribed to its updates second; a load that completed in between fired
+  its one "complete" event to nobody. It now subscribes before reading. Found
+  as a 50 % failure rate of the real-Chrome test after an unrelated fixture
+  change shifted the timing.
+
 ## [0.24.1] — 2026-09-30
 
 ### Fixed
