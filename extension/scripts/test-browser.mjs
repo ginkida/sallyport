@@ -48,7 +48,7 @@ const server = createServer((req, res) => {
         '<button id="navigate-soon" onclick="setTimeout(() => location.assign(`/?next`), 300)">Navigate</button>' +
         '<button id="start-clock" onclick="startClock()">Start clock</button><span id="clock">0</span>' +
         '<span class="dup" style="display:none">hidden copy</span><span class="dup">visible copy</span>' +
-        '<div id="list" style="height:150px;overflow:auto;position:relative" onscroll="renderRows()">' +
+        '<div id="list" style="height:150px;overflow:auto;position:relative;scroll-behavior:smooth" onscroll="renderRows()">' +
         '<div style="height:900px;position:relative"></div></div>' +
         '<script>function startChurn(mode) {' +
         ' const node = document.querySelector("#changing").firstChild;' +
@@ -611,6 +611,13 @@ try {
     console.log(
       `PASS: MCP reveal steps are not stalled by DOM churn outside the container (${Math.round(revealMs)} ms, ${revealed.steps} steps)`,
     );
+    // The list has `scroll-behavior: smooth` (so reveal above also proves a
+    // smooth container is not misread as a stall); scroll must report where it
+    // actually landed, not where an animation started from.
+    value(await callTool('scroll', { selector: '#list', to: 'top', tabId }));
+    const landed = value(await callTool('scroll', { selector: '#list', dy: 300, tabId }));
+    assert.equal(landed.y, 300, JSON.stringify(landed));
+    console.log('PASS: MCP scroll and reveal land at once under scroll-behavior: smooth');
     const password = await callTool('fill', {
       selector: '#password',
       value: 'do-not-record',

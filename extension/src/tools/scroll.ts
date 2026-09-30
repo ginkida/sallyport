@@ -19,9 +19,15 @@
 import { attach, cdp } from './cdp.js';
 import { resolveSelectorOrRef } from './resolve.js';
 import { BridgeError } from './errors.js';
-import { ensureAllowed } from './gates.js';
+import { ensureAllowed, ensureStillAllowed } from './gates.js';
 import { parseObserve, runObserve } from './observe.js';
-import { parseWaitFor, runEmbeddedWait, SCROLL_BY_PROBE, SCROLL_INTO_VIEW_PROBE } from './poll.js';
+import {
+  parseWaitFor,
+  runEmbeddedWait,
+  SCROLL_BY_PROBE,
+  SCROLL_GEOMETRY_PROBE,
+  SCROLL_INTO_VIEW_PROBE,
+} from './poll.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
@@ -152,12 +158,36 @@ export const scroll: Tool = async (args, ctx) => {
     arguments: [{ value: spec.dx }, { value: spec.dy }, { value: spec.to }],
     returnByValue: true,
   });
-  const v = out.result.value ?? { x: 0, y: 0, scrollHeight: 0, clientHeight: 0 };
-  // Whether we bottomed out — the signal a lazy-load loop needs to stop.
-  const atBottom = v.y + v.clientHeight >= v.scrollHeight - 1;
+  const first = out.result.value;
+  if (!first) {
+    // A probe that threw in the page (a script broke scrolling) has no reading.
+    // Zeros here used to read as ok:true, atBottom:true — a harvest loop stop.
+    throw new BridgeError('error', 'scroll: the page gave no scroll position back');
+  }
+  let v = first;
   const wait = waitSpec
     ? await runEmbeddedWait(tabId, waitSpec, ctx?.startedAt, !!observeSpec)
     : null;
+  if (wait) {
+    // The wait is usually for MORE content (lazy-load), which changes exactly
+    // what atBottom is computed from. Re-read — but only a page the allowlist
+    // still covers (a same-document route change can take it off a path-scoped
+    // entry mid-wait; #3). If the container went with the page, or the gate
+    // refuses, the first reading is the best there is.
+    try {
+      await ensureStillAllowed(tabId);
+      const again = await cdp<{ result?: { value?: ScrollByResult } }>(
+        tabId,
+        'Runtime.callFunctionOn',
+        { objectId, functionDeclaration: SCROLL_GEOMETRY_PROBE, returnByValue: true },
+      );
+      if (again.result?.value) v = again.result.value;
+    } catch {
+      // Keep the pre-wait reading.
+    }
+  }
+  // Whether we bottomed out — the signal a lazy-load loop needs to stop.
+  const atBottom = v.y + v.clientHeight >= v.scrollHeight - 1;
   const observed = observeSpec ? await runObserve(tabId, observeSpec, ctx?.startedAt) : null;
   return {
     tabId,

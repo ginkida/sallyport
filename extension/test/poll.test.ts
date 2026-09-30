@@ -8,6 +8,7 @@ import {
   parseTimeoutMs,
   parseWaitFor,
   SCROLL_BY_PROBE,
+  SCROLL_GEOMETRY_PROBE,
   SCROLL_INTO_VIEW_PROBE,
   SCROLL_STEP_PROBE,
   atScrollEdge,
@@ -991,5 +992,209 @@ describe('budgetWaitSpec (an embedded wait spends what the call has LEFT)', () =
 
   it('keeps the whole call under the daemon 60 s timeout, with room left', () => {
     expect(CALL_BUDGET_MS).toBeLessThanOrEqual(50_000);
+  });
+});
+
+describe('scroll probes under scroll-behavior: smooth', () => {
+  /** An element whose scrollTop SETTER only starts an animation (the value
+   * does not move until later), as Chrome does under `scroll-behavior: smooth`;
+   * only scrollTo with behavior 'instant' lands at once. */
+  function smoothElement(scrollHeight = 5000, clientHeight = 500) {
+    let top = 0;
+    let left = 0;
+    return {
+      get scrollTop() {
+        return top;
+      },
+      set scrollTop(_v: number) {
+        /* animating — not there yet */
+      },
+      get scrollLeft() {
+        return left;
+      },
+      set scrollLeft(_v: number) {
+        /* animating */
+      },
+      scrollHeight,
+      clientHeight,
+      scrollTo(o: { top?: number; left?: number; behavior?: string }) {
+        if (o.behavior !== 'instant') return;
+        if (o.top !== undefined) top = Math.min(o.top, scrollHeight - clientHeight);
+        if (o.left !== undefined) left = o.left;
+      },
+    };
+  }
+
+  it("reveal's step lands at once, so it is not misread as a stall", () => {
+    const fn = new Function(`return (${SCROLL_STEP_PROBE});`)() as (
+      this: unknown,
+      dir: number,
+    ) => { before: number; after: number };
+    const out = fn.call(smoothElement(), 1);
+    expect(out.before).toBe(0);
+    expect(out.after).toBe(450);
+    expect(scrollStalled(out, null)).toBe(false);
+  });
+
+  it('scroll reports where it actually landed, by delta and to an edge', () => {
+    const fn = new Function(`return (${SCROLL_BY_PROBE});`)() as (
+      this: unknown,
+      dx: number,
+      dy: number,
+      to: string | null,
+    ) => { y: number; scrollHeight: number; clientHeight: number };
+    const el = smoothElement();
+    expect(fn.call(el, 0, 800, null).y).toBe(800);
+    const bottom = fn.call(el, 0, 0, 'bottom');
+    expect(bottom.y + bottom.clientHeight).toBe(bottom.scrollHeight);
+    expect(fn.call(el, 0, 0, 'top').y).toBe(0);
+  });
+
+  it.each([
+    [
+      'throws',
+      () => {
+        throw new TypeError('bad options');
+      },
+    ],
+    [
+      'is a legacy (x, y) polyfill',
+      function (this: { scrollTop: number }, x: unknown, y: unknown) {
+        this.scrollTop = y as number; // an options object: scrollTop = undefined → 0
+        void x;
+      },
+    ],
+  ])('falls back to the native setter when a page scrollTo %s', (_label, scrollTo) => {
+    const el = { scrollTop: 100, scrollLeft: 0, clientHeight: 500, scrollHeight: 5000, scrollTo };
+    const step = new Function(`return (${SCROLL_STEP_PROBE});`)() as (
+      this: unknown,
+      dir: number,
+    ) => { after: number };
+    expect(step.call(el, 1).after).toBe(550);
+    const by = new Function(`return (${SCROLL_BY_PROBE});`)() as (
+      this: unknown,
+      dx: number,
+      dy: number,
+      to: string | null,
+    ) => { y: number };
+    expect(by.call(el, 0, 200, null).y).toBe(750);
+  });
+
+  it('the geometry re-read is self-contained and moves nothing', () => {
+    const fn = new Function(`return (${SCROLL_GEOMETRY_PROBE});`)() as (this: unknown) => unknown;
+    const el = { scrollLeft: 3, scrollTop: 40, scrollHeight: 900, clientHeight: 300 };
+    expect(fn.call(el)).toEqual({ x: 3, y: 40, scrollHeight: 900, clientHeight: 300 });
+    expect(el.scrollTop).toBe(40);
+  });
+});
+
+describe('scroll — atBottom after an embedded wait', () => {
+  const SHOP = 'https://shop.example/cart';
+
+  beforeEach(async () => {
+    installChrome([SHOP]);
+    await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('re-reads the geometry, so a feed that grew during the wait is not "at the bottom"', async () => {
+    const { scroll } = await import('../src/tools/scroll.js');
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method, params) => {
+      const p = params as { functionDeclaration?: string };
+      if (method === 'Runtime.evaluate') return { result: { objectId: 'root' } };
+      if (p?.functionDeclaration === SCROLL_BY_PROBE) {
+        // Landed at the end of the feed as it was.
+        return { result: { value: { x: 0, y: 1000, scrollHeight: 1500, clientHeight: 500 } } };
+      }
+      if (p?.functionDeclaration === SELECTOR_VISIBILITY_FN) {
+        return { result: { value: { visible: true, total: 61 } } }; // the next batch arrived
+      }
+      if (p?.functionDeclaration === SCROLL_GEOMETRY_PROBE) {
+        return { result: { value: { x: 0, y: 1000, scrollHeight: 3000, clientHeight: 500 } } };
+      }
+      return {};
+    });
+    const res = await scroll({
+      to: 'bottom',
+      waitFor: { selector: '.row', timeoutMs: 1000 },
+      tabId: TAB,
+    });
+    const data = res.data as { atBottom: boolean; scrollHeight: number; wait: { found: boolean } };
+    expect(data.wait.found).toBe(true);
+    expect(data.scrollHeight).toBe(3000);
+    expect(data.atBottom).toBe(false);
+  });
+
+  it('does not re-read a page that left the allowlist during the wait (#3)', async () => {
+    // A same-document route change onto a path the allowlist does not cover,
+    // landing just as the wait finishes: the re-read must not follow it.
+    const { scroll } = await import('../src/tools/scroll.js');
+    let moved = false;
+    const tabsGet = chrome.tabs.get;
+    vi.spyOn(chrome.tabs, 'get').mockImplementation(async (id: number) =>
+      moved ? ({ id, url: 'https://elsewhere.example/admin' } as chrome.tabs.Tab) : tabsGet(id),
+    );
+    const send = vi
+      .spyOn(chrome.debugger, 'sendCommand')
+      .mockImplementation(async (_t, method, params) => {
+        const p = params as { functionDeclaration?: string };
+        if (method === 'Runtime.evaluate') return { result: { objectId: 'root' } };
+        if (p?.functionDeclaration === SCROLL_BY_PROBE) {
+          return { result: { value: { x: 0, y: 1000, scrollHeight: 1500, clientHeight: 500 } } };
+        }
+        if (p?.functionDeclaration === SELECTOR_VISIBILITY_FN) {
+          moved = true;
+          return { result: { value: { visible: true, total: 1 } } };
+        }
+        return { result: { value: { x: 0, y: 0, scrollHeight: 9999, clientHeight: 1 } } };
+      });
+    const res = await scroll({
+      to: 'bottom',
+      waitFor: { selector: '.row', timeoutMs: 1000 },
+      tabId: TAB,
+    });
+    expect((res.data as { wait: { found: boolean } }).wait.found).toBe(true);
+    const geometryReads = send.mock.calls.filter(
+      ([, , params]) =>
+        (params as { functionDeclaration?: string })?.functionDeclaration === SCROLL_GEOMETRY_PROBE,
+    );
+    expect(geometryReads).toHaveLength(0);
+    expect((res.data as { scrollHeight: number }).scrollHeight).toBe(1500);
+  });
+
+  it('refuses to report geometry the page never gave back', async () => {
+    const { scroll } = await import('../src/tools/scroll.js');
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'Runtime.evaluate') return { result: { objectId: 'root' } };
+      return { result: { type: 'object' }, exceptionDetails: {} }; // the probe threw
+    });
+    await expect(scroll({ to: 'bottom', tabId: TAB })).rejects.toMatchObject({ code: 'error' });
+  });
+
+  it('keeps the first reading if the container went away during the wait', async () => {
+    const { scroll } = await import('../src/tools/scroll.js');
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method, params) => {
+      const p = params as { functionDeclaration?: string };
+      if (method === 'Runtime.evaluate') return { result: { objectId: 'root' } };
+      if (p?.functionDeclaration === SCROLL_BY_PROBE) {
+        return { result: { value: { x: 0, y: 1000, scrollHeight: 1500, clientHeight: 500 } } };
+      }
+      if (p?.functionDeclaration === SELECTOR_VISIBILITY_FN) {
+        return { result: { value: { visible: true, total: 1 } } };
+      }
+      if (p?.functionDeclaration === SCROLL_GEOMETRY_PROBE) {
+        throw new Error('Could not find object with given id');
+      }
+      return {};
+    });
+    const res = await scroll({
+      to: 'bottom',
+      waitFor: { selector: '.row', timeoutMs: 1000 },
+      tabId: TAB,
+    });
+    expect((res.data as { atBottom: boolean }).atBottom).toBe(true);
   });
 });

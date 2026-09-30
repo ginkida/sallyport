@@ -16,7 +16,7 @@ Claude Code ── MCP/stdio ──▶ daemon ── WS+HMAC ──▶ extension
 | Status | Number |
 |---|---|
 | Daemon tests (pytest) | 538 |
-| Extension tests (vitest) | 1138 |
+| Extension tests (vitest) | 1147 |
 | Lint / typecheck (ruff, mypy, eslint, prettier, tsc) | all green |
 
 ## What's in the box

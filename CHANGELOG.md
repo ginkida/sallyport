@@ -24,6 +24,24 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `reveal` and `scroll` on a container or page with `scroll-behavior: smooth`
+  (Bootstrap 5 sets it on `:root`, Tailwind's `scroll-smooth` on anything)
+  read the scroll position back before the browser's animation had moved it.
+  `reveal` saw no movement and answered `stall` on its first step, on a list
+  it never got to scroll; `scroll` reported the position it started from.
+  Both probes now scroll with `behavior: 'instant'`, as `scroll`'s
+  into-view mode already did, and fall back to the native setter when a
+  page's own `scrollTo` throws or does not move the element. A probe that
+  gives no reading at all is now an error, where it used to read as position
+  zero: `scroll` answered `atBottom: true` and `reveal` answered `stall`.
+
+- `scroll` with an embedded `waitFor` computed `atBottom` and `scrollHeight`
+  before the wait. The wait is usually for the next batch of a lazy-loaded
+  feed, which is exactly what makes the page taller, so a harvest loop was
+  told it had reached the bottom of a feed that had just grown. The geometry
+  is now re-read after the wait, provided the allowlist still covers the
+  page.
+
 - A call could run past the daemon's 60 s request timeout: `navigate`,
   `reload` and `history_go` may spend 30 s loading, and an embedded `waitFor`
   then got a fresh 30 s on top, followed by an unbounded `observe` snapshot

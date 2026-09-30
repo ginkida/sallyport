@@ -1196,7 +1196,9 @@ TOOLS: list[Tool] = [
             "{mode, x, y, scrollHeight, atBottom} tells you when you've "
             "bottomed out so the loop can stop, and waitFor polls for the newly "
             "loaded content in the same call so a harvest loop costs one call "
-            "per screenful instead of two. Structured CDP only (fixed "
+            "per screenful instead of two; with waitFor, x/y/scrollHeight/atBottom "
+            "are re-read AFTER the wait, so a feed that grew is not reported as "
+            "bottomed out. Structured CDP only (fixed "
             "scroll probe), no evaluate flag. Domain must be in allowlist."
         ),
         inputSchema={

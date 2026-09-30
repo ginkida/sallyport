@@ -547,9 +547,20 @@ export async function settleFor(tabId: number, spec: SettleSpec): Promise<Settle
 // callFunctionOn argument, NEVER interpolated into the body — same trust shape
 // as the aim probes — so reveal needs no allowEvaluate. Lives here in an
 // import-safe module (poll.ts pulls in no chrome at load).
+// `scrollTo({behavior:'instant'})`, not a `scrollTop` assignment: the setter
+// follows the element's computed `scroll-behavior`, and under `smooth`
+// (Bootstrap 5's `:root`, Tailwind's `scroll-smooth`) Chrome ANIMATES — the read
+// right after still returns the old offset, so reveal saw after === before and
+// answered `stall` on a list it never got to scroll. The assignment stays as the
+// fallback — and the VERIFIED one: scrollTo is page-owned, and a legacy
+// polyfill or a throwing override must not turn a scroll the native setter
+// would have made into a silent non-move.
 export const SCROLL_STEP_PROBE =
   'function(dir) { var b = this.scrollTop; var p = this.clientHeight || 0;' +
-  ' this.scrollTop = b + dir * Math.max(1, p * 0.9);' +
+  ' var t = b + dir * Math.max(1, p * 0.9);' +
+  ' var want = Math.min(Math.max(t, 0), Math.max(0, (this.scrollHeight || 0) - p));' +
+  " try { if (typeof this.scrollTo === 'function') this.scrollTo({ top: t, behavior: 'instant' }); } catch (e) {}" +
+  ' if (!(Math.abs(this.scrollTop - want) <= 1)) this.scrollTop = t;' +
   ' return { before: b, after: this.scrollTop, scrollHeight: this.scrollHeight, clientHeight: p }; }';
 
 /** Did this scroll step leave the container at the edge it is moving toward?
@@ -616,10 +627,24 @@ export const SCROLL_INTO_VIEW_PROBE =
 // callFunctionOn arguments, NEVER interpolated. Returns the resulting position
 // plus scrollHeight/clientHeight so the caller can tell whether it bottomed out
 // (lazy-load termination) without a second probe.
+// Instant for the same reason as SCROLL_STEP_PROBE: under `scroll-behavior:
+// smooth` an assignment animates, and the position read back was the old one.
 export const SCROLL_BY_PROBE =
   'function(dx, dy, to) {' +
-  " if (to === 'top') { this.scrollTop = 0; this.scrollLeft = 0; }" +
-  " else if (to === 'bottom') { this.scrollTop = this.scrollHeight; }" +
-  ' else { this.scrollTop = this.scrollTop + dy; this.scrollLeft = this.scrollLeft + dx; }' +
+  ' var top, left;' +
+  " if (to === 'top') { top = 0; left = 0; }" +
+  " else if (to === 'bottom') { top = this.scrollHeight; left = this.scrollLeft; }" +
+  ' else { top = this.scrollTop + dy; left = this.scrollLeft + dx; }' +
+  ' var want = Math.min(Math.max(top, 0), Math.max(0, this.scrollHeight - this.clientHeight));' +
+  ' var ok = false;' +
+  " try { if (typeof this.scrollTo === 'function') { this.scrollTo({ top: top, left: left, behavior: 'instant' }); ok = true; } } catch (e) {}" +
+  ' if (!ok || !(Math.abs(this.scrollTop - want) <= 1)) { this.scrollTop = top; this.scrollLeft = left; }' +
   ' return { x: this.scrollLeft, y: this.scrollTop,' +
+  ' scrollHeight: this.scrollHeight, clientHeight: this.clientHeight }; }';
+
+// Read-only: where `this` is now, and how tall. `scroll` re-reads after its
+// embedded wait — a feed that grew while the wait watched it is not at the
+// bottom any more, whatever the position said a moment before.
+export const SCROLL_GEOMETRY_PROBE =
+  'function() { return { x: this.scrollLeft, y: this.scrollTop,' +
   ' scrollHeight: this.scrollHeight, clientHeight: this.clientHeight }; }';

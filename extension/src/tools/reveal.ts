@@ -126,7 +126,12 @@ export const reveal: Tool = async (args) => {
       arguments: [{ value: direction }],
       returnByValue: true,
     });
-    const sc = scrollRes.result.value ?? { before: 0, after: 0 };
+    const sc = scrollRes.result.value;
+    if (!sc) {
+      // No reading is not "the list stopped moving": reporting `stall` here
+      // would tell the agent it reached an end it never saw.
+      throw new BridgeError('error', 'reveal: the page gave no scroll position back');
+    }
     if (scrollStalled(sc, prevAfter)) {
       // scrollTop didn't move (or bounced back) — we've hit the end.
       return { tabId: tab.id, url: readUrl, data: { found: false, reason: 'stall', steps: step } };
