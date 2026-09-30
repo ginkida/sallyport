@@ -10,6 +10,7 @@ import {
   SCROLL_BY_PROBE,
   SCROLL_INTO_VIEW_PROBE,
   SCROLL_STEP_PROBE,
+  atScrollEdge,
   scrollStalled,
   pollFor,
   settleFor,
@@ -17,7 +18,7 @@ import {
 import { BridgeError } from '../src/tools/errors.js';
 import { setAllowlist } from '../src/storage.js';
 import { resetAttachedTabs } from '../src/tools/cdp.js';
-import { CREATE_QUIESCENCE_PROBE } from '../src/tools/quiescence.js';
+import { CREATE_QUIESCENCE_PROBE, OBSERVE_ELEMENT_FN } from '../src/tools/quiescence.js';
 
 describe('parseTimeoutMs', () => {
   it('defaults when undefined', () => {
@@ -81,6 +82,24 @@ describe('parseWaitFor', () => {
   });
 });
 
+describe('atScrollEdge (reveal)', () => {
+  it('knows when a downward step reached the bottom, with a pixel of slack', () => {
+    expect(atScrollEdge({ after: 500, clientHeight: 500, scrollHeight: 1000 }, 1)).toBe(true);
+    expect(atScrollEdge({ after: 499.5, clientHeight: 500, scrollHeight: 1000 }, 1)).toBe(true);
+    expect(atScrollEdge({ after: 400, clientHeight: 500, scrollHeight: 1000 }, 1)).toBe(false);
+  });
+
+  it('knows when an upward step reached the top', () => {
+    expect(atScrollEdge({ after: 0, clientHeight: 500, scrollHeight: 1000 }, -1)).toBe(true);
+    expect(atScrollEdge({ after: 10, clientHeight: 500, scrollHeight: 1000 }, -1)).toBe(false);
+  });
+
+  it('treats unreadable geometry as an edge — the stricter wait', () => {
+    expect(atScrollEdge({ after: 10 }, 1)).toBe(true);
+    expect(atScrollEdge({ after: 10, clientHeight: '500', scrollHeight: 1000 }, 1)).toBe(true);
+  });
+});
+
 describe('SCROLL_STEP_PROBE (reveal)', () => {
   it('is self-contained and scrolls the container by ~90% of its viewport', () => {
     // reveal serialises this into the page and invokes it on the container via
@@ -89,11 +108,12 @@ describe('SCROLL_STEP_PROBE (reveal)', () => {
     const fn = new Function(`return (${SCROLL_STEP_PROBE});`)() as (
       this: { scrollTop: number; clientHeight: number; scrollHeight: number },
       dir: number,
-    ) => { before: number; after: number; scrollHeight: number };
+    ) => { before: number; after: number; scrollHeight: number; clientHeight: number };
     const container = { scrollTop: 100, clientHeight: 200, scrollHeight: 1000 };
     const down = fn.call(container, 1);
     expect(down.before).toBe(100);
     expect(down.after).toBe(280); // 100 + 90% of 200
+    expect(down).toMatchObject({ scrollHeight: 1000, clientHeight: 200 });
     expect(container.scrollTop).toBe(280);
     const up = fn.call(container, -1);
     expect(up.after).toBe(100); // 280 - 180
@@ -611,6 +631,103 @@ describe('settle observer lifecycle', () => {
     expect(send).toHaveBeenLastCalledWith({ tabId: TAB }, 'Runtime.releaseObjectGroup', {
       objectGroup: 'sallyport-settle',
     });
+  });
+
+  it('scopes the observer to a root element when one is given', async () => {
+    const send = channel([0]);
+    send.mockImplementation(async (_target, method, params) => {
+      const p = params as { functionDeclaration?: string };
+      if (
+        method === 'Runtime.callFunctionOn' &&
+        p.functionDeclaration?.includes('MutationObserver')
+      )
+        return { result: { objectId: 'observer' } };
+      if (method === 'Runtime.callFunctionOn' && p.functionDeclaration?.includes('sample'))
+        return { result: { value: 0 } };
+      return {};
+    });
+    const pending = settleFor(TAB, { stableMs: 250, timeoutMs: 1000, root: 'list' });
+    await vi.runAllTimersAsync();
+    expect((await pending).settled).toBe(true);
+    expect(send).toHaveBeenCalledWith({ tabId: TAB }, 'Runtime.callFunctionOn', {
+      objectId: 'list',
+      functionDeclaration: OBSERVE_ELEMENT_FN,
+      objectGroup: 'sallyport-settle',
+    });
+    expect(send).not.toHaveBeenCalledWith({ tabId: TAB }, 'Runtime.evaluate', expect.anything());
+    expectCleanup(send);
+  });
+
+  it('falls back to the whole document once a scoped root is lost with its page', async () => {
+    // The element died with its document; nothing here can re-resolve it, and
+    // a wait that went blind would be worse than a stricter one.
+    let samples = 0;
+    const send = channel([0]);
+    send.mockImplementation(async (_target, method, params) => {
+      const p = params as { functionDeclaration?: string };
+      if (method === 'Runtime.evaluate') return { result: { objectId: 'observer' } };
+      if (
+        method === 'Runtime.callFunctionOn' &&
+        p.functionDeclaration?.includes('MutationObserver')
+      )
+        return { result: { objectId: 'scoped' } };
+      if (method === 'Runtime.callFunctionOn' && p.functionDeclaration?.includes('sample')) {
+        if (samples++ === 1) throw new Error('Cannot find context with specified id');
+        return { result: { value: 0 } };
+      }
+      return {};
+    });
+    const pending = settleFor(TAB, { stableMs: 250, timeoutMs: 3000, root: 'list' });
+    await vi.runAllTimersAsync();
+    expect((await pending).settled).toBe(true);
+    const creates = send.mock.calls.filter(
+      ([, method, params]) =>
+        method === 'Runtime.evaluate' ||
+        String((params as { functionDeclaration?: string }).functionDeclaration).includes(
+          'MutationObserver',
+        ),
+    );
+    expect(creates.map(([, method]) => method)).toEqual([
+      'Runtime.callFunctionOn',
+      'Runtime.evaluate',
+    ]);
+  });
+
+  it.each([
+    ['throws in the page', 'exception'],
+    ['has lost its context', 'lost'],
+  ])('falls back to the whole document when a scoped creation %s', async (_label, how) => {
+    // The root handle is the one thing settleFor cannot re-resolve: retrying it
+    // every tick would read nothing and burn the whole budget.
+    const send = channel([0]);
+    send.mockImplementation(async (_target, method, params) => {
+      const p = params as { functionDeclaration?: string };
+      if (method === 'Runtime.evaluate') return { result: { objectId: 'observer' } };
+      if (
+        method === 'Runtime.callFunctionOn' &&
+        p.functionDeclaration?.includes('MutationObserver')
+      ) {
+        if (how === 'lost') throw new Error('Could not find object with given id');
+        return { result: { objectId: 'the-error' }, exceptionDetails: {} };
+      }
+      if (method === 'Runtime.callFunctionOn' && p.functionDeclaration?.includes('sample'))
+        return { result: { value: 0 } };
+      return {};
+    });
+    const pending = settleFor(TAB, { stableMs: 250, timeoutMs: 3000, root: 'list' });
+    await vi.runAllTimersAsync();
+    expect((await pending).settled).toBe(true);
+    const creates = send.mock.calls.filter(
+      ([, method, params]) =>
+        method === 'Runtime.evaluate' ||
+        String((params as { functionDeclaration?: string }).functionDeclaration).includes(
+          'MutationObserver',
+        ),
+    );
+    expect(creates.map(([, method]) => method)).toEqual([
+      'Runtime.callFunctionOn',
+      'Runtime.evaluate',
+    ]);
   });
 
   it('cleans up after a protocol error without hiding the error', async () => {

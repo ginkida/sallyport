@@ -16,7 +16,7 @@ Claude Code ── MCP/stdio ──▶ daemon ── WS+HMAC ──▶ extension
 | Status | Number |
 |---|---|
 | Daemon tests (pytest) | 538 |
-| Extension tests (vitest) | 1096 |
+| Extension tests (vitest) | 1107 |
 | Lint / typecheck (ruff, mypy, eslint, prettier, tsc) | all green |
 
 ## What's in the box
@@ -276,7 +276,7 @@ the full model, including the tab-ownership and MCP-client-auth invariants.
 | `wait_for` | Poll (250 ms) until a selector/`@eN` ref is visible and/or page text contains a substring; `absent=true` waits until it is GONE. `timeoutMs` ≤ 30 s; timeout returns `{found:false}`, not an error. Replaces blind sleeps. Prefer the embedded `waitFor` on the preceding action when there is one. |
 | `settle` | Wait for the DOM to stop changing (no child, text or attribute mutations in the top-level document for `stableMs`, default 500 ms) — for "the page just did *something*" moments with no single element to `wait_for`. Catches equal-length edits and changes between polls. Excludes iframe/shadow-root contents, CSS animations and network activity. A navigation mid-wait continues on the new page. Poll (250 ms), ≤ 30 s; a never-settling page returns `{settled:false}`, not an error. |
 | `find` | Semantic element locator — match by `role`/`name`/`nameExact`/`value` over the accessibility tree instead of a CSS selector, ranked exact-match-first (`limit`, ≤ 50). No `evaluate`, no probe. |
-| `reveal` | Scroll a virtualized list/container and re-`snapshot` until an element matching `find`'s predicate appears — for infinite-scroll feeds and lazy-rendered tables. Stops on found/stall/`maxSteps` (≤ 40)/timeout. |
+| `reveal` | Scroll a virtualized list/container and re-`snapshot` until an element matching `find`'s predicate appears — for infinite-scroll feeds and lazy-rendered tables. `container` is the element that scrolls; between steps reveal waits for its subtree to go quiet (≈ 0.5–1.5 s), so a clock or ticker elsewhere on the page doesn't slow it, and a step that reaches the end waits on the whole page for the next batch to load. Stops on found/stall/`maxSteps` (≤ 40)/timeout. |
 | `scroll` | Deterministic scrolling — the predicate-less companion to `reveal`. `selector` → `scrollIntoView`; or scroll the page (or a `selector` container) by `dx`/`dy` (negatives = up/left) or `to='top'\|'bottom'`. Returns `{x, y, scrollHeight, atBottom}` so a lazy-load loop knows when to stop. Fixed scroll probe, no `evaluate`. |
 | `evaluate` | Per-domain opt-in. Returns `{type, value}`. |
 | `fetch_in_page` | `fetch()` with page cookies/auth. Returns `{status, contentType, headers, mode, data}`. `saveAs=<filename>` writes the body straight into the download sandbox instead — result becomes `{status, contentType, mode, path, size, filename}`, so a multi-MB asset never enters the agent's context, and it replaces the old `fetch_in_page` → `save_to_file` pair with one call (it also defaults `returnAs` to `base64`, since the text path would UTF-8-decode binary lossily). Bodies whose serialised payload exceeds 12 MiB fail with `fetch_too_large` (measured extension-side, on the escaped form — a control character costs six bytes in JSON); `saveAs` does **not** raise that ceiling, because the body still crosses the bridge before the daemon writes it. Allowlist-gated. |

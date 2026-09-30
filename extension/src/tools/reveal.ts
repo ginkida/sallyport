@@ -9,6 +9,7 @@ import {
   parseMaxSteps,
   parseTimeoutMs,
   SCROLL_STEP_PROBE,
+  atScrollEdge,
   scrollStalled,
   settleFor,
 } from './poll.js';
@@ -17,8 +18,10 @@ import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
 // After each scroll, let the virtualiser render the new window before the next
-// snapshot — an adaptive settle (cheaper than a fixed sleep), itself capped so
-// a never-quiescing feed can't stall the loop.
+// snapshot — an adaptive settle (cheaper than a fixed sleep) over the CONTAINER's
+// subtree, itself capped so a never-quiescing feed can't stall the loop. Two
+// equal samples still take ≥ STEP_STABLE_MS, so a list that renders elsewhere
+// keeps that floor rather than being snapshotted mid-scroll.
 const STEP_STABLE_MS = 350;
 const STEP_SETTLE_TIMEOUT_MS = 1500;
 
@@ -113,23 +116,32 @@ export const reveal: Tool = async (args) => {
       containerBackendNodeId !== null
         ? await resolveBackendNode(tab.id!, containerBackendNodeId, container, 'reveal')
         : await resolveSelectorOrRef(tab.id!, container, 'reveal');
-    const scrollRes = await cdp<{ result: { value?: { before: number; after: number } } }>(
-      tab.id!,
-      'Runtime.callFunctionOn',
-      {
-        objectId,
-        functionDeclaration: SCROLL_STEP_PROBE,
-        arguments: [{ value: direction }],
-        returnByValue: true,
-      },
-    );
+    const scrollRes = await cdp<{
+      result: {
+        value?: { before: number; after: number; scrollHeight?: number; clientHeight?: number };
+      };
+    }>(tab.id!, 'Runtime.callFunctionOn', {
+      objectId,
+      functionDeclaration: SCROLL_STEP_PROBE,
+      arguments: [{ value: direction }],
+      returnByValue: true,
+    });
     const sc = scrollRes.result.value ?? { before: 0, after: 0 };
     if (scrollStalled(sc, prevAfter)) {
       // scrollTop didn't move (or bounced back) — we've hit the end.
       return { tabId: tab.id, url: readUrl, data: { found: false, reason: 'stall', steps: step } };
     }
     prevAfter = sc.after;
-    await settleFor(tab.id!, { stableMs: STEP_STABLE_MS, timeoutMs: STEP_SETTLE_TIMEOUT_MS });
+    // Scoped to the container: the rows it renders are what the next snapshot
+    // needs, and page-wide churn (a clock, a ticker) outside it is not — with a
+    // document-wide observer such a page cost every step the full budget. At
+    // the container's edge the next page may be loading behind an indicator
+    // outside it, so that one step waits on the whole document.
+    await settleFor(tab.id!, {
+      stableMs: STEP_STABLE_MS,
+      timeoutMs: STEP_SETTLE_TIMEOUT_MS,
+      root: atScrollEdge(sc, direction) ? undefined : objectId,
+    });
   }
   // The loop always returns; this satisfies the type checker.
   return {

@@ -1,7 +1,8 @@
-/** A per-wait observer. Only a mutation counter leaves the page; neither
- * text nor attribute values are read or retained. Keep this self-contained:
- * CREATE_QUIESCENCE_PROBE serialises it into the page's execution context. */
-export function createQuiescenceObserver(doc: Document): {
+/** A per-wait observer over `root`'s subtree. Only a mutation counter leaves
+ * the page; neither text nor attribute values are read or retained. Keep this
+ * self-contained: both probes below serialise it into the page's execution
+ * context. */
+export function createQuiescenceObserver(root: Node): {
   sample: () => number | null;
   stop: () => void;
 } {
@@ -12,7 +13,7 @@ export function createQuiescenceObserver(doc: Document): {
   });
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    observer.observe(doc, {
+    observer.observe(root, {
       subtree: true,
       childList: true,
       attributes: true,
@@ -43,3 +44,9 @@ export function createQuiescenceObserver(doc: Document): {
 }
 
 export const CREATE_QUIESCENCE_PROBE = '(' + createQuiescenceObserver.toString() + ')(document)';
+
+/** The same observer scoped to ONE element — `this`, a node the tool already
+ * resolved and gated — for `callFunctionOn`. Fixed literal: the element travels
+ * as the call's receiver, never interpolated. */
+export const OBSERVE_ELEMENT_FN =
+  'function() { return (' + createQuiescenceObserver.toString() + ')(this); }';

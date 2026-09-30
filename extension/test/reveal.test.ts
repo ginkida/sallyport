@@ -49,7 +49,11 @@ function axNodes(withTarget: boolean) {
 
 /** Install a CDP channel that answers exactly what reveal issues. `foundAtStep`
  * is the pass on which the target finally appears. */
-function installChrome(opts: { foundAtStep: number; urls?: string[] }): Cmd[] {
+function installChrome(opts: {
+  foundAtStep: number;
+  urls?: string[];
+  scrollHeight?: number;
+}): Cmd[] {
   const sent: Cmd[] = [];
   let axCalls = 0;
   let scrollTop = 0;
@@ -102,6 +106,13 @@ function installChrome(opts: { foundAtStep: number; urls?: string[] }): Cmd[] {
         if (method === 'DOM.resolveNode') return { object: { objectId: 'obj-container' } };
         if (
           method === 'Runtime.callFunctionOn' &&
+          String(params?.functionDeclaration).includes('MutationObserver')
+        ) {
+          // The per-step settle's observer, installed on the container.
+          return { result: { objectId: 'quiescence' } };
+        }
+        if (
+          method === 'Runtime.callFunctionOn' &&
           /this\.(sample|stop)\(/.test(String(params?.functionDeclaration))
         ) {
           // Quiescence observer — a steady reading so the per-step settle is
@@ -111,7 +122,16 @@ function installChrome(opts: { foundAtStep: number; urls?: string[] }): Cmd[] {
         if (method === 'Runtime.callFunctionOn') {
           const before = scrollTop;
           scrollTop += 500;
-          return { result: { value: { before, after: scrollTop, scrollHeight: 99_999 } } };
+          return {
+            result: {
+              value: {
+                before,
+                after: scrollTop,
+                scrollHeight: opts.scrollHeight ?? 99_999,
+                clientHeight: 500,
+              },
+            },
+          };
         }
         if (method === 'Runtime.evaluate') return { result: { objectId: 'quiescence' } };
         return {};
@@ -213,7 +233,7 @@ describe('reveal — the page must stay allowlisted for the WHOLE scroll (invari
     const scrolls = sent.filter(
       (c) =>
         c.method === 'Runtime.callFunctionOn' &&
-        !/this\.(sample|stop)\(/.test(String(c.params?.functionDeclaration)),
+        !/this\.(sample|stop)\(|MutationObserver/.test(String(c.params?.functionDeclaration)),
     );
     expect(scrolls.length).toBeGreaterThan(0);
   });
@@ -230,5 +250,43 @@ describe('reveal — the page must stay allowlisted for the WHOLE scroll (invari
     // The url is re-read each pass now, so it describes the page the result
     // came off rather than the one the call started on.
     expect(res.url).toBe('https://chat.example.com/');
+  });
+
+  it('waits between steps on the CONTAINER, not the whole document', async () => {
+    // A document-wide observer made a ticking clock anywhere on the page cost
+    // every step the full settle budget; the rows live in the container.
+    const sent = installChrome({ foundAtStep: 2 });
+    await allowChat();
+    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages');
+    await reveal({ container, role: 'button', name: 'Older', tabId: TAB }, undefined);
+    const observers = sent.filter((c) =>
+      String(c.params?.functionDeclaration).includes('MutationObserver'),
+    );
+    expect(observers).toHaveLength(2); // one per scroll step
+    for (const c of observers) {
+      expect(c.method).toBe('Runtime.callFunctionOn');
+      expect(c.params).toMatchObject({
+        objectId: 'obj-container',
+        objectGroup: 'sallyport-settle',
+      });
+    }
+    expect(sent.some((c) => c.method === 'Runtime.evaluate')).toBe(false);
+  });
+
+  it('waits on the whole document for a step that reaches the end of the container', async () => {
+    // An infinite feed fetches its next page at the bottom, often behind a
+    // progress bar OUTSIDE the container while the container sits unchanged —
+    // a scoped wait would snapshot before the rows land and call it a stall.
+    // Container is 500 px tall over 1500 px: the 2nd step (to 1000) is the end.
+    const sent = installChrome({ foundAtStep: 2, scrollHeight: 1500 });
+    await allowChat();
+    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages');
+    await reveal({ container, role: 'button', name: 'Older', tabId: TAB }, undefined);
+    const creates = sent.filter(
+      (c) =>
+        c.method === 'Runtime.evaluate' ||
+        String(c.params?.functionDeclaration).includes('MutationObserver'),
+    );
+    expect(creates.map((c) => c.method)).toEqual(['Runtime.callFunctionOn', 'Runtime.evaluate']);
   });
 });

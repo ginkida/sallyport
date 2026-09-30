@@ -46,6 +46,9 @@ const server = createServer((req, res) => {
         '<button id="churn-attribute" onclick="startChurn(1)">Update attributes</button>' +
         '<button id="churn-revert" onclick="startChurn(2)">Revert changes</button>' +
         '<button id="navigate-soon" onclick="setTimeout(() => location.assign(`/?next`), 300)">Navigate</button>' +
+        '<button id="start-clock" onclick="startClock()">Start clock</button><span id="clock">0</span>' +
+        '<div id="list" style="height:150px;overflow:auto;position:relative" onscroll="renderRows()">' +
+        '<div style="height:900px;position:relative"></div></div>' +
         '<script>function startChurn(mode) {' +
         ' const node = document.querySelector("#changing").firstChild;' +
         ' node.data = "AAAA";' +
@@ -55,7 +58,28 @@ const server = createServer((req, res) => {
         ' if (mode === 2) { const el = document.createElement("span"); document.body.append(el); el.remove(); }' +
         ' }, 25);' +
         ' setTimeout(() => { clearInterval(timer); node.data = "DONE"; }, 2000);' +
-        '}</script>',
+        '}' +
+        // A minimal virtualised list: only the rows in view exist, so reveal
+        // really has to scroll for "Row 25", and each scroll re-renders rows.
+        'function renderRows() {' +
+        ' const list = document.querySelector("#list");' +
+        ' const first = Math.floor(list.scrollTop / 30);' +
+        ' const rows = [];' +
+        ' for (let i = first; i < Math.min(30, first + 6); i++) {' +
+        '  const row = document.createElement("button");' +
+        '  row.textContent = "Row " + i;' +
+        '  row.style.cssText = "position:absolute;top:" + i * 30 + "px;height:30px";' +
+        '  rows.push(row);' +
+        ' }' +
+        ' list.firstChild.replaceChildren(...rows);' +
+        '}' +
+        'function startClock() {' +
+        ' const clock = document.querySelector("#clock");' +
+        ' const timer = setInterval(() => { clock.textContent = String(performance.now()); }, 50);' +
+        ' setTimeout(() => clearInterval(timer), 20000);' +
+        '}' +
+        'renderRows();' +
+        '</script>',
     );
   }
 });
@@ -545,6 +569,29 @@ try {
     assert.equal(moved.settled, true, 'settle must follow a navigation to the new page');
     assert.match(JSON.stringify((await callTool('list_tabs', {})).content), /\?next/);
     console.log('PASS: MCP settle survives a navigation during the wait');
+    // reveal waits between scroll steps on its CONTAINER: a clock ticking
+    // elsewhere on the page must not cost every step the full 1.5 s budget.
+    value(await callTool('click', { selector: '#start-clock', tabId }));
+    const revealStart = performance.now();
+    const revealed = value(
+      await callTool('reveal', {
+        container: '#list',
+        role: 'button',
+        name: 'Row 25',
+        timeoutMs: 30000,
+        tabId,
+      }),
+    );
+    const revealMs = performance.now() - revealStart;
+    assert.equal(revealed.found, true, JSON.stringify(revealed));
+    assert.ok(revealed.steps >= 3, `the target must need scrolling: ${revealed.steps} steps`);
+    assert.ok(
+      revealMs / revealed.steps < 1100,
+      `${Math.round(revealMs)} ms over ${revealed.steps} steps — page churn is stalling each step`,
+    );
+    console.log(
+      `PASS: MCP reveal steps are not stalled by DOM churn outside the container (${Math.round(revealMs)} ms, ${revealed.steps} steps)`,
+    );
     const password = await callTool('fill', {
       selector: '#password',
       value: 'do-not-record',

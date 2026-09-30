@@ -17,7 +17,7 @@ import {
 import { BridgeError, staleRefError } from './errors.js';
 import { ensureStillAllowed } from './gates.js';
 import { getRef, isRef } from './refs.js';
-import { CREATE_QUIESCENCE_PROBE } from './quiescence.js';
+import { CREATE_QUIESCENCE_PROBE, OBSERVE_ELEMENT_FN } from './quiescence.js';
 import { READ_TEXT_FN } from './text.js';
 
 export { READ_TEXT_FN } from './text.js';
@@ -251,7 +251,15 @@ export async function runEmbeddedWait(tabId: number, spec: WaitSpec): Promise<Wa
 
 // --- settle: DOM quiescence -------------------------------------------------
 
-export type SettleSpec = { stableMs: number; timeoutMs: number };
+export type SettleSpec = {
+  stableMs: number;
+  timeoutMs: number;
+  /** objectId of an element to watch instead of the whole document. `settle`
+   * never passes one: "the page went quiet" is its whole contract. `reveal`
+   * does — between scroll steps it waits for the LIST to render, and a clock
+   * ticking in the page header must not cost every step its full budget. */
+  root?: string;
+};
 export type SettleOutcome = { settled: boolean; elapsedMs: number };
 
 export type Signal = number;
@@ -301,17 +309,29 @@ export function advanceSettle(
   return { state: { prev: sig, prevAt: now, stableSince: null }, settled: false };
 }
 
-/** Install a fresh per-wait observer in the tab's CURRENT document. `undefined`
- * when there is no document to observe right now — the page threw during
- * creation (a shadowed `MutationObserver`), or a navigation is mid-commit. The
- * caller treats that as a reading-less tick and simply tries again next tick. */
-async function createObserver(tabId: number, objectGroup: string): Promise<string | undefined> {
+/** Install a fresh per-wait observer — on `root` when given, else on the tab's
+ * CURRENT document. `undefined` when there is nothing to observe right now —
+ * the page threw during creation (a shadowed `MutationObserver`), or a
+ * navigation is mid-commit. The caller treats that as a reading-less tick and
+ * simply tries again next tick. */
+async function createObserver(
+  tabId: number,
+  objectGroup: string,
+  root: string | undefined,
+): Promise<string | undefined> {
   try {
-    const created = await cdp<{ result: { objectId?: string }; exceptionDetails?: unknown }>(
-      tabId,
-      'Runtime.evaluate',
-      { expression: CREATE_QUIESCENCE_PROBE, objectGroup },
-    );
+    type Created = { result: { objectId?: string }; exceptionDetails?: unknown };
+    const created =
+      root === undefined
+        ? await cdp<Created>(tabId, 'Runtime.evaluate', {
+            expression: CREATE_QUIESCENCE_PROBE,
+            objectGroup,
+          })
+        : await cdp<Created>(tabId, 'Runtime.callFunctionOn', {
+            objectId: root,
+            functionDeclaration: OBSERVE_ELEMENT_FN,
+            objectGroup,
+          });
     // A thrown value also comes back WITH an objectId — the exception object's.
     return created.exceptionDetails ? undefined : created.result.objectId;
   } catch (e) {
@@ -329,17 +349,25 @@ async function createObserver(tabId: number, objectGroup: string): Promise<strin
  * execution context, and sampling the dead handle rejects. That is a new page,
  * not a failure — the tick counts as reading-less (restarting the window) and
  * the next tick installs a fresh observer, AFTER that tick's allowlist gate, so
- * the new document is approved before anything is placed in it. */
+ * the new document is approved before anything is placed in it.
+ *
+ * A `root` element dies with its document too, and there is no re-resolving it
+ * from here — so a scoped wait whose creation fails or whose context is lost
+ * falls back to watching the whole (new) document: stricter, never blinder. */
 export async function settleFor(tabId: number, spec: SettleSpec): Promise<SettleOutcome> {
   const start = performance.now();
   let state = INITIAL_SETTLE_STATE;
   let objectId: string | undefined;
+  let root = spec.root;
   // Per-tab tool serialisation prevents overlapping waits in this group.
   const objectGroup = 'sallyport-settle';
   try {
     for (;;) {
       await ensureStillAllowed(tabId);
-      objectId ??= await createObserver(tabId, objectGroup);
+      if (objectId === undefined) {
+        objectId = await createObserver(tabId, objectGroup, root);
+        if (objectId === undefined) root = undefined;
+      }
       let sig: Signal | null = null;
       if (objectId !== undefined) {
         try {
@@ -359,6 +387,7 @@ export async function settleFor(tabId: number, spec: SettleSpec): Promise<Settle
         } catch (e) {
           if (!looksLikeLostContextError(e)) throw e;
           objectId = undefined; // its document is gone; observe the new one next tick
+          root = undefined;
         }
       }
       const now = performance.now();
@@ -405,7 +434,25 @@ export async function settleFor(tabId: number, spec: SettleSpec): Promise<Settle
 export const SCROLL_STEP_PROBE =
   'function(dir) { var b = this.scrollTop; var p = this.clientHeight || 0;' +
   ' this.scrollTop = b + dir * Math.max(1, p * 0.9);' +
-  ' return { before: b, after: this.scrollTop, scrollHeight: this.scrollHeight }; }';
+  ' return { before: b, after: this.scrollTop, scrollHeight: this.scrollHeight, clientHeight: p }; }';
+
+/** Did this scroll step leave the container at the edge it is moving toward?
+ * That is where an infinite feed fetches its next page — often behind a
+ * progress bar OUTSIDE the container, while the container itself sits unchanged
+ * until the rows land. `reveal` waits for the whole document on such a step,
+ * so a slow fetch is not snapshotted early and misread as `stall`. Unreadable
+ * geometry counts as an edge: document-wide is the stricter wait, never the
+ * blinder one. Pure. */
+export function atScrollEdge(
+  sc: { after: number; scrollHeight?: unknown; clientHeight?: unknown },
+  dir: number,
+): boolean {
+  if (dir < 0) return sc.after <= 0;
+  const { scrollHeight, clientHeight } = sc;
+  if (typeof scrollHeight !== 'number' || typeof clientHeight !== 'number') return true;
+  // scrollTop is fractional under zoom; a pixel of slack absorbs the rounding.
+  return sc.after + clientHeight >= scrollHeight - 1;
+}
 
 const MAX_STEPS = 40;
 const DEFAULT_MAX_STEPS = 20;

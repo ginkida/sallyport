@@ -6,6 +6,22 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `reveal` waits between scroll steps on its container's subtree instead of
+  the whole document. With 0.24.1's mutation-based settle, any churn on the
+  page (a ticking clock, a progress attribute, a ticker) cost every step its
+  full 1.5 s budget; the wait now drops to about 0.5–0.75 s once the list
+  itself has finished rendering. Changes inside the container, text included
+  (virtualisers that recycle row nodes rewrite their text), still hold the
+  step. A step that reaches the end of the container waits on the whole
+  document instead, because an infinite feed's next page often loads behind an
+  indicator outside the list, and a scoped wait would snapshot before the rows
+  land and report `stall`. If the page navigates mid-wait, or the container
+  cannot be observed, the wait falls back to the whole document rather than
+  going blind. `settle` itself stays document-wide. The browser test reveals a
+  row in a virtualised list while a clock ticks outside it.
+
 ### Fixed
 
 - `navigate`, `reload` and `history_go` could report `timeout` after 30 s for

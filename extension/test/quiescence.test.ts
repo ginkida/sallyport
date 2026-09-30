@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createQuiescenceObserver, CREATE_QUIESCENCE_PROBE } from '../src/tools/quiescence.js';
+import {
+  createQuiescenceObserver,
+  CREATE_QUIESCENCE_PROBE,
+  OBSERVE_ELEMENT_FN,
+} from '../src/tools/quiescence.js';
 
 describe('per-wait DOM observer', () => {
   let deliver: (records: unknown[]) => void;
@@ -102,6 +106,18 @@ describe('per-wait DOM observer', () => {
       doc: Document,
     ) => ReturnType<typeof createQuiescenceObserver>;
     const observer = run(doc);
+    deliver([{}]);
+    expect(observer.sample()).toBe(1);
+    observer.stop();
+  });
+
+  it('scopes to the receiver element without interpolating it', () => {
+    const element = {} as Node;
+    const fn = new Function(`return ${OBSERVE_ELEMENT_FN};`)() as (
+      this: Node,
+    ) => ReturnType<typeof createQuiescenceObserver>;
+    const observer = fn.call(element);
+    expect(observe).toHaveBeenCalledWith(element, expect.objectContaining({ subtree: true }));
     deliver([{}]);
     expect(observer.sample()).toBe(1);
     observer.stop();
