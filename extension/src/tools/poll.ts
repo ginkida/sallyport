@@ -44,7 +44,7 @@ export type WaitSpec = {
 // keep reading it, and the answer is about where the tab went, not about the
 // condition), 'error' (anything else).
 export type WaitReason =
-  'invalid_selector' | 'bad_ref' | 'timeout' | 'domain_not_allowed' | 'error';
+  'invalid_selector' | 'bad_ref' | 'timeout' | 'domain_not_allowed' | 'not_loaded' | 'error';
 
 export type WaitOutcome = {
   found: boolean;

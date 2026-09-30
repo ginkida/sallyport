@@ -84,7 +84,7 @@ export type ObserveResult = {
    * somewhere the allowlist does not cover — typically a redirect) or
    * `tab_gone` (it closed between the action and the look). A closed set, so
    * the model-facing schema can name both. */
-  skipped?: 'domain_not_allowed' | 'tab_gone' | 'budget';
+  skipped?: 'domain_not_allowed' | 'tab_gone' | 'budget' | 'not_loaded';
   error?: string;
 };
 

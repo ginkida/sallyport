@@ -12,7 +12,14 @@ import { parseObserve, runObserve } from './observe.js';
 import { loadTimeoutMs } from './budget.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { clearRefsForTab } from './refs.js';
-import { agentTabIds, filterTabsToOwned, getEpoch, isBrokerMode, mintEpoch } from './ownership.js';
+import {
+  agentTabIds,
+  dropEpoch,
+  filterTabsToOwned,
+  getEpoch,
+  isBrokerMode,
+  mintEpoch,
+} from './ownership.js';
 import { persistEpochs, reapAgentTabs } from './ownership-store.js';
 import { createAgentTab } from './agent-window.js';
 import type { Tool } from './types.js';
@@ -228,7 +235,37 @@ export const navigate: Tool = async (args, ctx) => {
       await chrome.tabs.update(tab.id!, { url });
     }
   }
-  await waitForLoad(tab.id!, 'navigate', loadTimeoutMs(ctx?.startedAt, Date.now()));
+  // Ownership epoch (broker mode only): a created tab mints a fresh epoch (the
+  // daemon records ownership from it); an in-place navigate echoes the existing
+  // one. The daemon ignores `epoch` in standalone, so we don't mint there.
+  // Minted BEFORE the load wait: a created tab whose load outlived the watchdog
+  // used to throw here with no epoch minted — open in the agent window, owned
+  // by nobody, invisible to list_tabs, the sweep and the reaper, unnameable by
+  // its own agent, whom the `timeout` hint then told to retry (another tab).
+  let epoch: string | undefined;
+  if (isBrokerMode()) {
+    epoch = created ? mintEpoch(tab.id!, ctx?.client) : getEpoch(tab.id!);
+    if (created) await persistEpochs();
+  }
+  let loaded = true;
+  try {
+    await waitForLoad(tab.id!, 'navigate', loadTimeoutMs(ctx?.startedAt, Date.now()));
+  } catch (e) {
+    // A tab this call CREATED is the agent's to keep using: hand it back with
+    // its id (and epoch) marked unloaded rather than fail the call and lose
+    // it. An in-place navigate keeps failing — the agent already holds that id.
+    if (!created || !(e instanceof BridgeError) || e.code !== 'timeout') {
+      // The tab closed before it loaded (the human, or another session): the
+      // epoch minted above names a dead id, and would hold a reaper slot until
+      // the next worker boot reconciled it away.
+      if (created && epoch !== undefined && e instanceof BridgeError && e.code === 'tab_gone') {
+        dropEpoch(tab.id!);
+        await persistEpochs();
+      }
+      throw e;
+    }
+    loaded = false;
+  }
   // Navigation invalidates any refs we held for this tab, and any pending
   // dialog arm — a one-shot is scoped to the page it was set on, not a
   // standing grant that should still apply once the tab has moved on.
@@ -236,16 +273,13 @@ export const navigate: Tool = async (args, ctx) => {
   // the moment the new document commits; this is belt-and-suspenders.)
   clearRefsForTab(tab.id!);
   clearArmedDialog(tab.id!);
-  // Ownership epoch (broker mode only): a created tab mints a fresh epoch (the
-  // daemon records ownership from it); an in-place navigate echoes the existing
-  // one. The daemon ignores `epoch` in standalone, so we don't mint there.
-  let epoch: string | undefined;
-  if (isBrokerMode()) {
-    epoch = created ? mintEpoch(tab.id!, ctx?.client) : getEpoch(tab.id!);
-    if (created) await persistEpochs();
-  }
   let wait = null;
-  if (waitSpec) {
+  if (waitSpec && !loaded) {
+    // Nothing has committed yet (the usual reason a created tab outlives the
+    // watchdog: the server never answered), so there is no page to wait on —
+    // every probe would refuse with no_url and read as a generic `error`.
+    wait = { found: false, elapsedMs: 0, reason: 'not_loaded' as const };
+  } else if (waitSpec) {
     // "Loaded" (tab status complete) rarely means "rendered" on SPAs — the
     // embedded wait covers the gap to the element/text actually appearing,
     // saving the follow-up wait_for round-trip. attach() already ran above
@@ -259,9 +293,15 @@ export const navigate: Tool = async (args, ctx) => {
   // and echoing the request made that invisible until some later call surprised
   // the agent — and wrote the wrong URL into the audit row. Read after the
   // embedded wait so the answer describes the tab as the call returns it.
-  const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
+  const observed = !observeSpec
+    ? null
+    : loaded
+      ? await runObserve(tab.id!, observeSpec, ctx?.startedAt)
+      : { skipped: 'not_loaded' as const };
   const landed = await currentUrl(tab.id!);
-  const finalUrl = landed ?? url;
+  // `||`, not `??`: a tab whose navigation has not committed reports url ''
+  // (the address sits in pendingUrl), and '' is not where it is going.
+  const finalUrl = landed || url;
   return {
     tabId: tab.id,
     url: finalUrl,
@@ -270,6 +310,7 @@ export const navigate: Tool = async (args, ctx) => {
       url: finalUrl,
       ...(landedElsewhere(url, landed) ? { redirectedFrom: url } : {}),
       ...(epoch ? { epoch } : {}),
+      ...(loaded ? {} : { loaded: false }),
       ...(wait ? { wait } : {}),
       ...(observed ? { observed } : {}),
     },

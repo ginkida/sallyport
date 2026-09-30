@@ -72,7 +72,8 @@ _WAIT_FOR_SCHEMA: dict[str, Any] = {
         "re-render — re-snapshot), 'invalid_selector' (malformed CSS you passed — "
         "permanent), 'domain_not_allowed' (the page navigated off the allowlist WHILE "
         "waiting — the action still happened, but the tab is somewhere you may not "
-        "read; check where it went before continuing), 'error' (other)."
+        "read; check where it went before continuing), 'not_loaded' (navigate opened a "
+        "tab whose page never committed — nothing to wait on yet), 'error' (other)."
     ),
 }
 
@@ -115,7 +116,8 @@ _OBSERVE_SCHEMA: dict[str, Any] = {
         "the ELEMENT LIST is partial (walker caps), so what you want may not be in it; "
         "error: the look failed, the action still succeeded; skipped: nothing was read, "
         "'domain_not_allowed' (the tab redirected off the allowlist), 'tab_gone', or "
-        "'budget' (a slow load and wait spent the call's time — snapshot next call). "
+        "'budget' (a slow load and wait spent the call's time — snapshot next call), or "
+        "'not_loaded' (navigate opened a tab whose page has not committed yet). "
         "A snapshot observation RE-MINTS the tab's @eN, so refs from an earlier "
         "snapshot stop resolving (bad_ref, never a silent rebind) — use the ones it "
         "returns. Prefer 'compact': this payload is re-read on every later turn."
@@ -159,7 +161,11 @@ TOOLS: list[Tool] = [
         name="navigate",
         description=(
             "Open a URL. The destination domain must be in the extension's allowlist "
-            "or the call fails with domain_not_allowed. Set newTab=true to open a "
+            "or the call fails with domain_not_allowed. A navigate that OPENS a tab "
+            "and whose page does not finish loading in time still succeeds, with "
+            "loaded=false and the new tabId: keep using that tab instead of navigating "
+            "again (until its page commits, calls on it may answer no_url — retry them "
+            "with the same tabId). Set newTab=true to open a "
             "new tab; otherwise updates the tab passed in tabId, or the active tab "
             "in the current window if tabId is omitted. In broker mode (a shared "
             "broker daemon) there is no active-tab fallback: a navigate with no tabId "

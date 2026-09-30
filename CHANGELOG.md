@@ -24,6 +24,22 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `navigate` that opened a new tab (broker-mode create-own, `newTab`, or a
+  `chrome://` source) and whose page did not reach "complete" before the load
+  watchdog failed with `timeout` before the tab's ownership was recorded. The
+  tab stayed open in the agent window, owned by nobody: invisible to
+  `list_tabs`, the popup's sweep and the reaper, and unnameable by its own
+  agent, whom the `timeout` hint then told to retry, opening another. The
+  ownership epoch is now minted before the load wait, and such a navigate
+  succeeds with `loaded: false` and the new `tabId`; its url is the one
+  requested (an uncommitted tab reports ''), and an embedded wait or observe
+  says `not_loaded` rather than failing on a page that does not exist yet. An
+  in-place navigate still fails with `timeout`, and the `timeout` and `no_url`
+  hints now say which is which. A tab closed before it loaded drops the epoch
+  minted for it. The 50 s
+  call budget made this likelier (the watchdog can be as short as 1 s on an
+  overdrawn call), so it is fixed before that ships.
+
 - Waits now report what actually happened:
   - a navigation mid-tick (a click that submits, then `waitFor` text) no
     longer fails the wait with a raw CDP error; the tick counts as unread and

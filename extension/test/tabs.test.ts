@@ -486,6 +486,94 @@ describe('navigate/reload — attach is BEST-EFFORT (a debugger conflict must no
     // (open, but unowned on both extension and daemon sides).
     expect(result.data.epoch).toBeTruthy();
   });
+
+  it('broker mode: a new tab whose load outlives the watchdog is handed back owned, not orphaned', async () => {
+    setBrokerMode(true);
+    installChromeMock({ active: { id: 3, url: 'https://allowed.example/old' } });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    // The usual shape: the server never answered, so nothing has committed —
+    // url is '' and the address sits in pendingUrl.
+    (
+      globalThis as unknown as {
+        chrome: { tabs: { get: (id: number, cb?: (t?: unknown) => void) => unknown } };
+      }
+    ).chrome.tabs.get = (id: number, cb?: (t?: unknown) => void) => {
+      const tab = { id, status: 'loading', url: '', pendingUrl: ALLOW };
+      if (cb) cb(tab);
+      return Promise.resolve(tab);
+    };
+    const res = (await navigate(
+      {
+        url: ALLOW,
+        newTab: true,
+        waitFor: { selector: '#app', timeoutMs: 5000 },
+        observe: { snapshot: 'compact' },
+      },
+      { startedAt: Date.now() - 70_000 },
+    )) as {
+      url: string;
+      data: {
+        tabId: number;
+        url: string;
+        epoch?: string;
+        loaded?: boolean;
+        wait?: { reason?: string };
+        observed?: { skipped?: string };
+      };
+    };
+    // Failing here used to leave the tab open in the agent window with no
+    // epoch minted: owned by nobody, and the agent told to retry (another tab).
+    expect(res.data.loaded).toBe(false);
+    expect(res.data.epoch).toBeTruthy();
+    expect(getEpoch(res.data.tabId)).toBe(res.data.epoch);
+    // No page to read yet: said so, rather than no_url dressed as `error` or
+    // an observe claiming the tab drifted off the allowlist.
+    expect(res.data.wait?.reason).toBe('not_loaded');
+    expect(res.data.observed).toEqual({ skipped: 'not_loaded' });
+    expect(res.data.url).toBe(ALLOW); // not ''
+    expect(res.url).toBe(ALLOW);
+  });
+
+  it('broker mode: a new tab closed before it loaded leaves no epoch behind', async () => {
+    setBrokerMode(true);
+    installChromeMock({ active: { id: 3, url: 'https://allowed.example/old' } });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    let createdId: number | undefined;
+    (
+      globalThis as unknown as {
+        chrome: { tabs: { get: (id: number, cb?: (t?: unknown) => void) => unknown } };
+      }
+    ).chrome.tabs.get = (id: number, cb?: (t?: unknown) => void) => {
+      createdId = id;
+      if (cb) {
+        cb(undefined); // gone
+        return undefined;
+      }
+      return Promise.reject(new Error(`No tab with id: ${id}.`));
+    };
+    await expect(navigate({ url: ALLOW, newTab: true })).rejects.toMatchObject({
+      code: 'tab_gone',
+    });
+    expect(createdId).toBeDefined();
+    expect(getEpoch(createdId!)).toBeUndefined();
+  });
+
+  it('an in-place navigate whose load times out still fails — the agent already holds the id', async () => {
+    installChromeMock({ tabs: [{ id: 7, url: 'about:blank' }] });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    (
+      globalThis as unknown as {
+        chrome: { tabs: { get: (id: number, cb?: (t?: unknown) => void) => unknown } };
+      }
+    ).chrome.tabs.get = (id: number, cb?: (t?: unknown) => void) => {
+      const tab = { id, status: 'loading', url: ALLOW };
+      if (cb) cb(tab);
+      return Promise.resolve(tab);
+    };
+    await expect(
+      navigate({ tabId: 7, url: ALLOW }, { startedAt: Date.now() - 70_000 }),
+    ).rejects.toMatchObject({ code: 'timeout' });
+  });
 });
 
 describe('isBlankTarget', () => {

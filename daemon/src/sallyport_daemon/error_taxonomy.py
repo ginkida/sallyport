@@ -214,20 +214,25 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "— fix the script before retrying; an identical retry throws the same way."
         ),
         "no_url": (
-            "retryable=no; the tab has no navigable URL yet (a blank/new tab) — navigate to a "
-            "page first, then retry."
+            "retryable=maybe; the tab has no committed URL yet. If navigate just returned "
+            "loaded=false for this tab, its page is still loading — retry with the SAME tabId "
+            "shortly, do not navigate again (that opens another tab). Otherwise it is a "
+            "blank/new tab — navigate it to a page first, then retry."
         ),
         "unknown_tool": (
             "retryable=no; no tool by that name is registered — check the advertised tool list; "
             "a retry with the same name won't succeed."
         ),
         "timeout": (
-            "retryable=maybe; the page-load watchdog fired (30s) without the tab reaching "
-            "'complete' — thrown by navigate, reload (bypassCache or not) and history_go, which "
+            "retryable=maybe; the page-load watchdog fired (up to 30 s, less when the call had "
+            "already spent its budget) without the tab reaching 'complete' — thrown by an "
+            "in-place navigate (tabId given), reload (bypassCache or not) and history_go, which "
             "all share the same watchdog. The page may just be slow/heavy, or stuck loading; "
-            "wait_for/settle on a concrete selector instead of relying on full page load. For "
-            "navigate/reload it's safe to retry the SAME tool (navigate needs a URL; reload just "
-            "needs the tabId) — both are idempotent. For history_go, do NOT blindly retry: "
+            "wait_for/settle on a concrete selector instead of relying on full page load. An "
+            "in-place navigate or a reload is safe to retry with the same tabId. A navigate that "
+            "OPENED a tab never ends here: it returns the new tabId with loaded=false — keep "
+            "using that tab rather than navigating again, which would open another. For "
+            "history_go, do NOT blindly retry: "
             "Page.navigateToHistoryEntry fires and can complete BEFORE this watchdog does, so a "
             "timeout likely means the hop already landed and only 'reached complete' timed out — "
             "retrying would move further than intended. Instead read_text/snapshot the tab to see "
