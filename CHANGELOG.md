@@ -24,6 +24,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- One console line, dialog message or network body holding half of a
+  surrogate pair — cut there by the capture's own length cap, or produced by
+  the page's script — made that tab's `console_tail`, `handle_dialog` or
+  `network_tail` fail as `unserialisable_result` on EVERY later read until the
+  entry aged out of the ring (the signer refuses lone surrogates). The three
+  caps now cut surrogate-safe and replace any lone half with U+FFFD at
+  capture time (`text.ts:wellFormedCut`).
+
 - `find` and `reveal` returned each match's `name` and `value` uncapped: a
   textarea's whole draft, or a card link named by its entire text, went into
   the result verbatim, up to 50 matches across 10 queries. They now get the

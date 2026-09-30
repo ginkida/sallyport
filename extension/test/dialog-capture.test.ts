@@ -230,3 +230,15 @@ describe('isMainFrameNavigation', () => {
     expect(isMainFrameNavigation({})).toBe(false);
   });
 });
+
+describe('shapeDialogEntry — a message that would poison the ring', () => {
+  it('stores a well-formed message, whatever the page alerted', () => {
+    const entry = shapeDialogEntry(
+      { type: 'alert', message: 'saved \uD83D', url: 'https://app.example.com/' },
+      { accept: true },
+      false,
+      1,
+    );
+    expect(entry.message).toBe('saved \uFFFD');
+  });
+});

@@ -39,6 +39,7 @@
 
 import { pushCapped } from './console-capture.js';
 import { BridgeError } from './errors.js';
+import { wellFormedCut } from './text.js';
 import { NetworkBodyCache, type CapturedBody } from './network-body-cache.js';
 
 export interface NetworkEntry extends CapturedBody {
@@ -182,8 +183,10 @@ export function clipBody(
   body: string,
   max = NETWORK_MAX_BODY,
 ): { body: string; truncated: boolean } {
-  if (body.length <= max) return { body, truncated: false };
-  return { body: body.slice(0, max), truncated: true };
+  // Surrogate-safe, and a page body's own lone halves replaced: one stored
+  // bad body would make every later network_tail on the tab unsignable.
+  const { text, cut } = wellFormedCut(body, max);
+  return { body: text, truncated: cut };
 }
 
 /** Build a NetworkEntry from assembled metadata + an optional body string

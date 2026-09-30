@@ -114,3 +114,26 @@ export function capText(text: string, maxChars: number, offset = 0): CappedText 
   }
   return out;
 }
+
+/** A lone UTF-16 surrogate half — the one thing the signer refuses to carry
+ * (protocol.ts), so ONE stored in a capture ring fails every later read. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/** Cut `s` to at most `max` code units WITHOUT splitting a surrogate pair, and
+ * replace any lone half the page itself produced (a script that sliced an
+ * emoji) with U+FFFD. For page strings stored in capture rings — console
+ * lines, dialog messages, network bodies — where a bad entry would otherwise
+ * make every later console_tail/handle_dialog/network_tail on that tab fail
+ * as unserialisable_result until evicted. Pure. */
+export function wellFormedCut(s: string, max: number): { text: string; cut: boolean } {
+  let text = s;
+  let cut = false;
+  if (text.length > max) {
+    let end = max;
+    const c = text.charCodeAt(end - 1);
+    if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+    text = text.slice(0, end);
+    cut = true;
+  }
+  return { text: text.replace(LONE_SURROGATE, '\uFFFD'), cut };
+}

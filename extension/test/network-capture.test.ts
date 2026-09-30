@@ -363,3 +363,11 @@ describe('applyResponseBudget', () => {
     expect(FRAME_CAP - NETWORK_RESPONSE_BUDGET).toBeGreaterThanOrEqual(4 * 1024 * 1024);
   });
 });
+
+describe('clipBody — surrogate-safe', () => {
+  it('does not end a capped body on half an emoji', async () => {
+    const { clipBody } = await import('../src/tools/network-capture.js');
+    const out = clipBody('a'.repeat(9) + '😀', 10);
+    expect(out).toEqual({ body: 'a'.repeat(9), truncated: true });
+  });
+});

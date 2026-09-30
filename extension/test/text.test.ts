@@ -9,7 +9,8 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { capText, parseMaxChars, parseOffset } from '../src/tools/text.js';
+import { capText, parseMaxChars, parseOffset, wellFormedCut } from '../src/tools/text.js';
+import { canonicalJson } from '../src/protocol.js';
 
 /**
  * read_text's window. The cut was always REPORTED but never resumable: reading
@@ -117,5 +118,25 @@ describe('capText / parseMaxChars / parseOffset (read_text)', () => {
     expect(() => parseOffset(-1)).toThrowError(/offset/);
     expect(() => parseOffset(2.5)).toThrowError(/offset/);
     expect(() => parseOffset('lots')).toThrowError(/offset/);
+  });
+});
+
+describe('wellFormedCut (page strings stored in capture rings)', () => {
+  it('never splits a surrogate pair at the cut', () => {
+    const s = 'a'.repeat(9) + '😀' + 'tail';
+    expect(wellFormedCut(s, 10)).toEqual({ text: 'a'.repeat(9), cut: true });
+  });
+
+  it("replaces the page's own lone halves, so the entry stays signable", () => {
+    const hi = 'x\uD83Dy';
+    const lo = 'x\uDE00y';
+    expect(wellFormedCut(hi, 100).text).toBe('x\uFFFDy');
+    expect(wellFormedCut(lo, 100).text).toBe('x\uFFFDy');
+    expect(() => canonicalJson({ m: wellFormedCut(hi, 100).text })).not.toThrow();
+    expect(() => canonicalJson({ m: hi })).toThrow(); // what used to be stored
+  });
+
+  it('leaves a well-formed string alone', () => {
+    expect(wellFormedCut('ok 😀', 100)).toEqual({ text: 'ok 😀', cut: false });
   });
 });

@@ -168,3 +168,18 @@ describe('parseConsoleLimit', () => {
     expect(() => parseConsoleLimit(2.5)).toThrowError(/limit/);
   });
 });
+
+describe('shapeConsoleEntry — a line that would poison the ring', () => {
+  it('stores a well-formed text, whatever the page logged', () => {
+    const entry = shapeConsoleEntry(
+      'Runtime.consoleAPICalled',
+      {
+        type: 'error',
+        args: [{ value: 'cut mid-emoji \uD83D' }],
+        stackTrace: { callFrames: [{ url: 'https://app.example.com/x.js' }] },
+      },
+      1,
+    );
+    expect(entry?.text).toBe('cut mid-emoji \uFFFD');
+  });
+});

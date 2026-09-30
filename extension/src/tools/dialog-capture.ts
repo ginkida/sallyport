@@ -66,6 +66,7 @@
  */
 
 import { BridgeError } from './errors.js';
+import { wellFormedCut } from './text.js';
 import { originFromStackUrl, pushCapped } from './console-capture.js';
 
 export const DIALOG_MAX_ENTRIES = 20;
@@ -171,7 +172,7 @@ export function shapeDialogEntry(
   return {
     ts,
     type: typeof params.type === 'string' ? params.type : '',
-    message: raw.length > DIALOG_MAX_MESSAGE ? raw.slice(0, DIALOG_MAX_MESSAGE) : raw,
+    message: wellFormedCut(raw, DIALOG_MAX_MESSAGE).text,
     origin: originFromStackUrl(params.url),
     response,
     armed,

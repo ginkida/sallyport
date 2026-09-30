@@ -26,6 +26,7 @@
  */
 
 import { BridgeError } from './errors.js';
+import { wellFormedCut } from './text.js';
 
 export type ConsoleLevel = 'error' | 'warning';
 
@@ -89,7 +90,7 @@ function topFrameUrl(stack: StackTraceLike | undefined): string | undefined {
 }
 
 function clip(s: string): string {
-  return s.length > CONSOLE_MAX_TEXT ? s.slice(0, CONSOLE_MAX_TEXT) : s;
+  return wellFormedCut(s, CONSOLE_MAX_TEXT).text;
 }
 
 /** A console arg (CDP RemoteObject) → a flat display string. No nested
