@@ -32,3 +32,33 @@ export function budgetLeft(startedAt: number | undefined, now: number, reserveMs
 export function loadTimeoutMs(startedAt: number | undefined, now: number, usual = 30_000): number {
   return Math.max(MIN_LOAD_TIMEOUT_MS, Math.min(usual, budgetLeft(startedAt, now)));
 }
+
+/** Below this, a page step is not even sent: a call whose budget queueing and
+ * attach already spent would otherwise dispatch a POST (or arbitrary code) and
+ * then report the side effect it caused as a timeout. */
+export const MIN_STEP_MS = 1_000;
+
+/** How long a single page-awaited step (fetch_in_page, evaluate) may take: what
+ * the call has left, never more than the whole budget. Pure. */
+export function stepDeadlineMs(startedAt: number | undefined, now: number): number {
+  return Math.max(0, Math.min(CALL_BUDGET_MS, budgetLeft(startedAt, now)));
+}
+
+/** Settle `p`, or reject with `onTimeout()` after `ms`. The losing promise is
+ * NOT cancelled — this is what frees the tab's call queue (tools.ts onTab) from
+ * a page promise that never settles, not a way to stop the page. */
+export async function raceDeadline<T>(
+  p: Promise<T>,
+  ms: number,
+  onTimeout: () => Error,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(onTimeout()), ms);
+  });
+  try {
+    return await Promise.race([p, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}

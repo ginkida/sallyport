@@ -1401,7 +1401,9 @@ TOOLS: list[Tool] = [
         description=(
             "Run arbitrary JavaScript in the page context. REQUIRES the domain to have "
             "evaluate explicitly enabled in the extension allowlist; otherwise fails "
-            "with evaluate_not_allowed. Use sparingly — prefer click/fill/read_text."
+            "with evaluate_not_allowed. Use sparingly — prefer click/fill/read_text. "
+            "A promise that never settles is cut off at the call's ~50 s budget "
+            "(evaluate_timeout), freeing the tab."
         ),
         inputSchema={
             "type": "object",
@@ -1416,7 +1418,9 @@ TOOLS: list[Tool] = [
     Tool(
         name="fetch_in_page",
         description=(
-            "Run fetch() from the page's JS context, with its cookies/auth. Use this "
+            "Run fetch() from the page's JS context, with its cookies/auth (a response "
+            "that never finishes — a stream, a long-poll — is aborted at the call's "
+            "~50 s budget as fetch_timeout, freeing the tab). Use this "
             "to download image/binary URLs you found via snapshot or evaluate "
             "(e.g. card photos from a logged-in 2gis session), or to issue a "
             "fresh request. To read a response the page ALREADY fetched "

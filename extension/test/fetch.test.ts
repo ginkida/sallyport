@@ -117,8 +117,18 @@ describe('the serialised page expression', () => {
     const body = m![1]
       .replace(/\$\{JSON\.stringify\([^)]*\)\}/g, '"x"')
       .replace(/\$\{bodyJson\}/g, 'undefined')
-      .replace(/\$\{FETCH_MAX_BYTES\}/g, String(FETCH_MAX_BYTES));
+      .replace(/\$\{FETCH_MAX_BYTES\}/g, String(FETCH_MAX_BYTES))
+      .replace(/\$\{abortMs\}/g, '49000');
     expect(() => new Function('return ' + body)).not.toThrow();
+  });
+
+  it('aborts a response that never finishes, with a number we computed', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync(new URL('../src/tools/fetch.ts', import.meta.url), 'utf8');
+    const m = src.match(/const expr = `([\s\S]*?)`;/);
+    expect(m![1]).toContain('AbortSignal.timeout(${abortMs})');
+    // ...guarded, so a page with an old AbortSignal polyfill keeps fetch_in_page.
+    expect(m![1]).toContain("typeof AbortSignal.timeout === 'function'");
   });
 
   it('checks the size on BOTH the binary and the text path', async () => {

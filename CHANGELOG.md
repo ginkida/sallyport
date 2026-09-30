@@ -24,6 +24,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `fetch_in_page` on a response that never finishes (an event stream, a
+  long-poll, a stalled server), or an `evaluate` awaiting a promise that never
+  settles, held its tab forever: the daemon gave up at 60 s, but the call sat
+  in the tab's call queue, and every later call on that tab — `close_tab`
+  included — queued behind it until the tab died. Both are now bounded by
+  what is left of the call's budget and fail as `fetch_timeout` /
+  `evaluate_timeout`, freeing the tab; the in-page fetch also aborts itself
+  (`AbortSignal.timeout`, a number the extension computed, not agent input,
+  and skipped on a page whose `AbortSignal` polyfill lacks it). A call whose
+  budget was already spent before the step does not send the request or code
+  at all, so a POST can never land behind a reported timeout.
+
 - One console line, dialog message or network body holding half of a
   surrogate pair — cut there by the capture's own length cap, or produced by
   the page's script — made that tab's `console_tail`, `handle_dialog` or

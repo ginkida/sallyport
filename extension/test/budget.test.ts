@@ -6,6 +6,8 @@ import {
   loadTimeoutMs,
   MIN_LOAD_TIMEOUT_MS,
   OBSERVE_RESERVE_MS,
+  raceDeadline,
+  stepDeadlineMs,
 } from '../src/tools/budget.js';
 
 describe('budgetLeft', () => {
@@ -39,5 +41,22 @@ describe('loadTimeoutMs', () => {
 
   it('keeps a floor, so an overdrawn call fails fast with a retryable timeout', () => {
     expect(loadTimeoutMs(0, 70_000)).toBe(MIN_LOAD_TIMEOUT_MS);
+  });
+});
+
+describe('stepDeadlineMs / raceDeadline (a page step that may never settle)', () => {
+  it('bounds a step by what the call has left, never past the whole budget', () => {
+    expect(stepDeadlineMs(undefined, 0)).toBe(CALL_BUDGET_MS);
+    expect(stepDeadlineMs(0, 40_000)).toBe(CALL_BUDGET_MS - 40_000);
+    expect(stepDeadlineMs(0, 90_000)).toBe(0);
+  });
+
+  it('passes a settled result through', async () => {
+    await expect(raceDeadline(Promise.resolve(7), 1000, () => new Error('late'))).resolves.toBe(7);
+  });
+
+  it('rejects with the given error when the step never settles', async () => {
+    const never = new Promise<number>(() => {});
+    await expect(raceDeadline(never, 20, () => new Error('late'))).rejects.toThrow('late');
   });
 });

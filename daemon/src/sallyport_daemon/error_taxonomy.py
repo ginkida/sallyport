@@ -212,6 +212,16 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "retryable=maybe; the in-page fetch failed (network error, CORS, or a blocked "
             "request) — verify the URL and that its host is allowlisted, then retry."
         ),
+        "fetch_timeout": (
+            "retryable=no as-is; the response never finished within the call's budget (a "
+            "stream, a long-poll, or a stalled server). The tab is free again. Fetch a "
+            "finite resource, or read the stream's effect from the page instead."
+        ),
+        "evaluate_timeout": (
+            "retryable=no as-is; the evaluated code never settled within the call's budget "
+            "(an await on a promise that never resolves). The tab is free again. Return "
+            "sooner, or poll for the effect with wait_for."
+        ),
         "eval_threw": (
             "retryable=no; the evaluated JavaScript threw (the message carries the page error) "
             "— fix the script before retrying; an identical retry throws the same way."

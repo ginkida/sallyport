@@ -2,6 +2,7 @@ import { attach, cdp } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { resolveTab } from './tabs.js';
+import { MIN_STEP_MS, raceDeadline, stepDeadlineMs } from './budget.js';
 import type { Tool } from './types.js';
 
 /**
@@ -81,7 +82,7 @@ export function fetchTooLarge(bytes: number, saveAs: boolean): BridgeError {
   );
 }
 
-export const fetchInPage: Tool = async (args) => {
+export const fetchInPage: Tool = async (args, ctx) => {
   const url = String(args.url || '');
   if (!url) throw new BridgeError('bad_args', 'fetch_in_page: url required');
   const method = typeof args.method === 'string' ? args.method.toUpperCase() : 'GET';
@@ -120,12 +121,33 @@ export const fetchInPage: Tool = async (args) => {
   // The function body is FIXED. Only the args are JSON-interpolated, which
   // means an attacker can't inject code by crafting a URL with a quote
   // (JSON-stringification escapes it).
+  // A response that never finishes (SSE, long-poll, a stalled server) must not
+  // hold the tab: the abort is a NUMBER this extension computed from the call's
+  // budget, not agent input, and it also aborts the body read.
+  const deadlineMs = stepDeadlineMs(ctx?.startedAt, Date.now());
+  if (deadlineMs < MIN_STEP_MS) {
+    throw new BridgeError(
+      'fetch_timeout',
+      'fetch_in_page: the call spent its time budget before the request was sent (queued ' +
+        'behind another call on the tab) — nothing was sent; retry',
+    );
+  }
+  // A second under the extension-side deadline, so the page's own abort
+  // normally wins and the error names the stalled response.
+  const abortMs = Math.max(1, deadlineMs - 1000);
   const expr = `(async () => {
     const resp = await fetch(${JSON.stringify(url)}, {
       method: ${JSON.stringify(method)},
       headers: ${JSON.stringify(headers)},
       body: ${bodyJson},
       credentials: 'include',
+      // Guarded: a page that swapped AbortSignal for an old polyfill without
+      // .timeout must not lose fetch_in_page altogether — the extension-side
+      // race is the authoritative bound, this is only the polite one.
+      signal:
+        typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+          ? AbortSignal.timeout(${abortMs})
+          : undefined,
     });
     const ct = resp.headers.get('content-type') || '';
     const status = resp.status;
@@ -165,16 +187,38 @@ export const fetchInPage: Tool = async (args) => {
     return { status, contentType: ct, headers: headerEntries, mode: 'base64', data: btoa(binary) };
   })()`;
 
-  const out = await cdp<{
-    result: { type: string; value?: unknown };
-    exceptionDetails?: { text: string; exception?: { description?: string } };
-  }>(tab.id!, 'Runtime.evaluate', {
-    expression: expr,
-    returnByValue: true,
-    awaitPromise: true,
-  });
+  // And an extension-side deadline in case the page's own fetch/AbortSignal
+  // cannot be trusted to honour it: without one, a never-settling evaluate held
+  // the per-tab call chain, and every later call on that tab — close_tab
+  // included — queued behind it until the tab died.
+  const out = await raceDeadline(
+    cdp<{
+      result: { type: string; value?: unknown };
+      exceptionDetails?: { text: string; exception?: { description?: string } };
+    }>(tab.id!, 'Runtime.evaluate', {
+      expression: expr,
+      returnByValue: true,
+      awaitPromise: true,
+    }),
+    deadlineMs,
+    () =>
+      new BridgeError(
+        'fetch_timeout',
+        'fetch_in_page: the response did not finish in time (a stream, a long-poll, or a ' +
+          'stalled server) — the tab is free again; fetch a finite resource instead',
+      ),
+  );
   if (out.exceptionDetails) {
     const msg = out.exceptionDetails.exception?.description ?? out.exceptionDetails.text;
+    // Anchored to the DOMException our own AbortSignal.timeout raises; a page's
+    // "GatewayTimeoutError: 504" is its own failure, not our budget.
+    if (/^TimeoutError\b/.test(msg)) {
+      throw new BridgeError(
+        'fetch_timeout',
+        'fetch_in_page: the response did not finish in time (a stream, a long-poll, or a ' +
+          `stalled server) — fetch a finite resource instead (${msg.split('\n')[0].slice(0, 200)})`,
+      );
+    }
     throw new BridgeError('fetch_failed', `fetch_in_page: ${msg}`);
   }
   const value = out.result.value as { tooLargeBytes?: number; data?: unknown } | undefined;
