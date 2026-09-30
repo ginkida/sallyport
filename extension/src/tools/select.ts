@@ -153,8 +153,11 @@ export function planSelection(input: SelectInput, spec: SelectSpec): SelectionPl
 /** FIXED literal. `planSelection` is OUR serialised code; the chosen
  * value/label/index arrive only as the structured `spec` argument, never
  * interpolated — so the probe needs no `allowEvaluate`. Single-select uses the
- * native `HTMLSelectElement.prototype` value setter (the React-safe path `fill`
- * uses); multi-select sets `option.selected`. Fires bubbling `input` + `change`
+ * native `HTMLSelectElement.prototype` selectedIndex setter — by INDEX, not
+ * value: two options sharing a value (a placeholder and "Other", both '') made
+ * the value setter pick the first one, i.e. not the option the plan chose;
+ * multi-select sets `option.selected`. The read-back compares SETS — the order
+ * the caller listed values in is not the order the element holds them. Fires bubbling `input` + `change`
  * so frameworks react as if a human chose the option. */
 const SELECT_APPLY_PROBE = `function(spec) {
   var planSelection = ${planSelection.toString()};
@@ -164,7 +167,11 @@ const SELECT_APPLY_PROBE = `function(spec) {
     var opts = [];
     for (var i = 0; i < el.options.length; i++) {
       var o = el.options[i];
-      opts.push({ value: o.value, label: (o.label || o.text || '').trim(), index: i, disabled: !!o.disabled });
+      // o.disabled reflects only the option's own attribute; :disabled also
+      // covers an <optgroup disabled> around it, which a person cannot pick.
+      var off = !!o.disabled;
+      try { if (!off && typeof o.matches === 'function') off = o.matches(':disabled'); } catch (e) {}
+      opts.push({ value: o.value, label: (o.label || o.text || '').trim(), index: i, disabled: off });
     }
     input = { tagName: 'SELECT', disabled: !!el.disabled, multiple: !!el.multiple, options: opts };
   } else {
@@ -172,14 +179,17 @@ const SELECT_APPLY_PROBE = `function(spec) {
   }
   var plan = planSelection(input, spec);
   if (!plan.ok) return plan;
+  var want = [];
+  for (var u = 0; u < plan.indices.length; u++) {
+    if (want.indexOf(plan.indices[u]) < 0) want.push(plan.indices[u]);
+  }
   if (input.multiple) {
     for (var j = 0; j < el.options.length; j++) el.options[j].selected = false;
     for (var k = 0; k < plan.indices.length; k++) el.options[plan.indices[k]].selected = true;
   } else {
-    var desc = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value');
-    var target = input.options[plan.indices[0]].value;
-    if (desc && desc.set) desc.set.call(el, target);
-    else el.value = target;
+    var desc = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'selectedIndex');
+    if (desc && desc.set) desc.set.call(el, plan.indices[0]);
+    else el.selectedIndex = plan.indices[0];
   }
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -195,10 +205,10 @@ const SELECT_APPLY_PROBE = `function(spec) {
           selected.push({ index: m, value: got.value, label: (got.label || got.text || '').trim() });
         }
       }
-      var same = selected.length === plan.indices.length;
+      var same = selected.length === want.length;
       if (same) {
-        for (var n = 0; n < plan.indices.length; n++) {
-          if (selected[n].index !== plan.indices[n]) { same = false; break; }
+        for (var n = 0; n < selected.length; n++) {
+          if (want.indexOf(selected[n].index) < 0) { same = false; break; }
         }
       }
       applied = same ? 'yes' : 'no';
@@ -208,8 +218,8 @@ const SELECT_APPLY_PROBE = `function(spec) {
   }
   if (applied === 'unclear') {
     selected = [];
-    for (var q = 0; q < plan.indices.length; q++) {
-      var ix = plan.indices[q];
+    for (var q = 0; q < want.length; q++) {
+      var ix = want[q];
       selected.push({ index: ix, value: input.options[ix].value, label: input.options[ix].label });
     }
   }

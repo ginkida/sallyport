@@ -334,6 +334,12 @@ describe('SELECT_APPLY_PROBE — the result must describe the ELEMENT, not the p
       set: setValue,
       configurable: true,
     });
+    Object.defineProperty(win.HTMLSelectElement.prototype, 'selectedIndex', {
+      set(this: { options: Opt[] }, i: number) {
+        this.options.forEach((o, k) => (o.selected = k === i));
+      },
+      configurable: true,
+    });
     const fn = new Function('window', 'Event', `return (${SELECT_APPLY_PROBE});`)(
       win,
       class {
@@ -392,6 +398,44 @@ describe('SELECT_APPLY_PROBE — the result must describe the ELEMENT, not the p
     const out = runProbe(el, { by: 'value', values: ['A', 'B'] });
     expect(out.applied).toBe('no');
     expect((out.selected as Array<{ value: string }>).map((o) => o.value)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('selects the planned option even when another shares its value', () => {
+    // A placeholder and "Other" both carry value ''. Setting .value picked the
+    // FIRST one — not the option the label named — and the read-back then
+    // blamed the page for it.
+    const { el } = fakeSelect([
+      { value: '', label: '— choose —' },
+      { value: '', label: 'Other' },
+    ]);
+    const out = runProbe(el, { by: 'label', values: ['Other'] });
+    expect(out.applied).toBe('yes');
+    expect(out.selected).toEqual([{ index: 1, value: '', label: 'Other' }]);
+  });
+
+  it('refuses an option inside a disabled <optgroup>, as a person could not pick it', () => {
+    const { el } = fakeSelect([
+      { value: 'a' },
+      // option.disabled is false; only :disabled sees the optgroup.
+      { value: 'x', matches: (s: string) => s === ':disabled' } as never,
+    ]);
+    const out = runProbe(el, { by: 'value', values: ['x'] });
+    expect(out.ok).toBe(false);
+  });
+
+  it('accepts a multi-select given out of document order', () => {
+    const { el } = fakeSelect([{ value: 'UA' }, { value: 'PL' }, { value: 'DE' }], {
+      multiple: true,
+    });
+    const out = runProbe(el, { by: 'value', values: ['DE', 'UA'] });
+    expect(out.applied).toBe('yes');
+  });
+
+  it('accepts a value listed twice', () => {
+    const { el } = fakeSelect([{ value: 'A' }, { value: 'B' }], { multiple: true });
+    const out = runProbe(el, { by: 'value', values: ['A', 'A'] });
+    expect(out.applied).toBe('yes');
+    expect(out.selected).toEqual([{ index: 0, value: 'A', label: 'A' }]);
   });
 
   it('still refuses a non-select before touching anything', () => {

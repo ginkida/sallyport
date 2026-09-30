@@ -51,6 +51,8 @@ const server = createServer((req, res) => {
         '<fieldset disabled><button id="fs-btn">In a disabled fieldset</button></fieldset>' +
         '<svg id="svg-btn" role="button" width="24" height="24" onclick="document.querySelector(\'#result\').textContent = \'svg clicked\'"><rect width="24" height="24"></rect></svg>' +
         '<input id="ro" readonly value="2026-10-01">' +
+        '<select id="multi" multiple><option value="UA">UA</option><option value="PL">PL</option><option value="DE">DE</option></select>' +
+        '<select id="dupe"><option value="">— choose —</option><option value="">Other</option></select>' +
         '<div id="list" style="height:150px;overflow:auto;position:relative;scroll-behavior:smooth" onscroll="renderRows()">' +
         '<div style="height:900px;position:relative"></div></div>' +
         '<script>function startChurn(mode) {' +
@@ -568,6 +570,18 @@ try {
     assert.equal(readonly.isError, true, JSON.stringify(readonly));
     assert.match(readonly.content[0].text, /no_editable_focus/);
     console.log('PASS: MCP click/key_type refuse what the browser would not deliver');
+    // select_option: values out of document order, and a label whose value
+    // another option shares, must both land AND read back as landed.
+    const multi = value(
+      await callTool('select_option', { selector: '#multi', value: ['DE', 'UA'], tabId }),
+    );
+    assert.equal(multi.applied, 'yes', JSON.stringify(multi));
+    const dupe = value(
+      await callTool('select_option', { selector: '#dupe', label: 'Other', tabId }),
+    );
+    assert.equal(dupe.applied, 'yes', JSON.stringify(dupe));
+    assert.equal(dupe.selected[0].label, 'Other');
+    console.log('PASS: MCP select_option lands the planned option and reads it back');
     for (const mode of ['text', 'attribute', 'revert']) {
       value(await callTool('click', { selector: `#churn-${mode}`, tabId }));
       const busy = value(await callTool('settle', { stableMs: 500, timeoutMs: 1000, tabId }));

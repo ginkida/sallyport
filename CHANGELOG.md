@@ -24,6 +24,15 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `select_option` reported `applied: 'no'` ("the page overrode it") for
+  selections that had landed: a multi-select whose values were listed in a
+  different order than the document holds them, or with a value listed twice.
+  And choosing by `label` or `index` between options that share a value (a
+  placeholder and "Other", both `''`) selected the first of them, then blamed
+  the page. Single-select now applies by index, and the read-back compares
+  sets. An option inside `<optgroup disabled>` is now refused like any other
+  disabled option, where it used to be selected by script.
+
 - `click` answered `ok: true` for clicks that never happened: on an SVG or
   MathML target (no `.click()` of its own, so the probe threw and its empty
   result read as success) and on a button inside `<fieldset disabled>`
