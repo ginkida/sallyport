@@ -33,8 +33,15 @@ export default defineConfig({
         'src/tools/network-capture.ts',
         'src/tools/capture-settings.ts',
         'src/tools/network-body-cache.ts',
+        'src/tools/quiescence.ts',
       ],
       thresholds: {
+        'src/tools/quiescence.ts': {
+          lines: 100,
+          statements: 100,
+          functions: 100,
+          branches: 100,
+        },
         'src/tools/network-body-cache.ts': {
           lines: 95,
           statements: 95,

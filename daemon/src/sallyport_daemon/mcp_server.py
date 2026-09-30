@@ -1304,15 +1304,18 @@ TOOLS: list[Tool] = [
     Tool(
         name="settle",
         description=(
-            "Wait until the DOM stops changing for stableMs (element count AND "
-            "body size both hold steady) — the adaptive replacement for a blind "
+            "Wait until the top-level document has no child, text or attribute "
+            "mutations for stableMs — the adaptive replacement for a blind "
             "sleep after an action on a busy SPA. Use this when you have NO "
             "concrete thing to wait for; when you do (a selector appearing, a "
             "spinner leaving, text showing up), wait_for is a sharper signal. "
+            "Tracks mutations between polls, including equal-length edits. "
+            "Does not track iframe/shadow-root contents, CSS animations or network activity. "
+            "A navigation during the wait restarts it on the new page. "
             "Polls every 250 ms up to "
             "timeoutMs (capped at 30000); stableMs is capped at 10000. Returns "
-            "{settled, elapsedMs}. A page that never quiesces (live feed, "
-            "animation loop), or whose probe never yields a reading, returns "
+            "{settled, elapsedMs}. A page that never quiesces (live feed, a "
+            "script rewriting text or attributes), or whose probe never yields a reading, returns "
             "settled=false at the cap — not an error; a page that navigates off the "
             "allowlist mid-wait stops with domain_not_allowed (the allowlist is "
             "re-checked every poll). Structured CDP only (fixed "

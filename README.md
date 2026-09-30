@@ -16,7 +16,7 @@ Claude Code ── MCP/stdio ──▶ daemon ── WS+HMAC ──▶ extension
 | Status | Number |
 |---|---|
 | Daemon tests (pytest) | 538 |
-| Extension tests (vitest) | 1069 |
+| Extension tests (vitest) | 1096 |
 | Lint / typecheck (ruff, mypy, eslint, prettier, tsc) | all green |
 
 ## What's in the box
@@ -274,7 +274,7 @@ the full model, including the tab-ownership and MCP-client-auth invariants.
 | `set_viewport` | Emulate a device viewport — the way to test responsive/mobile layouts. Per **tab**, not a window resize: it disturbs nothing the human is looking at, and gives you a device pixel ratio and mobile `<meta name=viewport>` handling that no window size can. `preset` (`mobile-small` 375×667, `mobile` 393×852, `mobile-large` 412×915, `tablet` 820×1180, `desktop` 1280×800, `desktop-wide` 1920×1080) or explicit `width`+`height`, with `deviceScaleFactor` (≤ 3), `mobile`, `touch`, `orientation`. The mobile presets also present a mobile Chrome UA + matching UA client hints (`mobileUserAgent=false` opts out), so a UA-sniffing server sends its mobile bundle — set the viewport **before** navigating. `reset=true` restores the real viewport; no arguments at all reads the current one. Reports what the page actually sees, not what you asked for. Refs invalidate (a breakpoint change remounts DOM). Structured CDP only, no `evaluate`. |
 | `print_to_pdf` | Render the page to a PDF in the download sandbox — returns `{path, size, filename}`, so the bytes never enter the model context. Unlike `screenshot` it **needs no visible tab**: a background agent tab prints fine, which makes it the fallback when a capture fails with `tab_not_visible`. `landscape`, `printBackground` (default true), `scale` (0.1–2). `filename` is a single name with no path separators (default `print-<UTC timestamp>.pdf`) written under `~/Downloads/sallyport/` — same sandbox as `save_to_file`. Fails with `pdf_too_large` past the bridge frame cap (~9 MiB). Structured CDP only, no `evaluate`. |
 | `wait_for` | Poll (250 ms) until a selector/`@eN` ref is visible and/or page text contains a substring; `absent=true` waits until it is GONE. `timeoutMs` ≤ 30 s; timeout returns `{found:false}`, not an error. Replaces blind sleeps. Prefer the embedded `waitFor` on the preceding action when there is one. |
-| `settle` | Wait for the DOM to stop changing (element count + page size steady for `stableMs`, default 500 ms) — for "the page just did *something*" moments with no single element to `wait_for`. Poll (250 ms), ≤ 30 s; a never-settling page returns `{settled:false}`, not an error. |
+| `settle` | Wait for the DOM to stop changing (no child, text or attribute mutations in the top-level document for `stableMs`, default 500 ms) — for "the page just did *something*" moments with no single element to `wait_for`. Catches equal-length edits and changes between polls. Excludes iframe/shadow-root contents, CSS animations and network activity. A navigation mid-wait continues on the new page. Poll (250 ms), ≤ 30 s; a never-settling page returns `{settled:false}`, not an error. |
 | `find` | Semantic element locator — match by `role`/`name`/`nameExact`/`value` over the accessibility tree instead of a CSS selector, ranked exact-match-first (`limit`, ≤ 50). No `evaluate`, no probe. |
 | `reveal` | Scroll a virtualized list/container and re-`snapshot` until an element matching `find`'s predicate appears — for infinite-scroll feeds and lazy-rendered tables. Stops on found/stall/`maxSteps` (≤ 40)/timeout. |
 | `scroll` | Deterministic scrolling — the predicate-less companion to `reveal`. `selector` → `scrollIntoView`; or scroll the page (or a `selector` container) by `dx`/`dy` (negatives = up/left) or `to='top'\|'bottom'`. Returns `{x, y, scrollHeight, atBottom}` so a lazy-load loop knows when to stop. Fixed scroll probe, no `evaluate`. |
@@ -479,7 +479,9 @@ CHROME_BIN='/absolute/path/to/chromium' npm run test:e2e
 dependencies installed. This mode starts a standalone daemon on a temporary
 local port with a new test secret, then verifies MCP initialization and tool
 discovery, authenticated pairing, allowlist refusal, form filling and clicking,
-reading the result, password refusal and audit redaction. Both daemon and
+reading the result, password refusal, audit redaction, and waiting for a page
+whose text and attributes keep changing without changing length, including
+DOM changes reverted between polls and a navigation during the wait. Both daemon and
 browser are stopped after the test. It does not connect to your usual daemon.
 
 ### Pre-commit

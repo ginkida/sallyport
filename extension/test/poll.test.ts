@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   advanceSettle,
@@ -7,8 +7,6 @@ import {
   parseMaxSteps,
   parseTimeoutMs,
   parseWaitFor,
-  quiescenceSignal,
-  QUIESCENCE_PROBE,
   SCROLL_BY_PROBE,
   SCROLL_INTO_VIEW_PROBE,
   SCROLL_STEP_PROBE,
@@ -19,6 +17,7 @@ import {
 import { BridgeError } from '../src/tools/errors.js';
 import { setAllowlist } from '../src/storage.js';
 import { resetAttachedTabs } from '../src/tools/cdp.js';
+import { CREATE_QUIESCENCE_PROBE } from '../src/tools/quiescence.js';
 
 describe('parseTimeoutMs', () => {
   it('defaults when undefined', () => {
@@ -82,35 +81,6 @@ describe('parseWaitFor', () => {
   });
 });
 
-describe('quiescenceSignal / QUIESCENCE_PROBE (settle)', () => {
-  const fakeDoc = (n: number, html: string) => ({
-    getElementsByTagName: () => ({ length: n }),
-    body: { innerHTML: html },
-  });
-
-  it('returns element count and body HTML length, never the content', () => {
-    expect(quiescenceSignal(fakeDoc(42, 'hello'))).toEqual({ n: 42, len: 5 });
-  });
-
-  it('tolerates a missing body', () => {
-    expect(quiescenceSignal({ getElementsByTagName: () => ({ length: 3 }), body: null })).toEqual({
-      n: 3,
-      len: 0,
-    });
-  });
-
-  it('is self-contained: QUIESCENCE_PROBE runs with no closure refs', () => {
-    // settle serialises the probe into the page; any import / module-const
-    // reference would throw a ReferenceError there. `document` is the only
-    // free name and it is a fixed reference, not agent input.
-    const run = new Function('document', `return ${QUIESCENCE_PROBE};`) as (d: unknown) => {
-      n: number;
-      len: number;
-    };
-    expect(run(fakeDoc(7, 'abcd'))).toEqual({ n: 7, len: 4 });
-  });
-});
-
 describe('SCROLL_STEP_PROBE (reveal)', () => {
   it('is self-contained and scrolls the container by ~90% of its viewport', () => {
     // reveal serialises this into the page and invokes it on the container via
@@ -131,20 +101,18 @@ describe('SCROLL_STEP_PROBE (reveal)', () => {
 });
 
 describe('advanceSettle (settle state machine)', () => {
-  const sig = (n: number, len: number) => ({ n, len });
-
   it('declares settled only after equal readings span the stability window', () => {
-    let s = advanceSettle(INITIAL_SETTLE_STATE, sig(10, 100), 1000, 500);
+    let s = advanceSettle(INITIAL_SETTLE_STATE, 10, 1000, 500);
     expect(s.settled).toBe(false); // first reading: steadiness not yet confirmable
-    s = advanceSettle(s.state, sig(10, 100), 1300, 500);
+    s = advanceSettle(s.state, 10, 1300, 500);
     expect(s.settled).toBe(false);
-    // The window is BACKDATED to the earlier of the two equal readings: they
-    // being equal is evidence the DOM held still across the whole interval,
+    // The window is BACKDATED to the earlier of the two equal readings: an
+    // unchanged mutation counter is evidence no observed changes occurred,
     // not merely at the instant of the second sample.
     expect(s.state.stableSince).toBe(1000);
-    s = advanceSettle(s.state, sig(10, 100), 1499, 500);
+    s = advanceSettle(s.state, 10, 1499, 500);
     expect(s.settled).toBe(false); // 499 ms < 500 ms window
-    s = advanceSettle(s.state, sig(10, 100), 1500, 500);
+    s = advanceSettle(s.state, 10, 1500, 500);
     expect(s.settled).toBe(true); // 500 ms elapsed since the window opened
   });
 
@@ -153,31 +121,31 @@ describe('advanceSettle (settle state machine)', () => {
     // guaranteed extra POLL_MS: a static page proved a 500 ms window by t=500
     // but was only told so at t=750 — paid again on every reveal scroll step.
     const POLL = 250;
-    let s = advanceSettle(INITIAL_SETTLE_STATE, sig(7, 70), 0, 500);
-    s = advanceSettle(s.state, sig(7, 70), POLL, 500);
+    let s = advanceSettle(INITIAL_SETTLE_STATE, 7, 0, 500);
+    s = advanceSettle(s.state, 7, POLL, 500);
     expect(s.settled).toBe(false);
-    s = advanceSettle(s.state, sig(7, 70), POLL * 2, 500);
+    s = advanceSettle(s.state, 7, POLL * 2, 500);
     expect(s.settled).toBe(true); // t=500, not t=750
   });
 
   it('still refuses to settle on a single reading, however long the gap', () => {
     // The saving must not weaken the rule that two genuinely equal samples are
     // required — a long first tick is not evidence of anything.
-    const s = advanceSettle(INITIAL_SETTLE_STATE, sig(4, 4), 10_000, 500);
+    const s = advanceSettle(INITIAL_SETTLE_STATE, 4, 10_000, 500);
     expect(s.settled).toBe(false);
     expect(s.state.stableSince).toBeNull();
   });
 
-  it('restarts the window when either signal changes', () => {
-    let s = advanceSettle(INITIAL_SETTLE_STATE, sig(1, 1), 0, 500);
-    s = advanceSettle(s.state, sig(1, 1), 400, 500); // window open
-    s = advanceSettle(s.state, sig(2, 1), 800, 500); // n changed → reset
+  it('restarts the window when the mutation counter changes', () => {
+    let s = advanceSettle(INITIAL_SETTLE_STATE, 1, 0, 500);
+    s = advanceSettle(s.state, 1, 400, 500); // window open
+    s = advanceSettle(s.state, 2, 800, 500); // mutation → reset
     expect(s.settled).toBe(false);
     expect(s.state.stableSince).toBeNull();
     // a fresh steady stretch must again span the full window from scratch
-    s = advanceSettle(s.state, sig(2, 1), 1000, 500);
+    s = advanceSettle(s.state, 2, 1000, 500);
     expect(s.settled).toBe(false);
-    s = advanceSettle(s.state, sig(2, 1), 1600, 500);
+    s = advanceSettle(s.state, 2, 1600, 500);
     expect(s.settled).toBe(true);
   });
 
@@ -192,17 +160,17 @@ describe('advanceSettle (settle state machine)', () => {
   });
 
   it('a reading-less tick resets a window that had already started', () => {
-    let s = advanceSettle(INITIAL_SETTLE_STATE, sig(5, 5), 0, 200);
-    s = advanceSettle(s.state, sig(5, 5), 100, 200); // window open
+    let s = advanceSettle(INITIAL_SETTLE_STATE, 5, 0, 200);
+    s = advanceSettle(s.state, 5, 100, 200); // window open
     expect(s.state.stableSince).not.toBeNull();
     s = advanceSettle(s.state, null, 200, 200); // no reading → reset
     expect(s.state).toEqual(INITIAL_SETTLE_STATE);
   });
 
   it('settles on the second equal reading when stableMs is 0', () => {
-    let s = advanceSettle(INITIAL_SETTLE_STATE, sig(3, 3), 0, 0);
+    let s = advanceSettle(INITIAL_SETTLE_STATE, 3, 0, 0);
     expect(s.settled).toBe(false); // first reading
-    s = advanceSettle(s.state, sig(3, 3), 0, 0);
+    s = advanceSettle(s.state, 3, 0, 0);
     expect(s.settled).toBe(true);
   });
 });
@@ -389,7 +357,8 @@ function installChrome(urls: string[], present = false): { tabGets: () => number
         if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
         if (method === 'DOM.querySelector') return { nodeId: present ? 5 : 0 };
         if (method === 'DOM.getBoxModel') return { model: { width: 10, height: 10 } };
-        if (method === 'Runtime.evaluate') return { result: { value: { n: 1, len: 1 } } };
+        if (method === 'Runtime.evaluate') return { result: { objectId: 'observer' } };
+        if (method === 'Runtime.callFunctionOn') return { result: { value: 0 } };
         return {};
       },
       onEvent: { addListener() {} },
@@ -459,5 +428,247 @@ describe('pollFor / settleFor re-gate every tick', () => {
     await expect(
       pollFor(TAB, { selector: '#done', text: null, timeoutMs: 5000, absent: false }),
     ).rejects.toMatchObject({ code: 'tab_gone' });
+  });
+});
+
+describe('settle observer lifecycle', () => {
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    installChrome(['https://shop.example/cart']);
+    await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function channel(values: unknown[]) {
+    let index = 0;
+    return vi
+      .spyOn(chrome.debugger, 'sendCommand')
+      .mockImplementation(async (_target, method, params) => {
+        if (method === 'Runtime.evaluate') return { result: { objectId: 'observer' } };
+        if (
+          method === 'Runtime.callFunctionOn' &&
+          (params as { functionDeclaration: string }).functionDeclaration.includes('sample')
+        ) {
+          const value = values[Math.min(index++, values.length - 1)];
+          if (value instanceof Error) throw value;
+          return { result: { value } };
+        }
+        return {};
+      });
+  }
+
+  function expectCleanup(send: ReturnType<typeof channel>) {
+    expect(send).toHaveBeenCalledWith({ tabId: TAB }, 'Runtime.callFunctionOn', {
+      objectId: 'observer',
+      functionDeclaration: 'function() { this.stop(); }',
+      returnByValue: true,
+    });
+    expect(send).toHaveBeenLastCalledWith({ tabId: TAB }, 'Runtime.releaseObjectGroup', {
+      objectGroup: 'sallyport-settle',
+    });
+  }
+
+  it('waits for a full quiet window after the last observed mutation and cleans up', async () => {
+    const send = channel([0, 1, 2, 2, 2]);
+    const pending = settleFor(TAB, { stableMs: 500, timeoutMs: 2000 });
+    await vi.runAllTimersAsync();
+    expect(await pending).toEqual({ settled: true, elapsedMs: 1000 });
+    expectCleanup(send);
+  });
+
+  it.each([[0, 1, 2, 3], [undefined], ['0'], [-1], [NaN], [{}]])(
+    'never settles on changing or invalid samples: %j',
+    async (...values) => {
+      const send = channel(values);
+      const pending = settleFor(TAB, { stableMs: 500, timeoutMs: 750 });
+      await vi.runAllTimersAsync();
+      expect(await pending).toEqual({ settled: false, elapsedMs: 750 });
+      expectCleanup(send);
+    },
+  );
+
+  it('creates the observer by reference in the settle object group', async () => {
+    const send = channel([0]);
+    const pending = settleFor(TAB, { stableMs: 0, timeoutMs: 500 });
+    await vi.runAllTimersAsync();
+    await pending;
+    // No returnByValue: Chrome would answer a by-value copy with no objectId,
+    // and settle would silently never settle again.
+    expect(send).toHaveBeenCalledWith({ tabId: TAB }, 'Runtime.evaluate', {
+      expression: CREATE_QUIESCENCE_PROBE,
+      objectGroup: 'sallyport-settle',
+    });
+  });
+
+  it.each([
+    'Cannot find context with specified id',
+    'Could not find object with given id',
+    'Execution context was destroyed.',
+  ])('survives a navigation mid-wait (%s) by observing the new document', async (message) => {
+    // click → settle on a submit button: the observer's document is replaced
+    // under it. That is a new page to wait on, not a failed settle.
+    const send = channel([0, new Error(message), 5, 5, 5]);
+    const pending = settleFor(TAB, { stableMs: 500, timeoutMs: 3000 });
+    await vi.runAllTimersAsync();
+    const out = await pending;
+    expect(out.settled).toBe(true);
+    // The lost tick restarted the window: settled on the NEW document's readings.
+    expect(out.elapsedMs).toBe(1000);
+    const creates = send.mock.calls.filter(([, method]) => method === 'Runtime.evaluate');
+    expect(creates).toHaveLength(2);
+    expectCleanup(send);
+  });
+
+  it('keeps retrying creation while a navigation is mid-commit', async () => {
+    let creates = 0;
+    const send = channel([3]);
+    const sample = send.getMockImplementation()!;
+    send.mockImplementation(async (...args) => {
+      if (args[1] === 'Runtime.evaluate' && creates++ === 0) {
+        throw new Error('Cannot find default execution context');
+      }
+      return sample(...args);
+    });
+    const pending = settleFor(TAB, { stableMs: 250, timeoutMs: 3000 });
+    await vi.runAllTimersAsync();
+    expect(await pending).toEqual({ settled: true, elapsedMs: 500 });
+    expect(creates).toBe(2);
+  });
+
+  it('never samples the exception a throwing page returns from creation', async () => {
+    // A thrown value comes back WITH an objectId (the exception's) — sampling it
+    // would be meaningless, so no handle is kept and every tick stays unread.
+    const send = channel([0]);
+    send.mockImplementation(async (_target, method) => {
+      if (method === 'Runtime.evaluate') {
+        return { result: { objectId: 'the-error', subtype: 'error' }, exceptionDetails: {} };
+      }
+      return {};
+    });
+    const pending = settleFor(TAB, { stableMs: 0, timeoutMs: 500 });
+    await vi.runAllTimersAsync();
+    expect(await pending).toEqual({ settled: false, elapsedMs: 500 });
+    expect(send).not.toHaveBeenCalledWith(
+      { tabId: TAB },
+      'Runtime.callFunctionOn',
+      expect.anything(),
+    );
+  });
+
+  it('treats a sample that threw in the page as no reading', async () => {
+    const send = channel([0]);
+    send.mockImplementation(async (_target, method) => {
+      if (method === 'Runtime.evaluate') return { result: { objectId: 'observer' } };
+      if (method === 'Runtime.callFunctionOn') {
+        // V8 hands a thrown primitive back as a by-value result.
+        return { result: { type: 'number', value: 7 }, exceptionDetails: {} };
+      }
+      return {};
+    });
+    const pending = settleFor(TAB, { stableMs: 0, timeoutMs: 500 });
+    await vi.runAllTimersAsync();
+    expect(await pending).toEqual({ settled: false, elapsedMs: 500 });
+  });
+
+  it('replaces an observer that has expired', async () => {
+    const send = channel([null, 4, 4]);
+    const pending = settleFor(TAB, { stableMs: 250, timeoutMs: 3000 });
+    await vi.runAllTimersAsync();
+    expect((await pending).settled).toBe(true);
+    const creates = send.mock.calls.filter(([, method]) => method === 'Runtime.evaluate');
+    expect(creates).toHaveLength(2);
+  });
+
+  it('re-gates a final tick that lost its observer, so a closed tab is tab_gone', async () => {
+    // "Inspected target navigated or closed" is also what a CLOSED tab says.
+    // Ticks run at 0/250/500/750 ms; 750 is the last, with no next iteration
+    // whose gate would notice — the tab closes between its gate and its sample.
+    let closed = false;
+    const send = channel([0, 0, 0, 'close']);
+    const sample = send.getMockImplementation()!;
+    send.mockImplementation(async (...args) => {
+      const out = await sample(...args);
+      if ((out as { result?: { value?: unknown } }).result?.value === 'close') {
+        closed = true;
+        throw new Error('Inspected target navigated or closed');
+      }
+      return out;
+    });
+    const tabsGet = chrome.tabs.get;
+    vi.spyOn(chrome.tabs, 'get').mockImplementation(async (id: number) => {
+      if (closed) throw new Error(`No tab with id: ${id}.`);
+      return tabsGet(id);
+    });
+    const pending = settleFor(TAB, { stableMs: 5000, timeoutMs: 750 });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'tab_gone' });
+    await vi.runAllTimersAsync();
+    await rejected;
+    expect(closed).toBe(true);
+    expect(send).toHaveBeenLastCalledWith({ tabId: TAB }, 'Runtime.releaseObjectGroup', {
+      objectGroup: 'sallyport-settle',
+    });
+  });
+
+  it('cleans up after a protocol error without hiding the error', async () => {
+    // A detached debugger is not a navigation: it must still fail the wait.
+    const send = channel([new Error('Debugger is not attached to the tab with id: 7.')]);
+    await expect(settleFor(TAB, { stableMs: 500, timeoutMs: 1000 })).rejects.toThrow(
+      'Debugger is not attached',
+    );
+    expectCleanup(send);
+  });
+
+  it('reports unsettled if observer creation yields no handle', async () => {
+    const send = channel([0]);
+    send.mockImplementation(async () => ({ result: {} }));
+    const pending = settleFor(TAB, { stableMs: 0, timeoutMs: 500 });
+    await vi.runAllTimersAsync();
+    expect(await pending).toEqual({ settled: false, elapsedMs: 500 });
+    expect(send).not.toHaveBeenCalledWith(
+      { tabId: TAB },
+      'Runtime.callFunctionOn',
+      expect.anything(),
+    );
+    expect(send).toHaveBeenLastCalledWith({ tabId: TAB }, 'Runtime.releaseObjectGroup', {
+      objectGroup: 'sallyport-settle',
+    });
+  });
+
+  it('preserves the outcome when the object group was already destroyed', async () => {
+    const send = channel([0]);
+    const implementation = send.getMockImplementation()!;
+    send.mockImplementation(async (...args) => {
+      if (args[1] === 'Runtime.releaseObjectGroup') throw new Error('tab closed');
+      return implementation(...args);
+    });
+    const pending = settleFor(TAB, { stableMs: 500, timeoutMs: 1000 });
+    await vi.runAllTimersAsync();
+    expect(await pending).toEqual({ settled: true, elapsedMs: 500 });
+  });
+
+  it('cleans up when permission is revoked during the wait', async () => {
+    const send = channel([0]);
+    const pending = settleFor(TAB, { stableMs: 500, timeoutMs: 1000 });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'domain_not_allowed' });
+    await vi.advanceTimersByTimeAsync(0);
+    await setAllowlist([]);
+    await vi.runAllTimersAsync();
+    await rejected;
+    expectCleanup(send);
+  });
+
+  it('releases the group even if stopping the observer fails', async () => {
+    const send = channel([0]);
+    send.mockImplementation(async (_target, method) => {
+      if (method === 'Runtime.evaluate') return { result: { objectId: 'observer' } };
+      if (method === 'Runtime.callFunctionOn') throw new Error('detached');
+      return {};
+    });
+    await expect(settleFor(TAB, { stableMs: 500, timeoutMs: 1000 })).rejects.toThrow('detached');
+    expectCleanup(send);
   });
 });

@@ -8,10 +8,16 @@
  * import cycle dom.ts ↔ wait.ts (this module imports neither).
  */
 
-import { cdp, looksLikeMissingNodeError, looksLikeSelectorSyntaxError } from './cdp.js';
+import {
+  cdp,
+  looksLikeLostContextError,
+  looksLikeMissingNodeError,
+  looksLikeSelectorSyntaxError,
+} from './cdp.js';
 import { BridgeError, staleRefError } from './errors.js';
 import { ensureStillAllowed } from './gates.js';
 import { getRef, isRef } from './refs.js';
+import { CREATE_QUIESCENCE_PROBE } from './quiescence.js';
 import { READ_TEXT_FN } from './text.js';
 
 export { READ_TEXT_FN } from './text.js';
@@ -245,39 +251,15 @@ export async function runEmbeddedWait(tabId: number, spec: WaitSpec): Promise<Wa
 
 // --- settle: DOM quiescence -------------------------------------------------
 
-type QuiescenceDoc = {
-  getElementsByTagName: (t: string) => { length: number };
-  body: { innerHTML: string } | null;
-};
-
-/** Two cheap, side-effect-free quiescence signals sampled each tick:
- * `n` = total element count (catches nodes added/removed — virtualized lists
- * settling, a spinner appearing/vanishing) and `len` = body HTML size (catches
- * in-place text/attribute churn that doesn't change the node count). We read
- * only the `.length`, never the content, so no field value can leak
- * (invariant #5). Pure + self-contained so it serialises cleanly — the same
- * shape as domtree's collectDomTree. */
-export function quiescenceSignal(doc: QuiescenceDoc): { n: number; len: number } {
-  return {
-    n: doc.getElementsByTagName('*').length,
-    len: doc.body ? doc.body.innerHTML.length : 0,
-  };
-}
-
-// FIXED literal — `document` is a fixed reference, NOT agent input — so it
-// carries the same trust shape as read_text's body probe / keyboard.ts's
-// ACTIVE_FIELD_PROBE and needs no per-domain evaluate flag.
-export const QUIESCENCE_PROBE = '(' + quiescenceSignal.toString() + ')(document)';
-
 export type SettleSpec = { stableMs: number; timeoutMs: number };
 export type SettleOutcome = { settled: boolean; elapsedMs: number };
 
-export type Signal = { n: number; len: number };
+export type Signal = number;
 export type SettleState = {
   prev: Signal | null;
   /** When `prev` was sampled — the point the stability window is BACKDATED to,
-   * because two equal readings prove the DOM was unchanged across the whole
-   * interval between them, not merely at the second one. */
+   * because an unchanged mutation counter proves no observed changes across
+   * the interval between samples. */
   prevAt: number | null;
   stableSince: number | null;
 };
@@ -287,8 +269,8 @@ export const INITIAL_SETTLE_STATE: SettleState = { prev: null, prevAt: null, sta
 /** Pure per-tick advance of the settle state machine, split out from settleFor
  * so the decision logic is unit-testable without chrome.
  *
- * `sig === null` means the probe produced NO reading this tick — Runtime.evaluate
- * returned a value-less result because the page-side eval threw. We treat that as
+ * `sig === null` means the probe produced NO reading this tick — the page-side
+ * observer expired or its sample did not return a valid counter. We treat that as
  * "unknown" and conservatively RESTART the stability window: a reading-less tick
  * must never be mistaken for a steady DOM. (The old code substituted a fixed
  * {n:-1,len:-1} sentinel, so two consecutive failures compared equal and falsely
@@ -302,7 +284,7 @@ export function advanceSettle(
 ): { state: SettleState; settled: boolean } {
   if (sig === null) return { state: INITIAL_SETTLE_STATE, settled: false };
   const { prev } = state;
-  if (prev && sig.n === prev.n && sig.len === prev.len) {
+  if (prev !== null && sig === prev) {
     // Backdate the window to the EARLIER of the two equal readings. Anchoring it
     // to `now` instead charged every settle one guaranteed extra POLL_MS tick —
     // an already-static page needed three samples (t=0, 250, 500, 750) to prove
@@ -319,30 +301,97 @@ export function advanceSettle(
   return { state: { prev: sig, prevAt: now, stableSince: null }, settled: false };
 }
 
-/** Wait until the DOM stops changing for `stableMs` — the adaptive replacement
- * for a blind sleep after an action on a busy SPA. Polls the two quiescence
- * signals every POLL_MS; declares settled once both hold steady across the
- * stability window. A page that never quiesces (live feed, animation loop) — or
- * whose probe never yields a reading — returns {settled:false} at the cap, NOT
- * an error (mirrors pollFor). */
+/** Install a fresh per-wait observer in the tab's CURRENT document. `undefined`
+ * when there is no document to observe right now — the page threw during
+ * creation (a shadowed `MutationObserver`), or a navigation is mid-commit. The
+ * caller treats that as a reading-less tick and simply tries again next tick. */
+async function createObserver(tabId: number, objectGroup: string): Promise<string | undefined> {
+  try {
+    const created = await cdp<{ result: { objectId?: string }; exceptionDetails?: unknown }>(
+      tabId,
+      'Runtime.evaluate',
+      { expression: CREATE_QUIESCENCE_PROBE, objectGroup },
+    );
+    // A thrown value also comes back WITH an objectId — the exception object's.
+    return created.exceptionDetails ? undefined : created.result.objectId;
+  } catch (e) {
+    if (looksLikeLostContextError(e)) return undefined;
+    throw e;
+  }
+}
+
+/** Wait for a quiet interval in the top-level document's DOM. The observer
+ * catches changes between polls, including equal-length edits and changes
+ * reverted before the next tick. Every read re-checks the domain allowlist.
+ *
+ * The observer lives in ONE document: a navigation mid-wait (click → settle on
+ * a submit button, a reveal step that loads a page) destroys it along with its
+ * execution context, and sampling the dead handle rejects. That is a new page,
+ * not a failure — the tick counts as reading-less (restarting the window) and
+ * the next tick installs a fresh observer, AFTER that tick's allowlist gate, so
+ * the new document is approved before anything is placed in it. */
 export async function settleFor(tabId: number, spec: SettleSpec): Promise<SettleOutcome> {
-  const start = Date.now();
+  const start = performance.now();
   let state = INITIAL_SETTLE_STATE;
-  for (;;) {
-    // Same re-gate as pollFor: settle reads the live DOM (element count, body
-    // size) once per tick for up to 30 s, so it must keep asking whether it may.
-    await ensureStillAllowed(tabId);
-    const out = await cdp<{ result: { value?: Signal } }>(tabId, 'Runtime.evaluate', {
-      expression: QUIESCENCE_PROBE,
-      returnByValue: true,
-    });
-    const now = Date.now();
-    const step = advanceSettle(state, out.result.value ?? null, now, spec.stableMs);
-    state = step.state;
-    if (step.settled) return { settled: true, elapsedMs: now - start };
-    const elapsedMs = now - start;
-    if (elapsedMs + POLL_MS > spec.timeoutMs) return { settled: false, elapsedMs };
-    await new Promise((r) => setTimeout(r, POLL_MS));
+  let objectId: string | undefined;
+  // Per-tab tool serialisation prevents overlapping waits in this group.
+  const objectGroup = 'sallyport-settle';
+  try {
+    for (;;) {
+      await ensureStillAllowed(tabId);
+      objectId ??= await createObserver(tabId, objectGroup);
+      let sig: Signal | null = null;
+      if (objectId !== undefined) {
+        try {
+          const out = await cdp<{ result: { value?: unknown }; exceptionDetails?: unknown }>(
+            tabId,
+            'Runtime.callFunctionOn',
+            {
+              objectId,
+              functionDeclaration: 'function() { return this.sample(); }',
+              returnByValue: true,
+            },
+          );
+          const value = out.exceptionDetails ? undefined : out.result.value;
+          if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) sig = value;
+          // An expired observer answers null for good: replace it next tick.
+          else if (value === null) objectId = undefined;
+        } catch (e) {
+          if (!looksLikeLostContextError(e)) throw e;
+          objectId = undefined; // its document is gone; observe the new one next tick
+        }
+      }
+      const now = performance.now();
+      const step = advanceSettle(state, sig, now, spec.stableMs);
+      state = step.state;
+      if (step.settled) return { settled: true, elapsedMs: Math.round(now - start) };
+      const elapsedMs = now - start;
+      if (elapsedMs + POLL_MS > spec.timeoutMs) {
+        // No live observer on the last tick: the context may have died with a
+        // CLOSED tab, not a navigation — the gate says so (tab_gone) instead of
+        // an ordinary "never quiesced".
+        if (objectId === undefined) await ensureStillAllowed(tabId);
+        return { settled: false, elapsedMs: Math.round(elapsedMs) };
+      }
+      await new Promise((r) => setTimeout(r, POLL_MS));
+    }
+  } finally {
+    try {
+      if (objectId) {
+        await cdp(tabId, 'Runtime.callFunctionOn', {
+          objectId,
+          functionDeclaration: 'function() { this.stop(); }',
+          returnByValue: true,
+        });
+      }
+    } catch {
+      // Navigation or detach may already have destroyed the observer.
+    }
+    try {
+      await cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup });
+    } catch {
+      // A closed tab or detached debugger has already released its objects.
+    }
   }
 }
 
@@ -351,9 +400,8 @@ export async function settleFor(tabId: number, spec: SettleSpec): Promise<Settle
 // FIXED literal used by `reveal` to scroll a virtualised container (`this`) by
 // ~90% of its viewport. The direction (1 down / -1 up) travels as a STRUCTURED
 // callFunctionOn argument, NEVER interpolated into the body — same trust shape
-// as the aim probes — so reveal needs no allowEvaluate. Lives here next to
-// QUIESCENCE_PROBE so both serialised DOM probes stay in one import-safe module
-// (poll.ts pulls in no chrome at load, so they're vitest-testable).
+// as the aim probes — so reveal needs no allowEvaluate. Lives here in an
+// import-safe module (poll.ts pulls in no chrome at load).
 export const SCROLL_STEP_PROBE =
   'function(dir) { var b = this.scrollTop; var p = this.clientHeight || 0;' +
   ' this.scrollTop = b + dir * Math.max(1, p * 0.9);' +

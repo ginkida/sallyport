@@ -17,9 +17,9 @@ function parseStableMs(raw: unknown): number {
   return Math.min(t, MAX_STABLE_MS);
 }
 
-/** Wait until the DOM stops changing for `stableMs` (element count and body
- * size both steady), capped at `timeoutMs`. Structured CDP only — the
- * quiescence probe is a fixed literal — so no allowEvaluate needed. */
+/** Wait until the DOM stops changing for `stableMs` (no observed child, text or
+ * attribute mutations in the top-level document), capped at `timeoutMs`.
+ * The quiescence probe is a fixed literal, so no allowEvaluate is needed. */
 export const settle: Tool = async (args) => {
   const stableMs = parseStableMs(args.stableMs);
   const timeoutMs = parseTimeoutMs(args.timeoutMs, 'settle');

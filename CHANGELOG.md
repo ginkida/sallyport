@@ -6,6 +6,33 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.24.1] — 2026-09-30
+
+### Fixed
+
+- `settle` now observes child, text and attribute mutations in the top-level
+  document instead of comparing element counts and HTML lengths. Equal-length
+  edits and changes reverted between polls restart the quiet window, so a live
+  page no longer reports ready merely because its size stayed constant. This
+  also applies to the waits between `reveal` scroll steps. No page text or
+  attribute values are read by this observer. Observers disconnect on success,
+  timeout or failure, with a fallback expiry if the extension worker disappears.
+  A navigation during the wait (`click` on a submit button, then `settle`)
+  still continues on the new page: the lost tick restarts the quiet window and
+  a fresh observer is installed after the next allowlist check. A
+  page whose own script breaks observer creation reads as unsettled rather than
+  being sampled through the thrown exception. Trade-off: a page with perpetual
+  small DOM churn (a ticking clock, a progress attribute) no longer settles
+  where the old size signal missed the churn, and each `reveal` step on such a
+  page spends its full per-step settle budget (1.5 s). The MCP browser test
+  covers equal-length text/attribute edits, changes reverted between polls, a
+  quiet page afterwards, and a navigation mid-wait.
+
+- The isolated browser-test page now installs the capture-settings listener,
+  so disabling capture clears that page's buffers as it does in the production
+  worker. Browser tests disable background throttling for deterministic fixture
+  updates and include tab state and Chrome diagnostics when setup fails.
+
 ## [0.24.0] — 2026-09-18
 
 ### Added
@@ -2771,7 +2798,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.24.1...HEAD
+[0.24.1]: https://github.com/ginkida/sallyport/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/ginkida/sallyport/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/ginkida/sallyport/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/ginkida/sallyport/compare/v0.21.0...v0.22.0

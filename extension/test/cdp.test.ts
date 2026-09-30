@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   classifyAttachError,
   keepAwakeAction,
+  looksLikeLostContextError,
   looksLikeMissingNodeError,
   looksLikeSelectorSyntaxError,
 } from '../src/tools/cdp.js';
@@ -162,5 +163,30 @@ describe('staleRefError / invalidSelectorError', () => {
     expect(err.code).toBe('bad_args');
     expect(err.message).toContain(':has-text');
     expect(err.message).toContain('find');
+  });
+});
+
+describe('looksLikeLostContextError', () => {
+  it('recognises a remote object whose document navigated away', () => {
+    for (const msg of [
+      'Cannot find context with specified id',
+      'Could not find object with given id',
+      'Execution context was destroyed.',
+      'Cannot find default execution context',
+      'Inspected target navigated or closed',
+    ]) {
+      expect(looksLikeLostContextError(new Error(msg))).toBe(true);
+    }
+  });
+
+  it('does not mistake a detached debugger or a stale node for a navigation', () => {
+    for (const msg of [
+      'Debugger is not attached to the tab with id: 7.',
+      'Target closed.',
+      'No node with given id found',
+      'Could not find node with given id',
+    ]) {
+      expect(looksLikeLostContextError(new Error(msg))).toBe(false);
+    }
   });
 });

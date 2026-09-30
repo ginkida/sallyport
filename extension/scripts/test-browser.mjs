@@ -29,7 +29,9 @@ let browser;
 let socket;
 let mcp;
 let diagnostics = '';
+let fixtureRequests = 0;
 const server = createServer((req, res) => {
+  fixtureRequests++;
   if (req.url?.startsWith('/data')) {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify({ value: 42 }));
@@ -39,7 +41,21 @@ const server = createServer((req, res) => {
       '<!doctype html><title>Sallyport test</title><p>Local capture fixture</p>' +
         '<label>Name <input id="name"></label><label>Password <input id="password" type="password"></label>' +
         "<button id=\"submit\" onclick=\"document.querySelector('#result').textContent = 'Hello ' + document.querySelector('#name').value\">Submit</button>" +
-        '<p id="result"></p>',
+        '<p id="result"></p><p id="changing">AAAA</p>' +
+        '<button id="churn-text" onclick="startChurn(0)">Update text</button>' +
+        '<button id="churn-attribute" onclick="startChurn(1)">Update attributes</button>' +
+        '<button id="churn-revert" onclick="startChurn(2)">Revert changes</button>' +
+        '<button id="navigate-soon" onclick="setTimeout(() => location.assign(`/?next`), 300)">Navigate</button>' +
+        '<script>function startChurn(mode) {' +
+        ' const node = document.querySelector("#changing").firstChild;' +
+        ' node.data = "AAAA";' +
+        ' const timer = setInterval(() => {' +
+        ' if (mode === 0) node.data = node.data === "AAAA" ? "BBBB" : "AAAA";' +
+        ' if (mode === 1) document.documentElement.dataset.state = document.documentElement.dataset.state === "A" ? "B" : "A";' +
+        ' if (mode === 2) { const el = document.createElement("span"); document.body.append(el); el.remove(); }' +
+        ' }, 25);' +
+        ' setTimeout(() => { clearInterval(timer); node.data = "DONE"; }, 2000);' +
+        '}</script>',
     );
   }
 });
@@ -97,7 +113,9 @@ try {
         import { attach, detach } from './src/tools/cdp.ts';
         import { readNetwork, ensureNetworkCapture } from './src/tools/network-capture.ts';
         import { readConsole, ensureConsoleCapture } from './src/tools/console-capture.ts';
+        import { installCaptureSettingsListener } from './src/tools/capture-settings.ts';
         import { setSettings } from './src/storage.ts';
+        installCaptureSettingsListener();
         async function waitFor(probe) {
           const deadline = performance.now() + 10000;
           while (performance.now() < deadline) {
@@ -110,7 +128,11 @@ try {
           async setup(url) {
             await setSettings({ captureConsole: true, captureNetwork: true, keepAwake: false });
             const tab = await chrome.tabs.create({ url, active: true });
-            await waitFor(async () => (await chrome.tabs.get(tab.id)).status === 'complete');
+            try {
+              await waitFor(async () => (await chrome.tabs.get(tab.id)).status === 'complete');
+            } catch (error) {
+              throw new Error('Fixture did not load: ' + JSON.stringify(await chrome.tabs.get(tab.id)), { cause: error });
+            }
             await attach(tab.id);
             return tab.id;
           },
@@ -162,6 +184,9 @@ try {
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
       '--disable-component-update',
       '--disable-sync',
       '--metrics-recording-only',
@@ -277,7 +302,15 @@ try {
       { expression, awaitPromise: true, returnByValue: true },
       sessionId,
     );
-    if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
+    if (result.exceptionDetails) {
+      throw new Error(
+        JSON.stringify(result.exceptionDetails) +
+          '\nFixture requests: ' +
+          fixtureRequests +
+          '\n' +
+          diagnostics,
+      );
+    }
     return result.result.value;
   };
   try {
@@ -495,6 +528,23 @@ try {
     const text = await callTool('read_text', { tabId });
     assert.ok(!text.isError);
     assert.match(JSON.stringify(text.content), /Hello Sallyport/);
+    for (const mode of ['text', 'attribute', 'revert']) {
+      value(await callTool('click', { selector: `#churn-${mode}`, tabId }));
+      const busy = value(await callTool('settle', { stableMs: 500, timeoutMs: 1000, tabId }));
+      assert.equal(busy.settled, false, `${mode} mutations must keep the page unsettled`);
+      const quiet = value(await callTool('settle', { stableMs: 500, timeoutMs: 5000, tabId }));
+      assert.equal(quiet.settled, true, 'the page should settle once updates stop');
+      assert.match(JSON.stringify((await callTool('read_text', { tabId })).content), /DONE/);
+    }
+    console.log('PASS: MCP settle detects text/attribute/reverted changes and waits for DOM quiet');
+    // The observer lives in one document: a navigation mid-wait must hand the
+    // wait to the NEW page, not fail it. stableMs outlasts the 300 ms delay, so
+    // the old page cannot settle before it is replaced.
+    value(await callTool('click', { selector: '#navigate-soon', tabId }));
+    const moved = value(await callTool('settle', { stableMs: 1000, timeoutMs: 8000, tabId }));
+    assert.equal(moved.settled, true, 'settle must follow a navigation to the new page');
+    assert.match(JSON.stringify((await callTool('list_tabs', {})).content), /\?next/);
+    console.log('PASS: MCP settle survives a navigation during the wait');
     const password = await callTool('fill', {
       selector: '#password',
       value: 'do-not-record',

@@ -107,6 +107,23 @@ export function looksLikeMissingNodeError(e: unknown): boolean {
   );
 }
 
+/** Does this CDP rejection mean "the document that owned that remote object is
+ * gone"? A `RemoteObjectId` is bound to its execution context, so after a
+ * main-frame navigation `Runtime.callFunctionOn` on a handle minted in the old
+ * page rejects — the handle is dead, the tab is not. Same narrow discipline as
+ * above: a detached debugger or a closed target stays unmatched and keeps its
+ * own failure. Pure / chrome-free. */
+export function looksLikeLostContextError(e: unknown): boolean {
+  const msg = messageOf(e);
+  return (
+    msg.includes('cannot find context with specified id') ||
+    msg.includes('could not find object with given id') ||
+    msg.includes('execution context was destroyed') ||
+    msg.includes('cannot find default execution context') ||
+    msg.includes('inspected target navigated')
+  );
+}
+
 /** One CDP attachment per tab. Detach happens when the tab closes or the
  * user clicks "Cancel" on the debugger banner — we listen for both so the
  * set stays accurate without polling. */

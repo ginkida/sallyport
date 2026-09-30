@@ -100,15 +100,20 @@ function installChrome(opts: { foundAtStep: number; urls?: string[] }): Cmd[] {
           return { nodes: axNodes(step >= opts.foundAtStep) };
         }
         if (method === 'DOM.resolveNode') return { object: { objectId: 'obj-container' } };
+        if (
+          method === 'Runtime.callFunctionOn' &&
+          /this\.(sample|stop)\(/.test(String(params?.functionDeclaration))
+        ) {
+          // Quiescence observer — a steady reading so the per-step settle is
+          // quick; its cleanup must not count as a scroll.
+          return { result: { value: 0 } };
+        }
         if (method === 'Runtime.callFunctionOn') {
           const before = scrollTop;
           scrollTop += 500;
           return { result: { value: { before, after: scrollTop, scrollHeight: 99_999 } } };
         }
-        if (method === 'Runtime.evaluate') {
-          // Quiescence probe — a steady reading so the per-step settle is quick.
-          return { result: { value: { n: 10, len: 100 } } };
-        }
+        if (method === 'Runtime.evaluate') return { result: { objectId: 'quiescence' } };
         return {};
       },
       onEvent: { addListener() {} },
@@ -205,7 +210,12 @@ describe('reveal — the page must stay allowlisted for the WHOLE scroll (invari
       reveal({ container, role: 'button', name: 'Older', tabId: TAB }, undefined),
     ).rejects.toMatchObject({ code: 'domain_not_allowed' });
     // It really was mid-loop: passes had already run and scrolled the list.
-    expect(sent.filter((c) => c.method === 'Runtime.callFunctionOn').length).toBeGreaterThan(0);
+    const scrolls = sent.filter(
+      (c) =>
+        c.method === 'Runtime.callFunctionOn' &&
+        !/this\.(sample|stop)\(/.test(String(c.params?.functionDeclaration)),
+    );
+    expect(scrolls.length).toBeGreaterThan(0);
   });
 
   it('keeps going while the page stays put, and reports the url it read', async () => {
