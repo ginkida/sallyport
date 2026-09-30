@@ -3,6 +3,7 @@ import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { minSettleTimeoutMs, parseTimeoutMs, settleFor } from './poll.js';
 import { resolveTab } from './tabs.js';
+import { budgetLeft } from './budget.js';
 import type { Tool } from './types.js';
 
 const DEFAULT_STABLE_MS = 500;
@@ -20,7 +21,7 @@ function parseStableMs(raw: unknown): number {
 /** Wait until the DOM stops changing for `stableMs` (no observed child, text or
  * attribute mutations in the top-level document), capped at `timeoutMs`.
  * The quiescence probe is a fixed literal, so no allowEvaluate is needed. */
-export const settle: Tool = async (args) => {
+export const settle: Tool = async (args, ctx) => {
   const stableMs = parseStableMs(args.stableMs);
   const need = minSettleTimeoutMs(stableMs);
   let timeoutMs = parseTimeoutMs(args.timeoutMs, 'settle');
@@ -40,7 +41,19 @@ export const settle: Tool = async (args) => {
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
+  // What the CALL has left (budget.ts), not a fresh allowance.
+  const effective = Math.min(timeoutMs, budgetLeft(ctx?.startedAt, Date.now()));
+  if (effective < need) {
+    // The window cannot fit in what the call has left: polling would run out
+    // the clock on a static page and read as "never quiesced". Say why instead.
+    return {
+      tabId: tab.id,
+      url: tab.url,
+      data: { settled: false, elapsedMs: 0, budgetLimited: true, reason: 'budget' },
+    };
+  }
   const seen: { url?: string } = {};
-  const out = await settleFor(tab.id!, { stableMs, timeoutMs }, seen);
-  return { tabId: tab.id, url: seen.url ?? tab.url, data: out };
+  const out = await settleFor(tab.id!, { stableMs, timeoutMs: effective }, seen);
+  const data = effective < timeoutMs ? { ...out, budgetLimited: true as const } : out;
+  return { tabId: tab.id, url: seen.url ?? tab.url, data };
 };

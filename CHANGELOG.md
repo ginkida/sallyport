@@ -24,6 +24,21 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `wait_for`, `settle`, `reveal` and `find` called on their own still gave
+  themselves a fresh timeout of up to 30 s, so one queued behind another call
+  on the same tab could run past the daemon's 60 s and come back as
+  `extension_timeout`. They now spend what is left of the call's 50 s budget
+  and report `budgetLimited: true` when it cut them, as embedded waits do
+  (a `settle` left too little time to fit its quiet window answers
+  `reason: 'budget'` rather than calling the page busy). A
+  `find` polling with `timeoutMs` no longer fails outright when a tick lands
+  in a navigation (the "click submit, then find the heading" case it exists
+  for): that tick is skipped and the next reads the new page, and a
+  navigation on the last tick is a clear "retry on the new page" error rather
+  than a raw CDP message. `scroll` in
+  into-view mode no longer reports position 0,0 when the page gave no
+  reading.
+
 - `fill` by `@eN` straight after a `snapshot` refused an ordinary text field
   as `password_field`, and the error told the agent to pass
   `allowPassword=true`. The password gate read the node through

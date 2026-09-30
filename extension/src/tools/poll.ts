@@ -428,7 +428,13 @@ export type SettleSpec = {
    * ticking in the page header must not cost every step its full budget. */
   root?: string;
 };
-export type SettleOutcome = { settled: boolean; elapsedMs: number };
+export type SettleOutcome = {
+  settled: boolean;
+  elapsedMs: number;
+  /** 'budget': the call had too little time left for the quiet window to fit,
+   * so nothing was measured — not a verdict that the page is busy. */
+  reason?: 'budget';
+};
 
 export type Signal = number;
 export type SettleState = {

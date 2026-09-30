@@ -15,6 +15,7 @@ import {
 } from './poll.js';
 import { buildSnapshotTree } from './snapshot.js';
 import { resolveTab } from './tabs.js';
+import { budgetLeft } from './budget.js';
 import type { Tool } from './types.js';
 
 // After each scroll, let the virtualiser render the new window before the next
@@ -31,7 +32,22 @@ const STEP_SETTLE_TIMEOUT_MS = 1500;
  * max_steps, or timeout. The scroll probe is a fixed literal with the direction
  * as a structured argument, so reveal needs no allowEvaluate. NOTE: this
  * scrolls the page (a side effect), within mouse_click's precedent. */
-export const reveal: Tool = async (args) => {
+export const reveal: Tool = async (args, ctx) => {
+  // A standalone poll spends what the CALL has left (budget.ts), same as an
+  // embedded wait: queued behind another call on the tab, a fresh 30 s would
+  // outlive the daemon's timeout and come back as extension_timeout.
+  const asked = parseTimeoutMs(args.timeoutMs, 'reveal');
+  const budget = { startedAt: ctx?.startedAt, limited: false };
+  const res = await revealWithin(args, asked, budget);
+  if (!budget.limited) return res;
+  return { ...res, data: { ...(res.data as Record<string, unknown>), budgetLimited: true } };
+};
+
+async function revealWithin(
+  args: Record<string, unknown>,
+  asked: number,
+  budget: { startedAt?: number; limited: boolean },
+): ReturnType<Tool> {
   const pred = parsePredicate(args, 'reveal');
   const container =
     typeof args.container === 'string' && args.container !== '' ? args.container : null;
@@ -41,7 +57,6 @@ export const reveal: Tool = async (args) => {
   const direction = args.direction === 'up' ? -1 : 1;
   const mode = args.mode === 'a11y' || args.mode === 'dom' ? args.mode : 'auto';
   const maxSteps = parseMaxSteps(args.maxSteps);
-  const timeoutMs = parseTimeoutMs(args.timeoutMs, 'reveal');
 
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
@@ -70,6 +85,10 @@ export const reveal: Tool = async (args) => {
   // those refs never leave the extension, so they must not push the agent's ids
   // up by up to 40 snapshots' worth.
   const mark = refWatermark(tab.id!);
+  // Clamped AFTER attach and the container pin: the time they took is the
+  // call's too.
+  const timeoutMs = Math.min(asked, budgetLeft(budget.startedAt, Date.now()));
+  budget.limited = timeoutMs < asked;
 
   const start = Date.now();
   let prevAfter: number | null = null;
@@ -154,4 +173,4 @@ export const reveal: Tool = async (args) => {
     url: readUrl,
     data: { found: false, reason: 'max_steps', steps: maxSteps },
   };
-};
+}

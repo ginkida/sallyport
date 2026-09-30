@@ -115,7 +115,11 @@ export const scroll: Tool = async (args, ctx) => {
       'Runtime.callFunctionOn',
       { objectId, functionDeclaration: SCROLL_INTO_VIEW_PROBE, returnByValue: true },
     );
-    const v = out.result.value ?? { x: 0, y: 0 };
+    const v = out.result.value;
+    if (!v) {
+      // Same as the by/to branch: no reading is not position zero.
+      throw new BridgeError('error', 'scroll: the page gave no scroll position back');
+    }
     const intoViewWait = waitSpec
       ? await runEmbeddedWait(tabId, waitSpec, ctx?.startedAt, !!observeSpec)
       : null;

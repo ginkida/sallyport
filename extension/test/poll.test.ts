@@ -1176,6 +1176,19 @@ describe('scroll — atBottom after an embedded wait', () => {
     await expect(scroll({ to: 'bottom', tabId: TAB })).rejects.toMatchObject({ code: 'error' });
   });
 
+  it('into_view refuses to report a position the page never gave back', async () => {
+    const { scroll } = await import('../src/tools/scroll.js');
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
+      if (method === 'DOM.querySelector') return { nodeId: 5 };
+      if (method === 'DOM.resolveNode') return { object: { objectId: 'target' } };
+      return { result: { type: 'object' }, exceptionDetails: {} }; // the probe threw
+    });
+    await expect(scroll({ selector: '#target', tabId: TAB })).rejects.toMatchObject({
+      code: 'error',
+    });
+  });
+
   it('keeps the first reading if the container went away during the wait', async () => {
     const { scroll } = await import('../src/tools/scroll.js');
     vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method, params) => {
@@ -1361,6 +1374,44 @@ describe('pollFor — ticks that tell the truth', () => {
     await vi.runAllTimersAsync();
     await pending;
     expect(seen.url).toBe('https://shop.example/item/42');
+  });
+});
+
+describe('standalone wait_for / settle spend what the CALL has left', () => {
+  const SHOP = 'https://shop.example/cart';
+
+  beforeEach(async () => {
+    installChrome([SHOP]);
+    await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+  });
+
+  it('wait_for clamps and flags budgetLimited', async () => {
+    const { waitFor } = await import('../src/tools/wait.js');
+    const t0 = Date.now();
+    const res = await waitFor(
+      { selector: '#never', timeoutMs: 30_000, tabId: TAB },
+      { startedAt: t0 - 49_800 },
+    );
+    expect(res.data).toMatchObject({ found: false, reason: 'timeout', budgetLimited: true });
+    expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+
+  it('settle clamps and flags budgetLimited', async () => {
+    const { settle } = await import('../src/tools/settle.js');
+    const t0 = Date.now();
+    const res = await settle(
+      { stableMs: 500, timeoutMs: 30_000, tabId: TAB },
+      { startedAt: t0 - 49_800 },
+    );
+    // 200 ms left cannot fit a 500 ms window: nothing is measured, and it says
+    // why rather than calling the page busy.
+    expect(res.data).toEqual({
+      settled: false,
+      elapsedMs: 0,
+      budgetLimited: true,
+      reason: 'budget',
+    });
+    expect(Date.now() - t0).toBeLessThan(5_000);
   });
 });
 

@@ -290,3 +290,110 @@ describe('reveal — the page must stay allowlisted for the WHOLE scroll (invari
     expect(creates.map((c) => c.method)).toEqual(['Runtime.callFunctionOn', 'Runtime.evaluate']);
   });
 });
+
+describe('standalone polls spend what the CALL has left, and survive a navigation tick', () => {
+  it('find with timeoutMs treats a tick that lost its document as unread', async () => {
+    const sent = installChrome({ foundAtStep: 2 });
+    await allowChat();
+    const send = chrome.debugger.sendCommand as unknown as (
+      t: unknown,
+      m: string,
+      p?: unknown,
+    ) => Promise<unknown>;
+    let ax = 0;
+    (chrome.debugger as unknown as { sendCommand: typeof send }).sendCommand = async (t, m, p) => {
+      if (m === 'Accessibility.getFullAXTree' && ax++ === 1) {
+        throw new Error('Cannot find context with specified id');
+      }
+      return send(t, m, p);
+    };
+    const { find } = await import('../src/tools/find.js');
+    const res = await find({
+      role: 'button',
+      name: 'Older',
+      mode: 'a11y',
+      timeoutMs: 5000,
+      tabId: TAB,
+    });
+    expect((res.data as { total: number }).total).toBe(1);
+    expect(
+      sent.filter((c) => c.method === 'Accessibility.getFullAXTree').length,
+    ).toBeGreaterThanOrEqual(3);
+  });
+
+  it('find still fails on an error that is not a lost document', async () => {
+    installChrome({ foundAtStep: 2 });
+    await allowChat();
+    (chrome.debugger as unknown as { sendCommand: unknown }).sendCommand = async () => {
+      throw new Error('Debugger is not attached to the tab with id: 7.');
+    };
+    const { find } = await import('../src/tools/find.js');
+    await expect(
+      find({ role: 'button', name: 'Older', mode: 'a11y', timeoutMs: 5000, tabId: TAB }),
+    ).rejects.toThrow('Debugger is not attached');
+  });
+
+  it('find clamps its poll to the budget and says so', async () => {
+    installChrome({ foundAtStep: 99 });
+    await allowChat();
+    const { find } = await import('../src/tools/find.js');
+    const t0 = Date.now();
+    const res = await find(
+      { role: 'button', name: 'Older', mode: 'a11y', timeoutMs: 30_000, tabId: TAB },
+      { startedAt: t0 - 49_000 },
+    );
+    expect(res.data).toMatchObject({ total: 0, budgetLimited: true });
+    expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+
+  it('a batched find flags the budget cut too', async () => {
+    installChrome({ foundAtStep: 99 });
+    await allowChat();
+    const { find } = await import('../src/tools/find.js');
+    const res = await find(
+      {
+        queries: [
+          { role: 'button', name: 'Older' },
+          { role: 'button', name: 'Newer' },
+        ],
+        mode: 'a11y',
+        timeoutMs: 30_000,
+        tabId: TAB,
+      },
+      { startedAt: Date.now() - 49_000 },
+    );
+    expect(res.data).toMatchObject({ budgetLimited: true });
+  });
+
+  it('a navigation on the LAST tick is a clear error, not a raw CDP message', async () => {
+    installChrome({ foundAtStep: 99 });
+    await allowChat();
+    const send = chrome.debugger.sendCommand as unknown as (
+      t: unknown,
+      m: string,
+      p?: unknown,
+    ) => Promise<unknown>;
+    (chrome.debugger as unknown as { sendCommand: typeof send }).sendCommand = async (t, m, p) => {
+      if (m === 'Accessibility.getFullAXTree') {
+        throw new Error('Cannot find context with specified id');
+      }
+      return send(t, m, p);
+    };
+    const { find } = await import('../src/tools/find.js');
+    await expect(
+      find({ role: 'button', name: 'Older', mode: 'a11y', timeoutMs: 600, tabId: TAB }),
+    ).rejects.toThrow(/navigated during the last poll/);
+  });
+
+  it('reveal clamps its loop to the budget and says so', async () => {
+    installChrome({ foundAtStep: 99 });
+    await allowChat();
+    const t0 = Date.now();
+    const res = await reveal(
+      { container: '#list', role: 'button', name: 'Older', timeoutMs: 30_000, tabId: TAB },
+      { startedAt: t0 - 49_000 },
+    );
+    expect(res.data).toMatchObject({ found: false, budgetLimited: true });
+    expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+});

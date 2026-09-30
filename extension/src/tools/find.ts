@@ -1,11 +1,12 @@
 import { collectInteractive } from './axtree.js';
-import { attach } from './cdp.js';
+import { attach, looksLikeLostContextError } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed, ensureStillAllowed } from './gates.js';
 import { matchElements, parseLimit, parsePredicate, type Match, type Predicate } from './match.js';
 import { refWatermark } from './refs.js';
 import { buildSnapshotTree } from './snapshot.js';
 import { resolveTab } from './tab-resolve.js';
+import { budgetLeft } from './budget.js';
 import type { Tool } from './types.js';
 
 /** Semantic locator: snapshot the page, then return @eN refs of interactive
@@ -105,13 +106,17 @@ function shape(all: Match[], limit: number): { matches: Match[]; total: number }
   return { matches: all.slice(0, limit), total: all.length };
 }
 
-export const find: Tool = async (args) => {
+export const find: Tool = async (args, ctx) => {
   const { queries, batch } = parseQueries(args);
   const mode = args.mode === 'a11y' || args.mode === 'dom' ? args.mode : 'auto';
-  const timeoutMs = parseFindTimeout(args.timeoutMs);
+  const asked = parseFindTimeout(args.timeoutMs);
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
+  // What the CALL has left (budget.ts), not a fresh allowance — measured after
+  // attach, whose time is the call's too.
+  const timeoutMs = Math.min(asked, budgetLeft(ctx?.startedAt, Date.now()));
+  const budgetLimited = timeoutMs < asked;
 
   const start = Date.now();
   // One mark for the whole poll: every tick but the last is discarded, and
@@ -129,7 +134,26 @@ export const find: Tool = async (args) => {
     // URL actually read, so the result and the audit row describe the same page
     // rather than the one the call started on.
     readUrl = await ensureStillAllowed(tab.id!);
-    const built = await buildSnapshotTree(tab.id!, mode, mark);
+    let built: Awaited<ReturnType<typeof buildSnapshotTree>>;
+    try {
+      built = await buildSnapshotTree(tab.id!, mode, mark);
+    } catch (e) {
+      // A tick straddling a navigation commit (the "click submit, then find the
+      // heading" case timeoutMs exists for) loses its document mid-walk. That
+      // is an unread tick, not a failed find — the next one reads the new page.
+      if (!timeoutMs || !looksLikeLostContextError(e)) throw e;
+      if (Date.now() - start + FIND_POLL_MS > timeoutMs) {
+        // The last tick lost its page: nothing was read, and the refs the
+        // earlier ticks minted died with that walk. Say so, not a raw CDP error.
+        throw new BridgeError(
+          'error',
+          'find: the page navigated during the last poll, so nothing was read — ' +
+            'retry find on the new page',
+        );
+      }
+      await new Promise((r) => setTimeout(r, FIND_POLL_MS));
+      continue;
+    }
     source = built.source;
     truncated = built.truncated;
     const flat = collectInteractive(built.tree);
@@ -153,6 +177,7 @@ export const find: Tool = async (args) => {
         ...results[0],
         ...(truncated ? { truncated: true } : {}),
         ...(timeoutMs ? { elapsedMs } : {}),
+        ...(budgetLimited ? { budgetLimited: true } : {}),
       },
     };
   }
@@ -164,6 +189,7 @@ export const find: Tool = async (args) => {
       results: queries.map((q, i) => ({ query: q.raw, ...results[i] })),
       ...(truncated ? { truncated: true } : {}),
       ...(timeoutMs ? { elapsedMs } : {}),
+      ...(budgetLimited ? { budgetLimited: true } : {}),
     },
   };
 };
