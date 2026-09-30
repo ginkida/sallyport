@@ -96,7 +96,8 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "wait_for, then retry with a fresh selector/@eN."
         ),
         "element_disabled": (
-            "retryable=no as-is; the control carries the HTML disabled attribute, so the "
+            "retryable=no as-is; the control is disabled (its own disabled attribute, a "
+            "<fieldset disabled> around it, or a disabled <optgroup>), so the "
             "browser dispatches no click at all — satisfy whatever enables it (fill the "
             "required fields, dismiss the blocking state) and wait_for it to become "
             "enabled, then retry; an identical immediate retry does nothing."
@@ -144,8 +145,10 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
         ),
         "no_editable_focus": (
             "retryable=no; key_type inserts into whatever holds focus and nothing there can "
-            "take text (after a navigate that is <body>) — click the field first, or use "
-            "fill(selector, value), which focuses it for you."
+            "take text. After a navigate that is <body>: click the field first, or use "
+            "fill(selector, value), which focuses it for you. A focused read-only or "
+            "disabled field will not change by clicking it again: drive the widget its own "
+            "way (its picker, select_option, find)."
         ),
         "result_too_large": (
             "retryable=no; the result was too big to send and was refused before it could "

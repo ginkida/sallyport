@@ -131,6 +131,10 @@ export function domNodeAcceptsText(raw: unknown): boolean | null {
 
   let type: string | null = null;
   let editable: string | null = null;
+  // Browser-owned attributes, like everything here: a date picker's
+  // `<input readonly>` takes focus but no text, and insertText into it is a
+  // silent no-op the tool would have reported as typed.
+  let locked = false;
   if (Array.isArray(node.attributes)) {
     for (let i = 0; i + 1 < node.attributes.length; i += 2) {
       const name = node.attributes[i];
@@ -139,16 +143,39 @@ export function domNodeAcceptsText(raw: unknown): boolean | null {
       const lower = name.toLowerCase();
       if (lower === 'type') type = value.trim().toLowerCase();
       if (lower === 'contenteditable') editable = value.trim().toLowerCase();
+      if (lower === 'readonly' || lower === 'disabled') locked = true;
     }
   }
 
   // contenteditable is how every rich composer works (Slack, Notion, Gmail,
   // ProseMirror/Slate editors) — and `contenteditable=""` means true.
   if (editable !== null && editable !== 'false') return true;
-  if (tag === 'TEXTAREA') return true;
+  if (tag === 'TEXTAREA') return !locked;
   if (tag === 'INPUT') {
     if (node.attributes === undefined) return null;
+    if (locked) return false;
     return type === null || !NON_TEXT_INPUT_TYPES.has(type);
+  }
+  return false;
+}
+
+/** Is this a text field the page has LOCKED (`readonly`/`disabled`) — i.e.
+ * refused by domNodeAcceptsText for a reason clicking it again cannot fix?
+ * Lets the refusal give advice that is not a loop. Pure; malformed → false. */
+export function textFieldLocked(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object') return false;
+  const node = raw as DOMNode;
+  if (typeof node.nodeName !== 'string' || !Array.isArray(node.attributes)) return false;
+  const tag = node.nodeName.toUpperCase();
+  if (tag !== 'INPUT' && tag !== 'TEXTAREA') return false;
+  for (let i = 0; i < node.attributes.length; i += 2) {
+    const name = node.attributes[i];
+    if (
+      typeof name === 'string' &&
+      (name.toLowerCase() === 'readonly' || name.toLowerCase() === 'disabled')
+    ) {
+      return true;
+    }
   }
   return false;
 }

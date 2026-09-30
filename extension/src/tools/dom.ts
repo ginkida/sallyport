@@ -133,9 +133,12 @@ async function ensureFocusedLeafNotPassword(
 /** Click the node — unless the click is guaranteed to do nothing, in which case
  * say so instead of pretending.
  *
- * Two cases the browser silently swallows: a form control with the HTML
- * `disabled` attribute (Chrome dispatches no click event at all) and a node the
- * page has detached (`.click()` fires into a document nobody is watching).
+ * Two cases the browser silently swallows: a disabled form control — its own
+ * `disabled` attribute, a `<fieldset disabled>` ancestor or a disabled
+ * `<optgroup>`, i.e. `:disabled` (Chrome dispatches no click event at all) — and
+ * a node the page has detached (`.click()` fires into a document nobody is
+ * watching). SVG/MathML have no `.click()`: they get the event it would have
+ * dispatched (a PointerEvent in current Chrome).
  * Both used to return `{ok:true}` — the most expensive kind of wrong answer,
  * since the agent then spends turns hunting for why the page did not react, and
  * an embedded `waitFor` cannot rescue it either: it just times out.
@@ -153,10 +156,36 @@ async function ensureFocusedLeafNotPassword(
  * that would have been the no-op we are reporting anyway. It cannot cause an
  * action, only decline one. FIXED literal, no agent interpolation. */
 export const CLICK_FN = `function() {
-  if (this.disabled === true) return { tag: this.tagName, blocked: 'disabled' };
+  let off = this.disabled === true;
+  // :disabled also covers what .disabled misses: a control inside
+  // <fieldset disabled> or a disabled <optgroup>. The browser dispatches no
+  // click to any of them.
+  try {
+    if (!off && typeof this.matches === 'function') off = this.matches(':disabled');
+  } catch (e) {}
+  if (off) return { tag: this.tagName, blocked: 'disabled' };
   if (this.isConnected === false) return { tag: this.tagName, blocked: 'detached' };
   this.scrollIntoView({ block: 'center' });
-  this.click();
+  if (typeof this.click === 'function') {
+    this.click();
+  } else {
+    // SVG and MathML elements have no .click(): dispatch what it would have.
+    // Chrome's .click() fires a PointerEvent (pointerId -1, pointerType ''):
+    // handlers that check \`instanceof PointerEvent\` must see the same.
+    const view = (this.ownerDocument && this.ownerDocument.defaultView) || globalThis;
+    const Ctor = view.PointerEvent || view.MouseEvent;
+    this.dispatchEvent(
+      new Ctor('click', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view,
+        detail: 1,
+        pointerId: -1,
+        pointerType: '',
+      }),
+    );
+  }
   const r = this.getBoundingClientRect();
   const out = { tag: this.tagName, text: (this.textContent || '').slice(0, 100) };
   if (r.width === 0 && r.height === 0) out.hidden = true;
@@ -179,12 +208,30 @@ export const click: Tool = async (args, ctx) => {
   await ensureAllowed(tab.url);
   await attach(tab.id!);
   const objectId = await resolveSelectorOrRef(tab.id!, selector, 'click');
-  const out = await cdp<{ result: { value?: ClickProbe } }>(tab.id!, 'Runtime.callFunctionOn', {
+  const out = await cdp<{
+    result?: { value?: ClickProbe };
+    exceptionDetails?: { text?: string; exception?: { description?: string } };
+  }>(tab.id!, 'Runtime.callFunctionOn', {
     objectId,
     functionDeclaration: CLICK_FN,
     returnByValue: true,
   });
-  const probe = out.result.value ?? {};
+  const probe = out.exceptionDetails ? undefined : out.result?.value;
+  if (!probe) {
+    // The click threw in the page (or gave nothing back). Defaulting to {} here
+    // answered ok:true for a click that never happened.
+    const why =
+      out.exceptionDetails?.exception?.description?.split('\n')[0] ??
+      out.exceptionDetails?.text ??
+      'no result';
+    throw new BridgeError(
+      'error',
+      // Page-controlled text: cut, then drop any half of a surrogate pair — a
+      // lone one makes the whole error unsignable (protocol.ts).
+      `click: the click on ${selector} did not run (${why.slice(0, 200).replace(/[\uD800-\uDFFF]/g, '')}) — try mouse_click, ` +
+        `which dispatches a real pointer click`,
+    );
+  }
   if (probe.blocked === 'disabled') {
     throw new BridgeError(
       'element_disabled',

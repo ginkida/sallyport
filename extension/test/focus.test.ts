@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   collectFrameIds,
   domNodeAcceptsText,
+  textFieldLocked,
   domNodeIsPassword,
   focusedBackendNodeIds,
 } from '../src/tools/focus.js';
@@ -92,6 +93,22 @@ describe('domNodeAcceptsText — can Input.insertText land here at all?', () => 
     expect(domNodeAcceptsText(node('INPUT', ['type', 'text']))).toBe(true);
     expect(domNodeAcceptsText(node('INPUT', ['type', 'search']))).toBe(true);
     expect(domNodeAcceptsText(node('INPUT', []))).toBe(true); // no type = text
+  });
+
+  it('refuses a read-only or disabled field — focus, but no text', () => {
+    // A date picker's <input readonly>: insertText is a silent no-op there.
+    expect(domNodeAcceptsText(node('INPUT', ['readonly', '']))).toBe(false);
+    expect(domNodeAcceptsText(node('INPUT', ['type', 'text', 'disabled', '']))).toBe(false);
+    expect(domNodeAcceptsText(node('TEXTAREA', ['readonly', 'readonly']))).toBe(false);
+    expect(domNodeAcceptsText(node('TEXTAREA', ['disabled', '']))).toBe(false);
+  });
+
+  it('textFieldLocked tells a locked field from a merely non-text one', () => {
+    expect(textFieldLocked(node('INPUT', ['readonly', '']))).toBe(true);
+    expect(textFieldLocked(node('TEXTAREA', ['DISABLED', '']))).toBe(true);
+    expect(textFieldLocked(node('INPUT', ['type', 'checkbox']))).toBe(false);
+    expect(textFieldLocked(node('BODY', ['readonly', '']))).toBe(false); // meaningless there
+    expect(textFieldLocked(null)).toBe(false);
   });
 
   it('accepts a contenteditable host — every rich composer is one', () => {

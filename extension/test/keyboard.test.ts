@@ -234,6 +234,16 @@ describe('key_type needs somewhere for the text to LAND', () => {
     ).rejects.toThrow(/<body>.*click the field first/s);
   });
 
+  it('a read-only field gets advice that is not "click it again"', async () => {
+    // A date picker's <input readonly> is already focused: re-clicking it
+    // would refocus the same locked field and fail identically, forever.
+    focusOn({ nodeName: 'INPUT', attributes: ['readonly', ''] });
+    const err = ensureFocusUsable(1, { allowPassword: false, requireTypable: true }, 'key_type');
+    await expect(err).rejects.toMatchObject({ code: 'no_editable_focus' });
+    await expect(err).rejects.toThrow(/read-only or disabled/);
+    await expect(err).rejects.not.toThrow(/click the field first/);
+  });
+
   it('passes for a real text field', async () => {
     focusOn({ nodeName: 'INPUT', attributes: ['type', 'search'] });
     await expect(

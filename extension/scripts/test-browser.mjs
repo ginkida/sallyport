@@ -48,6 +48,9 @@ const server = createServer((req, res) => {
         '<button id="navigate-soon" onclick="setTimeout(() => location.assign(`/?next`), 300)">Navigate</button>' +
         '<button id="start-clock" onclick="startClock()">Start clock</button><span id="clock">0</span>' +
         '<span class="dup" style="display:none">hidden copy</span><span class="dup">visible copy</span>' +
+        '<fieldset disabled><button id="fs-btn">In a disabled fieldset</button></fieldset>' +
+        '<svg id="svg-btn" role="button" width="24" height="24" onclick="document.querySelector(\'#result\').textContent = \'svg clicked\'"><rect width="24" height="24"></rect></svg>' +
+        '<input id="ro" readonly value="2026-10-01">' +
         '<div id="list" style="height:150px;overflow:auto;position:relative;scroll-behavior:smooth" onscroll="renderRows()">' +
         '<div style="height:900px;position:relative"></div></div>' +
         '<script>function startChurn(mode) {' +
@@ -553,6 +556,18 @@ try {
     const text = await callTool('read_text', { tabId });
     assert.ok(!text.isError);
     assert.match(JSON.stringify(text.content), /Hello Sallyport/);
+    // Clicks that the browser would not (or could not) deliver must not read
+    // as ok:true.
+    const fieldset = await callTool('click', { selector: '#fs-btn', tabId });
+    assert.equal(fieldset.isError, true, JSON.stringify(fieldset));
+    assert.match(fieldset.content[0].text, /element_disabled/);
+    value(await callTool('click', { selector: '#svg-btn', tabId }));
+    assert.match(JSON.stringify((await callTool('read_text', { tabId })).content), /svg clicked/);
+    value(await callTool('mouse_click', { selector: '#ro', tabId }));
+    const readonly = await callTool('key_type', { text: 'abc', tabId });
+    assert.equal(readonly.isError, true, JSON.stringify(readonly));
+    assert.match(readonly.content[0].text, /no_editable_focus/);
+    console.log('PASS: MCP click/key_type refuse what the browser would not deliver');
     for (const mode of ['text', 'attribute', 'revert']) {
       value(await callTool('click', { selector: `#churn-${mode}`, tabId }));
       const busy = value(await callTool('settle', { stableMs: 500, timeoutMs: 1000, tabId }));

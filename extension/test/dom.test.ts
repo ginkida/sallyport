@@ -194,6 +194,74 @@ describe('CLICK_FN (serialised in-page probe)', () => {
     return { el, calls };
   };
 
+  it('refuses a control disabled by an ancestor <fieldset disabled>, without clicking', () => {
+    // .disabled is false there; :disabled is what the browser actually honours.
+    const { el, calls } = fakeEl({ disabled: false, matches: (s: string) => s === ':disabled' });
+    expect(run().call(el)).toMatchObject({ blocked: 'disabled' });
+    expect(calls.clicked).toBe(0);
+  });
+
+  it('still clicks when matches() throws on a page that broke it', () => {
+    const { el, calls } = fakeEl({
+      matches: () => {
+        throw new Error('broken');
+      },
+    });
+    run().call(el);
+    expect(calls.clicked).toBe(1);
+  });
+
+  it('dispatches a click on an element with no .click() (SVG, MathML) — as a PointerEvent', () => {
+    const events: Array<{ ctor: string; type: string; init: Record<string, unknown> }> = [];
+    const make = (ctor: string) =>
+      class {
+        ctor = ctor;
+        constructor(
+          public type: string,
+          public init: Record<string, unknown>,
+        ) {}
+      };
+    const view = { MouseEvent: make('MouseEvent'), PointerEvent: make('PointerEvent') };
+    const { el } = fakeEl({
+      tagName: 'svg',
+      click: undefined,
+      ownerDocument: { defaultView: view },
+      dispatchEvent: (e: { ctor: string; type: string; init: Record<string, unknown> }) => {
+        events.push(e);
+        return true;
+      },
+    });
+    const out = run().call(el);
+    expect(out.tag).toBe('svg');
+    expect(events).toHaveLength(1);
+    // What Chrome's own .click() fires, so an `instanceof PointerEvent` handler reacts.
+    expect(events[0]).toMatchObject({
+      ctor: 'PointerEvent',
+      type: 'click',
+      init: { bubbles: true, cancelable: true, composed: true, view, pointerId: -1 },
+    });
+  });
+
+  it('falls back to MouseEvent where there is no PointerEvent', () => {
+    const events: Array<{ ctor: string }> = [];
+    const { el } = fakeEl({
+      click: undefined,
+      ownerDocument: {
+        defaultView: {
+          MouseEvent: class {
+            ctor = 'MouseEvent';
+          },
+        },
+      },
+      dispatchEvent: (e: { ctor: string }) => {
+        events.push(e);
+        return true;
+      },
+    });
+    run().call(el);
+    expect(events[0].ctor).toBe('MouseEvent');
+  });
+
   it('clicks a normal element and reports its tag and text', () => {
     const { el, calls } = fakeEl();
     const out = run().call(el);
@@ -301,6 +369,41 @@ describe('click refusals', () => {
     const { setAllowlist } = await import('../src/storage.js');
     await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
   }
+
+  it('a probe that reports an exception is an error even if a value came along', async () => {
+    installChrome({ tag: 'BUTTON' });
+    await allowApp();
+    const { click: clickTool } = await import('../src/tools/dom.js');
+    const send = chrome.debugger.sendCommand as unknown as (
+      t: unknown,
+      m: string,
+    ) => Promise<unknown>;
+    (chrome.debugger as unknown as { sendCommand: typeof send }).sendCommand = async (t, m) =>
+      m === 'Runtime.callFunctionOn'
+        ? {
+            result: { value: { tag: 'BUTTON' } },
+            exceptionDetails: {
+              text: 'Uncaught',
+              exception: { description: 'TypeError: boom \uD83D\n    at page.js:1:1' },
+            },
+          }
+        : send(t, m);
+    const err = clickTool({ selector: '#save', tabId: TAB });
+    await expect(err).rejects.toMatchObject({ code: 'error' });
+    // First line only, and no lone surrogate half (it would make the error unsignable).
+    await expect(err).rejects.toThrow(/did not run \(TypeError: boom \)/);
+  });
+
+  it('a click that threw in the page is an error, never ok:true', async () => {
+    // No value comes back when the probe throws; defaulting to {} answered
+    // ok:true for a click that never happened.
+    installChrome(undefined as never);
+    await allowApp();
+    await expect(click({ selector: '#save', tabId: TAB })).rejects.toMatchObject({
+      code: 'error',
+      message: expect.stringContaining('did not run'),
+    });
+  });
 
   it('turns a disabled control into element_disabled, not ok:true', async () => {
     installChrome({ tag: 'BUTTON', blocked: 'disabled' });

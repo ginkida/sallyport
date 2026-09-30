@@ -3,6 +3,7 @@ import { BridgeError } from './errors.js';
 import {
   collectFrameIds,
   domNodeAcceptsText,
+  textFieldLocked,
   domNodeIsPassword,
   focusedBackendNodeIds,
 } from './focus.js';
@@ -197,7 +198,7 @@ export async function ensureFocusUsable(
   // A holder rather than a `let`: the only assignment happens inside a nested
   // function, which control-flow analysis cannot see, so a plain binding would
   // narrow to `null` at the throw below.
-  const focused: { tag: string | null } = { tag: null };
+  const focused: { tag: string | null; locked: boolean } = { tag: null, locked: false };
   const fail = (): never => {
     throw new BridgeError(
       'focus_probe_failed',
@@ -232,6 +233,7 @@ export async function ensureFocusUsable(
       if (requireTypable) {
         const node = described.node as { nodeName?: unknown } | undefined;
         if (typeof node?.nodeName === 'string') focused.tag = node.nodeName;
+        if (textFieldLocked(described.node)) focused.locked = true;
         const typable = domNodeAcceptsText(described.node);
         if (typable === null) return fail();
         if (typable) sawTypable = true;
@@ -303,6 +305,16 @@ export async function ensureFocusUsable(
       // the insert would land nowhere and the tool would report success for a
       // no-op. Say what is focused: after a navigate that is `BODY`, and the
       // fix is a click, not a retry.
+      if (focused.locked) {
+        // Clicking it again would only refocus the same locked field — a loop.
+        throw new BridgeError(
+          'no_editable_focus',
+          `${tool}: the focused <${(focused.tag ?? 'input').toLowerCase()}> is read-only or ` +
+            'disabled, so typing goes nowhere — drive the widget its own way (click its ' +
+            'picker/options, select_option, find), or fill(selector, value) if the page ' +
+            'accepts a value set directly',
+        );
+      }
       throw new BridgeError(
         'no_editable_focus',
         `${tool}: nothing that accepts text is focused` +

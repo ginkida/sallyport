@@ -24,6 +24,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `click` answered `ok: true` for clicks that never happened: on an SVG or
+  MathML target (no `.click()` of its own, so the probe threw and its empty
+  result read as success) and on a button inside `<fieldset disabled>`
+  (`.disabled` is false there, yet the browser dispatches nothing). SVG/MathML
+  targets now get the click event `.click()` would have fired (a
+  `PointerEvent`, as Chrome's own), a control disabled by any means
+  (`:disabled`) is `element_disabled`, and a click that throws in the page is
+  an error. `key_type` into a focused read-only or disabled field (a date
+  picker's `<input readonly>`) was likewise reported as typed; it is now
+  `no_editable_focus`, with advice to drive the widget itself rather than
+  "click the field first", which would only refocus the same locked field.
+
 - A `navigate` that opened a new tab (broker-mode create-own, `newTab`, or a
   `chrome://` source) and whose page did not reach "complete" before the load
   watchdog failed with `timeout` before the tab's ownership was recorded. The
