@@ -51,6 +51,7 @@ const server = createServer((req, res) => {
         '<fieldset disabled><button id="fs-btn">In a disabled fieldset</button></fieldset>' +
         '<svg id="svg-btn" role="button" width="24" height="24" onclick="document.querySelector(\'#result\').textContent = \'svg clicked\'"><rect width="24" height="24"></rect></svg>' +
         '<input id="ro" readonly value="2026-10-01">' +
+        '<x-pass id="xpass" type="password"></x-pass>' +
         '<select id="multi" multiple><option value="UA">UA</option><option value="PL">PL</option><option value="DE">DE</option></select>' +
         '<select id="dupe"><option value="">— choose —</option><option value="">Other</option></select>' +
         '<div id="list" style="height:150px;overflow:auto;position:relative;scroll-behavior:smooth" onscroll="renderRows()">' +
@@ -85,6 +86,11 @@ const server = createServer((req, res) => {
         ' setTimeout(() => clearInterval(timer), 20000);' +
         '}' +
         'renderRows();' +
+        // A design-system password field: the real input sits in a CLOSED
+        // shadow root that takes focus — fill can only see the host.
+        "customElements.define('x-pass', class extends HTMLElement { constructor() { super();" +
+        " const root = this.attachShadow({ mode: 'closed', delegatesFocus: true });" +
+        " root.innerHTML = '<input type=password>'; } });" +
         '</script>',
     );
   }
@@ -553,7 +559,21 @@ try {
       `chrome.storage.local.set({sallyport_allowlist:[{pattern:${JSON.stringify(fixtureUrl + '/*')},allowEvaluate:false,addedAt:Date.now()}]})`,
     );
     value(await callTool('navigate', { url: fixtureUrl, tabId }));
-    value(await callTool('fill', { selector: '#name', value: 'Sallyport', tabId }));
+    // fill by @eN straight after an a11y snapshot: nothing has fetched the DOM
+    // document yet, which is the state a ref-based password gate must handle.
+    const snap = value(await callTool('snapshot', { compact: true, tabId }));
+    const nameRef = snap.elements.find((e) => e.role === 'textbox' && /Name/.test(e.name))?.ref;
+    assert.ok(nameRef, JSON.stringify(snap.elements));
+    value(await callTool('fill', { selector: nameRef, value: 'Sallyport', tabId }));
+    // ...and the same path still refuses the real password field (invariant #5).
+    const pwRef = snap.elements.find((e) => e.role === 'textbox' && /Password/.test(e.name))?.ref;
+    assert.ok(pwRef, JSON.stringify(snap.elements));
+    const pwByRef = await callTool('fill', { selector: pwRef, value: 'do-not-record', tabId });
+    assert.equal(pwByRef.isError, true, JSON.stringify(pwByRef));
+    assert.match(pwByRef.content[0].text, /password_field/);
+    const pwHost = await callTool('fill', { selector: '#xpass', value: 'do-not-record', tabId });
+    assert.equal(pwHost.isError, true, JSON.stringify(pwHost));
+    assert.match(pwHost.content[0].text, /password_field/);
     value(await callTool('click', { selector: '#submit', tabId }));
     const text = await callTool('read_text', { tabId });
     assert.ok(!text.isError);

@@ -77,6 +77,26 @@ describe('domNodeIsPassword', () => {
     );
   });
 
+  it('counts a password-typed custom element: its closed shadow root hides the real field', () => {
+    // <x-pass type="password"> delegating focus into a closed root: the host's
+    // own type is the only thing the gate can see.
+    expect(domNodeIsPassword({ nodeName: 'X-PASS', attributes: ['type', 'password'] })).toBe(true);
+  });
+
+  it('counts a prefixed x:input', () => {
+    expect(domNodeIsPassword({ nodeName: 'X:INPUT', attributes: ['type', 'password'] })).toBe(true);
+    expect(domNodeIsPassword({ nodeName: 'x:input' })).toBeNull(); // attributes unseen
+  });
+
+  it('is not masked by a decoy type attribute ahead of the real one', () => {
+    expect(
+      domNodeIsPassword({ nodeName: 'INPUT', attributes: ['TYPE', 'text', 'type', 'password'] }),
+    ).toBe(true);
+    expect(
+      domNodeIsPassword({ nodeName: 'INPUT', attributes: ['x:type', 'text', 'type', 'password'] }),
+    ).toBe(true);
+  });
+
   it('fails closed on malformed or unreadable DOM descriptions', () => {
     expect(domNodeIsPassword(undefined)).toBeNull();
     expect(domNodeIsPassword({ nodeName: 7, attributes: [] })).toBeNull();

@@ -5,6 +5,7 @@ import { ensureAllowed } from './gates.js';
 import { parseObserve, runObserve } from './observe.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { capText, parseMaxChars, parseOffset, READ_TEXT_FN } from './text.js';
+import { domNodeIsPassword } from './focus.js';
 import { getRef, isRef } from './refs.js';
 import { resolveBackendNode, resolveSelectorOrRef } from './resolve.js';
 import { resolveTab } from './tabs.js';
@@ -32,41 +33,21 @@ export function ensureFocusLanded(focused: boolean | undefined): void {
 }
 
 /**
- * Decide whether a fill target is an `<input type=password>` from the flat
- * `[name, value, name, value, …]` attribute list CDP's `DOM.getAttributes`
- * returns. The list comes from the browser's own DOM, NOT from a page-readable
- * JS getter, so a hostile page cannot mask a password field from the gate by
- * shadowing `this.type` with a throwing or lying accessor.
+ * Read the fill target's tag and `type` through CDP, so the password gate reads
+ * the browser's ground truth instead of a page-controllable `this.type`. Any
+ * failure to read the node fails closed (treated as a password field).
  *
- * Fail-closed: a nullish list means the node's attributes could not be read,
- * so we treat it as a password field rather than letting text through. A
- * present-but-empty list (an element with no attributes) is an ordinary field.
- * Attribute names are compared case-insensitively and the value is trimmed and
- * lower-cased to match the HTML content-attribute semantics (`type=PASSWORD`).
+ * `DOM.describeNode` by objectId, not `DOM.requestNode` + `getAttributes`:
+ * requestNode needs the document already pushed to the frontend and answers
+ * nodeId 0 when nothing has called `DOM.getDocument` — exactly the state right
+ * after an a11y snapshot, so `fill('@e3')` on a plain text field failed closed
+ * as `password_field` and the error told the agent to pass allowPassword=true.
+ * describeNode needs no pushed document (the keystroke gate already uses it).
  */
-export function attributesIndicatePassword(attrs: readonly string[] | null | undefined): boolean {
-  if (!attrs) return true;
-  for (let i = 0; i + 1 < attrs.length; i += 2) {
-    if (attrs[i].toLowerCase() === 'type') {
-      return attrs[i + 1].trim().toLowerCase() === 'password';
-    }
-  }
-  return false;
-}
-
-/**
- * Resolve the fill target to a DOM node and read its `type` attribute through
- * CDP, so the password gate reads the browser's ground truth instead of a
- * page-controllable `this.type`. Any failure to read the node fails closed
- * (treated as a password field).
- */
-async function targetIsPasswordField(tabId: number, objectId: string): Promise<boolean> {
-  const node = await cdp<{ nodeId?: number }>(tabId, 'DOM.requestNode', { objectId });
-  if (!node.nodeId) return true;
-  const res = await cdp<{ attributes?: string[] }>(tabId, 'DOM.getAttributes', {
-    nodeId: node.nodeId,
-  });
-  return attributesIndicatePassword(res.attributes);
+export async function targetIsPasswordField(tabId: number, objectId: string): Promise<boolean> {
+  const out = await cdp<{ node?: unknown }>(tabId, 'DOM.describeNode', { objectId, depth: 0 });
+  const verdict = domNodeIsPassword(out.node);
+  return verdict === null ? true : verdict;
 }
 
 // Walk document.activeElement down to the element that ACTUALLY holds focus.

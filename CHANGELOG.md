@@ -24,6 +24,22 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `fill` by `@eN` straight after a `snapshot` refused an ordinary text field
+  as `password_field`, and the error told the agent to pass
+  `allowPassword=true`. The password gate read the node through
+  `DOM.requestNode`, which answers nodeId 0 until something has fetched the
+  DOM document, and an a11y snapshot never does; the gate then failed
+  closed. It now reads the node with `DOM.describeNode` (as the keystroke
+  gate already did), which needs no fetched document. The shared password
+  classifier (also used by `key_type`/`send_keys`) got stricter on the way:
+  any element whose `type` attribute is `password` counts, not only an
+  `<input>` — a design-system `<x-pass type="password">` whose real field sits
+  in a closed shadow root is refused — and every attribute is read, so a decoy
+  duplicate `type` ahead of the real one cannot mask it. The real-Chrome test
+  fills a field by ref from a fresh snapshot, and checks that the password
+  field reached the same way, and a closed-shadow password component, are
+  still refused.
+
 - `select_option` reported `applied: 'no'` ("the page overrode it") for
   selections that had landed: a multi-select whose values were listed in a
   different order than the document holds them, or with a value listed twice.

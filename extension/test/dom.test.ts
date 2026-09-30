@@ -1,11 +1,9 @@
 /**
- * `fill`'s password gate reads the target's `type` attribute from the browser
- * DOM via CDP `DOM.getAttributes` (a flat `[name, value, …]` list) rather than
- * a page-readable `this.type` getter, so a hostile page can't shadow the gate
- * with a throwing or lying accessor. `attributesIndicatePassword` is the pure
- * decision over that list; the chrome-bound read around it is exercised
- * manually / via the daemon e2e harness. These tests pin the fail-closed
- * semantics that the gate depends on.
+ * `fill`'s password gate reads the target's tag and `type` from the browser
+ * DOM via CDP `DOM.describeNode` rather than a page-readable `this.type`
+ * getter, so a hostile page can't shadow the gate with a throwing or lying
+ * accessor. The pure decision is focus.ts:domNodeIsPassword (tested there);
+ * `targetIsPasswordField` pins the read around it and its fail-closed rule.
  *
  * `dom.ts` imports `cdp.ts`, which registers `chrome.*` listeners at module
  * load, so we stub the minimal surface and import the module dynamically once
@@ -14,7 +12,7 @@
 
 import { beforeAll, describe, expect, it } from 'vitest';
 
-let attributesIndicatePassword: (attrs: readonly string[] | null | undefined) => boolean;
+let targetIsPasswordField: (tabId: number, objectId: string) => Promise<boolean>;
 let ensureFocusLanded: (focused: boolean | undefined) => void;
 let CLICK_FN: string;
 let FILL_READBACK_FN: string;
@@ -28,7 +26,7 @@ beforeAll(async () => {
     debugger: { onDetach: { addListener() {} } },
   };
   ({
-    attributesIndicatePassword,
+    targetIsPasswordField,
     ensureFocusLanded,
     CLICK_FN,
     click,
@@ -36,7 +34,7 @@ beforeAll(async () => {
     DEEPEST_ACTIVE_ELEMENT_EXPR,
     classifyApplied,
   } = (await import('../src/tools/dom.js')) as unknown as {
-    attributesIndicatePassword: typeof attributesIndicatePassword;
+    targetIsPasswordField: typeof targetIsPasswordField;
     ensureFocusLanded: typeof ensureFocusLanded;
     CLICK_FN: string;
     click: typeof click;
@@ -46,39 +44,49 @@ beforeAll(async () => {
   });
 });
 
-describe('attributesIndicatePassword', () => {
-  it('flags an explicit type=password', () => {
-    expect(attributesIndicatePassword(['type', 'password'])).toBe(true);
-    expect(attributesIndicatePassword(['id', 'pw', 'type', 'password', 'name', 'p'])).toBe(true);
+describe("targetIsPasswordField (fill's up-front gate)", () => {
+  function answer(node: unknown) {
+    const calls: string[] = [];
+    (globalThis as unknown as { chrome: Record<string, unknown> }).chrome = {
+      ...(globalThis as unknown as { chrome: Record<string, unknown> }).chrome,
+      debugger: {
+        onDetach: { addListener() {} },
+        async sendCommand(_t: unknown, method: string) {
+          calls.push(method);
+          if (method === 'DOM.describeNode') return { node };
+          // What Chrome answers when nothing has fetched the document yet — the
+          // state right after an a11y snapshot. Must not be consulted at all.
+          if (method === 'DOM.requestNode') return { nodeId: 0 };
+          return {};
+        },
+      },
+    };
+    return calls;
+  }
+
+  it('passes a plain text field reached by @eN before any DOM.getDocument', async () => {
+    // requestNode's nodeId 0 made this fail closed as password_field, and the
+    // error told the agent to pass allowPassword=true.
+    const calls = answer({ nodeName: 'INPUT', attributes: ['id', 'name', 'type', 'text'] });
+    await expect(targetIsPasswordField(1, 'obj')).resolves.toBe(false);
+    expect(calls).toEqual(['DOM.describeNode']);
   });
 
-  it('matches case-insensitively and trims, per HTML content-attribute rules', () => {
-    expect(attributesIndicatePassword(['type', 'PASSWORD'])).toBe(true);
-    expect(attributesIndicatePassword(['type', 'Password'])).toBe(true);
-    expect(attributesIndicatePassword(['TYPE', 'password'])).toBe(true);
-    expect(attributesIndicatePassword(['type', '  password  '])).toBe(true);
+  it('refuses a password field, however its type is cased', async () => {
+    answer({ nodeName: 'input', attributes: ['type', 'PassWord'] });
+    await expect(targetIsPasswordField(1, 'obj')).resolves.toBe(true);
   });
 
-  it('does not flag ordinary fields', () => {
-    expect(attributesIndicatePassword(['type', 'text'])).toBe(false);
-    expect(attributesIndicatePassword(['type', 'email'])).toBe(false);
-    expect(attributesIndicatePassword(['placeholder', 'password'])).toBe(false);
+  it('refuses a password-typed custom host whose closed shadow root hides the field', async () => {
+    answer({ nodeName: 'X-PASS', attributes: ['type', 'password'] });
+    await expect(targetIsPasswordField(1, 'obj')).resolves.toBe(true);
   });
 
-  it('treats a present-but-typeless element as ordinary (defaults to text)', () => {
-    expect(attributesIndicatePassword([])).toBe(false);
-    expect(attributesIndicatePassword(['id', 'x', 'class', 'y'])).toBe(false);
-  });
-
-  it('fails closed when the attribute list could not be read', () => {
-    expect(attributesIndicatePassword(null)).toBe(true);
-    expect(attributesIndicatePassword(undefined)).toBe(true);
-  });
-
-  it('ignores a dangling final name with no value', () => {
-    // A malformed odd-length list must not throw; the trailing name is skipped.
-    expect(attributesIndicatePassword(['type'])).toBe(false);
-    expect(attributesIndicatePassword(['id', 'x', 'type'])).toBe(false);
+  it('fails closed on a node it cannot classify', async () => {
+    answer({ nodeName: 'INPUT', attributes: 'type=password' });
+    await expect(targetIsPasswordField(1, 'obj')).resolves.toBe(true);
+    answer(undefined);
+    await expect(targetIsPasswordField(1, 'obj')).resolves.toBe(true);
   });
 });
 

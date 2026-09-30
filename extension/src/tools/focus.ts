@@ -72,21 +72,34 @@ export function focusedBackendNodeIds(rawNodes: unknown): number[] | null {
 }
 
 /** Browser-DOM password classification. null means the node could not be
- * classified safely; false is a well-formed non-password node. */
+ * classified safely; false is a well-formed non-password node.
+ *
+ * ANY element with a `type` attribute of `password` counts, not only an
+ * `<input>`: a design-system `<x-pass type="password">` with a CLOSED shadow
+ * root delegates focus to the real field inside, and neither the host's tag
+ * nor fill's active-element walk (which cannot open a closed root) sees it —
+ * the host's own `type` is the only tell. A prefixed `x:input` is still an
+ * input. EVERY attribute is scanned: a page can put a decoy `TYPE=text` (a
+ * differently-cased or namespaced duplicate) ahead of the real one.
+ * Over-refusing an odd element is harmless; missing a password field is not. */
 export function domNodeIsPassword(raw: unknown): boolean | null {
   if (!raw || typeof raw !== 'object') return null;
   const node = raw as DOMNode;
   if (typeof node.nodeName !== 'string') return null;
-  if (node.attributes !== undefined && !Array.isArray(node.attributes)) return null;
-  if (node.nodeName.toUpperCase() !== 'INPUT') return false;
+  if (node.attributes === undefined) {
+    // Can't see an input's attributes: unknown. Anything else (a document, a
+    // text node) simply has none.
+    return /(^|:)input$/i.test(node.nodeName) ? null : false;
+  }
   if (!Array.isArray(node.attributes)) return null;
+  let password = false;
   for (let i = 0; i + 1 < node.attributes.length; i += 2) {
     const name = node.attributes[i];
     const value = node.attributes[i + 1];
     if (typeof name !== 'string' || typeof value !== 'string') return null;
-    if (name.toLowerCase() === 'type') return value.trim().toLowerCase() === 'password';
+    if (/(^|:)type$/i.test(name) && value.trim().toLowerCase() === 'password') password = true;
   }
-  return false;
+  return password;
 }
 
 /** Input types that cannot hold typed text at all. Everything else — including
