@@ -19,9 +19,6 @@ import { ensureStillAllowed } from './gates.js';
 import { getRef, isRef } from './refs.js';
 import { budgetLeft, OBSERVE_RESERVE_MS } from './budget.js';
 import { CREATE_QUIESCENCE_PROBE, OBSERVE_ELEMENT_FN } from './quiescence.js';
-import { READ_TEXT_FN } from './text.js';
-
-export { READ_TEXT_FN } from './text.js';
 
 const POLL_MS = 250;
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -131,7 +128,7 @@ export function parseWaitFor(raw: unknown, tool: string): WaitSpec | null {
 /** `unknown` = no trustworthy reading this tick (the probe threw in the page,
  * returned nonsense, or a navigation took its document away). A present-wait
  * keeps waiting on it, and so must an absent-wait: absence was not shown. */
-export type SelectorVisibility = 'visible' | 'hidden' | 'unknown';
+export type SelectorVisibility = 'visible' | 'hidden' | 'unknown' | 'destroyed';
 
 /** Page-side half of a CSS-selector wait, over EVERY match: is any of them laid
  * out? Only `{visible, total}` leaves the page — no node, text or attribute.
@@ -169,16 +166,22 @@ export const SELECTOR_VISIBILITY_FN =
 
 const WAIT_GROUP = 'sallyport-wait';
 
-async function nodeHasBox(tabId: number, params: Record<string, unknown>): Promise<boolean> {
+async function nodeVisibility(
+  tabId: number,
+  params: Record<string, unknown>,
+): Promise<SelectorVisibility> {
   try {
     const box = await cdp<{ model?: { width: number; height: number } }>(
       tabId,
       'DOM.getBoxModel',
       params,
     );
-    return !!box.model && box.model.width > 0 && box.model.height > 0;
-  } catch {
-    return false; // no box model — display:none / detached; keep waiting
+    return box.model && box.model.width > 0 && box.model.height > 0 ? 'visible' : 'hidden';
+  } catch (e) {
+    // "Could not compute box model" (display:none, detached-but-alive) is
+    // hidden — keep waiting. A node the page DESTROYED is not going to come
+    // back, and `ensureRefStillExists` only checked once, before the loop.
+    return looksLikeMissingNodeError(e) ? 'destroyed' : 'hidden';
   }
 }
 
@@ -201,7 +204,7 @@ async function selectorVisibility(tabId: number, selector: string): Promise<Sele
         `wait: unknown ref "${selector}" for tab ${tabId} — run snapshot first`,
       );
     }
-    return (await nodeHasBox(tabId, { backendNodeId: r.backendDOMNodeId })) ? 'visible' : 'hidden';
+    return nodeVisibility(tabId, { backendNodeId: r.backendDOMNodeId });
   }
   let v: unknown;
   try {
@@ -238,25 +241,48 @@ async function selectorVisibility(tabId: number, selector: string): Promise<Sele
   return 'unknown';
 }
 
-/** Does the page's visible text contain `text`? Re-resolves <body> on every
- * poll — SPAs replace it. Fixed probe function, same as read_text. */
-async function textPresent(tabId: number, text: string): Promise<boolean> {
-  const doc = await cdp<{ root: { nodeId: number } }>(tabId, 'DOM.getDocument', { depth: 0 });
-  const q = await cdp<{ nodeId: number }>(tabId, 'DOM.querySelector', {
-    nodeId: doc.root.nodeId,
-    selector: 'body',
-  });
-  if (!q.nodeId) return false;
-  const resolved = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
-    nodeId: q.nodeId,
-  });
-  if (!resolved.object.objectId) return false;
-  const out = await cdp<{ result: { value?: string } }>(tabId, 'Runtime.callFunctionOn', {
-    objectId: resolved.object.objectId,
-    functionDeclaration: READ_TEXT_FN,
-    returnByValue: true,
-  });
-  return (out.result.value ?? '').includes(text);
+/** Page-side half of a text wait: the body's RENDERED text. `innerText` only —
+ * READ_TEXT_FN's `textContent` fallback is right for read_text (a page with no
+ * layout still has words to read) and wrong here: before hydration a SPA's
+ * body is an empty root plus inline `<script>` state, and "wait for text
+ * 'Dashboard'" matched the JSON in that script before anything rendered.
+ * Fixed literal, no argument; only the string comes back. */
+// And '' for a body that is not RENDERED: per spec innerText of a
+// display:none element (an anti-FOUC `<body hidden>` until hydration) IS its
+// textContent, script source included. A display:contents body has no boxes of
+// its own but its children render, so it still reads.
+export const VISIBLE_TEXT_FN =
+  'function() {' +
+  " if (typeof this.getClientRects === 'function' && this.getClientRects().length === 0) {" +
+  '   var w = this.ownerDocument && this.ownerDocument.defaultView;' +
+  "   if (!w || w.getComputedStyle(this).display !== 'contents') return '';" +
+  ' }' +
+  " return this.innerText || ''; }";
+
+/** Does the page's visible text contain `text`? `null` = no reading this tick
+ * (a navigation took the document between the two calls): neither present
+ * nor, under `absent`, gone. Re-resolves <body> on every poll — SPAs replace
+ * it. */
+async function textPresent(tabId: number, text: string): Promise<boolean | null> {
+  try {
+    const body = await cdp<{ result?: { objectId?: string }; exceptionDetails?: unknown }>(
+      tabId,
+      'Runtime.evaluate',
+      { expression: 'document.body', objectGroup: WAIT_GROUP },
+    );
+    if (body.exceptionDetails) return null;
+    if (!body.result?.objectId) return false; // no body yet: no text on the page
+    const out = await cdp<{ result?: { value?: unknown }; exceptionDetails?: unknown }>(
+      tabId,
+      'Runtime.callFunctionOn',
+      { objectId: body.result.objectId, functionDeclaration: VISIBLE_TEXT_FN, returnByValue: true },
+    );
+    const value = out.exceptionDetails ? undefined : out.result?.value;
+    return typeof value === 'string' ? value.includes(text) : null;
+  } catch (e) {
+    if (looksLikeLostContextError(e)) return null;
+    throw e;
+  }
 }
 
 /** Is the node behind a `@eN` still in the document?
@@ -289,12 +315,20 @@ async function ensureRefStillExists(tabId: number, ref: string): Promise<void> {
 /** Poll until the spec holds (AND across given conditions; `absent` inverts
  * both). A timeout is NOT an error: returns {found:false, elapsedMs} so the
  * caller decides what to do next. */
-export async function pollFor(tabId: number, spec: WaitSpec): Promise<WaitOutcome> {
-  if (spec.selector === null || isRef(spec.selector)) return pollLoop(tabId, spec);
+/** `seen.url` is set to the url of the page each tick actually read (the
+ * re-gate's answer), so a caller can report where the wait ENDED, not where
+ * it began. */
+export async function pollFor(
+  tabId: number,
+  spec: WaitSpec,
+  seen?: { url?: string },
+): Promise<WaitOutcome> {
+  const usesHandles = spec.text !== null || (spec.selector !== null && !isRef(spec.selector));
+  if (!usesHandles) return pollLoop(tabId, spec, seen);
   try {
-    return await pollLoop(tabId, spec);
+    return await pollLoop(tabId, spec, seen);
   } finally {
-    // One `document` handle per tick, all in this group.
+    // One `document`/`body` handle per tick, all in this group.
     try {
       await cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: WAIT_GROUP });
     } catch {
@@ -303,7 +337,11 @@ export async function pollFor(tabId: number, spec: WaitSpec): Promise<WaitOutcom
   }
 }
 
-async function pollLoop(tabId: number, spec: WaitSpec): Promise<WaitOutcome> {
+async function pollLoop(
+  tabId: number,
+  spec: WaitSpec,
+  seen?: { url?: string },
+): Promise<WaitOutcome> {
   // Only for the PRESENT condition. Under `absent:true` a destroyed node is
   // precisely what is being waited for, and the loop below already reports it
   // as found — turning it into an error there would break the tool.
@@ -317,20 +355,21 @@ async function pollLoop(tabId: number, spec: WaitSpec): Promise<WaitOutcome> {
     // preceded this wait followed a link off-site. One entry check must not
     // license half a minute of reading whatever the tab drifted onto
     // (invariant #3); `find` already worked this way.
-    await ensureStillAllowed(tabId);
+    const url = await ensureStillAllowed(tabId);
+    if (seen) seen.url = url;
     let ok: boolean;
+    const sel = spec.selector === null ? null : await selectorVisibility(tabId, spec.selector);
     if (spec.absent) {
-      // Gone-condition: selector invisible/detached AND text not on page.
-      const selGone =
-        spec.selector === null || (await selectorVisibility(tabId, spec.selector)) === 'hidden';
-      const textGone = !selGone || spec.text === null || !(await textPresent(tabId, spec.text));
-      ok = selGone && textGone;
+      // Gone-condition: selector invisible/detached AND text not on page. An
+      // unreadable tick (`unknown`, text `null`) is never proof of absence.
+      const selGone = sel === null || sel === 'hidden' || sel === 'destroyed';
+      const text = !selGone || spec.text === null ? false : await textPresent(tabId, spec.text);
+      ok = selGone && text === false;
     } else {
-      const selOk =
-        spec.selector === null || (await selectorVisibility(tabId, spec.selector)) === 'visible';
+      if (sel === 'destroyed') throw staleRefError('wait', spec.selector!);
+      const selOk = sel === null || sel === 'visible';
       // Short-circuit: skip the text probe while the selector is failing.
-      const textOk = !selOk || spec.text === null || (await textPresent(tabId, spec.text));
-      ok = selOk && textOk;
+      ok = selOk && (spec.text === null || (await textPresent(tabId, spec.text)) === true);
     }
     const elapsedMs = Date.now() - start;
     if (ok) return { found: true, elapsedMs };
@@ -351,13 +390,16 @@ export async function runEmbeddedWait(
   observing = false,
 ): Promise<WaitOutcome> {
   const { spec, limited } = budgetWaitSpec(requested, startedAt, Date.now(), observing);
+  const began = Date.now();
   let out: WaitOutcome;
   try {
     out = await pollFor(tabId, spec);
   } catch (e) {
     out = {
       found: false,
-      elapsedMs: 0,
+      // How long it ran before failing — a drift after 20 s of polling is not
+      // a wait that ended at once.
+      elapsedMs: Date.now() - began,
       error: e instanceof Error ? e.message : String(e),
       reason: classifyWaitError(e),
     };
@@ -366,6 +408,16 @@ export async function runEmbeddedWait(
 }
 
 // --- settle: DOM quiescence -------------------------------------------------
+
+/** The shortest timeoutMs in which a settle over `stableMs` CAN succeed: a
+ * window of stableMs opened by the first sample, plus one tick for that sample
+ * (and a second sample at stableMs 0). Below it a static page runs out the clock and
+ * reads as "never quiesced" — a false verdict about the page. Pure. */
+export function minSettleTimeoutMs(stableMs: number): number {
+  // The window opens at the first sample, a tick in; settleFor waits out a
+  // window that closes inside the budget, so latency needs no extra margin.
+  return Math.max(stableMs, POLL_MS) + POLL_MS;
+}
 
 export type SettleSpec = {
   stableMs: number;
@@ -470,7 +522,11 @@ async function createObserver(
  * A `root` element dies with its document too, and there is no re-resolving it
  * from here — so a scoped wait whose creation fails or whose context is lost
  * falls back to watching the whole (new) document: stricter, never blinder. */
-export async function settleFor(tabId: number, spec: SettleSpec): Promise<SettleOutcome> {
+export async function settleFor(
+  tabId: number,
+  spec: SettleSpec,
+  seen?: { url?: string },
+): Promise<SettleOutcome> {
   const start = performance.now();
   let state = INITIAL_SETTLE_STATE;
   let objectId: string | undefined;
@@ -479,7 +535,8 @@ export async function settleFor(tabId: number, spec: SettleSpec): Promise<Settle
   const objectGroup = 'sallyport-settle';
   try {
     for (;;) {
-      await ensureStillAllowed(tabId);
+      const url = await ensureStillAllowed(tabId);
+      if (seen) seen.url = url;
       if (objectId === undefined) {
         objectId = await createObserver(tabId, objectGroup, root);
         if (objectId === undefined) root = undefined;
@@ -512,6 +569,16 @@ export async function settleFor(tabId: number, spec: SettleSpec): Promise<Settle
       if (step.settled) return { settled: true, elapsedMs: Math.round(now - start) };
       const elapsedMs = now - start;
       if (elapsedMs + POLL_MS > spec.timeoutMs) {
+        // A quiet window already open that closes INSIDE the budget gets its
+        // closing sample: the POLL_MS grid plus per-tick latency (tab read,
+        // sample round-trip) otherwise let a static page run out the clock a
+        // few ms short and read as "never quiesced". Bounded: the window either
+        // closes on that sample or a mutation resets it and the next pass exits.
+        const closeAt = state.stableSince === null ? null : state.stableSince + spec.stableMs;
+        if (closeAt !== null && closeAt <= start + spec.timeoutMs && closeAt > now) {
+          await new Promise((r) => setTimeout(r, closeAt - now));
+          continue;
+        }
         // No live observer on the last tick: the context may have died with a
         // CLOSED tab, not a navigation — the gate says so (tab_gone) instead of
         // an ordinary "never quiesced".

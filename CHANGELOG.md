@@ -24,6 +24,31 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Waits now report what actually happened:
+  - a navigation mid-tick (a click that submits, then `waitFor` text) no
+    longer fails the wait with a raw CDP error; the tick counts as unread and
+    the next one reads the new page, and an unread tick never counts as the
+    text being gone;
+  - an `@eN` the page destroys during a present-wait fails at once as
+    `bad_ref` instead of polling out its budget and answering `timeout`
+    ("longer may help");
+  - a text wait matches RENDERED text only: before hydration a SPA's body is
+    an empty root plus inline script state (or hidden outright), and "wait
+    for 'Dashboard'" matched the JSON in that script before anything
+    rendered;
+  - a folded embedded-wait failure reports how long it ran, not `0`;
+  - `wait_for` and `settle` report the url their last read came from, not the
+    one the call started on (the result and the audit row);
+  - `settle` could run out the clock on a static page and call it "never
+    quiesced": when its `timeoutMs` could not fit the `stableMs` window, or
+    when per-tick latency pushed the window's closing sample a few ms past
+    the last poll. A window that closes inside the budget now gets its closing
+    sample; an explicit timeout that cannot fit the window is `bad_args`, and a
+    defaulted one is stretched to fit;
+  - the `domain_not_allowed` recovery hint names the other cause: a tab that
+    navigated off the allowlist DURING the call should go back, not have the
+    allowlist widened for wherever it drifted.
+
 - `reveal` and `scroll` on a container or page with `scroll-behavior: smooth`
   (Bootstrap 5 sets it on `:root`, Tailwind's `scroll-smooth` on anything)
   read the scroll position back before the browser's animation had moved it.

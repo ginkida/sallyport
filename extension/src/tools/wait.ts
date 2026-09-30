@@ -26,6 +26,9 @@ export const waitFor: Tool = async (args) => {
   await ensureAllowed(tab.url);
   await attach(tab.id!);
 
-  const outcome = await pollFor(tab.id!, { selector, text, timeoutMs, absent });
-  return { tabId: tab.id, url: tab.url, data: outcome };
+  // The url the LAST tick read: a wait that outlived a same-site navigation
+  // ended somewhere else, and the result and audit row should say where.
+  const seen: { url?: string } = {};
+  const outcome = await pollFor(tab.id!, { selector, text, timeoutMs, absent }, seen);
+  return { tabId: tab.id, url: seen.url ?? tab.url, data: outcome };
 };

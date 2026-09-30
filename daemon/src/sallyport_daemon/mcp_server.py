@@ -44,7 +44,12 @@ _WAIT_FOR_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "selector": {"type": "string", "description": "CSS selector or @eN ref"},
-        "text": {"type": "string", "description": "Substring of the page's visible text"},
+        "text": {
+            "type": "string",
+            "description": (
+                "Substring of the page's RENDERED text (innerText; not script or hidden source)"
+            ),
+        },
         "timeoutMs": {"type": "integer", "minimum": 0, "maximum": 30000, "default": 10000},
         "absent": {
             "type": "boolean",
@@ -1076,11 +1081,14 @@ TOOLS: list[Tool] = [
         name="wait_for",
         description=(
             "Wait until a CSS selector (or @eN ref) is present AND visible, "
-            "and/or until the page's visible text contains a substring — the "
+            "and/or until the page's rendered text (innerText) contains a substring — the "
             "replacement for blind sleeps between actions. absent=true inverts "
             "both: wait until the selector/text is GONE (spinner finished, "
             "modal closed). A CSS selector counts as present if ANY of its matches "
-            "is laid out, and as gone only when NONE is — so found=true does not "
+            "is laid out, and as gone only when NONE is (visible = a non-zero "
+            "layout box, so visibility:hidden and opacity:0 still count as "
+            "visible — for a fade, wait for a state class such as .modal.show "
+            "with absent=true). found=true does not "
             "mean the FIRST match (the one click/fill/get_state act on) is "
             "visible. A malformed selector fails at once with bad_args. Polls "
             "every 250 ms up to timeoutMs (default 10000, "
@@ -1100,7 +1108,13 @@ TOOLS: list[Tool] = [
             "type": "object",
             "properties": {
                 "selector": {"type": "string", "description": "CSS selector or @eN ref"},
-                "text": {"type": "string", "description": "Substring of the page's visible text"},
+                "text": {
+                    "type": "string",
+                    "description": (
+                        "Substring of the page's RENDERED text "
+                        "(innerText; not script or hidden source)"
+                    ),
+                },
                 "timeoutMs": {
                     "type": "integer",
                     "minimum": 0,
@@ -1330,7 +1344,10 @@ TOOLS: list[Tool] = [
             "Does not track iframe/shadow-root contents, CSS animations or network activity. "
             "A navigation during the wait restarts it on the new page. "
             "Polls every 250 ms up to "
-            "timeoutMs (capped at 30000); stableMs is capped at 10000. Returns "
+            "timeoutMs (capped at 30000); stableMs is capped at 10000, and "
+            "timeoutMs must leave room for it (at least max(stableMs, 250) + "
+            "250 ms): an explicit timeoutMs too short is bad_args, a defaulted "
+            "one is stretched. Returns "
             "{settled, elapsedMs}. A page that never quiesces (live feed, a "
             "script rewriting text or attributes), or whose probe never yields a reading, returns "
             "settled=false at the cap — not an error; a page that navigates off the "

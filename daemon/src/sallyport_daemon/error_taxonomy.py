@@ -29,9 +29,12 @@ from types import MappingProxyType
 _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
     {
         "domain_not_allowed": (
-            "retryable=no; the page's domain isn't in the allowlist — the user must add it "
-            "in the extension popup (Allowlist tab); list_tabs shows which tabs you can "
-            "already drive."
+            "retryable=no; the page's domain isn't in the allowlist. If the tab was on an "
+            "allowlisted page when the call started, it navigated there DURING the call "
+            "(a redirect, an SSO bounce, an off-site link) — navigate back to an "
+            "allowlisted page instead of asking to widen the allowlist. Otherwise the user "
+            "must add it in the extension popup (Allowlist tab); list_tabs shows which "
+            "tabs you can already drive."
         ),
         "evaluate_not_allowed": (
             "retryable=no; this domain hasn't enabled evaluate — prefer the structured "

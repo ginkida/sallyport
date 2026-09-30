@@ -14,6 +14,8 @@ import {
   atScrollEdge,
   anyMatchVisible,
   budgetWaitSpec,
+  minSettleTimeoutMs,
+  VISIBLE_TEXT_FN,
   runEmbeddedWait,
   SELECTOR_VISIBILITY_FN,
   scrollStalled,
@@ -1196,5 +1198,222 @@ describe('scroll — atBottom after an embedded wait', () => {
       tabId: TAB,
     });
     expect((res.data as { atBottom: boolean }).atBottom).toBe(true);
+  });
+});
+
+describe('VISIBLE_TEXT_FN (text waits read RENDERED text only)', () => {
+  it('does not fall back to textContent, so script state is not "on the page"', () => {
+    // A SPA before hydration: nothing rendered, the words only in inline JSON.
+    const fn = new Function(`return (${VISIBLE_TEXT_FN});`)() as (this: unknown) => string;
+    expect(fn.call({ innerText: '', textContent: '{"title":"Dashboard"}' })).toBe('');
+    expect(fn.call({ innerText: 'Dashboard' })).toBe('Dashboard');
+  });
+});
+
+describe('VISIBLE_TEXT_FN — a body that is not rendered', () => {
+  const fn = () => new Function(`return (${VISIBLE_TEXT_FN});`)() as (this: unknown) => string;
+  const view = (display: string) => ({ defaultView: { getComputedStyle: () => ({ display }) } });
+
+  it('reads nothing from a display:none body, whose innerText IS its textContent', () => {
+    const body = {
+      getClientRects: () => [],
+      ownerDocument: view('none'),
+      innerText: '{"title":"Dashboard"}', // what Chrome returns for an unrendered element
+    };
+    expect(fn().call(body)).toBe('');
+  });
+
+  it('still reads a display:contents body, whose children render', () => {
+    const body = { getClientRects: () => [], ownerDocument: view('contents'), innerText: 'Hi' };
+    expect(fn().call(body)).toBe('Hi');
+  });
+});
+
+describe('minSettleTimeoutMs', () => {
+  it('fits two samples spanning the window on the poll grid, plus a tick', () => {
+    expect(minSettleTimeoutMs(0)).toBe(500);
+    expect(minSettleTimeoutMs(500)).toBe(750);
+    expect(minSettleTimeoutMs(9_800)).toBe(10_050);
+    expect(minSettleTimeoutMs(10_000)).toBe(10_250);
+  });
+});
+
+describe('pollFor — ticks that tell the truth', () => {
+  const SHOP = 'https://shop.example/cart';
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    installChrome([SHOP]);
+    await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  /** A text probe answering each of `texts` in turn; an Error rejects. */
+  function textProbe(texts: unknown[]) {
+    let i = 0;
+    return vi
+      .spyOn(chrome.debugger, 'sendCommand')
+      .mockImplementation(async (_t, method, params) => {
+        const p = params as { functionDeclaration?: string };
+        if (method === 'Runtime.evaluate') return { result: { objectId: 'body' } };
+        if (p?.functionDeclaration === VISIBLE_TEXT_FN) {
+          const r = texts[Math.min(i++, texts.length - 1)];
+          if (r instanceof Error) throw r;
+          return { result: { value: r } };
+        }
+        return {};
+      });
+  }
+
+  it('rides out a navigation that takes the body mid-tick, then finds the text', async () => {
+    textProbe([new Error('Cannot find context with specified id'), 'Welcome back']);
+    const pending = pollFor(TAB, {
+      selector: null,
+      text: 'Welcome',
+      timeoutMs: 1000,
+      absent: false,
+    });
+    await vi.runAllTimersAsync();
+    expect(await pending).toMatchObject({ found: true });
+  });
+
+  it('never reads a lost tick as the text being gone', async () => {
+    textProbe([new Error('Execution context was destroyed.'), 'Loading…', 'Done']);
+    const pending = pollFor(TAB, {
+      selector: null,
+      text: 'Loading',
+      timeoutMs: 2000,
+      absent: true,
+    });
+    await vi.runAllTimersAsync();
+    const out = await pending;
+    expect(out).toMatchObject({ found: true });
+    expect(out.elapsedMs).toBeGreaterThanOrEqual(500); // not on the lost tick at 0
+  });
+
+  it('fails a present-wait at once when its @eN is destroyed mid-wait', async () => {
+    const { newRef } = await import('../src/tools/refs.js');
+    const ref = '@' + newRef(TAB, 77, 'button', 'Save');
+    let boxes = 0;
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'DOM.describeNode') return { node: {} }; // alive before the loop
+      if (method === 'DOM.getBoxModel') {
+        if (boxes++ === 0) throw new Error('Could not compute box model.'); // hidden
+        throw new Error('No node found for given backend id'); // then destroyed
+      }
+      return {};
+    });
+    const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 10_000, absent: false });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'bad_ref' });
+    await vi.runAllTimersAsync();
+    await rejected;
+    expect(boxes).toBe(2); // two ticks, not the whole 10 s
+  });
+
+  it('counts a destroyed @eN as gone under absent', async () => {
+    const { newRef } = await import('../src/tools/refs.js');
+    const ref = '@' + newRef(TAB, 78, 'dialog', 'Saving');
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'DOM.getBoxModel') throw new Error('No node found for given backend id');
+      return {};
+    });
+    const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 1000, absent: true });
+    await vi.runAllTimersAsync();
+    expect(await pending).toMatchObject({ found: true });
+  });
+
+  it('reports how long a folded wait ran before it failed', async () => {
+    let gets = 0;
+    const tabsGet = chrome.tabs.get;
+    vi.spyOn(chrome.tabs, 'get').mockImplementation(async (id: number) =>
+      ++gets > 3 ? ({ id, url: 'https://sso.example/login' } as chrome.tabs.Tab) : tabsGet(id),
+    );
+    textProbe(['not yet']);
+    const pending = runEmbeddedWait(TAB, {
+      selector: null,
+      text: 'Done',
+      timeoutMs: 5000,
+      absent: false,
+    });
+    await vi.runAllTimersAsync();
+    const out = await pending;
+    expect(out.reason).toBe('domain_not_allowed');
+    expect(out.elapsedMs).toBeGreaterThanOrEqual(500);
+  });
+
+  it('reports the url its LAST tick read', async () => {
+    let gets = 0;
+    vi.spyOn(chrome.tabs, 'get').mockImplementation(
+      async (id: number) =>
+        ({ id, url: ++gets > 1 ? 'https://shop.example/item/42' : SHOP }) as chrome.tabs.Tab,
+    );
+    textProbe(['list', 'item 42']);
+    const seen: { url?: string } = {};
+    const pending = pollFor(
+      TAB,
+      { selector: null, text: 'item', timeoutMs: 1000, absent: false },
+      seen,
+    );
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(seen.url).toBe('https://shop.example/item/42');
+  });
+});
+
+describe('settle — a window that cannot fit its timeout', () => {
+  const SHOP = 'https://shop.example/cart';
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    installChrome([SHOP]);
+    await setAllowlist([{ pattern: 'shop.example', allowEvaluate: false, addedAt: 0 }]);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('refuses an explicit timeoutMs too short for stableMs, instead of calling the page busy', async () => {
+    const { settle } = await import('../src/tools/settle.js');
+    await expect(settle({ stableMs: 2000, timeoutMs: 1500, tabId: TAB })).rejects.toMatchObject({
+      code: 'bad_args',
+      message: expect.stringContaining('timeoutMs >= 2250'),
+    });
+  });
+
+  it('settles a static page when real per-tick latency eats the last grid slot', async () => {
+    // 40 ms to create the observer, 6 ms per sample: with a window that closes
+    // a few ms after the last POLL_MS tick, the loop used to exit first and
+    // call a static page "never quiesced".
+    const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method, params) => {
+      const p = params as { functionDeclaration?: string };
+      if (method === 'Runtime.evaluate') {
+        await delay(40);
+        return { result: { objectId: 'observer' } };
+      }
+      if (p?.functionDeclaration?.includes('sample')) {
+        await delay(6);
+        return { result: { value: 0 } };
+      }
+      return {};
+    });
+    const pending = settleFor(TAB, { stableMs: 10_000, timeoutMs: minSettleTimeoutMs(10_000) });
+    await vi.runAllTimersAsync();
+    expect((await pending).settled).toBe(true);
+  });
+
+  it('stretches a DEFAULTED timeout to fit, so a static page settles', async () => {
+    // stableMs 10000 against the 10000 default could never succeed.
+    const { settle } = await import('../src/tools/settle.js');
+    const pending = settle({ stableMs: 10_000, tabId: TAB });
+    await vi.runAllTimersAsync();
+    const res = await pending;
+    expect((res.data as { settled: boolean }).settled).toBe(true);
   });
 });

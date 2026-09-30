@@ -11,8 +11,10 @@
 import { BridgeError } from './errors.js';
 
 // Trimmed innerText preferred; fall back to textContent (hidden-but-present
-// nodes). Pinned as a const so read_text's two branches and the text-wait
-// probe can't drift apart. FIXED literal.
+// nodes). Pinned as a const so read_text's two branches and observe can't
+// drift apart. FIXED literal. The text WAIT deliberately does not use it
+// (poll.ts:VISIBLE_TEXT_FN, innerText only): for "is it on screen yet" the
+// fallback matched pre-hydration script JSON — don't unify them.
 export const READ_TEXT_FN =
   'function() { return (this.innerText || this.textContent || "").trim(); }';
 

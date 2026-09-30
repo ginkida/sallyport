@@ -118,3 +118,13 @@ def test_hints_are_single_compact_lines() -> None:
         hint = format_error_hint(code)
         assert hint is not None
         assert "\n" not in hint
+
+
+def test_domain_not_allowed_names_the_mid_call_drift() -> None:
+    """A wait/settle/reveal/find re-gates every tick: the tab can leave the
+    allowlist DURING the call. The hint must not only send the agent to ask
+    for a wider allowlist for whatever host it drifted onto."""
+    hint = format_error_hint("domain_not_allowed")
+    assert hint is not None
+    assert "DURING the call" in hint
+    assert "navigate back" in hint

@@ -1,7 +1,7 @@
 import { attach } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
-import { parseTimeoutMs, settleFor } from './poll.js';
+import { minSettleTimeoutMs, parseTimeoutMs, settleFor } from './poll.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
@@ -22,10 +22,25 @@ function parseStableMs(raw: unknown): number {
  * The quiescence probe is a fixed literal, so no allowEvaluate is needed. */
 export const settle: Tool = async (args) => {
   const stableMs = parseStableMs(args.stableMs);
-  const timeoutMs = parseTimeoutMs(args.timeoutMs, 'settle');
+  const need = minSettleTimeoutMs(stableMs);
+  let timeoutMs = parseTimeoutMs(args.timeoutMs, 'settle');
+  if (timeoutMs < need) {
+    // Given explicitly, too short is the caller's contradiction: say so rather
+    // than run out the clock and call a static page busy. Defaulted, it is ours
+    // to fix (stableMs 10000 against the 10000 default).
+    if (args.timeoutMs !== undefined) {
+      throw new BridgeError(
+        'bad_args',
+        `settle: timeoutMs ${timeoutMs} cannot fit a ${stableMs} ms quiet window — ` +
+          `use timeoutMs >= ${need} or a smaller stableMs`,
+      );
+    }
+    timeoutMs = need;
+  }
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
-  const out = await settleFor(tab.id!, { stableMs, timeoutMs });
-  return { tabId: tab.id, url: tab.url, data: out };
+  const seen: { url?: string } = {};
+  const out = await settleFor(tab.id!, { stableMs, timeoutMs }, seen);
+  return { tabId: tab.id, url: seen.url ?? tab.url, data: out };
 };
