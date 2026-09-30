@@ -314,7 +314,7 @@ export function planError(f: SelectFailure): BridgeError {
   );
 }
 
-export const selectOption: Tool = async (args) => {
+export const selectOption: Tool = async (args, ctx) => {
   const selector = String(args.selector || '');
   if (!selector) throw new BridgeError('bad_args', 'select_option: selector required');
   const spec = buildSpec(args);
@@ -338,8 +338,10 @@ export const selectOption: Tool = async (args) => {
   }
   if (!r.ok) throw planError(r);
 
-  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+  const wait = waitSpec
+    ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+    : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   return {
     tabId: tab.id,
     url: tab.url,

@@ -335,7 +335,7 @@ function offViewportMessage(
   );
 }
 
-export const mouseClick: Tool = async (args) => {
+export const mouseClick: Tool = async (args, ctx) => {
   const target = parsePointerTarget(args, 'mouse_click');
 
   const button = String(args.button ?? 'left').toLowerCase();
@@ -365,8 +365,12 @@ export const mouseClick: Tool = async (args) => {
     const { x, y } = target;
     const info = await validateViewportPoint(tab.id!, x, y, 'mouse_click');
     await dispatchClick(tab.id!, x, y, button, clickCount);
-    const coordWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-    const coordObserved = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+    const coordWait = waitSpec
+      ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+      : null;
+    const coordObserved = observeSpec
+      ? await runObserve(tab.id!, observeSpec, ctx?.startedAt)
+      : null;
     return {
       tabId: tab.id,
       url: tab.url,
@@ -397,8 +401,10 @@ export const mouseClick: Tool = async (args) => {
   }
 
   await dispatchClick(tab.id!, point.x, point.y, button, clickCount);
-  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+  const wait = waitSpec
+    ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+    : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   // AFTER the observation: it reset the ref space, so a ref minted while aiming
   // would be dead in the very payload that carries it.
   const hitTargetRef = observed ? remintHitTarget(tab.id!, hitBackendNodeId, point) : aimedRef;
@@ -439,7 +445,7 @@ export const mouseClick: Tool = async (args) => {
  * nothing is activated. Pair with embedded `waitFor` to hover→wait-for-menu in
  * one call. The :hover state is transient — a synthetic mouseMoved holds it only
  * until the next mouse move. */
-export const hover: Tool = async (args) => {
+export const hover: Tool = async (args, ctx) => {
   const target = parsePointerTarget(args, 'hover');
   const waitSpec = parseWaitFor(args.waitFor, 'hover');
   const observeSpec = parseObserve(args.observe, 'hover');
@@ -452,8 +458,12 @@ export const hover: Tool = async (args) => {
     const { x, y } = target;
     const info = await validateViewportPoint(tab.id!, x, y, 'hover');
     await dispatchHover(tab.id!, x, y);
-    const coordWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-    const coordObserved = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+    const coordWait = waitSpec
+      ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+      : null;
+    const coordObserved = observeSpec
+      ? await runObserve(tab.id!, observeSpec, ctx?.startedAt)
+      : null;
     return {
       tabId: tab.id,
       url: tab.url,
@@ -482,8 +492,10 @@ export const hover: Tool = async (args) => {
   }
 
   await dispatchHover(tab.id!, point.x, point.y);
-  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+  const wait = waitSpec
+    ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+    : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   // See mouse_click: re-mint after the observation reset the ref space.
   const hitTargetRef = observed ? remintHitTarget(tab.id!, hitBackendNodeId, point) : aimedRef;
 

@@ -24,6 +24,21 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A call could run past the daemon's 60 s request timeout: `navigate`,
+  `reload` and `history_go` may spend 30 s loading, and an embedded `waitFor`
+  then got a fresh 30 s on top, followed by an unbounded `observe` snapshot
+  (`send_keys` typing many segments on a heavy page could do the same). The
+  agent received `extension_timeout` ("may still be running") for work that
+  had finished, and in broker mode a tab the call had just created was never
+  recorded as owned, so its agent could not name it. Every call now has a 50 s
+  budget, counted from when the extension received it (time queued behind
+  another call on the same tab included). An embedded wait gets only what is
+  left, 5 s less when an `observe` follows, and reports `budgetLimited: true`
+  with the time it actually had. An `observe` that would start after the
+  budget reports `skipped: 'budget'` instead of reading. The page-load
+  watchdog shrinks to what is left too, with a 1 s floor, so an overdrawn call
+  fails fast with the retryable `timeout`.
+
 - `wait_for` and every embedded `waitFor` judged a CSS selector by its FIRST
   match only. With one spinner per widget, hidden by a class as each finished,
   `absent=true` answered "gone" as soon as the first one hid while the rest

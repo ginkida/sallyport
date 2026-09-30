@@ -120,6 +120,7 @@ function onTab<T>(tabId: number | undefined, run: () => Promise<T>): Promise<T> 
 }
 
 export async function runTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  const startedAt = Date.now();
   const settings = await getSettings();
   if (settings.paused) {
     throw new BridgeError('paused', 'Sallyport is paused — resume from the popup');
@@ -164,7 +165,7 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
     }
     const result = await onTab(
       typeof callArgs.tabId === 'number' ? callArgs.tabId : undefined,
-      () => tool(callArgs, { client }),
+      () => tool(callArgs, { client, startedAt }),
     );
     audit.ok = true;
     if (result.tabId !== undefined) {

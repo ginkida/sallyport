@@ -9,6 +9,7 @@ import { attach } from './cdp.js';
 import { clearArmedDialog } from './dialog-capture.js';
 import { ensureAllowed, hostnameOf } from './gates.js';
 import { parseObserve, runObserve } from './observe.js';
+import { loadTimeoutMs } from './budget.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { clearRefsForTab } from './refs.js';
 import { agentTabIds, filterTabsToOwned, getEpoch, isBrokerMode, mintEpoch } from './ownership.js';
@@ -227,7 +228,7 @@ export const navigate: Tool = async (args, ctx) => {
       await chrome.tabs.update(tab.id!, { url });
     }
   }
-  await waitForLoad(tab.id!, 'navigate');
+  await waitForLoad(tab.id!, 'navigate', loadTimeoutMs(ctx?.startedAt, Date.now()));
   // Navigation invalidates any refs we held for this tab, and any pending
   // dialog arm — a one-shot is scoped to the page it was set on, not a
   // standing grant that should still apply once the tab has moved on.
@@ -251,14 +252,14 @@ export const navigate: Tool = async (args, ctx) => {
     // (best-effort) — no need to call it again: if it succeeded this is a
     // no-op either way, and if it failed, runEmbeddedWait's own CDP calls
     // will surface that on their own (same as if attach() had never run).
-    wait = await runEmbeddedWait(tab.id!, waitSpec);
+    wait = await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec);
   }
   // Report where the tab ACTUALLY is, not the URL we were handed. An SSO bounce,
   // a consent wall, a shortener or an expired session all land somewhere else,
   // and echoing the request made that invisible until some later call surprised
   // the agent — and wrote the wrong URL into the audit row. Read after the
   // embedded wait so the answer describes the tab as the call returns it.
-  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   const landed = await currentUrl(tab.id!);
   const finalUrl = landed ?? url;
   return {
@@ -301,7 +302,7 @@ export const closeTab: Tool = async (args) => {
   return { tabId, url: tab.url, data: { closed: tabId } };
 };
 
-export const reload: Tool = async (args) => {
+export const reload: Tool = async (args, ctx) => {
   const waitSpec = parseWaitFor(args.waitFor, 'reload');
   const observeSpec = parseObserve(args.observe, 'reload');
   const tab = await resolveTab(args);
@@ -317,7 +318,7 @@ export const reload: Tool = async (args) => {
   // must not block the reload the agent actually asked for.
   await bestEffortAttach(tab.id!);
   await chrome.tabs.reload(tab.id!, { bypassCache });
-  await waitForLoad(tab.id!, 'reload');
+  await waitForLoad(tab.id!, 'reload', loadTimeoutMs(ctx?.startedAt, Date.now()));
   // A reload invalidates any refs we may have built for this tab, and any
   // pending dialog arm (see the identical note in navigate).
   clearRefsForTab(tab.id!);
@@ -327,8 +328,10 @@ export const reload: Tool = async (args) => {
   // so a reload was ALWAYS followed by a wait and/or a re-snapshot. Folding the
   // wait in removes that second call. Errors inside it stay non-fatal
   // (runEmbeddedWait), so a bad selector can't retroactively fail the reload.
-  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+  const wait = waitSpec
+    ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+    : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   const landed = await currentUrl(tab.id!);
   const finalUrl = landed ?? before;
   return {

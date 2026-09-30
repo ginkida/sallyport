@@ -17,6 +17,7 @@ import {
 import { BridgeError, invalidSelectorError, staleRefError } from './errors.js';
 import { ensureStillAllowed } from './gates.js';
 import { getRef, isRef } from './refs.js';
+import { budgetLeft, OBSERVE_RESERVE_MS } from './budget.js';
 import { CREATE_QUIESCENCE_PROBE, OBSERVE_ELEMENT_FN } from './quiescence.js';
 import { READ_TEXT_FN } from './text.js';
 
@@ -25,8 +26,8 @@ export { READ_TEXT_FN } from './text.js';
 const POLL_MS = 250;
 const DEFAULT_TIMEOUT_MS = 10_000;
 // Capped well under the daemon's 60 s request timeout so a wait can never
-// turn into an opaque wire timeout. Mind the budget when combining an
-// embedded wait with a slow action.
+// turn into an opaque wire timeout. An embedded wait after a slow action is
+// clamped further, to what the call has left (budget.ts, budgetWaitSpec).
 const MAX_TIMEOUT_MS = 30_000;
 
 export type WaitSpec = {
@@ -54,7 +55,23 @@ export type WaitOutcome = {
   timeoutMs?: number;
   error?: string;
   reason?: WaitReason;
+  /** The wait got less than the timeoutMs asked for: the action before it
+   * (a slow page load) had spent that much of the call's budget. */
+  budgetLimited?: true;
 };
+
+/** Clamp an embedded wait to what the call has left (budget.ts), minus the
+ * observe reserve when an observation follows it. Pure. */
+export function budgetWaitSpec(
+  spec: WaitSpec,
+  startedAt: number | undefined,
+  now: number,
+  observing = false,
+): { spec: WaitSpec; limited: boolean } {
+  const left = budgetLeft(startedAt, now, observing ? OBSERVE_RESERVE_MS : 0);
+  if (spec.timeoutMs <= left) return { spec, limited: false };
+  return { spec: { ...spec, timeoutMs: left }, limited: true };
+}
 
 /** Classify a thrown wait error into a stable WaitReason. The embedded waitFor
  * FOLDS errors into the outcome (the action it followed already succeeded, so a
@@ -188,13 +205,13 @@ async function selectorVisibility(tabId: number, selector: string): Promise<Sele
   }
   let v: unknown;
   try {
-    const doc = await cdp<{ result: { objectId?: string }; exceptionDetails?: unknown }>(
+    const doc = await cdp<{ result?: { objectId?: string }; exceptionDetails?: unknown }>(
       tabId,
       'Runtime.evaluate',
       { expression: 'document', objectGroup: WAIT_GROUP },
     );
-    if (doc.exceptionDetails || !doc.result.objectId) return 'unknown';
-    const out = await cdp<{ result: { value?: unknown }; exceptionDetails?: unknown }>(
+    if (doc.exceptionDetails || !doc.result?.objectId) return 'unknown';
+    const out = await cdp<{ result?: { value?: unknown }; exceptionDetails?: unknown }>(
       tabId,
       'Runtime.callFunctionOn',
       {
@@ -204,7 +221,7 @@ async function selectorVisibility(tabId: number, selector: string): Promise<Sele
         returnByValue: true,
       },
     );
-    v = out.exceptionDetails ? undefined : out.result.value;
+    v = out.exceptionDetails ? undefined : out.result?.value;
   } catch (e) {
     // A navigation between the two calls: the next tick reads the new page.
     if (looksLikeLostContextError(e)) return 'unknown';
@@ -327,17 +344,25 @@ async function pollLoop(tabId: number, spec: WaitSpec): Promise<WaitOutcome> {
 /** Run an embedded wait after a successful action. The action's success must
  * stay visible even when the wait itself blows up (stale ref, invalid CSS),
  * so errors are folded into the outcome instead of thrown. */
-export async function runEmbeddedWait(tabId: number, spec: WaitSpec): Promise<WaitOutcome> {
+export async function runEmbeddedWait(
+  tabId: number,
+  requested: WaitSpec,
+  startedAt?: number,
+  observing = false,
+): Promise<WaitOutcome> {
+  const { spec, limited } = budgetWaitSpec(requested, startedAt, Date.now(), observing);
+  let out: WaitOutcome;
   try {
-    return await pollFor(tabId, spec);
+    out = await pollFor(tabId, spec);
   } catch (e) {
-    return {
+    out = {
       found: false,
       elapsedMs: 0,
       error: e instanceof Error ? e.message : String(e),
       reason: classifyWaitError(e),
     };
   }
+  return limited ? { ...out, budgetLimited: true } : out;
 }
 
 // --- settle: DOM quiescence -------------------------------------------------

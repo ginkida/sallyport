@@ -46,6 +46,7 @@ import {
   type TreeNode,
   type CompactElement,
 } from './axtree.js';
+import { budgetLeft } from './budget.js';
 import { cdp } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
@@ -83,7 +84,7 @@ export type ObserveResult = {
    * somewhere the allowlist does not cover — typically a redirect) or
    * `tab_gone` (it closed between the action and the look). A closed set, so
    * the model-facing schema can name both. */
-  skipped?: 'domain_not_allowed' | 'tab_gone';
+  skipped?: 'domain_not_allowed' | 'tab_gone' | 'budget';
   error?: string;
 };
 
@@ -159,8 +160,16 @@ async function pageText(tabId: number, maxChars: number): Promise<CappedText> {
  * action has already happened and cannot be undone, so a snapshot that fails
  * on a mid-navigation page must not retroactively turn a successful click into
  * a failure. Same rule `runEmbeddedWait` follows. */
-export async function runObserve(tabId: number, spec: ObserveSpec): Promise<ObserveResult> {
+export async function runObserve(
+  tabId: number,
+  spec: ObserveSpec,
+  startedAt?: number,
+): Promise<ObserveResult> {
   const out: ObserveResult = {};
+  // The action and its wait have spent the call's budget (budget.ts): a
+  // snapshot now would run into the daemon's timeout and cost the action's own
+  // answer. Report it; the agent can snapshot in its next call.
+  if (budgetLeft(startedAt, Date.now()) === 0) return { skipped: 'budget' };
   // Gate the page we are ABOUT to read, not the one the tool was asked about.
   // A navigate to an allowlisted URL can land somewhere else entirely (SSO
   // bounce, shortener, consent wall); every ordinary tool re-checks the tab's

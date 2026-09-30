@@ -12,6 +12,7 @@ import {
   SCROLL_STEP_PROBE,
   atScrollEdge,
   anyMatchVisible,
+  budgetWaitSpec,
   runEmbeddedWait,
   SELECTOR_VISIBILITY_FN,
   scrollStalled,
@@ -22,6 +23,7 @@ import { BridgeError } from '../src/tools/errors.js';
 import { setAllowlist } from '../src/storage.js';
 import { resetAttachedTabs } from '../src/tools/cdp.js';
 import { CREATE_QUIESCENCE_PROBE, OBSERVE_ELEMENT_FN } from '../src/tools/quiescence.js';
+import { CALL_BUDGET_MS, OBSERVE_RESERVE_MS } from '../src/tools/budget.js';
 
 describe('parseTimeoutMs', () => {
   it('defaults when undefined', () => {
@@ -960,5 +962,34 @@ describe('pollFor — a CSS selector with several matches', () => {
       absent: false,
     });
     expect(out).toMatchObject({ found: false, reason: 'invalid_selector' });
+  });
+});
+
+describe('budgetWaitSpec (an embedded wait spends what the call has LEFT)', () => {
+  const spec = { selector: '#x', text: null, timeoutMs: 30_000, absent: false };
+
+  it('leaves the wait alone without a call start, or with time to spare', () => {
+    expect(budgetWaitSpec(spec, undefined, 1e9)).toEqual({ spec, limited: false });
+    expect(budgetWaitSpec(spec, 1000, 1000 + 5_000)).toEqual({ spec, limited: false });
+  });
+
+  it('clamps to the remainder after a slow action', () => {
+    const out = budgetWaitSpec(spec, 0, 30_000); // a 30 s page load
+    expect(out.limited).toBe(true);
+    expect(out.spec.timeoutMs).toBe(CALL_BUDGET_MS - 30_000);
+    expect(spec.timeoutMs).toBe(30_000); // the caller's spec is not mutated
+  });
+
+  it('never goes negative once the budget is spent', () => {
+    expect(budgetWaitSpec(spec, 0, CALL_BUDGET_MS + 5_000).spec.timeoutMs).toBe(0);
+  });
+
+  it('ends earlier when an observation follows, so the snapshot has room', () => {
+    const out = budgetWaitSpec(spec, 0, 30_000, true);
+    expect(out.spec.timeoutMs).toBe(CALL_BUDGET_MS - OBSERVE_RESERVE_MS - 30_000);
+  });
+
+  it('keeps the whole call under the daemon 60 s timeout, with room left', () => {
+    expect(CALL_BUDGET_MS).toBeLessThanOrEqual(50_000);
   });
 });

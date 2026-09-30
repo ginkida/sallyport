@@ -317,6 +317,53 @@ describe('navigate — clobber gate (invariant #12 parity with close_tab)', () =
     expect(calls.create).toHaveLength(0);
   });
 
+  it('gives an embedded wait only what the call has left after a slow load', async () => {
+    // The daemon abandons a call at 60 s. A 30 s load plus a fresh 30 s wait
+    // used to get there, reporting extension_timeout for a finished navigate.
+    installChromeMock({ tabs: [{ id: 7, url: 'about:blank' }] });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    const res = await navigate(
+      { tabId: 7, url: ALLOW, waitFor: { selector: '#never', timeoutMs: 30_000 } },
+      { startedAt: Date.now() - 49_900 },
+    );
+    const wait = (res.data as { wait: Record<string, unknown> }).wait;
+    expect(wait).toMatchObject({ found: false, reason: 'timeout', budgetLimited: true });
+    expect(wait.timeoutMs as number).toBeLessThanOrEqual(100);
+  });
+
+  it('gives the page load only what an overdrawn call has left', async () => {
+    // A call that sat behind another on the same tab has already spent most of
+    // the daemon's 60 s: a fresh 30 s load watchdog would outlive it.
+    installChromeMock({ tabs: [{ id: 7, url: 'about:blank' }] });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    (
+      globalThis as unknown as {
+        chrome: { tabs: { get: (id: number, cb?: (t?: unknown) => void) => unknown } };
+      }
+    ).chrome.tabs.get = (id: number, cb?: (t?: unknown) => void) => {
+      const tab = { id, status: 'loading', url: ALLOW };
+      if (cb) cb(tab);
+      return Promise.resolve(tab);
+    };
+    const t0 = Date.now();
+    await expect(
+      navigate({ tabId: 7, url: ALLOW }, { startedAt: t0 - 70_000 }),
+    ).rejects.toMatchObject({ code: 'timeout' });
+    expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+
+  it('leaves a wait alone when the call has time for all of it', async () => {
+    installChromeMock({ tabs: [{ id: 7, url: 'about:blank' }] });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    const res = await navigate(
+      { tabId: 7, url: ALLOW, waitFor: { selector: '#never', timeoutMs: 300 } },
+      { startedAt: Date.now() },
+    );
+    const wait = (res.data as { wait: Record<string, unknown> }).wait;
+    expect(wait).toMatchObject({ found: false, reason: 'timeout', timeoutMs: 300 });
+    expect(wait.budgetLimited).toBeUndefined();
+  });
+
   it('navigates over about:blank without an allowlist check on the source', async () => {
     const calls = installChromeMock({ tabs: [{ id: 7, url: 'about:blank' }] });
     await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);

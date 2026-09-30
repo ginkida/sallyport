@@ -327,7 +327,7 @@ export async function ensureNotPasswordField(
   await ensureFocusUsable(tabId, { allowPassword, requireTypable: false }, tool);
 }
 
-export const keyType: Tool = async (args) => {
+export const keyType: Tool = async (args, ctx) => {
   const text = String(args.text ?? '');
   if (!text) throw new BridgeError('bad_args', 'key_type: text required');
   const waitSpec = parseWaitFor(args.waitFor, 'key_type');
@@ -341,8 +341,10 @@ export const keyType: Tool = async (args) => {
     'key_type',
   );
   await cdp(tab.id!, 'Input.insertText', { text });
-  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+  const wait = waitSpec
+    ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+    : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   return {
     tabId: tab.id,
     url: tab.url,
@@ -355,7 +357,7 @@ export const keyType: Tool = async (args) => {
   };
 };
 
-export const sendKeys: Tool = async (args) => {
+export const sendKeys: Tool = async (args, ctx) => {
   const keys = String(args.keys || '');
   if (!keys.trim()) throw new BridgeError('bad_args', 'send_keys: keys required');
   const waitSpec = parseWaitFor(args.waitFor, 'send_keys');
@@ -370,8 +372,10 @@ export const sendKeys: Tool = async (args) => {
   // one action tool guaranteed to be followed by a wait_for. Same shared engine
   // as click/fill; a failure inside the wait stays non-fatal, so the keystrokes
   // the page already received are never retracted by a bad selector.
-  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+  const wait = waitSpec
+    ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+    : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   return {
     tabId: tab.id,
     url: tab.url,

@@ -170,7 +170,7 @@ type ClickProbe = {
   blocked?: 'disabled' | 'detached';
 };
 
-export const click: Tool = async (args) => {
+export const click: Tool = async (args, ctx) => {
   const selector = String(args.selector || '');
   if (!selector) throw new BridgeError('bad_args', 'click: selector required');
   const waitSpec = parseWaitFor(args.waitFor, 'click');
@@ -204,8 +204,10 @@ export const click: Tool = async (args) => {
         `re-locate it (find/wait_for) and retry`,
     );
   }
-  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+  const wait = waitSpec
+    ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+    : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   return {
     tabId: tab.id,
     url: tab.url,
@@ -371,7 +373,7 @@ async function readBackApplied(
   }
 }
 
-export const fill: Tool = async (args) => {
+export const fill: Tool = async (args, ctx) => {
   const selector = String(args.selector || '');
   if (!selector) throw new BridgeError('bad_args', 'fill: selector required');
   if (args.value === undefined || args.value === null) {
@@ -423,8 +425,12 @@ export const fill: Tool = async (args) => {
       args.allowPassword === true || value === ''
         ? null
         : await readBackApplied(tab.id!, objectId, value);
-    const insertWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-    const insertObserved = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+    const insertWait = waitSpec
+      ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+      : null;
+    const insertObserved = observeSpec
+      ? await runObserve(tab.id!, observeSpec, ctx?.startedAt)
+      : null;
     return {
       tabId: tab.id,
       url: tab.url,
@@ -504,8 +510,10 @@ export const fill: Tool = async (args) => {
       args.allowPassword === true || value === ''
         ? null
         : await readBackApplied(tab.id!, objectId, value);
-    const fbWait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-    const fbObserved = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+    const fbWait = waitSpec
+      ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+      : null;
+    const fbObserved = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
     return {
       tabId: tab.id,
       url: tab.url,
@@ -520,8 +528,10 @@ export const fill: Tool = async (args) => {
       },
     };
   }
-  const wait = waitSpec ? await runEmbeddedWait(tab.id!, waitSpec) : null;
-  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+  const wait = waitSpec
+    ? await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec)
+    : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   return {
     tabId: tab.id,
     url: tab.url,

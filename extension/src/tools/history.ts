@@ -34,6 +34,7 @@ import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { getEpoch, isBrokerMode } from './ownership.js';
 import { parseObserve, runObserve } from './observe.js';
+import { loadTimeoutMs } from './budget.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { clearRefsForTab } from './refs.js';
 import { getTabOrGone, resolveTab, waitForLoad } from './tabs.js';
@@ -152,7 +153,7 @@ function waitForHistoryTransition(
   });
 }
 
-export const historyGo: Tool = async (args) => {
+export const historyGo: Tool = async (args, ctx) => {
   const direction = parseHistoryDirection(args.direction);
   const steps = parseHistorySteps(args.steps);
   const waitSpec = parseWaitFor(args.waitFor, 'history_go');
@@ -178,7 +179,7 @@ export const historyGo: Tool = async (args) => {
   const beforeUrl = tab.url ?? '';
   await cdp(tab.id!, 'Page.navigateToHistoryEntry', { entryId: target.id });
   await waitForHistoryTransition(tab.id!, beforeUrl);
-  await waitForLoad(tab.id!, 'history_go');
+  await waitForLoad(tab.id!, 'history_go', loadTimeoutMs(ctx?.startedAt, Date.now()));
   // The hop can be CANCELLED without either of the above noticing: a
   // beforeunload prompt that gets dismissed (handle_dialog's own default
   // policy, or a human clicking Cancel) leaves the tab exactly where it
@@ -212,9 +213,9 @@ export const historyGo: Tool = async (args) => {
   const epoch = isBrokerMode() ? getEpoch(tab.id!) : undefined;
   let wait = null;
   if (waitSpec) {
-    wait = await runEmbeddedWait(tab.id!, waitSpec);
+    wait = await runEmbeddedWait(tab.id!, waitSpec, ctx?.startedAt, !!observeSpec);
   }
-  const observed = observeSpec ? await runObserve(tab.id!, observeSpec) : null;
+  const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   return {
     tabId: tab.id,
     url: landedUrl,

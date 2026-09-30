@@ -91,7 +91,7 @@ export function parseScrollSpec(args: Record<string, unknown>): ScrollSpec {
 
 type ScrollByResult = { x: number; y: number; scrollHeight: number; clientHeight: number };
 
-export const scroll: Tool = async (args) => {
+export const scroll: Tool = async (args, ctx) => {
   const spec = parseScrollSpec(args);
   // Lazy-load harvesting is scroll → wait-for-new-content → read, repeated. The
   // embedded wait folds the middle step in, halving the calls per screenful.
@@ -110,8 +110,12 @@ export const scroll: Tool = async (args) => {
       { objectId, functionDeclaration: SCROLL_INTO_VIEW_PROBE, returnByValue: true },
     );
     const v = out.result.value ?? { x: 0, y: 0 };
-    const intoViewWait = waitSpec ? await runEmbeddedWait(tabId, waitSpec) : null;
-    const intoViewObserved = observeSpec ? await runObserve(tabId, observeSpec) : null;
+    const intoViewWait = waitSpec
+      ? await runEmbeddedWait(tabId, waitSpec, ctx?.startedAt, !!observeSpec)
+      : null;
+    const intoViewObserved = observeSpec
+      ? await runObserve(tabId, observeSpec, ctx?.startedAt)
+      : null;
     return {
       tabId,
       url: tab.url,
@@ -151,8 +155,10 @@ export const scroll: Tool = async (args) => {
   const v = out.result.value ?? { x: 0, y: 0, scrollHeight: 0, clientHeight: 0 };
   // Whether we bottomed out — the signal a lazy-load loop needs to stop.
   const atBottom = v.y + v.clientHeight >= v.scrollHeight - 1;
-  const wait = waitSpec ? await runEmbeddedWait(tabId, waitSpec) : null;
-  const observed = observeSpec ? await runObserve(tabId, observeSpec) : null;
+  const wait = waitSpec
+    ? await runEmbeddedWait(tabId, waitSpec, ctx?.startedAt, !!observeSpec)
+    : null;
+  const observed = observeSpec ? await runObserve(tabId, observeSpec, ctx?.startedAt) : null;
   return {
     tabId,
     url: tab.url,

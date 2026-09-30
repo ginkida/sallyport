@@ -144,6 +144,16 @@ describe('runObserve', () => {
     expect(cdpCalls).toEqual([]); // not a single CDP command was issued
   });
 
+  it('skips the snapshot once the call has spent its budget, reading nothing', async () => {
+    // The daemon gives up at 60 s; a snapshot started after the budget would
+    // cost the action its own answer.
+    const { cdpCalls } = installChrome({ url: 'https://app.example.com/' });
+    await allow('app.example.com');
+    const out = await runObserve(TAB, spec, Date.now() - 50_001);
+    expect(out).toEqual({ skipped: 'budget' });
+    expect(cdpCalls).toEqual([]);
+  });
+
   it('reports a vanished tab distinctly from a refused one', async () => {
     (globalThis as unknown as { chrome: Record<string, unknown> }).chrome = {
       ...(globalThis as unknown as { chrome: Record<string, unknown> }).chrome,
