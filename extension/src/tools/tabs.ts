@@ -101,6 +101,7 @@ export function waitForLoad(tabId: number, toolName: string, timeoutMs = 30000):
       settled = true;
       clearTimeout(t);
       chrome.tabs.onUpdated.removeListener(listener);
+      chrome.tabs.onRemoved.removeListener?.(removed);
       if (err) reject(err);
       else resolve();
     };
@@ -113,6 +114,19 @@ export function waitForLoad(tabId: number, toolName: string, timeoutMs = 30000):
     const listener = (id: number, info: chrome.tabs.OnUpdatedInfo, tab: chrome.tabs.Tab) => {
       if (id === tabId && info.status === 'complete' && ready(tab)) finish();
     };
+    const gone = () =>
+      new BridgeError(
+        'tab_gone',
+        `tab ${tabId} is gone (closed, or its id was recycled) — ` +
+          `open a fresh one with navigate(newTab:true)`,
+      );
+    // A tab closed MID-load never completes: without this the watchdog ran its
+    // whole length and answered `timeout`, which a created tab then turned into
+    // a "keep using it" success for a tab that no longer existed.
+    const removed = (id: number) => {
+      if (id === tabId) finish(gone());
+    };
+    chrome.tabs.onRemoved.addListener(removed);
     // Subscribe BEFORE reading the tab. Reading first left a window between the
     // snapshot `tabs.get` took ('loading') and the listener existing: a page that
     // finished loading inside it fired its one 'complete' to nobody, and the
@@ -128,13 +142,7 @@ export function waitForLoad(tabId: number, toolName: string, timeoutMs = 30000):
       // promise never settles, and the call hangs to the full timeout with a
       // misleading code:'timeout'. Fail fast with the same tab_gone getTabOrGone uses.
       if (chrome.runtime?.lastError || !tab) {
-        finish(
-          new BridgeError(
-            'tab_gone',
-            `tab ${tabId} is gone (closed, or its id was recycled) — ` +
-              `open a fresh one with navigate(newTab:true)`,
-          ),
-        );
+        finish(gone());
         return;
       }
       if (ready(tab)) finish();
@@ -266,6 +274,21 @@ export const navigate: Tool = async (args, ctx) => {
     }
     loaded = false;
   }
+  // "Did not reach complete" is usually NOT "nothing to read": one hanging
+  // pixel or long-poll keeps a rendered page 'loading' forever. Only a page
+  // that has not COMMITTED (url '' / about:blank, the address still in
+  // pendingUrl) has nothing for a wait or an observation to look at.
+  let committed = loaded;
+  if (!loaded) {
+    const now = await getTabOrGone(tab.id!).catch(async (e) => {
+      if (epoch !== undefined) {
+        dropEpoch(tab.id!);
+        await persistEpochs();
+      }
+      throw e;
+    });
+    committed = !!now.url && now.url !== 'about:blank';
+  }
   // Navigation invalidates any refs we held for this tab, and any pending
   // dialog arm — a one-shot is scoped to the page it was set on, not a
   // standing grant that should still apply once the tab has moved on.
@@ -274,7 +297,7 @@ export const navigate: Tool = async (args, ctx) => {
   clearRefsForTab(tab.id!);
   clearArmedDialog(tab.id!);
   let wait = null;
-  if (waitSpec && !loaded) {
+  if (waitSpec && !committed) {
     // Nothing has committed yet (the usual reason a created tab outlives the
     // watchdog: the server never answered), so there is no page to wait on —
     // every probe would refuse with no_url and read as a generic `error`.
@@ -295,7 +318,7 @@ export const navigate: Tool = async (args, ctx) => {
   // embedded wait so the answer describes the tab as the call returns it.
   const observed = !observeSpec
     ? null
-    : loaded
+    : committed
       ? await runObserve(tab.id!, observeSpec, ctx?.startedAt)
       : { skipped: 'not_loaded' as const };
   const landed = await currentUrl(tab.id!);

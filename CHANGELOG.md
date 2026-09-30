@@ -103,8 +103,12 @@ uses [Semantic Versioning](https://semver.org/).
   requested (an uncommitted tab reports ''), and an embedded wait or observe
   says `not_loaded` rather than failing on a page that does not exist yet. An
   in-place navigate still fails with `timeout`, and the `timeout` and `no_url`
-  hints now say which is which. A tab closed before it loaded drops the epoch
-  minted for it. The 50 s
+  hints now say which is which. A tab closed during its load is `tab_gone`
+  at once (the load watchdog now also listens for the tab's removal, which
+  also stops `reload`/`history_go` waiting out the clock on a closed tab)
+  and drops the epoch minted for it. `not_loaded` is reserved for a page
+  that never committed: one that rendered but kept a request hanging (so
+  never reached "complete") still gets its embedded wait and observe. The 50 s
   call budget made this likelier (the watchdog can be as short as 1 s on an
   overdrawn call), so it is fixed before that ships.
 

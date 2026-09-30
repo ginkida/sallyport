@@ -212,6 +212,7 @@ function installHistoryChromeMock(opts: {
         return Promise.resolve(tab);
       },
       onUpdated: { addListener() {}, removeListener() {} },
+      onRemoved: { addListener() {}, removeListener() {} },
     },
     debugger: {
       attach() {

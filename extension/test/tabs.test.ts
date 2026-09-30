@@ -245,6 +245,36 @@ describe('waitForLoad — timeout message names the calling tool', () => {
   });
 });
 
+describe('waitForLoad — a tab closed mid-load', () => {
+  it('fails fast as tab_gone instead of waiting out the watchdog as `timeout`', async () => {
+    installChromeMock({});
+    type Removed = (id: number) => void;
+    let onRemoved: Removed | undefined;
+    const tabs = (
+      globalThis as unknown as {
+        chrome: {
+          tabs: {
+            get: (id: number, cb: (t?: unknown) => void) => void;
+            onRemoved: { addListener: (l: Removed) => void; removeListener: (l: Removed) => void };
+          };
+        };
+      }
+    ).chrome.tabs;
+    tabs.onRemoved = {
+      addListener: (l) => void (onRemoved = l),
+      removeListener: () => void (onRemoved = undefined),
+    };
+    tabs.get = (id, cb) => {
+      cb({ id, status: 'loading', url: 'https://x.example/' });
+      setTimeout(() => onRemoved?.(id), 10); // the human closes it
+    };
+    const t0 = Date.now();
+    await expect(waitForLoad(1, 'navigate', 5000)).rejects.toMatchObject({ code: 'tab_gone' });
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(onRemoved).toBeUndefined(); // listener cleaned up
+  });
+});
+
 describe('waitForLoad — a load that finishes while the tab is being read', () => {
   type Listener = (id: number, info: { status?: string }, tab: unknown) => void;
   function raceMock(): { listeners: Set<Listener>; removed: () => number } {
@@ -556,6 +586,29 @@ describe('navigate/reload — attach is BEST-EFFORT (a debugger conflict must no
     });
     expect(createdId).toBeDefined();
     expect(getEpoch(createdId!)).toBeUndefined();
+  });
+
+  it('a created tab that committed but never reached complete still gets its wait and observe', async () => {
+    // One hanging pixel keeps a rendered page 'loading': that is not "nothing
+    // to read", so the embedded wait and observation must actually run.
+    setBrokerMode(true);
+    installChromeMock({ active: { id: 3, url: 'https://allowed.example/old' } });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    (
+      globalThis as unknown as {
+        chrome: { tabs: { get: (id: number, cb?: (t?: unknown) => void) => unknown } };
+      }
+    ).chrome.tabs.get = (id: number, cb?: (t?: unknown) => void) => {
+      const tab = { id, status: 'loading', url: ALLOW };
+      if (cb) cb(tab);
+      return Promise.resolve(tab);
+    };
+    const res = (await navigate(
+      { url: ALLOW, newTab: true, waitFor: { selector: '#app', timeoutMs: 300 } },
+      { startedAt: Date.now() - 70_000 },
+    )) as { data: { loaded?: boolean; wait?: { reason?: string } } };
+    expect(res.data.loaded).toBe(false);
+    expect(res.data.wait?.reason).not.toBe('not_loaded');
   });
 
   it('an in-place navigate whose load times out still fails — the agent already holds the id', async () => {
