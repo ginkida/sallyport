@@ -3,7 +3,7 @@ import { attach, cdp } from './cdp.js';
 import { resolveBackendNode, resolveSelectorOrRef } from './resolve.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed, ensureStillAllowed } from './gates.js';
-import { matchElements, parsePredicate } from './match.js';
+import { capMatches, matchElements, parsePredicate } from './match.js';
 import { getRef, isRef, refWatermark } from './refs.js';
 import {
   parseMaxSteps,
@@ -108,7 +108,11 @@ async function revealWithin(
     const { tree, source } = await buildSnapshotTree(tab.id!, mode, mark);
     const matches = matchElements(collectInteractive(tree), pred);
     if (matches.length) {
-      return { tabId: tab.id, url: readUrl, data: { found: true, matches, steps: step, source } };
+      return {
+        tabId: tab.id,
+        url: readUrl,
+        data: { found: true, matches: capMatches(matches), steps: step, source },
+      };
     }
     if (step === maxSteps) {
       return {

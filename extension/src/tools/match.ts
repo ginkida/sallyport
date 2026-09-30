@@ -5,7 +5,7 @@
  * interpolated into a page probe (the snapshot probes are fixed literals).
  * Chrome-free, so it is unit-tested under vitest. */
 
-import type { CompactElement } from './axtree.js';
+import { capName, type CompactElement } from './axtree.js';
 import { BridgeError } from './errors.js';
 
 export type Predicate = {
@@ -124,4 +124,18 @@ export function matchElements(els: CompactElement[], pred: Predicate): Match[] {
   });
   scored.sort((a, b) => b.score - a.score || a.i - b.i);
   return scored.map((x) => ({ ...x.el, score: x.score }));
+}
+
+/** Cap what a match EMITS, never what it was matched on: `matchElements`
+ * already ran over the full strings. The same 200-char, surrogate-safe cut
+ * `snapshot compact` applies to this very shape — a textarea's whole draft or a
+ * card link named by its entire text was otherwise shipped verbatim, up to 50
+ * matches × 10 queries of it. */
+export function capMatches(matches: Match[]): Match[] {
+  return matches.map((m) => {
+    const next: Match = { ...m };
+    if (typeof m.name === 'string') next.name = capName(m.name);
+    if (typeof m.value === 'string') next.value = capName(m.value);
+    return next;
+  });
 }

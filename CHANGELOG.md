@@ -24,6 +24,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `find` and `reveal` returned each match's `name` and `value` uncapped: a
+  textarea's whole draft, or a card link named by its entire text, went into
+  the result verbatim, up to 50 matches across 10 queries. They now get the
+  200-character, surrogate-safe cut `snapshot compact` already applies to the
+  same shape (matching still runs over the full strings). `get_state`'s
+  description no longer claims its `visible` matches `wait_for`'s: it checks
+  the first match, while `wait_for` weighs every one.
+
 - `fill` with `method: 'value'` on a `<textarea>` always failed its value
   write: it called the `<input>` prototype's native setter, which throws on a
   textarea, so every such fill fell back to typing and answered

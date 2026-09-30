@@ -2,7 +2,14 @@ import { collectInteractive } from './axtree.js';
 import { attach, looksLikeLostContextError } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed, ensureStillAllowed } from './gates.js';
-import { matchElements, parseLimit, parsePredicate, type Match, type Predicate } from './match.js';
+import {
+  capMatches,
+  matchElements,
+  parseLimit,
+  parsePredicate,
+  type Match,
+  type Predicate,
+} from './match.js';
 import { refWatermark } from './refs.js';
 import { buildSnapshotTree } from './snapshot.js';
 import { resolveTab } from './tab-resolve.js';
@@ -103,7 +110,7 @@ export function parseFindTimeout(raw: unknown): number {
 /** Which of the query's matches to report, and how many there were. Split out
  * so the shaping is identical for the scalar and batched answers. */
 function shape(all: Match[], limit: number): { matches: Match[]; total: number } {
-  return { matches: all.slice(0, limit), total: all.length };
+  return { matches: capMatches(all.slice(0, limit)), total: all.length };
 }
 
 export const find: Tool = async (args, ctx) => {

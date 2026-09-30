@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { CompactElement } from '../src/tools/axtree.js';
-import { matchElements, parseLimit, parsePredicate } from '../src/tools/match.js';
+import { capMatches, matchElements, parseLimit, parsePredicate } from '../src/tools/match.js';
 
 const el = (ref: string, role: string, name?: string, value?: unknown): CompactElement => ({
   ref,
@@ -138,5 +138,30 @@ describe('parseLimit (find)', () => {
     expect(() => parseLimit(-1)).toThrowError(/limit/);
     expect(() => parseLimit(1.5)).toThrowError(/limit/);
     expect(() => parseLimit('all')).toThrowError(/limit/);
+  });
+});
+
+describe('capMatches (what find/reveal EMIT)', () => {
+  it('cuts long names and values like snapshot compact, keeping ref and score', () => {
+    const draft = 'x'.repeat(5000);
+    const [m] = capMatches([
+      { ref: '@e3', role: 'textbox', name: 'Message', value: draft, score: 2 } as never,
+    ]);
+    expect(m).toMatchObject({ ref: '@e3', role: 'textbox', name: 'Message', score: 2 });
+    expect((m.value as string).length).toBeLessThanOrEqual(201);
+    expect((m.value as string).endsWith('…')).toBe(true);
+  });
+
+  it('never splits a surrogate pair (a lone half discards the whole result)', () => {
+    const name = 'a'.repeat(199) + '😀' + 'b'.repeat(50);
+    const [m] = capMatches([{ ref: '@e1', role: 'link', name, score: 1 } as never]);
+    expect(m.name).toBe('a'.repeat(199) + '…');
+  });
+
+  it('leaves short strings, non-string values and its input untouched', () => {
+    const input = [{ ref: '@e1', role: 'slider', name: 'Vol', value: 7, score: 1 } as never];
+    const out = capMatches(input);
+    expect(out[0]).toEqual(input[0]);
+    expect(out[0]).not.toBe(input[0]);
   });
 });
