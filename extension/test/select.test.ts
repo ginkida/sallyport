@@ -157,7 +157,7 @@ describe('SELECT_APPLY_PROBE', () => {
   it('inlines planSelection and interpolates no agent data', () => {
     expect(SELECT_APPLY_PROBE).not.toMatch(/\brequire\b|\bimport\b/);
     expect(SELECT_APPLY_PROBE).toContain('planSelection');
-    expect(SELECT_APPLY_PROBE).toContain("tagName === 'SELECT'");
+    expect(SELECT_APPLY_PROBE).toContain("toUpperCase() === 'SELECT'");
     // The spec is a callFunctionOn parameter, not baked into the source.
     expect(SELECT_APPLY_PROBE.startsWith('function(spec)')).toBe(true);
   });
@@ -436,6 +436,14 @@ describe('SELECT_APPLY_PROBE — the result must describe the ELEMENT, not the p
     const out = runProbe(el, { by: 'value', values: ['A', 'A'] });
     expect(out.applied).toBe('yes');
     expect(out.selected).toEqual([{ index: 0, value: 'A', label: 'A' }]);
+  });
+
+  it('accepts a <select> on an XHTML page, whose tagName is lower case', () => {
+    const { el } = fakeSelect([{ value: 'UA' }, { value: 'PL' }], { tagName: 'select' });
+    expect(runProbe(el, { by: 'value', values: ['PL'] })).toMatchObject({
+      ok: true,
+      applied: 'yes',
+    });
   });
 
   it('still refuses a non-select before touching anything', () => {

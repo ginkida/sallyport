@@ -104,8 +104,14 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
         ),
         "wrong_element": (
             "retryable=no; the target isn't the expected element type (e.g. select_option "
-            "on a custom combobox) — open it with click/mouse_click and pick the option "
-            "with click (find/reveal locate it)."
+            "on a custom combobox — open it with click/mouse_click and pick the option with "
+            "click, find/reveal locate it; or fill on a frame that is not an editor — target "
+            "the field itself)."
+        ),
+        "focus_moved": (
+            "retryable=maybe; focus left the fill target while typing (a page script moved "
+            "it), so the text was stopped or went to another document. Check the page with "
+            "snapshot, then fill the field again; do not assume anything was typed."
         ),
         "not_focusable": (
             "retryable=maybe; the fill target couldn't take focus (a wrapper div, a "

@@ -126,6 +126,20 @@ describe('runTool — force-redacts attempted secrets on password-probe failures
     expect(forceCall![0]).toBe('key_type');
   });
 
+  it.each(['not_focusable', 'no_editable_focus', 'focus_moved', 'wrong_element'])(
+    'force-redacts the attempted text on %s — fill refused before it could be vetted',
+    async (code) => {
+      vi.mocked(keyType).mockRejectedValueOnce(new BridgeError(code, 'refused'));
+      await expect(runTool('key_type', { tabId: 5, text: 'hunter2' })).rejects.toMatchObject({
+        code,
+      });
+      const forceCall = vi
+        .mocked(redactAuditArgs)
+        .mock.calls.find(([, , opts]) => opts?.force === true);
+      expect(forceCall).toBeDefined();
+    },
+  );
+
   it('does NOT force-redact on unrelated tool failures', async () => {
     vi.mocked(keyType).mockRejectedValueOnce(new BridgeError('bad_args', 'key_type: missing text'));
     await expect(runTool('key_type', { tabId: 5, text: 'hunter2' })).rejects.toMatchObject({

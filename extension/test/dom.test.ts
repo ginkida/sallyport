@@ -15,8 +15,10 @@ import { beforeAll, describe, expect, it } from 'vitest';
 let targetIsPasswordField: (tabId: number, objectId: string) => Promise<boolean>;
 let ensureFocusLanded: (focused: boolean | undefined) => void;
 let CLICK_FN: string;
+let FILL_GUARD_FN: string;
+let frameGateUrl: (t: unknown, id: string) => string | null;
+let findBody: (n: unknown, d: number) => { backendNodeId?: unknown } | undefined;
 let FILL_READBACK_FN: string;
-let DEEPEST_ACTIVE_ELEMENT_EXPR: string;
 let classifyApplied: typeof import('../src/tools/dom.js').classifyApplied;
 let click: (a: Record<string, unknown>, c?: unknown) => Promise<unknown>;
 
@@ -29,17 +31,21 @@ beforeAll(async () => {
     targetIsPasswordField,
     ensureFocusLanded,
     CLICK_FN,
+    FILL_GUARD_FN,
+    frameGateUrl,
+    findBody,
     click,
     FILL_READBACK_FN,
-    DEEPEST_ACTIVE_ELEMENT_EXPR,
     classifyApplied,
   } = (await import('../src/tools/dom.js')) as unknown as {
     targetIsPasswordField: typeof targetIsPasswordField;
     ensureFocusLanded: typeof ensureFocusLanded;
     CLICK_FN: string;
+    FILL_GUARD_FN: string;
+    frameGateUrl: typeof frameGateUrl;
+    findBody: typeof findBody;
     click: typeof click;
     FILL_READBACK_FN: string;
-    DEEPEST_ACTIVE_ELEMENT_EXPR: string;
     classifyApplied: typeof classifyApplied;
   });
 });
@@ -121,58 +127,6 @@ describe('ensureFocusLanded', () => {
  * that node away from the resolved one, and both must be followed or the gate
  * inspects a wrapper while the write lands on a credential field.
  */
-describe('DEEPEST_ACTIVE_ELEMENT_EXPR (password-gate focus walk)', () => {
-  const walk = (doc: unknown) =>
-    new Function('document', `return ${DEEPEST_ACTIVE_ELEMENT_EXPR};`)(doc) as {
-      tagName?: string;
-      name?: string;
-    };
-
-  it('descends a delegatesFocus shadow host to the control that really has focus', () => {
-    const inner = { tagName: 'INPUT', name: 'inner' };
-    const host = { tagName: 'X-FIELD', shadowRoot: { activeElement: inner } };
-    expect(walk({ activeElement: host })).toBe(inner);
-  });
-
-  it('descends a same-origin iframe — the gate used to stop at the frame element', () => {
-    // fill(selector='iframe.login') resolves to the FRAME, which is not a
-    // password field, so the up-front gate passes; focus() then moves inside and
-    // insertText lands on whatever is focused there. Stopping at the frame let a
-    // write reach an <input type=password> the gate never inspected.
-    const pw = { tagName: 'INPUT', name: 'password' };
-    const frame = { tagName: 'IFRAME', contentDocument: { activeElement: pw } };
-    expect(walk({ activeElement: frame })).toBe(pw);
-  });
-
-  it('stops at a cross-origin frame instead of throwing', () => {
-    const frame = {
-      tagName: 'IFRAME',
-      get contentDocument(): unknown {
-        throw new Error('cross-origin');
-      },
-    };
-    expect(walk({ activeElement: frame })).toBe(frame);
-  });
-
-  it('interleaves both descents', () => {
-    const leaf = { tagName: 'INPUT', name: 'leaf' };
-    const innerHost = { tagName: 'X-F', shadowRoot: { activeElement: leaf } };
-    const frame = { tagName: 'IFRAME', contentDocument: { activeElement: innerHost } };
-    const outerHost = { tagName: 'X-OUT', shadowRoot: { activeElement: frame } };
-    expect(walk({ activeElement: outerHost })).toBe(leaf);
-  });
-
-  it('cannot spin on a focus cycle', () => {
-    const a: Record<string, unknown> = { tagName: 'X-A' };
-    a.shadowRoot = { activeElement: a };
-    expect(() => walk({ activeElement: a })).not.toThrow();
-  });
-
-  it('returns null when nothing is focused', () => {
-    expect(walk({ activeElement: null })).toBeNull();
-  });
-});
-
 /**
  * `click`'s in-page probe. It runs via callFunctionOn with `this` bound to the
  * resolved element and NO arguments, so any closure or import reference would
@@ -461,11 +415,6 @@ describe('FILL_READBACK_FN (serialised in-page probe)', () => {
       expected: string,
     ) => { len: number; matched: boolean };
 
-  // The probe consults `this` AND the deepest focused leaf. A bare fake with no
-  // ownerDocument exercises the `this`-only path (globalThis.document is
-  // undefined under vitest, and the probe tolerates that).
-  const doc = (activeElement: unknown) => ({ activeElement });
-
   it('confirms a value that landed', () => {
     expect(run().call({ value: 'hello', isContentEditable: false }, 'hello')).toEqual({
       len: 5,
@@ -473,60 +422,26 @@ describe('FILL_READBACK_FN (serialised in-page probe)', () => {
     });
   });
 
-  it('finds the text through a delegatesFocus shadow host, where `this` is not the field', () => {
-    // The host has no value of its own; insertText went to the inner control.
-    const inner = { value: 'hello', isContentEditable: false };
-    const host = {
-      isContentEditable: false,
-      shadowRoot: { activeElement: inner },
-      ownerDocument: doc(undefined),
-    };
-    // activeElement retargets to the host, and the walk descends from there.
-    (host.ownerDocument as { activeElement: unknown }).activeElement = host;
-    expect(run().call(host, 'hello')).toEqual({ len: 5, matched: true });
-  });
-
-  it('does NOT report a successful fill inside a same-origin iframe as a failure', () => {
-    // Regression: reading only the main frame's focused leaf gets the <iframe>
-    // ELEMENT, which has no value — a successful write read as "nothing landed".
-    // Starting from the node's OWN document makes the field its own activeElement.
-    const field = { value: 'hello', isContentEditable: false, ownerDocument: doc(undefined) };
-    (field.ownerDocument as { activeElement: unknown }).activeElement = field;
-    expect(run().call(field, 'hello')).toEqual({ len: 5, matched: true });
-  });
-
-  it('descends into a same-origin iframe when the walk lands on one', () => {
-    const inner = { value: 'hello', isContentEditable: false };
-    const iframe = { tagName: 'IFRAME', isContentEditable: false, contentDocument: doc(inner) };
-    const wrapper = { isContentEditable: false, ownerDocument: doc(iframe) };
-    expect(run().call(wrapper, 'hello')).toEqual({ len: 5, matched: true });
-  });
-
-  it('stops at a cross-origin iframe instead of throwing', () => {
-    const iframe = {
-      tagName: 'IFRAME',
-      isContentEditable: false,
-      get contentDocument(): unknown {
-        throw new Error('cross-origin');
-      },
-    };
-    const field = { value: 'hello', isContentEditable: false, ownerDocument: doc(iframe) };
-    // Falls back to `this`, which IS the field here.
-    expect(run().call(field, 'hello')).toEqual({ len: 5, matched: true });
-  });
-
-  it('runs with no ownerDocument at all — the literal must be self-contained', () => {
-    expect(run().call({ value: 'hello', isContentEditable: false }, 'hello')).toEqual({
-      len: 5,
+  it('reads a contenteditable by its text', () => {
+    expect(run().call({ isContentEditable: true, innerText: 'hi there' }, 'there')).toEqual({
+      len: 8,
       matched: true,
     });
   });
 
-  it('cannot spin on a self-referential focus chain', () => {
-    const loop: Record<string, unknown> = { isContentEditable: false };
-    loop.shadowRoot = { activeElement: loop };
-    const field = { value: '', isContentEditable: false, ownerDocument: doc(loop) };
+  it('reads ONLY the write node — never wherever focus went after the write', () => {
+    // A card form that advanced focus to its CVV: the probe has no way to
+    // reach it, because nothing but `this` is consulted.
+    const field = {
+      value: '',
+      isContentEditable: false,
+      ownerDocument: { activeElement: { value: '123', isContentEditable: false } },
+    };
     expect(run().call(field, 'x')).toEqual({ len: 0, matched: false });
+  });
+
+  it('answers nothing-landed for a node with no value', () => {
+    expect(run().call({ isContentEditable: false }, 'x')).toEqual({ len: 0, matched: false });
   });
 
   it('reports a maxlength truncation as not-applied WITH the length that tells you why', () => {
@@ -683,5 +598,220 @@ describe('read_text says what it could not see', () => {
     };
     expect(out.data.text).toBe('plain page');
     expect(out.data.frames).toBeUndefined();
+  });
+});
+
+describe("FILL_GUARD_FN (fill's insert fence, run in an isolated world)", () => {
+  type Listener = (e: Record<string, unknown>) => void;
+  type Fake = Record<string, unknown>;
+  // A document with N nested shadow roots; the write node is in the innermost.
+  // Focus is modelled exactly as the browser exposes it: each root's
+  // activeElement is its node on the focus path.
+  function world(depth: number) {
+    const listeners = new Map<string, Listener>();
+    const win: Fake = {
+      addEventListener: (t: string, l: Listener) => void listeners.set(t, l),
+      removeEventListener: (t: string) => void listeners.delete(t),
+    };
+    const doc: Fake = { nodeType: 9, defaultView: win };
+    const roots: Fake[] = [doc];
+    const nodes: Fake[] = [];
+    let root = doc;
+    for (let i = 0; i <= depth; i++) {
+      const r = root;
+      const node: Fake = { getRootNode: () => r };
+      r.activeElement = node;
+      nodes.push(node);
+      if (i < depth) {
+        root = { nodeType: 11, host: node };
+        roots.push(root);
+      }
+    }
+    return { write: nodes[nodes.length - 1], roots, nodes, listeners };
+  }
+  function arm(write: Fake) {
+    return (
+      new Function(`return (${FILL_GUARD_FN});`)() as (this: unknown) => {
+        finish: () => { seen: number; blocked: number };
+      }
+    ).call(write);
+  }
+  function fire(
+    w: ReturnType<typeof world>,
+    type: string,
+    isTrusted = true,
+    inputType = 'insertText',
+  ) {
+    const e: Record<string, unknown> & { prevented?: boolean } = {
+      type,
+      isTrusted,
+      inputType,
+      preventDefault() {
+        e.prevented = true;
+      },
+      stopImmediatePropagation() {},
+    };
+    w.listeners.get(type)?.(e);
+    return e;
+  }
+  const g = globalThis as unknown as { setTimeout: unknown; clearTimeout: unknown };
+
+  it('lets an insert into the write node through, counts it, and removes itself', () => {
+    const w = world(0);
+    const guard = arm(w.write);
+    expect(fire(w, 'beforeinput').prevented).toBeUndefined();
+    expect(fire(w, 'textInput').prevented).toBeUndefined();
+    expect(guard.finish()).toEqual({ seen: 1, blocked: 0 });
+    expect(w.listeners.size).toBe(0);
+  });
+
+  it('cancels an insert once focus has moved to another field', () => {
+    const w = world(0);
+    const guard = arm(w.write);
+    w.roots[0].activeElement = { id: 'pw' };
+    expect(fire(w, 'beforeinput').prevented).toBe(true);
+    expect(guard.finish()).toEqual({ seen: 0, blocked: 1 });
+  });
+
+  it('catches a move made by a page beforeinput handler, at textInput', () => {
+    // beforeinput passes (focus still ours), then the page moves focus; the
+    // insert follows focus, and textInput is where that becomes visible.
+    const w = world(0);
+    const guard = arm(w.write);
+    expect(fire(w, 'beforeinput').prevented).toBeUndefined();
+    w.roots[0].activeElement = { id: 'pw' };
+    expect(fire(w, 'textInput').prevented).toBe(true);
+    expect(guard.finish()).toEqual({ seen: 1, blocked: 1 });
+  });
+
+  it('tells two fields in ONE shadow root apart, closed roots included', () => {
+    const w = world(1);
+    const guard = arm(w.write);
+    // The document still sees the same host; only the shadow root knows.
+    w.roots[1].activeElement = { id: 'sibling-password' };
+    expect(fire(w, 'beforeinput').prevented).toBe(true);
+    expect(guard.finish()).toEqual({ seen: 0, blocked: 1 });
+  });
+
+  it('checks every level of a nested component', () => {
+    const w = world(2);
+    arm(w.write);
+    expect(fire(w, 'beforeinput').prevented).toBeUndefined();
+    w.roots[1].activeElement = { id: 'other-host' };
+    expect(fire(w, 'beforeinput').prevented).toBe(true);
+  });
+
+  it('ignores page-dispatched (untrusted) events both ways', () => {
+    const w = world(0);
+    const guard = arm(w.write);
+    fire(w, 'beforeinput', false);
+    w.roots[0].activeElement = { id: 'pw' };
+    expect(fire(w, 'beforeinput', false).prevented).toBeUndefined();
+    expect(guard.finish()).toEqual({ seen: 0, blocked: 0 });
+  });
+
+  it('ignores non-insert beforeinput types', () => {
+    const w = world(0);
+    const guard = arm(w.write);
+    w.roots[0].activeElement = { id: 'other' };
+    fire(w, 'beforeinput', true, 'deleteContentBackward');
+    expect(guard.finish()).toEqual({ seen: 0, blocked: 0 });
+  });
+
+  it('refuses to arm on a node outside any document', () => {
+    const orphanHost = { getRootNode: () => ({ nodeType: 1 }) };
+    const orphanRoot = { nodeType: 11, host: orphanHost };
+    expect(() => arm({ getRootNode: () => orphanRoot })).toThrow(/not in a document/);
+    expect(() => arm({ getRootNode: () => ({ nodeType: 1 }) })).toThrow(/not in a document/);
+    expect(() => arm({ getRootNode: () => ({ nodeType: 9, defaultView: null }) })).toThrow(
+      /not in a document/,
+    );
+  });
+
+  it('expires on its own if finish never comes', () => {
+    const saved = { st: g.setTimeout, ct: g.clearTimeout };
+    let expire: (() => void) | null = null;
+    g.setTimeout = (fn: () => void) => ((expire = fn), 1);
+    g.clearTimeout = () => {};
+    try {
+      const w = world(1);
+      arm(w.write);
+      expect(w.listeners.size).toBe(2);
+      expire!();
+      expect(w.listeners.size).toBe(0);
+    } finally {
+      g.setTimeout = saved.st;
+      g.clearTimeout = saved.ct;
+    }
+  });
+});
+
+describe('frameGateUrl (an editor frame is allowlisted by its own origin)', () => {
+  const tree = {
+    frame: {
+      id: 'main',
+      url: 'https://app.example/app/edit',
+      securityOrigin: 'https://app.example',
+    },
+    childFrames: [
+      {
+        frame: {
+          id: 'http',
+          url: 'https://admin.example/x',
+          securityOrigin: 'https://admin.example',
+        },
+        childFrames: [
+          {
+            frame: {
+              id: 'nested-blank',
+              url: 'about:blank',
+              securityOrigin: 'https://app.example',
+            },
+          },
+        ],
+      },
+      { frame: { id: 'blank', url: 'about:blank', securityOrigin: 'https://app.example' } },
+      { frame: { id: 'sandboxed', url: 'about:srcdoc', securityOrigin: 'null' } },
+    ],
+  };
+  it('uses the frame url, not the tab url', () => {
+    expect(frameGateUrl(tree, 'http')).toBe('https://admin.example/x');
+  });
+  it("uses the parent's url for an about:blank editor of the parent's origin", () => {
+    // so a path-pinned entry for /app/* still admits it
+    expect(frameGateUrl(tree, 'blank')).toBe('https://app.example/app/edit');
+  });
+  it('falls back to the bare origin when the parent is another origin', () => {
+    expect(frameGateUrl(tree, 'nested-blank')).toBe('https://app.example/');
+  });
+  it('gives null for an opaque origin or an unknown frame', () => {
+    expect(frameGateUrl(tree, 'sandboxed')).toBeNull();
+    expect(frameGateUrl(tree, 'nope')).toBeNull();
+  });
+});
+
+describe("findBody (an editor frame's body, browser-described)", () => {
+  it('finds BODY under the document within the depth, case-insensitively', () => {
+    const doc = {
+      nodeName: '#document',
+      children: [
+        { nodeName: 'html' },
+        {
+          nodeName: 'HTML',
+          children: [{ nodeName: 'HEAD' }, { nodeName: 'body', backendNodeId: 9 }],
+        },
+      ],
+    };
+    expect(findBody(doc, 3)?.backendNodeId).toBe(9);
+  });
+
+  it('gives up past the depth or on nothing', () => {
+    expect(findBody(undefined, 3)).toBeUndefined();
+    expect(
+      findBody(
+        { nodeName: 'X', children: [{ nodeName: 'Y', children: [{ nodeName: 'BODY' }] }] },
+        1,
+      ),
+    ).toBeUndefined();
   });
 });

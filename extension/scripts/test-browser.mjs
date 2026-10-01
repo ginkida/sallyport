@@ -35,6 +35,92 @@ const server = createServer((req, res) => {
   if (req.url?.startsWith('/data')) {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify({ value: 42 }));
+  } else if (req.url?.startsWith('/xhtml')) {
+    // An XHTML page: tagName comes back lower case ("iframe"), which a
+    // case-sensitive focus walk failed to descend.
+    res.writeHead(200, { 'Content-Type': 'application/xhtml+xml' });
+    res.end(
+      '<?xml version="1.0" encoding="UTF-8"?>' +
+        '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>XHTML</title></head>' +
+        '<body><iframe id="login" src="/pwframe"></iframe></body></html>',
+    );
+  } else if (req.url?.startsWith('/htmlframe')) {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<!doctype html><iframe id="login" src="/pwframe"></iframe>');
+  } else if (req.url?.startsWith('/shadow')) {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(
+      '<!doctype html><x-text id="xt"></x-text><x-pw id="xp"></x-pw>' +
+        '<input id="jump" onfocus="setTimeout(() => document.getElementById(\'jumppw\').focus(), 0)">' +
+        '<input id="jumppw" type="password">' +
+        '<div aria-hidden="true"><input id="axhidden"></div>' +
+        // Two fields that trade focus every few ms once the first is focused —
+        // in the light DOM, and inside ONE closed shadow root (where a window-
+        // level listener sees the same host for both). Whatever the timing, the
+        // password field must stay empty; its length is mirrored for the test.
+        '<input id="flip" aria-label="flip"><input id="flippw" type="password">' +
+        '<x-login id="xl"></x-login><span id="pwlen">0</span><span id="spwlen">0</span>' +
+        // Focus moved BY THE PAGE'S OWN beforeinput handler — after the event's
+        // target is fixed, before Chrome inserts — in the light DOM, and in an
+        // open shadow root behind a document-level capture listener that also
+        // stops propagation (so no listener inside the root ever runs).
+        '<input id="bi" aria-label="bi"><input id="bipw" type="password"><span id="bilen">0</span>' +
+        '<x-sp id="xsp"></x-sp><span id="splen">0</span>' +
+        '<script>' +
+        "const bipw = document.getElementById('bipw');" +
+        "document.getElementById('bi').addEventListener('beforeinput', (e) => { if (e.inputType === 'insertText') bipw.focus(); });" +
+        "bipw.addEventListener('input', () => { document.getElementById('bilen').textContent = String(bipw.value.length); });" +
+        "customElements.define('x-sp', class extends HTMLElement { constructor() { super();" +
+        " const r = this.attachShadow({ mode: 'open', delegatesFocus: true });" +
+        " r.innerHTML = '<input aria-label=sp-user><input type=password aria-label=sp-pass>';" +
+        " const [, p] = r.querySelectorAll('input'); const host = this;" +
+        " p.addEventListener('input', () => { document.getElementById('splen').textContent = String(p.value.length); });" +
+        " document.addEventListener('beforeinput', (e) => { if (e.target === host && e.inputType === 'insertText') { p.focus(); e.stopPropagation(); } }, true); } });" +
+        "const flip = document.getElementById('flip'), flippw = document.getElementById('flippw');" +
+        "flippw.addEventListener('input', () => { document.getElementById('pwlen').textContent = String(flippw.value.length); });" +
+        "flip.addEventListener('focus', () => { if (flip.dataset.on) return; flip.dataset.on = '1';" +
+        ' setInterval(() => (document.activeElement === flip ? flippw : flip).focus(), 1); });' +
+        "customElements.define('x-login', class extends HTMLElement { constructor() { super();" +
+        " const r = this.attachShadow({ mode: 'closed', delegatesFocus: true });" +
+        " r.innerHTML = '<input aria-label=shadow-user><input type=password aria-label=shadow-pass>';" +
+        " const [u, p] = r.querySelectorAll('input'); let on = false;" +
+        " p.addEventListener('input', () => { document.getElementById('spwlen').textContent = String(p.value.length); });" +
+        " u.addEventListener('focus', () => { if (on) return; on = true;" +
+        ' setInterval(() => (r.activeElement === u ? p : u).focus(), 1); }); } });' +
+        "customElements.define('x-text', class extends HTMLElement { constructor() { super();" +
+        " this.attachShadow({ mode: 'closed', delegatesFocus: true }).innerHTML = '<input type=text aria-label=inner-text>'; } });" +
+        "customElements.define('x-pw', class extends HTMLElement { constructor() { super();" +
+        " this.attachShadow({ mode: 'closed', delegatesFocus: true }).innerHTML = '<input type=password>'; } });" +
+        '</script>',
+    );
+  } else if (req.url?.startsWith('/designframe')) {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<!doctype html><iframe id="dm" src="/designdoc"></iframe>');
+  } else if (req.url?.startsWith('/designdoc')) {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end("<!doctype html><body><p>x</p><script>document.designMode = 'on';</script></body>");
+  } else if (req.url?.startsWith('/xoframe')) {
+    // Same port, other host name: a different SITE, so an out-of-process frame.
+    const port = server.address().port;
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(`<!doctype html><iframe id="xo" src="http://localhost:${port}/editor"></iframe>`);
+  } else if (req.url?.startsWith('/editorframe')) {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<!doctype html><iframe id="ed" src="/editor"></iframe>');
+  } else if (req.url?.startsWith('/editor')) {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<!doctype html><body contenteditable="true"></body>');
+  } else if (req.url?.startsWith('/card')) {
+    // Auto-advance: a full card number moves focus to the CVV (a password
+    // field). The write was correct; nothing must be flagged or cleared.
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(
+      '<!doctype html><input id="card" oninput="if (this.value.length >= 16) document.getElementById(\'cvv\').focus()">' +
+        '<input id="cvv" type="password" value="123">',
+    );
+  } else if (req.url?.startsWith('/pwframe')) {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<!doctype html><input id="pw" type="password" autofocus>');
   } else {
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end(
@@ -684,6 +770,168 @@ try {
     });
     assert.match(password.content[0].text, /password_field/);
     assert.equal(password.isError, true);
+    // Invariant #5 through a frame: fill on a same-origin <iframe> whose own
+    // document autofocuses a password field. The DOM walk sees the frame's
+    // <body> until Chrome applies that pending focus AT the insert, so the text
+    // used to land in the password field. It must be refused — on an HTML page
+    // and on an XHTML one (whose lower-case "iframe" the walk also missed).
+    for (const page of ['/htmlframe', '/xhtml']) {
+      value(await callTool('navigate', { url: fixtureUrl + page, tabId }));
+      await until(
+        async () =>
+          value(await callTool('wait_for', { selector: '#login', timeoutMs: 1000, tabId })).found,
+        `${page} frame`,
+      );
+      await new Promise((r) => setTimeout(r, 500)); // the frame's own document
+      const intoFrame = await callTool('fill', {
+        selector: '#login',
+        value: 'do-not-record',
+        tabId,
+      });
+      assert.equal(intoFrame.isError, true, `${page}: ${JSON.stringify(intoFrame)}`);
+      // A frame is not a field: refused before anything is focused or typed.
+      assert.match(intoFrame.content[0].text, /wrong_element/);
+    }
+    // Closed-shadow components: a text one fills, a password one is refused —
+    // the browser's AX focus sees through the closed root to the real field.
+    value(await callTool('navigate', { url: fixtureUrl + '/shadow', tabId }));
+    await until(
+      async () =>
+        value(await callTool('wait_for', { selector: '#xt', timeoutMs: 1000, tabId })).found,
+      'shadow page',
+    );
+    const shadowText = value(
+      await callTool('fill', { selector: '#xt', value: 'via host', method: 'insertText', tabId }),
+    );
+    assert.equal(shadowText.applied, 'yes', JSON.stringify(shadowText));
+    // ...and by a ref straight to the INNER field, which is what snapshot/find
+    // hand out (the AX tree pierces even closed roots). The guard compares at
+    // the shadow root too, so the window only ever seeing the host is fine.
+    const inner = value(await callTool('find', { name: 'inner-text', tabId }));
+    assert.equal(inner.matches.length, 1, JSON.stringify(inner));
+    const innerFill = value(
+      await callTool('fill', {
+        selector: inner.matches[0].ref,
+        value: 'via ref',
+        method: 'insertText',
+        tabId,
+      }),
+    );
+    assert.equal(innerFill.applied, 'yes', JSON.stringify(innerFill));
+    // A field the AX tree ignores (aria-hidden) still takes a fill.
+    const axh = value(
+      await callTool('fill', {
+        selector: '#axhidden',
+        value: 'hidden ax',
+        method: 'insertText',
+        tabId,
+      }),
+    );
+    assert.equal(axh.applied, 'yes', JSON.stringify(axh));
+    const shadowPw = await callTool('fill', {
+      selector: '#xp',
+      value: 'do-not-record',
+      method: 'insertText',
+      tabId,
+    });
+    assert.equal(shadowPw.isError, true, JSON.stringify(shadowPw));
+    assert.match(shadowPw.content[0].text, /password_field/);
+    // A page that moves focus onto a password field as the target takes it:
+    // the insert is stopped, nothing lands in the password field.
+    const jump = await callTool('fill', {
+      selector: '#jump',
+      value: 'do-not-record',
+      method: 'insertText',
+      tabId,
+    });
+    assert.equal(jump.isError, true, JSON.stringify(jump));
+    assert.match(jump.content[0].text, /focus_moved|not_focusable|password_field/);
+    // Focus that keeps trading places with a password field — the race the
+    // guard exists for. Any outcome but text in the password field is fine.
+    const outcomes = {};
+    for (const [label, selector, mirror] of [
+      ['light', '#flip', '#pwlen'],
+      ['shadow', '#xl', '#spwlen'],
+    ]) {
+      for (let i = 0; i < 12; i++) {
+        // Not 'do-not-record': a write that DID land in the ordinary field is
+        // audited verbatim, as it should be.
+        const r = await callTool('fill', {
+          selector,
+          value: 'race-text',
+          method: 'insertText',
+          tabId,
+        });
+        const code = r.isError ? /\[(\w+)\]/.exec(r.content[0].text)?.[1] : 'ok';
+        assert.match(
+          String(code),
+          /^(ok|focus_moved|not_focusable|password_field|no_editable_focus)$/,
+        );
+        outcomes[`${label}:${code}`] = (outcomes[`${label}:${code}`] ?? 0) + 1;
+        const len = value(await callTool('get_state', { selector: mirror, tabId }));
+        assert.equal(
+          len.text,
+          '0',
+          `${label} password field received text (${JSON.stringify(outcomes)})`,
+        );
+      }
+    }
+    console.log('  focus-race outcomes:', JSON.stringify(outcomes));
+    // A fresh page: the race fixtures keep trading focus forever once started.
+    value(await callTool('navigate', { url: fixtureUrl + '/shadow', tabId }));
+    await until(
+      async () =>
+        value(await callTool('wait_for', { selector: '#xsp', timeoutMs: 1000, tabId })).found,
+      'shadow page again',
+    );
+    for (const [selector, mirror] of [
+      ['#bi', '#bilen'],
+      ['#xsp', '#splen'],
+    ]) {
+      const r = await callTool('fill', {
+        selector,
+        value: 'race-text',
+        method: 'insertText',
+        tabId,
+      });
+      assert.equal(r.isError, true, `${selector}: ${JSON.stringify(r)}`);
+      assert.match(r.content[0].text, /focus_moved/);
+      const len = value(await callTool('get_state', { selector: mirror, tabId }));
+      assert.equal(len.text, '0', `${selector}: the password field received text`);
+    }
+    // A cross-origin frame cannot be verified, so it is not typed into.
+    value(await callTool('navigate', { url: fixtureUrl + '/xoframe', tabId }));
+    await new Promise((r) => setTimeout(r, 800));
+    const xo = await callTool('fill', { selector: '#xo', value: 'do-not-record', tabId });
+    assert.equal(xo.isError, true, JSON.stringify(xo));
+    assert.match(xo.content[0].text, /wrong_element/);
+    // A designMode frame is an editor too.
+    value(await callTool('navigate', { url: fixtureUrl + '/designframe', tabId }));
+    await new Promise((r) => setTimeout(r, 800));
+    const dm = value(await callTool('fill', { selector: '#dm', value: 'designed', tabId }));
+    assert.equal(dm.applied, 'yes', JSON.stringify(dm));
+    // ...while a framed rich editor (a contenteditable body) still fills.
+    value(await callTool('navigate', { url: fixtureUrl + '/editorframe', tabId }));
+    await until(
+      async () =>
+        value(await callTool('wait_for', { selector: '#ed', timeoutMs: 1000, tabId })).found,
+      'editor frame',
+    );
+    await new Promise((r) => setTimeout(r, 500));
+    value(await callTool('fill', { selector: '#ed', value: 'hello editor', tabId }));
+    // ...and a form that advances focus to a password field after a CORRECT
+    // write is not mistaken for text landing in it.
+    value(await callTool('navigate', { url: fixtureUrl + '/card', tabId }));
+    const card = value(
+      await callTool('fill', {
+        selector: '#card',
+        value: '4111111111111111',
+        method: 'insertText',
+        tabId,
+      }),
+    );
+    assert.equal(card.applied, 'yes', JSON.stringify(card));
+    console.log('PASS: MCP fill refuses to type through a frame into its password field');
     const audit = await popupEval(
       'chrome.storage.local.get("sallyport_audit").then(value => value.sallyport_audit)',
     );

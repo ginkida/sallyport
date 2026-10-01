@@ -754,7 +754,14 @@ TOOLS: list[Tool] = [
             "'+7 (912) 345-67-89'), where the fill did work — confirm before "
             "relying on it, but do not blindly retype. The read-back is skipped "
             "when allowPassword=true or the value is empty, and absent entirely if "
-            "the probe could not run."
+            "the probe could not run. Typing is bound to the TARGET: if focus is "
+            "not on the field you named, fill refuses before typing "
+            "(not_focusable); if the page moves focus while the text goes in, "
+            "the insert is cancelled or reported (focus_moved — check the page "
+            "before retrying). A frame is not a field: fill on an <iframe> works "
+            "only when its whole document is an editor (contenteditable body or "
+            "designMode) on an allowlisted origin; any other frame, including an "
+            "out-of-process one, is refused (wrong_element)."
         ),
         inputSchema={
             "type": "object",

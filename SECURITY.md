@@ -65,7 +65,7 @@ the "Tools" table for per-tool notes. Quick reference:
 | Network exposure | Loopback-only bind (`refuse_non_loopback`) | `daemon/.../__main__.py` |
 | Domain scope | Allowlist enforced before every DOM tool | `extension/src/allowlist.ts`, `extension/src/tools/gates.ts` |
 | Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, `snapshot`'s DOM-fallback walker, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation; `set_viewport`'s viewport read-back; `screenshot`'s one-word `window.devicePixelRatio` read, used only to RAISE a browser-owned size bound, never to lower it) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `domtree.ts`, `aim.ts`, `viewport.ts`, `screenshot.ts`. `print_to_pdf` runs NO page JS at all — structured CDP only |
-| Password input | `fill` reads `type` via browser DOM; `key_type`/`send_keys` enumerate frames (temporary flat child sessions for OOPIFs), locate focused AX nodes through closed shadow DOM, then inspect browser-owned DOM attributes | `extension/src/tools/dom.ts`, `focus.ts`, `keyboard.ts` |
+| Password input | `fill` reads `type` via browser DOM, then binds the write to its target: after `focus()` the browser's AX tree must show focus inside the target's subtree (through closed shadow roots, never into a frame), and an isolated-world guard cancels the insert at `beforeinput`/`textInput` if the focus chain has left the field (limits below); a frame is refused unless its whole document is an editor on an allowlisted origin; `key_type`/`send_keys` enumerate frames (temporary flat child sessions for OOPIFs), locate focused AX nodes through closed shadow DOM, then inspect browser-owned DOM attributes | `extension/src/tools/dom.ts`, `focus.ts`, `keyboard.ts` |
 | Closing tabs | Allowlist-gated like other DOM tools, EXCEPT a tab the caller created in broker mode: the daemon has already proved ownership, which is a stronger answer to "may I destroy this tab" (and without it an agent tab that redirected off-allowlist could never be closed by its owner) | `extension/src/tools/tabs.ts:closeTab` |
 | Filesystem (write) | `save_to_file` and `print_to_pdf`'s daemon post-call processor sandbox to `~/Downloads/sallyport/` (shared `_write_sandbox_blob`: filename rules + resolved-path containment re-check) | `daemon/.../local_tools.py:save_to_file`, `POST_CALL_PROCESSORS` |
 | Filesystem (read via Chrome) | `upload` paths must resolve under the same sandbox; symlink-safe | `daemon/.../local_tools.py:validate_upload_paths` + `PRE_CALL_VALIDATORS` |
@@ -182,11 +182,45 @@ The same redaction applies when a typing call is REJECTED for touching
 (or possibly touching) a password field — both the confirmed
 `password_field` case and the fail-closed `focus_probe_failed` case (the
 CDP frame/AX/DOM focus walk returned incomplete data, so the field couldn't
-be ruled out) — so an attempted credential doesn't leak
+be ruled out), and `fill`'s target-binding refusals (`not_focusable`,
+`no_editable_focus`, `focus_moved`, `wrong_element`), each of which fires
+where the text could have been heading for a field nobody vetted — so an
+attempted credential doesn't leak
 into the audit log just because the keystroke itself was correctly
 blocked. Values typed into non-password fields are kept verbatim — that
 is the point of a visible audit trail — so treat the exported log as
 containing whatever the agent typed into ordinary inputs.
+
+### `fill`'s insert guard binds focus, not intent
+
+`fill` binds its write to the target: the browser must report focus inside
+the target before the insert, and a capture listener in an isolated world on
+the target's window checks, at `beforeinput` and again at `textInput`, that
+the whole focus chain (document and every shadow root, closed ones included)
+still ends at the field — cancelling the insert if not. That closes the
+passive trap that motivated it (a frame autofocusing a password field), an
+honest page moving focus at the wrong moment, and a page's `beforeinput`
+handler moving focus. What remains:
+
+- **A move into another document.** The guard listens in the target's
+  document. If focus moves into a different frame in the instant between the
+  browser's focus check and the insert — an honest auto-advance timer can do
+  this — the insert is not seen there and lands in that frame. `fill` then
+  fails with `focus_moved` ("the target never received the text … it may have
+  gone there") — detected and reported, not prevented.
+- **A page written to defeat it.** The isolated world shares the DOM with the
+  page. A page listener that runs after our `textInput` check (or a window
+  capture listener registered before ours that stops propagation) can move
+  focus once the check has passed, and Chrome inserts wherever focus then is.
+  Such a page can only steer the text into its OWN fields — which it can read
+  anyway, including the one the agent targeted — so this costs nothing the
+  page didn't already have. What the gate protects is that an agent is not
+  steered into a credential field by a page that isn't trying, or by the
+  agent's own mistaken target.
+
+`key_type` and `send_keys` have no target to bind to — they type into
+whatever has focus by contract — so they keep the fail-closed walk over every
+frame described above.
 
 ### Allowlist matches any port unless a port is pinned
 

@@ -6,6 +6,38 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- `fill` could type into a password field through a same-origin `<iframe>`
+  whose document autofocuses one (present since at least 0.24.0): Chrome
+  applies a frame's pending autofocus only at `Input.insertText`, so the
+  check that ran before the insert saw the frame's `<body>` and passed. `fill`
+  no longer asks "is wherever focus went safe?" but "is focus ON the target it
+  was told to fill?", answered by the browser, and fences the insert itself:
+  - a frame element is not a target. A frame whose whole document is an
+    editor (contenteditable body or designMode) is filled by targeting that
+    body, and only when the frame's OWN origin is on the allowlist; any other
+    frame, and any frame whose document this tab cannot reach (out-of-process,
+    not loaded), is refused as `wrong_element`;
+  - after `focus()`, `Accessibility.queryAXTree` over the target's subtree must
+    show the focused node (it sees through closed shadow roots and does not
+    descend into frames), that node must hold text, and it must not be a
+    password field unless `allowPassword` — otherwise `not_focusable`,
+    `no_editable_focus` or `password_field`, before anything is typed;
+  - during the insert, a capture listener in an isolated world on the
+    target's window checks, at both `beforeinput` and `textInput`, that every
+    root on the field's path (the document and each shadow root, closed ones
+    included) still has it focused, and cancels the insert if not
+    (`focus_moved`) — so focus moved by a page's own `beforeinput` handler, or
+    between two fields inside one component, is caught.
+  The page-JavaScript walk to the "deepest focused element" that the old gate
+  relied on is gone, and the insertText read-back now reads exactly the field
+  the browser reported, never "whatever is focused after the write" (a form
+  that advanced to its CVV field had that field's length reported). All of
+  these refusals redact the attempted value in the audit log, like
+  `password_field`. A refusal after `focus()` can leave the field cleared.
+
+
 ## [0.25.0] — 2026-10-01
 
 ### Changed

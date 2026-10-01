@@ -73,7 +73,8 @@ export const upload: Tool = async (args) => {
     { objectId, functionDeclaration: UPLOAD_TARGET_PROBE, returnByValue: true },
   );
   const t = probe.result.value;
-  if (!t || t.tag !== 'INPUT' || t.type !== 'file') {
+  // Upper-cased: an XHTML page reports 'input'.
+  if (!t || String(t.tag).toUpperCase() !== 'INPUT' || t.type !== 'file') {
     const tag = t?.tag ?? 'unknown';
     const typeStr = t?.type ? `[type=${t.type}]` : '';
     throw new BridgeError(

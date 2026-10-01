@@ -163,7 +163,8 @@ const SELECT_APPLY_PROBE = `function(spec) {
   var planSelection = ${planSelection.toString()};
   var el = this;
   var input;
-  if (el && el.tagName === 'SELECT') {
+  // Upper-cased: an XHTML page reports 'select', which is still a <select>.
+  if (el && String(el.tagName).toUpperCase() === 'SELECT') {
     var opts = [];
     for (var i = 0; i < el.options.length; i++) {
       var o = el.options[i];

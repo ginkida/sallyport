@@ -198,10 +198,21 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
     // OUT a password field, so the same "might be a credential" reasoning
     // applies — not redacting here would leak the attempted secret into the
     // persisted, popup-exportable audit log even though the keystroke itself
-    // was correctly blocked from reaching the page.
+    // was correctly blocked from reaching the page. fill's target-binding
+    // refusals join them — `not_focusable` (focus is not on the target),
+    // `no_editable_focus` (the focused node holds no text), `focus_moved` (the
+    // insert was aimed elsewhere and stopped), `wrong_element` (fill on a frame
+    // that is not an editor): each fires precisely where the text could have
+    // been heading for a field nobody vetted. Only typing tools have a value to
+    // redact, so the extra codes change nothing for the others.
     if (
       e instanceof BridgeError &&
-      (e.code === 'password_field' || e.code === 'focus_probe_failed')
+      (e.code === 'password_field' ||
+        e.code === 'focus_probe_failed' ||
+        e.code === 'not_focusable' ||
+        e.code === 'no_editable_focus' ||
+        e.code === 'focus_moved' ||
+        e.code === 'wrong_element')
     ) {
       audit.args = redactAuditArgs(name, callArgs, { force: true });
     }
