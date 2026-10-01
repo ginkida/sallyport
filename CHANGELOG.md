@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-10-01
+
 ### Changed
 
 - `reveal` waits between scroll steps on its container's subtree instead of
@@ -3004,7 +3006,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.24.1...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/ginkida/sallyport/compare/v0.24.1...v0.25.0
 [0.24.1]: https://github.com/ginkida/sallyport/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/ginkida/sallyport/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/ginkida/sallyport/compare/v0.22.0...v0.23.0
