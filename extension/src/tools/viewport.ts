@@ -56,7 +56,7 @@
 import { attach, CALL_GROUP, cdp, recordEmulatedDsf, releaseViewport } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
-import { clearRefsForTab } from './refs.js';
+import { resetRefsForTab } from './refs.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
@@ -626,7 +626,7 @@ export const setViewport: Tool = async (args) => {
 
   if (spec.mode === 'reset') {
     await releaseViewport(tabId);
-    clearRefsForTab(tabId);
+    resetRefsForTab(tabId);
     const page = await readViewport(tabId);
     return { tabId, url: tab.url, data: { ok: true, mode: 'reset', page } };
   }
@@ -635,7 +635,7 @@ export const setViewport: Tool = async (args) => {
   // Same reasoning as navigate/reload: the layout the refs were minted against
   // is gone. A breakpoint change remounts DOM, so a stale @eN would resolve to
   // a node the new layout no longer shows.
-  clearRefsForTab(tabId);
+  resetRefsForTab(tabId);
   const page = await readViewport(tabId);
 
   const requested = {

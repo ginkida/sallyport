@@ -6,6 +6,28 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- An `@eN` ref could act on an element of a DIFFERENT page (present in every
+  release whose refs are backendNodeIds). After a navigation the page started
+  itself — a link to another site, a form submit, a script redirect — no tool
+  had wiped the ref map, and the new renderer process numbers its nodes from 1
+  again, so an old ref resolved to a live node of the new page: `click`,
+  `fill`, `mouse_click`, `read_text`, `get_state` and `wait_for` on it acted on
+  or reported that foreign node, and answered `ok:true`. Each ref is now
+  stamped with the main-frame loader id of the document it was minted in and
+  refused as `bad_ref` ("issued for a different page … navigated") once the
+  tab shows another document; `get_state` answers
+  `{exists:false, reason:'unknown_ref'}`, an absent-wait counts the node as
+  gone. `pushState` keeps the loader id, so SPA routing keeps its refs. Costs
+  one `Page.getFrameTree` per ref resolve and per snapshot (no `Page.enable`).
+- `@eN` numbering no longer restarts at `e1` on a live tab. A navigate,
+  reload, history hop, viewport change or debugger detach (including the
+  human's Cancel on the debugging bar) used to reset the counter, so the next
+  snapshot could re-issue an id the agent still held, naming a different
+  element of the same page. The map is still wiped; the counter now restarts
+  only when the tab is closed.
+
 ## [0.25.1] — 2026-10-01
 
 ### Security

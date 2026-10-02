@@ -1310,9 +1310,10 @@ describe('pollFor — ticks that tell the truth', () => {
 
   it('fails a present-wait at once when its @eN is destroyed mid-wait', async () => {
     const { newRef } = await import('../src/tools/refs.js');
-    const ref = '@' + newRef(TAB, 77, 'button', 'Save');
+    const ref = '@' + newRef(TAB, 77, 'button', 'Save', 'L1');
     let boxes = 0;
     vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { loaderId: 'L1' } } };
       if (method === 'DOM.describeNode') return { node: {} }; // alive before the loop
       if (method === 'DOM.getBoxModel') {
         if (boxes++ === 0) throw new Error('Could not compute box model.'); // hidden
@@ -1329,7 +1330,7 @@ describe('pollFor — ticks that tell the truth', () => {
 
   it('counts a destroyed @eN as gone under absent', async () => {
     const { newRef } = await import('../src/tools/refs.js');
-    const ref = '@' + newRef(TAB, 78, 'dialog', 'Saving');
+    const ref = '@' + newRef(TAB, 78, 'dialog', 'Saving', 'L1');
     vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
       if (method === 'DOM.getBoxModel') throw new Error('No node found for given backend id');
       return {};
@@ -1337,6 +1338,91 @@ describe('pollFor — ticks that tell the truth', () => {
     const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 1000, absent: true });
     await vi.runAllTimersAsync();
     expect(await pending).toMatchObject({ found: true });
+  });
+
+  // A page-initiated navigation (link, form submit, script redirect) wipes no
+  // ref map, and after a cross-process one the old backendNodeId resolves to a
+  // LIVE node of the new document (Chrome 154: 41 of 41). The loader id stamped
+  // at mint time is what tells the two documents apart.
+  it('fails a present-wait as bad_ref once the page has navigated, even though the old id resolves', async () => {
+    const { newRef } = await import('../src/tools/refs.js');
+    const ref = '@' + newRef(TAB, 79, 'button', 'Pay', 'L1');
+    let frameTrees = 0;
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      // Alive at the entry check, a NEW document from the first tick on.
+      if (method === 'Page.getFrameTree') {
+        return { frameTree: { frame: { loaderId: frameTrees++ === 0 ? 'L1' : 'L2' } } };
+      }
+      if (method === 'DOM.describeNode') return { node: {} };
+      if (method === 'DOM.getBoxModel') return { model: { width: 10, height: 10 } }; // a foreign node, visible
+      return {};
+    });
+    const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 5000, absent: false });
+    const rejected = expect(pending).rejects.toMatchObject({
+      code: 'bad_ref',
+      message: expect.stringContaining('navigated'),
+    });
+    await vi.runAllTimersAsync();
+    await rejected;
+  });
+
+  it('refuses at the entry check when the ref is already from another document', async () => {
+    const { newRef } = await import('../src/tools/refs.js');
+    const ref = '@' + newRef(TAB, 80, 'button', 'Pay', 'L1');
+    let boxes = 0;
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { loaderId: 'L2' } } };
+      if (method === 'DOM.describeNode') return { node: {} };
+      if (method === 'DOM.getBoxModel') boxes++;
+      return { model: { width: 10, height: 10 } };
+    });
+    const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 5000, absent: false });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'bad_ref' });
+    await vi.runAllTimersAsync();
+    await rejected;
+    expect(boxes).toBe(0);
+  });
+
+  it('counts an @eN from a navigated-away document as gone under absent', async () => {
+    const { newRef } = await import('../src/tools/refs.js');
+    const ref = '@' + newRef(TAB, 81, 'dialog', 'Saving', 'L1');
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { loaderId: 'L2' } } };
+      if (method === 'DOM.getBoxModel') return { model: { width: 10, height: 10 } };
+      return {};
+    });
+    const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 1000, absent: true });
+    await vi.runAllTimersAsync();
+    expect(await pending).toMatchObject({ found: true });
+  });
+
+  it('keeps an @eN across same-document navigation (pushState keeps the loader id)', async () => {
+    const { newRef } = await import('../src/tools/refs.js');
+    const ref = '@' + newRef(TAB, 82, 'button', 'Next', 'L1');
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { loaderId: 'L1' } } };
+      if (method === 'DOM.describeNode') return { node: {} };
+      if (method === 'DOM.getBoxModel') return { model: { width: 10, height: 10 } };
+      return {};
+    });
+    const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 1000, absent: false });
+    await vi.runAllTimersAsync();
+    expect(await pending).toMatchObject({ found: true });
+  });
+
+  it('fails closed when the browser will not say which document the tab shows', async () => {
+    const { newRef } = await import('../src/tools/refs.js');
+    const ref = '@' + newRef(TAB, 83, 'dialog', 'Saving', 'L1');
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'Page.getFrameTree') throw new Error('Page.getFrameTree failed');
+      if (method === 'DOM.getBoxModel') return { model: { width: 10, height: 10 } };
+      return {};
+    });
+    // Under absent, too: no answer is never "it is gone".
+    const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 1000, absent: true });
+    const rejected = expect(pending).rejects.toThrow('Page.getFrameTree failed');
+    await vi.runAllTimersAsync();
+    await rejected;
   });
 
   it('reports how long a folded wait ran before it failed', async () => {

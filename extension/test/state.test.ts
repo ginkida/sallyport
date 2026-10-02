@@ -211,7 +211,9 @@ describe('get_state batching over CDP', () => {
   const TAB = 11;
   type Cmd = { method: string; params?: Record<string, unknown> };
 
-  function installChrome(opts: { querySelectorThrows?: string } = {}): Cmd[] {
+  function installChrome(
+    opts: { querySelectorThrows?: string; loaderId?: string; frameTreeThrows?: boolean } = {},
+  ): Cmd[] {
     const sent: Cmd[] = [];
     const store = new Map<string, unknown>();
     let nextRoot = 1;
@@ -253,6 +255,10 @@ describe('get_state batching over CDP', () => {
             return { nodeId: 42 };
           }
           if (method === 'DOM.resolveNode') return { object: { objectId: 'obj-1' } };
+          if (method === 'Page.getFrameTree') {
+            if (opts.frameTreeThrows) throw new Error('Page.getFrameTree failed');
+            return { frameTree: { frame: { loaderId: opts.loaderId ?? 'L1' } } };
+          }
           if (method === 'Runtime.callFunctionOn') {
             return {
               result: {
@@ -311,11 +317,55 @@ describe('get_state batching over CDP', () => {
     await allowApp();
     const { newRef, clearRefsForTab } = await import('../src/tools/refs.js');
     clearRefsForTab(TAB);
-    const a = '@' + newRef(TAB, 501, 'button', 'Save');
-    const b = '@' + newRef(TAB, 502, 'listitem', 'Row');
+    const a = '@' + newRef(TAB, 501, 'button', 'Save', 'L1');
+    const b = '@' + newRef(TAB, 502, 'listitem', 'Row', 'L1');
     const { getState } = await import('../src/tools/state.js');
     await getState({ selector: [a, b], tabId: TAB }, undefined);
     expect(sent.filter((c) => c.method === 'DOM.getDocument')).toHaveLength(0);
+  });
+
+  // A ref is stamped with the document it was minted in (refs.ts `loaderId`).
+  // After a navigation the page itself started, the old backendNodeId can
+  // resolve to a LIVE node of the new page; get_state must not describe that
+  // node as the agent's element.
+  it('answers unknown_ref for an @eN from a document the tab has navigated away from', async () => {
+    const sent = installChrome({ loaderId: 'L2' });
+    await allowApp();
+    const { newRef, clearRefsForTab } = await import('../src/tools/refs.js');
+    clearRefsForTab(TAB);
+    const a = '@' + newRef(TAB, 501, 'button', 'Pay', 'L1');
+    const { getState } = await import('../src/tools/state.js');
+    const out = (await getState({ selector: a, tabId: TAB }, undefined)) as {
+      data: Record<string, unknown>;
+    };
+    expect(out.data).toMatchObject({ exists: false, reason: 'unknown_ref', ref: a });
+    // Nothing was read off the foreign node.
+    expect(sent.filter((c) => c.method === 'Runtime.callFunctionOn')).toHaveLength(0);
+  });
+
+  it('still describes an @eN on the document it came from', async () => {
+    installChrome({ loaderId: 'L1' });
+    await allowApp();
+    const { newRef, clearRefsForTab } = await import('../src/tools/refs.js');
+    clearRefsForTab(TAB);
+    const a = '@' + newRef(TAB, 501, 'button', 'Pay', 'L1');
+    const { getState } = await import('../src/tools/state.js');
+    const out = (await getState({ selector: a, tabId: TAB }, undefined)) as {
+      data: Record<string, unknown>;
+    };
+    expect(out.data).toMatchObject({ exists: true });
+  });
+
+  it('throws rather than answer {exists:false} when the browser will not name the document', async () => {
+    installChrome({ frameTreeThrows: true });
+    await allowApp();
+    const { newRef, clearRefsForTab } = await import('../src/tools/refs.js');
+    clearRefsForTab(TAB);
+    const a = '@' + newRef(TAB, 501, 'button', 'Pay', 'L1');
+    const { getState } = await import('../src/tools/state.js');
+    await expect(getState({ selector: a, tabId: TAB }, undefined)).rejects.toThrow(
+      'Page.getFrameTree failed',
+    );
   });
 
   it('calls a malformed selector bad_args, but does NOT relabel a transient failure as one', async () => {

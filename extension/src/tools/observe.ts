@@ -2,7 +2,7 @@
  * action's own result.
  *
  * WHY IT EXISTS. Every action tool used to end blind. `navigate` and `reload`
- * call `clearRefsForTab`, so every `@eN` the agent held is dead the moment they
+ * call `resetRefsForTab`, so every `@eN` the agent held is dead the moment they
  * return — a follow-up `snapshot` or `find` is not a choice the agent can
  * optimise away, it is structural. And a `click` returns the tag and 100
  * characters of text, which is almost never enough to decide what to do next.

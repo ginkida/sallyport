@@ -8,7 +8,7 @@ import {
 import { clearDialogs, ensureDialogCapture, releaseDialogCapture } from './dialog-capture.js';
 import { BridgeError } from './errors.js';
 import { clearNetwork, ensureNetworkCapture, releaseNetworkCapture } from './network-capture.js';
-import { clearRefsForTab } from './refs.js';
+import { clearRefsForTab, resetRefsForTab } from './refs.js';
 import { onTab } from './tab-chain.js';
 
 // How long the teardown path waits for a tab to give its viewport emulation
@@ -205,9 +205,20 @@ export async function releaseKeepAwakeEverywhere(): Promise<void> {
 // module transitively (tabs.ts/poll.ts pull pure helpers) where it doesn't
 // exist at load time — guard the top-level registrations so importing never
 // demands the API surface, only calling does.
-function clearTabState(tabId: number): void {
+//
+// A tab's extension-side state dies in TWO halves, because the two ends of a
+// debugger session are not the same event:
+//  - `clearSessionState` — everything that belongs to the CDP session (the
+//    attached flag, capture rings and flags, a dialog arm, the emulated dpr, the
+//    hygiene timer). Gone with ANY detach.
+//  - the `@eN` refs. Their map dies with the session too, but their COUNTER
+//    only dies with the tab: a detach (the human's Cancel on the debugging bar,
+//    an explicit `detach()`) leaves a LIVE page, and restarting at `e1` there would let the
+//    next snapshot re-issue `@e5` while the agent still holds the old one — a
+//    silent rebind (#7). So a detach RESETS (map wiped, counter kept); only
+//    `tabs.onRemoved` CLEARS.
+export function clearSessionState(tabId: number): void {
   attached.delete(tabId);
-  clearRefsForTab(tabId);
   clearConsole(tabId);
   clearNetwork(tabId);
   clearDialogs(tabId);
@@ -215,14 +226,30 @@ function clearTabState(tabId: number): void {
   dropHygiene(tabId);
 }
 
+/** The tab is gone for good: session state AND the ref counter. */
+export function onTabRemoved(tabId: number): void {
+  clearSessionState(tabId);
+  clearRefsForTab(tabId);
+}
+
+/** The session ended, the tab may well live on — whatever the reason Chrome
+ * gives. `target_closed` is deliberately NOT read as proof that the TAB closed:
+ * a closed tab's `tabs.onRemoved` restarts the counter anyway, and a reset that
+ * lands after it leaves nothing behind (refs.ts), so keeping the counter here
+ * costs nothing and is the safe answer on any path where the tab survives. */
+export function onSessionDetached(tabId: number): void {
+  clearSessionState(tabId);
+  resetRefsForTab(tabId);
+}
+
 if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
-  chrome.tabs.onRemoved.addListener(clearTabState);
+  chrome.tabs.onRemoved.addListener(onTabRemoved);
 }
 
 if (typeof chrome !== 'undefined' && chrome.debugger?.onDetach) {
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId !== undefined) {
-      clearTabState(source.tabId);
+      onSessionDetached(source.tabId);
     }
   });
 }
@@ -437,7 +464,7 @@ export async function detach(tabId: number): Promise<void> {
   } catch {
     // already detached, tab closed, or never ours — nothing to undo
   }
-  clearTabState(tabId);
+  onSessionDetached(tabId);
 }
 
 export async function cdp<T = unknown>(

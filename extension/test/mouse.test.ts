@@ -122,8 +122,9 @@ type Cmd = { method: string; fn?: string };
  * — remembering that the probe has ALREADY scrolled the element into view
  * before measuring (aim.ts:findClickPoint), which is exactly what makes the
  * refusal below meaningful. */
-function installChrome(point: Record<string, unknown>): Cmd[] {
+function installChrome(point: Record<string, unknown>, loaders: string[] = ['L1']): Cmd[] {
   const sent: Cmd[] = [];
+  let frameTrees = 0;
   const store = new Map<string, unknown>();
   (globalThis as unknown as { chrome: unknown }).chrome = {
     storage: {
@@ -160,6 +161,12 @@ function installChrome(point: Record<string, unknown>): Cmd[] {
         if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
         if (method === 'DOM.querySelector') return { nodeId: 2 };
         if (method === 'DOM.resolveNode') return { object: { objectId: 'el' } };
+        if (method === 'Page.getFrameTree') {
+          return {
+            frameTree: { frame: { loaderId: loaders[Math.min(frameTrees++, loaders.length - 1)] } },
+          };
+        }
+        if (method === 'DOM.describeNode') return { node: { backendNodeId: 555 } };
         if (method === 'Runtime.callFunctionOn') {
           // The BY_VALUE projection is the only call that returns the measured
           // point; the aim probe itself hands back a handle.
@@ -238,5 +245,36 @@ describe('an element that is off-viewport AFTER the aim probe scrolled to it', (
     await expect(hover({ tabId: TAB, selector: '#menu' }, undefined)).rejects.toThrow(
       /hover: button was scrolled into view and still measures/,
     );
+  });
+});
+
+/**
+ * The covering node's `hitTargetRef` is minted outside any snapshot, so it
+ * carries its own document stamp (refs.ts `loaderId`) — read BEFORE the probe
+ * that finds the node. A click on a link can navigate, and the ref must stay
+ * bound to the document its node id came from.
+ */
+describe('hitTargetRef document stamp', () => {
+  const covered = { ...inView, covered: true, hitTarget: 'cookie banner', hitTag: 'DIV' };
+
+  it('is read before the aim probe, and stamps the ref with that document', async () => {
+    const sent = installChrome(covered, ['L1']);
+    const { mouseClick } = await load();
+    const out = (await mouseClick({ tabId: TAB, selector: '#buy' }, undefined)) as {
+      data: { hitTargetRef?: string };
+    };
+    expect(out.data.hitTargetRef).toMatch(/^@e\d+$/);
+    const methods = sent.map((c) => c.method);
+    const stamp = methods.indexOf('Page.getFrameTree');
+    expect(stamp).toBeGreaterThan(methods.indexOf('DOM.resolveNode'));
+    // Before the aim probe (the first callFunctionOn) and the describe that
+    // turns the covering node into an id.
+    expect(stamp).toBeLessThan(methods.indexOf('Runtime.callFunctionOn'));
+    expect(stamp).toBeLessThan(methods.indexOf('DOM.describeNode'));
+    const { getRef } = await import('../src/tools/refs.js');
+    expect(getRef(TAB, out.data.hitTargetRef!)).toMatchObject({
+      backendDOMNodeId: 555,
+      loaderId: 'L1',
+    });
   });
 });

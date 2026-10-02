@@ -118,6 +118,29 @@ const server = createServer((req, res) => {
       '<!doctype html><input id="card" oninput="if (this.value.length >= 16) document.getElementById(\'cvv\').focus()">' +
         '<input id="cvv" type="password" value="123">',
     );
+  } else if (req.url?.startsWith('/xsite-a')) {
+    // Invariant #7 across a navigation the PAGE starts: a link from this site
+    // (127.0.0.1) to another (localhost) swaps the renderer process, and the
+    // new process numbers its nodes from 1 again — so without the loader-id
+    // stamp, a ref from here resolves to a live node of /xsite-b.
+    const port = server.address().port;
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(
+      '<!doctype html><title>Site A</title>' +
+        Array.from({ length: 20 }, (_, i) => `<button>A button ${i}</button>`).join('') +
+        `<a id="tob" href="http://localhost:${port}/xsite-b">Go to B</a>`,
+    );
+  } else if (req.url?.startsWith('/xsite-b')) {
+    // Big enough that the new process's node ids cover whatever range the
+    // 127.0.0.1 process had reached by the time /xsite-a was walked, and every
+    // click ANYWHERE on it is counted.
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(
+      '<!doctype html><title>Site B</title><p>B page</p><span id="clicks">0</span>' +
+        Array.from({ length: 3000 }, (_, i) => `<button>B button ${i}</button>`).join('') +
+        '<script>let n = 0; document.addEventListener("click", () => {' +
+        ' document.getElementById("clicks").textContent = String(++n); }, true);</script>',
+    );
   } else if (req.url?.startsWith('/pwframe')) {
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end('<!doctype html><input id="pw" type="password" autofocus>');
@@ -932,6 +955,48 @@ try {
     );
     assert.equal(card.applied, 'yes', JSON.stringify(card));
     console.log('PASS: MCP fill refuses to type through a frame into its password field');
+    // A ref must not cross a navigation the page started itself (#7).
+    const bUrl = fixtureUrl.replace('127.0.0.1', 'localhost');
+    await popupEval(
+      `chrome.storage.local.set({sallyport_allowlist:[` +
+        `{pattern:${JSON.stringify(fixtureUrl + '/*')},allowEvaluate:false,addedAt:Date.now()},` +
+        `{pattern:${JSON.stringify(bUrl + '/*')},allowEvaluate:false,addedAt:Date.now()}]})`,
+    );
+    value(await callTool('navigate', { url: fixtureUrl + '/xsite-a', tabId }));
+    const siteA = value(await callTool('snapshot', { compact: true, tabId }));
+    const aRefs = siteA.elements.filter((e) => /^A button/.test(e.name)).map((e) => e.ref);
+    const link = siteA.elements.find((e) => e.name === 'Go to B')?.ref;
+    assert.ok(aRefs.length >= 10 && link, JSON.stringify(siteA.elements));
+    // The PAGE navigates (the link's own default action), not a tool.
+    value(await callTool('click', { selector: link, tabId }));
+    assert.ok(
+      value(await callTool('wait_for', { text: 'B page', timeoutMs: 10000, tabId })).found,
+      'the link did not reach site B',
+    );
+    // Give the new document node ids without touching the ref map, as any
+    // later call would: key_type's focus walk reads the whole AX tree (nothing
+    // is focused, so it refuses — the ids are assigned all the same).
+    const noFocus = await callTool('key_type', { text: 'x', tabId });
+    assert.equal(noFocus.isError, true, JSON.stringify(noFocus));
+    const stale = [];
+    for (const ref of aRefs) stale.push(await callTool('click', { selector: ref, tabId }));
+    for (const r of stale) {
+      assert.equal(r.isError, true, JSON.stringify(r));
+      assert.match(r.content[0].text, /bad_ref/);
+    }
+    // Not vacuous: the old ids DID resolve on the new page — only the document
+    // check stood between them and a click on site B.
+    assert.ok(
+      stale.some((r) => /issued for a different page/.test(r.content[0].text)),
+      JSON.stringify(stale.map((r) => r.content[0].text)),
+    );
+    const clicks = value(await callTool('get_state', { selector: '#clicks', tabId }));
+    assert.equal(clicks.text, '0', 'a stale ref clicked something on site B');
+    // …and a fresh snapshot keeps counting, so the old numbers never come back.
+    const siteB = value(await callTool('snapshot', { compact: true, tabId }));
+    const maxA = Math.max(...siteA.elements.map((e) => Number(e.ref.slice(2))));
+    for (const e of siteB.elements) assert.ok(Number(e.ref.slice(2)) > maxA, e.ref);
+    console.log('PASS: MCP refs from a page that navigated itself cross-site are refused');
     const audit = await popupEval(
       'chrome.storage.local.get("sallyport_audit").then(value => value.sallyport_audit)',
     );

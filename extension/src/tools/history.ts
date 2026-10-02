@@ -36,7 +36,7 @@ import { getEpoch, isBrokerMode } from './ownership.js';
 import { parseObserve, runObserve } from './observe.js';
 import { loadTimeoutMs } from './budget.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
-import { clearRefsForTab } from './refs.js';
+import { resetRefsForTab } from './refs.js';
 import { getTabOrGone, resolveTab, waitForLoad } from './tabs.js';
 import type { Tool } from './types.js';
 
@@ -206,7 +206,7 @@ export const historyGo: Tool = async (args, ctx) => {
   const landedUrl = landed.url ?? target.url;
   // Navigation invalidates any refs we held for this tab, and any pending
   // dialog arm (see the identical note in navigate).
-  clearRefsForTab(tab.id!);
+  resetRefsForTab(tab.id!);
   clearArmedDialog(tab.id!);
   // Broker epoch: an in-place move on an existing owned tab — echo, never mint
   // (mirrors navigate's non-created branch).

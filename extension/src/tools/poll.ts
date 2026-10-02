@@ -14,9 +14,10 @@ import {
   looksLikeMissingNodeError,
   looksLikeSelectorSyntaxError,
 } from './cdp.js';
-import { BridgeError, invalidSelectorError, staleRefError } from './errors.js';
+import { BridgeError, invalidSelectorError, navigatedRefError, staleRefError } from './errors.js';
 import { ensureStillAllowed } from './gates.js';
 import { getRef, isRef } from './refs.js';
+import { assertRefDocument, refDocumentIsCurrent } from './resolve.js';
 import { budgetLeft, OBSERVE_RESERVE_MS } from './budget.js';
 import { CREATE_QUIESCENCE_PROBE, OBSERVE_ELEMENT_FN } from './quiescence.js';
 
@@ -127,8 +128,11 @@ export function parseWaitFor(raw: unknown, tool: string): WaitSpec | null {
 
 /** `unknown` = no trustworthy reading this tick (the probe threw in the page,
  * returned nonsense, or a navigation took its document away). A present-wait
- * keeps waiting on it, and so must an absent-wait: absence was not shown. */
-export type SelectorVisibility = 'visible' | 'hidden' | 'unknown' | 'destroyed';
+ * keeps waiting on it, and so must an absent-wait: absence was not shown.
+ * `navigated` = an `@eN` from a document the tab no longer shows: its node is
+ * gone for an absent-wait, and a `bad_ref` for a present one — whatever its old
+ * id resolves to now is a node of the NEW page (refs.ts `loaderId`). */
+export type SelectorVisibility = 'visible' | 'hidden' | 'unknown' | 'destroyed' | 'navigated';
 
 /** Page-side half of a CSS-selector wait, over EVERY match: is any of them laid
  * out? Only `{visible, total}` leaves the page — no node, text or attribute.
@@ -204,7 +208,11 @@ async function selectorVisibility(tabId: number, selector: string): Promise<Sele
         `wait: unknown ref "${selector}" for tab ${tabId} — run snapshot first`,
       );
     }
-    return nodeVisibility(tabId, { backendNodeId: r.backendDOMNodeId });
+    const v = await nodeVisibility(tabId, { backendNodeId: r.backendDOMNodeId });
+    if (v === 'destroyed') return v;
+    // AFTER the box-model read (it may have reached the new document), and on
+    // EVERY tick: the page can navigate at any point of a 30 s wait.
+    return (await refDocumentIsCurrent(tabId, r.loaderId)) ? v : 'navigated';
   }
   let v: unknown;
   try {
@@ -309,7 +317,9 @@ async function ensureRefStillExists(tabId: number, ref: string): Promise<void> {
     await cdp(tabId, 'DOM.describeNode', { backendNodeId: r.backendDOMNodeId });
   } catch (e) {
     if (looksLikeMissingNodeError(e)) throw staleRefError('wait', ref);
+    return; // fail-open, as above: the loop's own per-tick check still runs
   }
+  await assertRefDocument(tabId, r.loaderId, ref, 'wait');
 }
 
 /** Poll until the spec holds (AND across given conditions; `absent` inverts
@@ -362,11 +372,13 @@ async function pollLoop(
     if (spec.absent) {
       // Gone-condition: selector invisible/detached AND text not on page. An
       // unreadable tick (`unknown`, text `null`) is never proof of absence.
-      const selGone = sel === null || sel === 'hidden' || sel === 'destroyed';
+      const selGone =
+        sel === null || sel === 'hidden' || sel === 'destroyed' || sel === 'navigated';
       const text = !selGone || spec.text === null ? false : await textPresent(tabId, spec.text);
       ok = selGone && text === false;
     } else {
       if (sel === 'destroyed') throw staleRefError('wait', spec.selector!);
+      if (sel === 'navigated') throw navigatedRefError('wait', spec.selector!);
       const selOk = sel === null || sel === 'visible';
       // Short-circuit: skip the text probe while the selector is failing.
       ok = selOk && (spec.text === null || (await textPresent(tabId, spec.text)) === true);

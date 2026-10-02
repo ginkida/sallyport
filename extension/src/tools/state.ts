@@ -26,6 +26,7 @@ import { attach, CALL_GROUP, cdp, looksLikeSelectorSyntaxError } from './cdp.js'
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { getRef, isRef, type RefInfo } from './refs.js';
+import { refDocumentIsCurrent } from './resolve.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
@@ -200,7 +201,16 @@ async function resolveForState(
     } catch {
       objectId = null;
     }
-    return objectId ? { objectId } : { exists: false, reason: 'detached', ref };
+    if (!objectId) return { exists: false, reason: 'detached', ref };
+    // A ref from a document the tab has since navigated away from names nothing
+    // here — its old id may resolve to a live node of the NEW page (refs.ts
+    // `loaderId`). Checked AFTER the resolve, so a resolve that reached the new
+    // document is caught. Same answer as a ref never minted; a frame-tree read
+    // the browser refuses throws, because {exists:false} would be a claim.
+    if (!(await refDocumentIsCurrent(tabId, refInfo.loaderId))) {
+      return { exists: false, reason: 'unknown_ref', ref };
+    }
+    return { objectId };
   }
 
   const root = await documentRoot();

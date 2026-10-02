@@ -7,7 +7,7 @@ import {
 } from './aim.js';
 import { attach, CALL_GROUP, cdp } from './cdp.js';
 import { parseObserve, runObserve } from './observe.js';
-import { resolveSelectorOrRef } from './resolve.js';
+import { mintLoaderId, resolveSelectorOrRef } from './resolve.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
@@ -185,8 +185,14 @@ async function aimAtElement(
   point: Omit<ClickPoint, 'hitEl'>;
   hitTargetRef: string | null;
   hitBackendNodeId: number | null;
+  hitLoaderId: string | null;
 }> {
   const GROUP = 'sallyport_mouse';
+  // The document stamp for a covering node's ref, read BEFORE the probe that
+  // finds that node (refs.ts / snapshot.ts: "before" is the side whose race
+  // only ever costs a conservative bad_ref). This ref is minted outside any
+  // snapshot, so it carries its own stamp rather than borrowing one.
+  const hitLoaderId = await mintLoaderId(tabId);
   // The probe runs INSIDE the try: one that throws in the page still mints its
   // exception object into GROUP, and only the finally releases it.
   try {
@@ -236,6 +242,7 @@ async function aimAtElement(
                 d.node.backendNodeId,
                 (point.hitTag || 'node').toLowerCase(),
                 point.hitTarget ?? '',
+                hitLoaderId,
               );
           }
         } catch {
@@ -244,7 +251,7 @@ async function aimAtElement(
         }
       }
     }
-    return { point, hitTargetRef, hitBackendNodeId };
+    return { point, hitTargetRef, hitBackendNodeId, hitLoaderId };
   } finally {
     try {
       await cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: GROUP });
@@ -296,16 +303,26 @@ async function validateViewportPoint(
  * reaches the agent, and refs are monotonic, so it does not even alias: it just
  * fails. Shipping a ref in the same payload that invalidated it is the kind of
  * small lie that costs a round-trip to discover. Minting again after the
- * observation puts it in the generation the result actually ships. */
+ * observation puts it in the generation the result actually ships.
+ *
+ * With the AIM-time document stamp, not the current one: the click may well
+ * have navigated, and the node id belongs to the document it was read from. */
 function remintHitTarget(
   tabId: number,
   hitBackendNodeId: number | null,
+  hitLoaderId: string | null,
   point: { hitTag?: string | null; hitTarget?: string | null },
 ): string | null {
   if (hitBackendNodeId === null) return null;
   return (
     '@' +
-    newRef(tabId, hitBackendNodeId, (point.hitTag || 'node').toLowerCase(), point.hitTarget ?? '')
+    newRef(
+      tabId,
+      hitBackendNodeId,
+      (point.hitTag || 'node').toLowerCase(),
+      point.hitTarget ?? '',
+      hitLoaderId,
+    )
   );
 }
 
@@ -395,6 +412,7 @@ export const mouseClick: Tool = async (args, ctx) => {
     point,
     hitTargetRef: aimedRef,
     hitBackendNodeId,
+    hitLoaderId,
   } = await aimAtElement(tab.id!, objectId, 'mouse_click');
   if (!point.visible) {
     throw new BridgeError('not_visible', `mouse_click: element ${point.tag} has zero size`);
@@ -410,7 +428,9 @@ export const mouseClick: Tool = async (args, ctx) => {
   const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   // AFTER the observation: it reset the ref space, so a ref minted while aiming
   // would be dead in the very payload that carries it.
-  const hitTargetRef = observed ? remintHitTarget(tab.id!, hitBackendNodeId, point) : aimedRef;
+  const hitTargetRef = observed
+    ? remintHitTarget(tab.id!, hitBackendNodeId, hitLoaderId, point)
+    : aimedRef;
 
   return {
     tabId: tab.id,
@@ -486,6 +506,7 @@ export const hover: Tool = async (args, ctx) => {
     point,
     hitTargetRef: aimedRef,
     hitBackendNodeId,
+    hitLoaderId,
   } = await aimAtElement(tab.id!, objectId, 'hover');
   if (!point.visible) {
     throw new BridgeError('not_visible', `hover: element ${point.tag} has zero size`);
@@ -500,7 +521,9 @@ export const hover: Tool = async (args, ctx) => {
     : null;
   const observed = observeSpec ? await runObserve(tab.id!, observeSpec, ctx?.startedAt) : null;
   // See mouse_click: re-mint after the observation reset the ref space.
-  const hitTargetRef = observed ? remintHitTarget(tab.id!, hitBackendNodeId, point) : aimedRef;
+  const hitTargetRef = observed
+    ? remintHitTarget(tab.id!, hitBackendNodeId, hitLoaderId, point)
+    : aimedRef;
 
   return {
     tabId: tab.id,

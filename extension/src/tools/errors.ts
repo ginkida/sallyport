@@ -37,6 +37,21 @@ export function staleRefError(tool: string, ref: string): BridgeError {
   );
 }
 
+/** A `@eN` minted in a document the tab no longer shows.
+ *
+ * The page navigated on its own (a link, a form submit, a script redirect) since
+ * the snapshot. Its old backendNodeId may well still RESOLVE — a new renderer
+ * process numbers its nodes from 1 again — but to a node of the new document, so
+ * the refusal rests on the loader-id check (`resolve.ts:refDocumentIsCurrent`),
+ * not on the node being missing. Same code and recovery as `staleRefError`. */
+export function navigatedRefError(tool: string, ref: string): BridgeError {
+  return new BridgeError(
+    'bad_ref',
+    `${tool}: ref "${ref}" was issued for a different page than the one now in this tab ` +
+      `(it navigated since the snapshot); run snapshot or find again for a fresh ref`,
+  );
+}
+
 /** CSS the browser refuses to parse. Names the Playwright-isms explicitly
  * because they are what a model emits by reflex, and points at the tool that
  * actually does what they were reaching for. `bad_args` is retryable=no, which

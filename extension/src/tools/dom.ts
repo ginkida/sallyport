@@ -1031,7 +1031,13 @@ export const readText: Tool = async (args) => {
     }
     // Same resolve, same classification as every other tool — this branch used
     // to hand-roll it and drift.
-    const objectId = await resolveBackendNode(tab.id!, r.backendDOMNodeId, args.ref, 'read_text');
+    const objectId = await resolveBackendNode(
+      tab.id!,
+      r.backendDOMNodeId,
+      r.loaderId,
+      args.ref,
+      'read_text',
+    );
     const out = await cdp<{ result: { value?: string } }>(tab.id!, 'Runtime.callFunctionOn', {
       objectId,
       functionDeclaration: READ_TEXT_FN,

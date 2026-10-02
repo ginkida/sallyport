@@ -21,6 +21,8 @@ import { describe, expect, it } from 'vitest';
 import { CALL_GROUP } from '../src/tools/cdp.js';
 
 const TAB = 23;
+// The document every ref here is minted in, and the one the mock tab shows.
+const LOADER = 'L1';
 type Cmd = { method: string; params?: Record<string, unknown> };
 type Respond = (method: string, params: Record<string, unknown>) => unknown;
 
@@ -62,6 +64,8 @@ function installChrome(respond: Respond = () => undefined): Cmd[] {
         const custom = respond(method, params);
         if (custom !== undefined) return custom;
         if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
+        if (method === 'Page.getFrameTree')
+          return { frameTree: { frame: { id: 'top', loaderId: LOADER } } };
         if (method === 'DOM.querySelector') return { nodeId: 2 };
         if (method === 'DOM.resolveNode') return { object: { objectId: 'el' } };
         if (method === 'Runtime.evaluate') {
@@ -89,7 +93,7 @@ async function allow(allowEvaluate = false): Promise<void> {
 async function refFor(backendNodeId: number): Promise<string> {
   const { newRef, clearRefsForTab } = await import('../src/tools/refs.js');
   clearRefsForTab(TAB);
-  return '@' + newRef(TAB, backendNodeId, 'button', 'Save');
+  return '@' + newRef(TAB, backendNodeId, 'button', 'Save', LOADER);
 }
 
 /** Every command that can mint a remote object, with the group it asked for. */

@@ -72,9 +72,15 @@ async function revealWithin(
   // identity for that node and is unaffected by our numbering, so read it once
   // while the ref is still live and resolve THAT each pass — which keeps the
   // per-pass re-resolve virtualised lists need.
-  const containerBackendNodeId = isRef(container)
-    ? (getRef(tab.id!, container)?.backendDOMNodeId ?? null)
-    : null;
+  //
+  // The loader id is pinned WITH it: the per-pass snapshots stamp their own refs
+  // with whatever document they walked, but the container keeps the document it
+  // was issued in, so a page that navigates mid-reveal fails the container's
+  // resolve as `bad_ref` instead of scrolling a node of the new page that
+  // happens to carry the old id (refs.ts `loaderId`).
+  const pinned = isRef(container) ? getRef(tab.id!, container) : null;
+  const containerBackendNodeId = pinned?.backendDOMNodeId ?? null;
+  const containerLoaderId = pinned?.loaderId ?? null;
   if (isRef(container) && containerBackendNodeId === null) {
     throw new BridgeError(
       'bad_ref',
@@ -137,7 +143,13 @@ async function revealWithin(
     // a silent miss.
     const objectId =
       containerBackendNodeId !== null
-        ? await resolveBackendNode(tab.id!, containerBackendNodeId, container, 'reveal')
+        ? await resolveBackendNode(
+            tab.id!,
+            containerBackendNodeId,
+            containerLoaderId,
+            container,
+            'reveal',
+          )
         : await resolveSelectorOrRef(tab.id!, container, 'reveal');
     const scrollRes = await cdp<{
       result: {

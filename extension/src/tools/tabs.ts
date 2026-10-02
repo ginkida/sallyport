@@ -11,7 +11,7 @@ import { ensureAllowed, hostnameOf } from './gates.js';
 import { parseObserve, runObserve } from './observe.js';
 import { loadTimeoutMs } from './budget.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
-import { clearRefsForTab } from './refs.js';
+import { resetRefsForTab } from './refs.js';
 import {
   agentTabIds,
   dropEpoch,
@@ -294,7 +294,7 @@ export const navigate: Tool = async (args, ctx) => {
   // standing grant that should still apply once the tab has moved on.
   // (dialog-capture.ts's own Page.frameNavigated listener already clears it
   // the moment the new document commits; this is belt-and-suspenders.)
-  clearRefsForTab(tab.id!);
+  resetRefsForTab(tab.id!);
   clearArmedDialog(tab.id!);
   let wait = null;
   if (waitSpec && !committed) {
@@ -385,7 +385,7 @@ export const reload: Tool = async (args, ctx) => {
   await waitForLoad(tab.id!, 'reload', loadTimeoutMs(ctx?.startedAt, Date.now()));
   // A reload invalidates any refs we may have built for this tab, and any
   // pending dialog arm (see the identical note in navigate).
-  clearRefsForTab(tab.id!);
+  resetRefsForTab(tab.id!);
   clearArmedDialog(tab.id!);
   // Same reason navigate carries one: "reloaded" rarely means "rendered" on an
   // SPA, and reload's own contract says the previous snapshot's refs are dead —

@@ -39,8 +39,12 @@ function fixtureTree(n: number) {
 }
 
 /** A channel that answers describes in REVERSE completion order. */
-function installChrome(nodeCount: number, frameTree?: unknown): { describeOrder: number[] } {
+function installChrome(
+  nodeCount: number,
+  frameTree?: unknown,
+): { describeOrder: number[]; methods: string[] } {
   const describeOrder: number[] = [];
+  const methods: string[] = [];
   const store = new Map<string, unknown>();
   const tree = fixtureTree(nodeCount);
   (globalThis as unknown as { chrome: unknown }).chrome = {
@@ -73,6 +77,7 @@ function installChrome(nodeCount: number, frameTree?: unknown): { describeOrder:
     debugger: {
       async attach() {},
       async sendCommand(_t: unknown, method: string, params?: Record<string, unknown>) {
+        methods.push(method);
         if (method === 'Runtime.evaluate') return { result: { objectId: 'probe' } };
         if (method === 'Runtime.callFunctionOn') {
           const fn = String(params?.functionDeclaration ?? '');
@@ -90,7 +95,7 @@ function installChrome(nodeCount: number, frameTree?: unknown): { describeOrder:
         }
         if (method === 'Page.getFrameTree') {
           if (!frameTree) throw new Error('Page.getFrameTree is not available');
-          return frameTree;
+          return typeof frameTree === 'function' ? (frameTree as () => unknown)() : frameTree;
         }
         if (method === 'DOM.describeNode') {
           const i = Number(String(params?.objectId).replace('el', ''));
@@ -110,7 +115,7 @@ function installChrome(nodeCount: number, frameTree?: unknown): { describeOrder:
       onDetach: { addListener() {} },
     },
   };
-  return { describeOrder };
+  return { describeOrder, methods };
 }
 
 beforeAll(async () => {
@@ -214,5 +219,69 @@ describe('frames — what the snapshot cannot see', () => {
     };
     expect(out.data.frames).toBeUndefined();
     expect(out.data.elements).toHaveLength(4); // the snapshot itself is unaffected
+  });
+});
+
+/**
+ * Every ref carries the main-frame loader id of the document it was minted in
+ * (refs.ts), read BEFORE the walk: read after, a navigation landing mid-walk
+ * would stamp the old document's node ids with the new document's id — and
+ * they would resolve there, which is the rebinding the stamp exists to refuse.
+ */
+describe('document stamp on minted refs', () => {
+  async function ready(): Promise<void> {
+    resetAttachedTabs();
+    clearRefsForTab(TAB);
+    await setAllowlist([{ pattern: 'app.example.com', allowEvaluate: false, addedAt: 0 }]);
+  }
+
+  it('reads the loader id before the walk and stamps every ref with it', async () => {
+    let reads = 0;
+    // The page navigates DURING the walk: every later read answers L2.
+    const { methods } = installChrome(5, () => ({
+      frameTree: { frame: { url: 'https://app.example.com/', loaderId: reads++ ? 'L2' : 'L1' } },
+    }));
+    await ready();
+    const out = (await snapshot({ mode: 'dom', compact: true, tabId: TAB }, undefined)) as {
+      data: { elements: Array<{ ref: string }> };
+    };
+    const firstTree = methods.indexOf('Page.getFrameTree');
+    expect(firstTree).toBeGreaterThanOrEqual(0);
+    expect(firstTree).toBeLessThan(methods.indexOf('Runtime.evaluate'));
+    expect(firstTree).toBeLessThan(methods.indexOf('DOM.describeNode'));
+    // The conservative side: the PRE-walk document, never the post-walk one.
+    for (const e of out.data.elements) expect(getRef(TAB, e.ref)?.loaderId).toBe('L1');
+  });
+
+  it('reads it before the a11y walk too', async () => {
+    const { methods } = installChrome(5, {
+      frameTree: { frame: { url: 'https://app.example.com/', loaderId: 'L1' } },
+    });
+    await ready();
+    await snapshot({ mode: 'a11y', tabId: TAB }, undefined).catch(() => undefined);
+    expect(methods.indexOf('Page.getFrameTree')).toBeGreaterThanOrEqual(0);
+    expect(methods.indexOf('Page.getFrameTree')).toBeLessThan(
+      methods.indexOf('Accessibility.getFullAXTree'),
+    );
+  });
+
+  it('reads it before resolving the scope of a scoped snapshot', async () => {
+    const { methods } = installChrome(4, {
+      frameTree: { frame: { url: 'https://app.example.com/', loaderId: 'L1' } },
+    });
+    await ready();
+    await snapshot({ selector: '#list', tabId: TAB }, undefined).catch(() => undefined);
+    expect(methods.indexOf('Page.getFrameTree')).toBeGreaterThanOrEqual(0);
+    expect(methods.indexOf('Page.getFrameTree')).toBeLessThan(methods.indexOf('DOM.getDocument'));
+  });
+
+  it('a browser that will not say mints refs that can never resolve, without failing the snapshot', async () => {
+    installChrome(4); // Page.getFrameTree throws in this mock
+    await ready();
+    const out = (await snapshot({ mode: 'dom', compact: true, tabId: TAB }, undefined)) as {
+      data: { elements: Array<{ ref: string }> };
+    };
+    expect(out.data.elements).toHaveLength(4);
+    for (const e of out.data.elements) expect(getRef(TAB, e.ref)?.loaderId).toBeNull();
   });
 });

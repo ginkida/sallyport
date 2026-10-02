@@ -9,7 +9,7 @@ import {
 } from './axtree.js';
 import { attach, cdp } from './cdp.js';
 import { pageFrameOrigins } from './frames.js';
-import { resolveSelectorOrRef } from './resolve.js';
+import { mintLoaderId, resolveSelectorOrRef } from './resolve.js';
 import { collectDomTree, type DomTreeNode, type DomTreeResult } from './domtree.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
@@ -31,9 +31,12 @@ const DOM_SUBTREE_PROBE =
  * and friends): run the fixed walker probe, pull the tree by value, then swap
  * each interactive element's `idx` for a per-tab `@eN` ref by resolving the
  * element handle to a backendNodeId (DOM.describeNode) — the same ref space
- * the a11y path uses, so click/fill/read_text work unchanged. */
+ * the a11y path uses, so click/fill/read_text work unchanged. `loaderId` is the
+ * document stamp every minted ref carries (refs.ts) — read by the CALLER before
+ * anything about the page was looked at. */
 async function domSnapshot(
   tabId: number,
+  loaderId: string | null,
   rootObjectId?: string,
 ): Promise<{ tree: TreeNode[]; truncated: boolean }> {
   const GROUP = 'sallyport_snapshot';
@@ -142,7 +145,7 @@ async function domSnapshot(
       const backendNodeId = backendIds[i];
       if (backendNodeId === undefined) continue;
       const n = pending[i].node;
-      n.ref = '@' + newRef(tabId, backendNodeId, n.role, n.name ?? '');
+      n.ref = '@' + newRef(tabId, backendNodeId, n.role, n.name ?? '', loaderId);
     }
     return { tree: out.tree as TreeNode[], truncated: out.truncated };
   } finally {
@@ -197,8 +200,14 @@ export async function buildSnapshotTree(
   // ids up by 40 snapshots' worth for no reason.
   const mark = watermark ?? refWatermark(tabId);
   resetRefsForTab(tabId, mark);
+  // Which document these refs belong to — read BEFORE the walk. Read after it,
+  // a navigation landing mid-walk would stamp the OLD document's node ids with
+  // the NEW loader id, and they would resolve there: the very rebinding the
+  // stamp exists to refuse. Read before, the same race only ever costs a
+  // conservative `bad_ref`.
+  const loaderId = await mintLoaderId(tabId);
   const makeRef = (backendDOMNodeId: number, role: string, name: string): string =>
-    newRef(tabId, backendDOMNodeId, role, name);
+    newRef(tabId, backendDOMNodeId, role, name, loaderId);
 
   let axNodes: AXNode[] = [];
   let tree: TreeNode[] = [];
@@ -219,7 +228,7 @@ export async function buildSnapshotTree(
     resetRefsForTab(tabId, mark); // drop the a11y attempt's refs; the DOM pass re-mints
     let dom: { tree: TreeNode[]; truncated: boolean } | null = null;
     try {
-      dom = await domSnapshot(tabId);
+      dom = await domSnapshot(tabId, loaderId);
     } catch (e) {
       // The cross-check must not lose a working (if sparse) a11y tree.
       if (axCount === 0) throw e;
@@ -275,9 +284,12 @@ export const snapshot: Tool = async (args) => {
   // BEFORE resetting refs — the selector may itself be an @eN from the
   // previous snapshot (the resolved objectId stays valid past the reset).
   if (scope) {
+    // Document stamp first — before the scope is even resolved (see
+    // buildSnapshotTree for why "before" is the safe side).
+    const loaderId = await mintLoaderId(tab.id!);
     const rootObjectId = await resolveSelectorOrRef(tab.id!, scope, 'snapshot');
     resetRefsForTab(tab.id!);
-    const dom = await domSnapshot(tab.id!, rootObjectId);
+    const dom = await domSnapshot(tab.id!, loaderId, rootObjectId);
     const shaped = shapeSnapshot(dom.tree, compact);
     const frames = await pageFrameOrigins(tab.id!);
     return {

@@ -65,7 +65,10 @@ Other deliberate choices:
   (`tabs`, `debugger`, `storage`, `alarms`, `contextMenus`).
 - Per-tab accessibility refs (`@e1`, `@e2`). Snapshotting tab A cannot
   invalidate refs for tab B, and a ref scoped to A cannot resolve to a node
-  in B.
+  in B. A ref is also bound to the document it came from: after any
+  cross-document navigation, including one the page starts itself (a link,
+  a form submit, a redirect), it fails as `bad_ref` instead of resolving to
+  an element of the new page, and ids are never reissued on a live tab.
 - MCP-side tool calls are serialised per client, with up to 8 clients running
   concurrently. The extension also serialises calls per tab to protect shared
   browser state.

@@ -66,6 +66,7 @@ the "Tools" table for per-tool notes. Quick reference:
 | Domain scope | Allowlist enforced before every DOM tool | `extension/src/allowlist.ts`, `extension/src/tools/gates.ts` |
 | Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, `snapshot`'s DOM-fallback walker, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation; `set_viewport`'s viewport read-back; `screenshot`'s one-word `window.devicePixelRatio` read, used only to RAISE a browser-owned size bound, never to lower it) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `domtree.ts`, `aim.ts`, `viewport.ts`, `screenshot.ts`. `print_to_pdf` runs NO page JS at all — structured CDP only |
 | Password input | `fill` reads `type` via browser DOM, then binds the write to its target: after `focus()` the browser's AX tree must show focus inside the target's subtree (through closed shadow roots, never into a frame), and an isolated-world guard cancels the insert at `beforeinput`/`textInput` if the focus chain has left the field (limits below); a frame is refused unless its whole document is an editor on an allowlisted origin; `key_type`/`send_keys` enumerate frames (temporary flat child sessions for OOPIFs), locate focused AX nodes through closed shadow DOM, then inspect browser-owned DOM attributes | `extension/src/tools/dom.ts`, `focus.ts`, `keyboard.ts` |
+| Element refs (`@eN`) | Per-tab map; ids are monotonic per tab and restart at `e1` only when the tab closes (a detach, navigation or re-snapshot wipes the map but keeps counting), so a held ref MISSES instead of re-binding. Each ref is stamped with the main-frame loader id of the document it was minted in and refused as `bad_ref` once the tab shows another document — after a navigation the PAGE starts into a new renderer process, an old backendNodeId resolves to a live node of the new page | `extension/src/tools/refs.ts`, `resolve.ts:refDocumentIsCurrent` |
 | Closing tabs | Allowlist-gated like other DOM tools, EXCEPT a tab the caller created in broker mode: the daemon has already proved ownership, which is a stronger answer to "may I destroy this tab" (and without it an agent tab that redirected off-allowlist could never be closed by its owner) | `extension/src/tools/tabs.ts:closeTab` |
 | Filesystem (write) | `save_to_file` and `print_to_pdf`'s daemon post-call processor sandbox to `~/Downloads/sallyport/` (shared `_write_sandbox_blob`: filename rules + resolved-path containment re-check) | `daemon/.../local_tools.py:save_to_file`, `POST_CALL_PROCESSORS` |
 | Filesystem (read via Chrome) | `upload` paths must resolve under the same sandbox; symlink-safe | `daemon/.../local_tools.py:validate_upload_paths` + `PRE_CALL_VALIDATORS` |
@@ -223,6 +224,34 @@ handler moving focus. What remains:
 `key_type` and `send_keys` have no target to bind to — they type into
 whatever has focus by contract — so they keep the fail-closed walk over every
 frame described above.
+
+### A ref is bound to a document, checked between two calls
+
+An `@eN` names a backendNodeId, which the browser keeps unique only within one
+renderer process: after a navigation into a new process (a link to another
+site, a form submit, a script redirect — even back to the first site) the new
+process numbers its nodes from 1 again, and an old id resolves to a LIVE node
+of the new page. Until this was fixed, a `click`/`fill`/`read_text` on a ref
+from before such a navigation acted on whatever element of the new page held
+that id and answered `ok:true` (reproduced on Chrome 154 through the real
+extension: twenty stale refs clicked twenty foreign buttons).
+
+Every ref therefore carries the main-frame loader id of its document, read
+BEFORE the walk that mints it, and every resolve reads the tab's current loader
+id AFTER turning the ref into a node and before acting; a mismatch is
+`bad_ref`. A loader id changes with every cross-document navigation and not
+with `pushState`, so SPA routing keeps its refs. What remains:
+
+- **An A → B → A round trip between the two reads.** A page restored from the
+  back/forward cache returns with its ORIGINAL loader id, and its old ids
+  honestly name its own nodes again. The only way to slip past the check is
+  for the tab to leave the document and come back to that very document
+  between the resolve and the loader-id read — two consecutive CDP calls,
+  under a millisecond apart. Not reachable in practice; noted because the
+  check is a comparison, not a lock.
+- **Frames.** The stamp is the MAIN frame's. Refs never reach into child
+  frames (snapshot does not descend into them), so a frame navigating has
+  nothing to rebind.
 
 ### Allowlist matches any port unless a port is pinned
 

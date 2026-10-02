@@ -25,6 +25,7 @@ let resetAttachedTabs: typeof import('../src/tools/cdp.js').resetAttachedTabs;
 
 const TAB = 3;
 const CONTAINER_BACKEND_ID = 900;
+const LOADER = 'L1';
 
 /** An a11y tree with enough interactive nodes that buildSnapshotTree trusts it
  * and never falls through to the DOM cross-check (MIN_TRUSTED_AX_REFS = 4). */
@@ -55,8 +56,12 @@ function installChrome(opts: {
   foundAtStep: number;
   urls?: string[];
   scrollHeight?: number;
+  /** The main-frame loader id each `Page.getFrameTree` answers, the last one
+   * repeating — i.e. which DOCUMENT the tab shows (refs.ts `loaderId`). */
+  loaders?: string[];
 }): Cmd[] {
   const sent: Cmd[] = [];
+  let frameTrees = 0;
   let axCalls = 0;
   let scrollTop = 0;
   let tabGets = 0;
@@ -101,6 +106,12 @@ function installChrome(opts: {
         params?: Record<string, unknown>,
       ) {
         sent.push({ method, params });
+        if (method === 'Page.getFrameTree') {
+          const loaders = opts.loaders ?? [LOADER];
+          return {
+            frameTree: { frame: { loaderId: loaders[Math.min(frameTrees++, loaders.length - 1)] } },
+          };
+        }
         if (method === 'Accessibility.getFullAXTree') {
           const step = axCalls++;
           return { nodes: axNodes(step >= opts.foundAtStep) };
@@ -164,7 +175,7 @@ describe('reveal with an @eN container', () => {
     const sent = installChrome({ foundAtStep: 2 });
     await allowChat();
     // The ref the agent holds from an earlier snapshot.
-    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages');
+    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages', LOADER);
 
     const out = (await reveal(
       { container, role: 'button', name: 'Older', tabId: TAB },
@@ -193,10 +204,32 @@ describe('reveal with an @eN container', () => {
     ).rejects.toMatchObject({ code: 'bad_ref' });
   });
 
+  it('refuses the pinned container once the page navigated mid-reveal, before scrolling a node of the new page', async () => {
+    // Per pass: one frame-tree read stamps the pass's snapshot, one checks the
+    // container's resolve. The document changes on the SECOND pass's check —
+    // after a cross-process navigation the old backendNodeId still resolves
+    // (the mock answers resolveNode happily), to a node of the NEW document.
+    const sent = installChrome({ foundAtStep: 99, loaders: [LOADER, LOADER, LOADER, 'L2'] });
+    await allowChat();
+    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages', LOADER);
+
+    await expect(
+      reveal({ container, role: 'button', name: 'Older', tabId: TAB }, undefined),
+    ).rejects.toMatchObject({ code: 'bad_ref', message: expect.stringContaining('navigated') });
+    const scrolls = sent.filter(
+      (c) =>
+        c.method === 'Runtime.callFunctionOn' &&
+        !/this\.(sample|stop)\(|MutationObserver/.test(String(c.params?.functionDeclaration)),
+    );
+    // Exactly the first pass's scroll: nothing was sent to the foreign node.
+    expect(scrolls).toHaveLength(1);
+    expect(sent.filter((c) => c.method === 'DOM.resolveNode')).toHaveLength(2);
+  });
+
   it('charges the agent only for the refs it actually returns, not one set per scroll step', async () => {
     installChrome({ foundAtStep: 3 });
     await allowChat();
-    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages');
+    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages', LOADER);
     const before = refWatermark(TAB);
 
     const out = (await reveal(
@@ -228,7 +261,7 @@ describe('reveal — the page must stay allowlisted for the WHOLE scroll (invari
       urls: [chat, chat, chat, chat, 'https://elsewhere.example/inbox'],
     });
     await allowChat();
-    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages');
+    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages', LOADER);
 
     await expect(
       reveal({ container, role: 'button', name: 'Older', tabId: TAB }, undefined),
@@ -245,7 +278,7 @@ describe('reveal — the page must stay allowlisted for the WHOLE scroll (invari
   it('keeps going while the page stays put, and reports the url it read', async () => {
     installChrome({ foundAtStep: 2 });
     await allowChat();
-    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages');
+    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages', LOADER);
 
     const res = await reveal({ container, role: 'button', name: 'Older', tabId: TAB }, undefined);
     const data = res.data as { found: boolean; steps: number };
@@ -261,7 +294,7 @@ describe('reveal — the page must stay allowlisted for the WHOLE scroll (invari
     // every step the full settle budget; the rows live in the container.
     const sent = installChrome({ foundAtStep: 2 });
     await allowChat();
-    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages');
+    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages', LOADER);
     await reveal({ container, role: 'button', name: 'Older', tabId: TAB }, undefined);
     const observers = sent.filter((c) =>
       String(c.params?.functionDeclaration).includes('MutationObserver'),
@@ -284,7 +317,7 @@ describe('reveal — the page must stay allowlisted for the WHOLE scroll (invari
     // Container is 500 px tall over 1500 px: the 2nd step (to 1000) is the end.
     const sent = installChrome({ foundAtStep: 2, scrollHeight: 1500 });
     await allowChat();
-    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages');
+    const container = '@' + newRef(TAB, CONTAINER_BACKEND_ID, 'list', 'messages', LOADER);
     await reveal({ container, role: 'button', name: 'Older', tabId: TAB }, undefined);
     const creates = sent.filter(
       (c) =>

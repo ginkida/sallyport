@@ -317,6 +317,7 @@ describe('click refusals', () => {
         async sendCommand(_t: unknown, method: string) {
           if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
           if (method === 'DOM.querySelector') return { nodeId: 7 };
+          if (method === 'Page.getFrameTree') return { frameTree: { frame: { loaderId: 'L1' } } };
           if (method === 'DOM.resolveNode') return { object: { objectId: 'obj-1' } };
           if (method === 'Runtime.callFunctionOn') return { result: { value: probe } };
           return {};
@@ -380,7 +381,7 @@ describe('click refusals', () => {
     await allowApp();
     const { newRef, clearRefsForTab } = await import('../src/tools/refs.js');
     clearRefsForTab(TAB);
-    const ref = '@' + newRef(TAB, 77, 'button', 'Send');
+    const ref = '@' + newRef(TAB, 77, 'button', 'Send', 'L1');
     await expect(click({ selector: ref, tabId: TAB })).rejects.toMatchObject({ code: 'bad_ref' });
   });
 
