@@ -55,7 +55,10 @@ uses [Semantic Versioning](https://semver.org/).
   stays warm; the release happens between bursts, runs through the tab's call
   queue so it never lands inside a call, and waits at most 2 s on a hung page.
   Tabs still attached when the extension's worker restarts are swept on
-  start. Tool output is unchanged.
+  start. A command Chrome never answers (an `evaluate` of a promise that never
+  settles, a screenshot of a minimised window) stops holding the release back
+  after 60 s, when the daemon has long given up on its call. Tool output is
+  unchanged.
 - Page objects a call resolves (a selector or `@eN` target, the probes of
   `get_state`, `read_text`, `scroll`, `mouse_click`, `evaluate`,
   `fetch_in_page`, `screenshot`, `set_viewport`, …) now go into one object

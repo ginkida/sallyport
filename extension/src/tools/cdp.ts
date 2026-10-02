@@ -1,4 +1,5 @@
 import { getSettings } from '../storage.js';
+import { CALL_BUDGET_MS } from './budget.js';
 import {
   clearConsole,
   ensureConsoleCapture,
@@ -167,6 +168,7 @@ export function resetAttachedTabs(): void {
   attached.clear();
   emulatedDsf.clear();
   for (const tabId of [...hygiene.keys()]) dropHygiene(tabId);
+  removedTabs.clear();
 }
 
 /** Decide what keep-awake should do for a tab on this attach: (re-)ENABLE the
@@ -228,6 +230,7 @@ export function clearSessionState(tabId: number): void {
 
 /** The tab is gone for good: session state AND the ref counter. */
 export function onTabRemoved(tabId: number): void {
+  rememberRemoved(tabId);
   clearSessionState(tabId);
   clearRefsForTab(tabId);
 }
@@ -274,6 +277,12 @@ export async function attach(tabId: number): Promise<void> {
   // NEVER issued on the unconditional attach path — only when the user
   // turned the setting on.
   const settings = await getSettings();
+  // The session ended while we read the settings (the tab closed, or the human
+  // hit Cancel): there is nothing left to configure, and configuring anyway
+  // would re-create per-tab state — capture revocation marks, hygiene records —
+  // after `clearSessionState` had already dropped it, for a tab whose one
+  // removal event has fired. The tool's own next command reports the loss.
+  if (!attached.has(tabId)) return;
   switch (keepAwakeAction(settings.keepAwake)) {
     case 'enable':
       await keepAwake(tabId);
@@ -484,11 +493,11 @@ export async function cdp<T = unknown>(
   method: string,
   params?: Record<string, unknown>,
 ): Promise<T> {
-  const st = noteSend(tabId, method, true);
+  const sent = noteSend(tabId, method, true);
   try {
     return (await chrome.debugger.sendCommand({ tabId }, method, params)) as unknown as T;
   } finally {
-    noteSettle(tabId, st);
+    noteSettle(tabId, sent);
   }
 }
 
@@ -507,7 +516,7 @@ export async function cdpSession<T = unknown>(
   method: string,
   params?: Record<string, unknown>,
 ): Promise<T> {
-  const st = noteSend(tabId, method, false);
+  const sent = noteSend(tabId, method, false);
   try {
     return (await chrome.debugger.sendCommand(
       { tabId, sessionId },
@@ -515,7 +524,7 @@ export async function cdpSession<T = unknown>(
       params,
     )) as unknown as T;
   } finally {
-    noteSettle(tabId, st);
+    noteSettle(tabId, sent);
   }
 }
 
@@ -580,11 +589,25 @@ export const HYGIENE_FLUSH_DEADLINE_MS = 2_000;
 /** Bound on the OOPIF child-session AX pair (`releaseChildAx`). */
 const CHILD_AX_RELEASE_DEADLINE_MS = 1_000;
 
+/** A command still unanswered this long after it was sent belongs to a call
+ * the daemon has already given up on (it abandons a call at 60 s), so it no
+ * longer holds the flush back. Without this cut-off ONE command Chrome never
+ * answers — an `evaluate` of a promise that never settles, which the tool
+ * abandons at its own deadline, a `Page.captureScreenshot` of a minimised
+ * window, a child-session query after `Target.detachFromTarget` — kept the tab
+ * "busy" for the rest of the attachment, and the flush never ran again. */
+export const ABANDONED_COMMAND_MS = CALL_BUDGET_MS + HYGIENE_IDLE_MS;
+
+/** How many closed tab ids `noteSend` remembers (see `removedTabs`). */
+const REMOVED_TAB_MEMORY = 256;
+
 interface TabHygiene {
   /** When a command for this tab was last sent or answered. */
   lastActivity: number;
-  /** Commands sent through cdp()/cdpSession() and not yet answered. */
-  inFlight: number;
+  /** Send time of every command sent through cdp()/cdpSession() and not yet
+   * answered, by token. Not a bare count: a command nobody will ever answer
+   * must age out (`ABANDONED_COMMAND_MS`) rather than block the flush. */
+  inFlight: Map<number, number>;
   /** An Accessibility query ran on the root session since the last flush. */
   ax: boolean;
   /** A DOM.* command ran on the root session since the last flush. */
@@ -593,33 +616,70 @@ interface TabHygiene {
    * tab — set by the startup sweep, which cannot know. */
   console: boolean;
   timer: ReturnType<typeof setTimeout> | undefined;
+  /** When the armed `timer` fires. */
+  timerDue: number;
   /** A flush is waiting on the tab chain. */
   queued: boolean;
 }
 
 const hygiene = new Map<number, TabHygiene>();
 
+/** Tabs `tabs.onRemoved` reported closed. A call in flight when its tab closes
+ * still sends commands afterwards (a `finally` releasing its object group, the
+ * rest of `attach`), and each one used to re-create the tab's state after
+ * `clearSessionState` had dropped it — an entry nothing would ever remove,
+ * since the tab's one removal event had already fired. Chrome never reuses a
+ * tab id within a browser session, so remembering the id is exact; bounded,
+ * because the window it guards is one call long. */
+const removedTabs = new Set<number>();
+
+function rememberRemoved(tabId: number): void {
+  removedTabs.delete(tabId);
+  removedTabs.add(tabId);
+  if (removedTabs.size > REMOVED_TAB_MEMORY) {
+    const oldest = removedTabs.values().next().value;
+    if (oldest !== undefined) removedTabs.delete(oldest);
+  }
+}
+
+function newHygiene(): TabHygiene {
+  return {
+    lastActivity: 0,
+    inFlight: new Map(),
+    ax: false,
+    dom: false,
+    console: false,
+    timer: undefined,
+    timerDue: 0,
+    queued: false,
+  };
+}
+
 function hygieneFor(tabId: number): TabHygiene {
   let st = hygiene.get(tabId);
   if (!st) {
-    st = {
-      lastActivity: 0,
-      inFlight: 0,
-      ax: false,
-      dom: false,
-      console: false,
-      timer: undefined,
-      queued: false,
-    };
+    st = newHygiene();
     hygiene.set(tabId, st);
   }
   return st;
 }
 
-function noteSend(tabId: number, method: string, rootSession: boolean): TabHygiene {
+let nextToken = 0;
+
+interface Sent {
+  st: TabHygiene;
+  token: number;
+}
+
+function noteSend(tabId: number, method: string, rootSession: boolean): Sent {
+  const token = ++nextToken;
+  // A closed tab gets a throwaway record nothing tracks: `noteSettle` ignores
+  // state that is not the tab's current entry.
+  if (removedTabs.has(tabId)) return { st: newHygiene(), token };
   const st = hygieneFor(tabId);
-  st.inFlight += 1;
-  st.lastActivity = Date.now();
+  const now = Date.now();
+  st.inFlight.set(token, now);
+  st.lastActivity = now;
   if (rootSession) {
     if (
       method.startsWith('Accessibility.') &&
@@ -631,43 +691,69 @@ function noteSend(tabId: number, method: string, rootSession: boolean): TabHygie
       st.dom = true;
     }
   }
-  return st;
+  // Armed at SEND too, so a command that is never answered still leads to a
+  // flush once it ages out — even if nothing else ever happens on the tab.
+  scheduleHygiene(tabId, st);
+  return { st, token };
 }
 
-function noteSettle(tabId: number, st: TabHygiene): void {
-  st.inFlight = Math.max(0, st.inFlight - 1);
+function noteSettle(tabId: number, { st, token }: Sent): void {
+  const sentAt = st.inFlight.get(token);
+  st.inFlight.delete(token);
   // The tab's state was dropped (closed, detached) while this was in flight.
   if (hygiene.get(tabId) !== st) return;
-  st.lastActivity = Date.now();
-  if (st.inFlight === 0) scheduleHygiene(tabId, st);
+  const now = Date.now();
+  // The late answer to an abandoned command is not activity: no live call is
+  // waiting for it.
+  if (sentAt !== undefined && now - sentAt < ABANDONED_COMMAND_MS) st.lastActivity = now;
+  scheduleHygiene(tabId, st);
+}
+
+/** The earliest moment the tab can be flushed: HYGIENE_IDLE_MS after its last
+ * activity, and not before every command still in flight has either been
+ * answered or aged out as abandoned. */
+function flushDueAt(st: TabHygiene, now: number): number {
+  let due = st.lastActivity + HYGIENE_IDLE_MS;
+  for (const sentAt of st.inFlight.values()) {
+    if (now - sentAt < ABANDONED_COMMAND_MS) due = Math.max(due, sentAt + ABANDONED_COMMAND_MS);
+  }
+  return due;
 }
 
 function isIdle(st: TabHygiene, now: number): boolean {
-  return st.inFlight === 0 && now - st.lastActivity >= HYGIENE_IDLE_MS;
+  return now >= flushDueAt(st, now);
 }
 
-/** Arm the tab's one timer for when it will have been idle long enough. A
- * timer already armed is left alone — it re-checks when it fires. */
+/** Arm the tab's one timer for when it can next be flushed. A timer already
+ * armed early enough is left alone — it re-checks when it fires; one armed
+ * LATER (for a command that was then answered) is pulled in. */
 function scheduleHygiene(tabId: number, st: TabHygiene): void {
-  if (st.timer !== undefined || st.queued) return;
-  const wait = Math.max(0, st.lastActivity + HYGIENE_IDLE_MS - Date.now());
-  st.timer = setTimeout(() => {
-    st.timer = undefined;
-    if (hygiene.get(tabId) !== st) return;
-    // A command in flight re-arms the timer when it is answered.
-    if (st.inFlight > 0) return;
-    if (!isIdle(st, Date.now())) {
-      scheduleHygiene(tabId, st);
-      return;
-    }
-    st.queued = true;
-    void onTab(tabId, () => flushIfStillIdle(tabId, st));
-  }, wait);
+  if (st.queued) return;
+  const now = Date.now();
+  const due = flushDueAt(st, now);
+  if (st.timer !== undefined) {
+    if (st.timerDue <= due) return;
+    clearTimeout(st.timer);
+  }
+  st.timerDue = due;
+  st.timer = setTimeout(
+    () => {
+      st.timer = undefined;
+      if (hygiene.get(tabId) !== st) return;
+      if (!isIdle(st, Date.now())) {
+        scheduleHygiene(tabId, st);
+        return;
+      }
+      st.queued = true;
+      void onTab(tabId, () => flushIfStillIdle(tabId, st));
+    },
+    Math.max(0, due - now),
+  );
 }
 
 async function flushIfStillIdle(tabId: number, st: TabHygiene): Promise<void> {
   st.queued = false;
-  if (hygiene.get(tabId) !== st || st.inFlight > 0) return;
+  if (hygiene.get(tabId) !== st) return;
   // A call queued ahead of us on the chain just ran: its burst is not over.
   if (!isIdle(st, Date.now())) {
     scheduleHygiene(tabId, st);

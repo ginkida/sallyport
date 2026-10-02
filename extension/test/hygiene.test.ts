@@ -168,14 +168,15 @@ describe('idle hygiene flush', () => {
   });
 
   it('never flushes while a command for the tab is in flight', async () => {
-    const { cdp } = await load();
+    const { cdp, ABANDONED_COMMAND_MS } = await load();
     const slow = deferred<object>();
     respond = (method) => (method === 'Runtime.callFunctionOn' ? slow.promise : {});
     await cdp(1, 'DOM.resolveNode', { backendNodeId: 1 });
     const pending = cdp(1, 'Runtime.callFunctionOn', { objectId: 'x' });
     const mark = calls.length;
 
-    await vi.advanceTimersByTimeAsync(IDLE * 6);
+    // Right up to the point where the call it belongs to is past saving.
+    await vi.advanceTimersByTimeAsync(ABANDONED_COMMAND_MS - 1);
     expect(flushed(mark)).toEqual([]);
 
     slow.resolve({});
@@ -184,6 +185,60 @@ describe('idle hygiene flush', () => {
     await vi.advanceTimersByTimeAsync(IDLE - 1);
     expect(flushed(mark)).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
+    expect(flushed(mark)).toEqual(['Runtime.releaseObjectGroup(sallyport-call)', 'DOM.disable']);
+  });
+
+  it('a command that is never answered stops holding the flush once it is abandoned', async () => {
+    // evaluate of a promise that never settles: the tool gives up at its own
+    // deadline, the command stays pending in Chrome until the context dies.
+    const { cdp, ABANDONED_COMMAND_MS } = await load();
+    expect(ABANDONED_COMMAND_MS).toBe(60_000);
+    respond = (method) => (method === 'Runtime.evaluate' ? new Promise(() => undefined) : {});
+    await cdp(1, 'Accessibility.getFullAXTree');
+    void cdp(1, 'Runtime.evaluate', { expression: 'new Promise(() => {})', awaitPromise: true });
+    await cdp(1, 'DOM.getDocument');
+    const mark = calls.length;
+
+    await vi.advanceTimersByTimeAsync(ABANDONED_COMMAND_MS - 1);
+    expect(flushed(mark)).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(flushed(mark)).toEqual([
+      'Runtime.releaseObjectGroup(sallyport-call)',
+      'DOM.disable',
+      'Accessibility.enable',
+      'Accessibility.disable',
+    ]);
+    expectNoBareAxDisable();
+
+    // The tab keeps working normally afterwards: the stuck command no longer
+    // blocks the NEXT idle period either.
+    await cdp(1, 'DOM.getDocument');
+    const mark2 = calls.length;
+    await vi.advanceTimersByTimeAsync(IDLE);
+    expect(flushed(mark2)).toEqual(['Runtime.releaseObjectGroup(sallyport-call)', 'DOM.disable']);
+  });
+
+  it('an abandoned command is flushed after even when it is the last thing the tab did', async () => {
+    const { cdp, ABANDONED_COMMAND_MS } = await load();
+    respond = () => new Promise(() => undefined);
+    void cdp(1, 'Page.captureScreenshot');
+    await vi.advanceTimersByTimeAsync(ABANDONED_COMMAND_MS);
+    expect(flushed(1)).toEqual(['Runtime.releaseObjectGroup(sallyport-call)']);
+  });
+
+  it('a late answer to an abandoned command is not activity', async () => {
+    const { cdp, ABANDONED_COMMAND_MS } = await load();
+    const late = deferred<object>();
+    respond = (method) => (method === 'Runtime.evaluate' ? late.promise : {});
+    const stuck = cdp(1, 'Runtime.evaluate', { awaitPromise: true });
+    await vi.advanceTimersByTimeAsync(ABANDONED_COMMAND_MS);
+    await cdp(1, 'DOM.getDocument');
+    await vi.advanceTimersByTimeAsync(IDLE - 100);
+    late.resolve({});
+    await stuck;
+    const mark = calls.length;
+    // Due IDLE after the DOM call, not IDLE after the stale answer.
+    await vi.advanceTimersByTimeAsync(100);
     expect(flushed(mark)).toEqual(['Runtime.releaseObjectGroup(sallyport-call)', 'DOM.disable']);
   });
 
@@ -364,6 +419,42 @@ describe('idle hygiene flush', () => {
     for (const l of removedListeners) l(1);
     slow.resolve({});
     await pending;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('a command sent after its tab closed leaves no state and arms no timer', async () => {
+    // A call in flight when the human closes the tab: its finally still
+    // releases its object group.
+    const { cdp, cdpSession } = await load();
+    await cdp(1, 'DOM.getDocument');
+    for (const l of removedListeners) l(1);
+    expect(vi.getTimerCount()).toBe(0);
+    respond = () => Promise.reject(new Error('No tab with given id 1'));
+    await expect(
+      cdp(1, 'Runtime.releaseObjectGroup', { objectGroup: 'sallyport-snapshot' }),
+    ).rejects.toThrow();
+    await expect(cdpSession(1, 'child', 'Accessibility.getFullAXTree')).rejects.toThrow();
+    expect(vi.getTimerCount()).toBe(0);
+    const mark = calls.length;
+    await vi.advanceTimersByTimeAsync(IDLE * 10);
+    expect(calls.slice(mark)).toEqual([]);
+  });
+
+  it('attach on a tab that closes while settings are read configures nothing', async () => {
+    const { attach } = await load();
+    const settings = deferred<Record<string, unknown>>();
+    const g = globalThis as unknown as { chrome: Record<string, Record<string, unknown>> };
+    g.chrome.debugger.attach = vi.fn().mockResolvedValue(undefined);
+    g.chrome.storage = { local: { get: vi.fn(() => settings.promise) } };
+    const attaching = attach(1);
+    await vi.advanceTimersByTimeAsync(0);
+    for (const l of removedListeners) l(1);
+    // Capture is OFF: an attach that went on would revoke it on the dead tab
+    // (Runtime.disable / Network.disable) and re-create its revocation marks.
+    settings.resolve({});
+    await attaching;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toEqual([]);
     expect(vi.getTimerCount()).toBe(0);
   });
 
