@@ -157,8 +157,8 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
     }
     if (result.url !== undefined) audit.url = result.url;
     // Every id in this result must be covered by a persisted mark before it
-    // leaves the extension (see `ref-store.ts`). A no-op unless the counter
-    // crossed its reservation.
+    // leaves the extension (see `ref-store.ts`). One small write when a call
+    // minted ids past the last mark; a no-op otherwise.
     await persistRefMarks();
     await appendAudit(audit);
     return result.data;
@@ -190,7 +190,7 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
     ) {
       audit.args = redactAuditArgs(name, callArgs, { force: true });
     }
-    // An error carries no `@eN`, but the call may have reserved ids before it
+    // An error carries no `@eN`, but the call may have minted ids before it
     // failed; writing the mark now keeps "persisted before handed out" true
     // without depending on which result shapes can carry one.
     await persistRefMarks();

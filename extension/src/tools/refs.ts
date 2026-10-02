@@ -26,7 +26,7 @@ export type RefInfo = {
 const refsByTab = new Map<number, Map<string, RefInfo>>();
 const refCounterByTab = new Map<number, number>();
 
-/** How far ahead of the counter a tab's persisted high-water mark runs.
+/** Per tab, the high-water mark last handed to a write (or seeded from one).
  *
  * The maps above are worker memory, and an MV3 worker restart (or an extension
  * reload) wipes them while the tab — and the document an agent's `@e5` was
@@ -35,15 +35,21 @@ const refCounterByTab = new Map<number, number>();
  * cannot tell the two apart. So every id handed out is covered by a mark
  * persisted before the result carrying it leaves the extension
  * (`ref-store.ts`, awaited in `runTool`), and a new worker counts on from the
- * mark. Reserving a block at a time keeps that to one storage write per
- * `REF_RESERVE_BLOCK` ids; the price is that ids jump by up to a block after a
- * restart. */
-export const REF_RESERVE_BLOCK = 1024;
-
-/** Per tab, the highest id the persisted mark covers. */
-const reservedByTab = new Map<number, number>();
-/** A reservation changed since the last `takeRefReservations`. */
-let reservationsDirty = false;
+ * mark.
+ *
+ * The mark is EXACT — the tab's counter itself, i.e. the highest id handed out
+ * — so a restart costs no ids: the next one is mark + 1. It used to run a
+ * reserved block (1024) ahead to save writes, but `runTool` persists at most
+ * once per call either way, so the block saved little and made every restart
+ * jump each live tab's numbering by up to a block (`@e51200` after enough of
+ * them). Now a call that minted ids costs one small write, and a call that
+ * minted none costs nothing. A snapshot's internal re-mints (rewound by
+ * `resetRefsForTab(watermark)`) may leave a mark a little above the final
+ * counter — only ever higher than what was handed out, never lower. */
+const markedByTab = new Map<number, number>();
+/** A counter moved past its mark (or a tab's mark must be dropped) since the
+ * last `takeRefMarks`. */
+let marksDirty = false;
 
 export function newRef(
   tabId: number,
@@ -59,10 +65,7 @@ export function newRef(
   }
   const counter = (refCounterByTab.get(tabId) ?? 0) + 1;
   refCounterByTab.set(tabId, counter);
-  if (counter > (reservedByTab.get(tabId) ?? 0)) {
-    reservedByTab.set(tabId, counter + REF_RESERVE_BLOCK);
-    reservationsDirty = true;
-  }
+  if (counter > (markedByTab.get(tabId) ?? 0)) marksDirty = true;
   const id = `e${counter}`;
   map.set(id, { backendDOMNodeId, role, name, loaderId });
   return id;
@@ -92,27 +95,28 @@ export function isRef(s: string): boolean {
 export function clearRefsForTab(tabId: number): void {
   refsByTab.delete(tabId);
   refCounterByTab.delete(tabId);
-  if (reservedByTab.delete(tabId)) reservationsDirty = true;
+  if (markedByTab.delete(tabId)) marksDirty = true;
 }
 
-/** The marks to persist, when they changed since the last call; `null` when
- * there is nothing new to write. The snapshot is taken synchronously, so the
- * write that carries it is never older than any id already handed out. */
-export function takeRefReservations(): Record<string, number> | null {
-  if (!reservationsDirty) return null;
-  reservationsDirty = false;
-  return Object.fromEntries(reservedByTab);
+/** The marks to persist — every live counter, exactly — when one moved past
+ * its mark since the last call; `null` when there is nothing new to write. The
+ * snapshot is taken synchronously, so the write that carries it is never older
+ * than any id already handed out. */
+export function takeRefMarks(): Record<string, number> | null {
+  if (!marksDirty) return null;
+  marksDirty = false;
+  for (const [tabId, counter] of refCounterByTab) markedByTab.set(tabId, counter);
+  return Object.fromEntries(refCounterByTab);
 }
 
 /** Re-arm the write after a persisted snapshot was refused (`ref-store.ts`).
- * `takeRefReservations` clears the flag before the write runs, and `newRef`
- * only sets it again once a whole reserved block is used up — so without this a
- * refused write would leave up to `REF_RESERVE_BLOCK` later ids covered by no
- * persisted mark. Reservations only grow (a closed tab's mark is the one that
- * shrinks, and the next snapshot drops it anyway), so the retry carries a
- * superset of what was refused. */
-export function markRefReservationsDirty(): void {
-  reservationsDirty = true;
+ * `takeRefMarks` clears the flag (and advances the in-memory marks) before the
+ * write runs, so without this a refused write would leave the ids it was for
+ * covered by no persisted mark until some later call happened to mint past
+ * them. A retry snapshots the counters again, which only grow (a closed tab is
+ * the one that shrinks, and dropping its mark is what the retry should do). */
+export function markRefMarksDirty(): void {
+  marksDirty = true;
 }
 
 /** Resume counting from marks a previous worker persisted.
@@ -129,12 +133,12 @@ export function seedRefCounters(marks: unknown, liveTabs: ReadonlySet<number>): 
       continue;
     }
     if (!liveTabs.has(tabId)) {
-      reservationsDirty = true;
+      marksDirty = true;
       continue;
     }
     const mark = value as number;
     if ((refCounterByTab.get(tabId) ?? 0) < mark) refCounterByTab.set(tabId, mark);
-    if ((reservedByTab.get(tabId) ?? 0) < mark) reservedByTab.set(tabId, mark);
+    if ((markedByTab.get(tabId) ?? 0) < mark) markedByTab.set(tabId, mark);
   }
 }
 
@@ -159,7 +163,7 @@ export function refWatermark(tabId: number): number {
  * the agent how to recover from ("re-snapshot"). The cost is one or two extra
  * characters per ref; the counter restarts at `e1` only when the tab is closed
  * (`clearRefsForTab`), and a worker restart resumes it from the persisted mark
- * (`REF_RESERVE_BLOCK`).
+ * (`markedByTab`).
  *
  * `watermark` rewinds the counter — ONLY sound for ids that were never returned
  * to the agent. `buildSnapshotTree` mints, discards and re-mints internally (a11y

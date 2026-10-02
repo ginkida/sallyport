@@ -14,13 +14,13 @@
  * before a result leaves the extension. Best-effort: a storage failure must not
  * fail a tool call, so it is swallowed — but never made STICKY. A refused load
  * is retried by the next call, and a refused write re-arms itself so the next
- * call writes again; memoising either failure kept the protection off for up to
- * a whole reservation block of later ids. And until a load has succeeded this
+ * call writes again; memoising either failure kept the protection off for the
+ * ids minted after it. And until a load has succeeded this
  * worker writes nothing: its snapshot holds only the tabs IT touched, and the
  * write replaces the stored map whole, so it would erase every other live
  * tab's mark — a loss a later, healthy worker would then inherit. */
 
-import { markRefReservationsDirty, seedRefCounters, takeRefReservations } from './refs.js';
+import { markRefMarksDirty, seedRefCounters, takeRefMarks } from './refs.js';
 
 const STORE_KEY = 'sallyport_ref_marks';
 
@@ -75,7 +75,7 @@ let lastWrite: Promise<void> = Promise.resolve();
  * that write lands. Never rejects.
  *
  * A worker whose load has not succeeded yet first retries it, and writes
- * nothing if it fails again (the reservations stay dirty for the next call). */
+ * nothing if it fails again (the marks stay dirty for the next call). */
 export function persistRefMarks(): Promise<void> {
   if (!loaded) {
     return (async () => {
@@ -84,7 +84,7 @@ export function persistRefMarks(): Promise<void> {
       else await lastWrite;
     })();
   }
-  const marks = takeRefReservations();
+  const marks = takeRefMarks();
   const area = storageArea();
   if (marks && area) {
     lastWrite = (async () => {
@@ -92,7 +92,7 @@ export function persistRefMarks(): Promise<void> {
         await area.set({ [STORE_KEY]: marks });
       } catch {
         // best-effort — see the module comment; the next call writes again
-        markRefReservationsDirty();
+        markRefMarksDirty();
       }
     })();
   }

@@ -36,11 +36,13 @@ uses [Semantic Versioning](https://semver.org/).
   element of the same page. The map is still wiped; the counter now restarts
   only when the tab is closed. The same rebind followed a restart of the
   extension's service worker (or an extension reload), which wiped the
-  in-memory counter while the page lived on: each tab's high-water mark is now
-  kept in `chrome.storage.local`, written before any id it covers is returned,
-  and a new worker counts on from it (ids jump by up to 1024 after a restart).
+  in-memory counter while the page lived on: each tab's high-water mark — the
+  highest id handed out, exactly — is now kept in `chrome.storage.local`,
+  written before any id it covers is returned (one small write per call that
+  minted ids, none otherwise), and a new worker counts on from the very next
+  id, so a restart costs no ids.
   A storage failure at that seam no longer outlasts the call it hit: a refused
-  write is retried by the next call (it used to leave up to 1024 later ids with
+  write is retried by the next call (it used to leave the ids it was for with
   no persisted mark), a refused load is retried instead of memoised for the
   worker's life, and a worker that never loaded writes nothing — its snapshot
   held only the tabs it had touched and replaced the stored map whole, erasing

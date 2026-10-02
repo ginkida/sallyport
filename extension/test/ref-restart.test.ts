@@ -72,11 +72,11 @@ describe('ref counters across a worker restart', () => {
     expect(Math.min(...fresh)).toBeGreaterThan(Math.max(...held));
   });
 
-  it('holds across several restarts and past a whole reservation block', async () => {
+  it('holds across several restarts', async () => {
     let w = await boot();
     const handedOut = new Set<number>();
     for (let restart = 0; restart < 4; restart++) {
-      for (const id of mint(w, 7, w.REF_RESERVE_BLOCK + 3)) {
+      for (const id of mint(w, 7, 1500)) {
         expect(handedOut.has(id)).toBe(false);
         handedOut.add(id);
       }
@@ -85,15 +85,52 @@ describe('ref counters across a worker restart', () => {
     }
   });
 
-  it('writes only when a reservation is crossed, and before the ids leave', async () => {
+  // The mark is the counter itself, not a reserved block ahead of it: a
+  // restart used to jump every live tab's ids by up to 1024 (`@e51200` after
+  // enough of them), costing tokens on every ref for nothing.
+  it('costs no ids: after a restart the next id is the one after the last handed out', async () => {
+    let w = await boot();
+    for (let restart = 0; restart < 5; restart++) {
+      const held = mint(w, 7, 3);
+      await w.persistRefMarks();
+      w = await boot();
+      w.resetRefsForTab(7, w.refWatermark(7));
+      expect(mint(w, 7, 1)).toEqual([Math.max(...held) + 1]);
+      await w.persistRefMarks();
+    }
+    expect((store.sallyport_ref_marks as Record<string, number>)['7']).toBe(20);
+  });
+
+  it('writes once per call that minted ids, and not at all for a call that minted none', async () => {
     const w = await boot();
     const set = vi.mocked(chrome.storage.local.set);
     mint(w, 7, 3);
     await w.persistRefMarks();
     expect(set).toHaveBeenCalledTimes(1);
+    expect((store.sallyport_ref_marks as Record<string, number>)['7']).toBe(3);
+    await w.persistRefMarks(); // a call that minted nothing
+    expect(set).toHaveBeenCalledTimes(1);
     mint(w, 7, 10);
     await w.persistRefMarks();
-    expect(set).toHaveBeenCalledTimes(1); // still inside the reserved block
+    expect(set).toHaveBeenCalledTimes(2);
+    expect((store.sallyport_ref_marks as Record<string, number>)['7']).toBe(13);
+  });
+
+  it("a snapshot's rewound internal ids never lower the mark below what was handed out", async () => {
+    const w = await boot();
+    const held = mint(w, 7, 5); // handed out: e1..e5
+    await w.persistRefMarks();
+    // The next snapshot mints a discarded pass, then rewinds and re-mints.
+    const mark = w.refWatermark(7);
+    mint(w, 7, 40);
+    w.resetRefsForTab(7, mark);
+    const kept = mint(w, 7, 2);
+    await w.persistRefMarks();
+    const stored = (store.sallyport_ref_marks as Record<string, number>)['7'];
+    expect(stored).toBeGreaterThanOrEqual(Math.max(...held, ...kept));
+    const after = await boot();
+    after.resetRefsForTab(7, after.refWatermark(7));
+    expect(Math.min(...mint(after, 7, 3))).toBeGreaterThan(Math.max(...kept));
   });
 
   it('drops the mark of a tab that is gone, and a closed tab restarts at e1', async () => {
@@ -110,9 +147,7 @@ describe('ref counters across a worker restart', () => {
     expect(mint(after, 7, 1)).toEqual([1]); // tab 7 closed while no worker ran
     await after.persistRefMarks();
     expect(Object.keys(store.sallyport_ref_marks as object)).toEqual(['7']);
-    expect((store.sallyport_ref_marks as Record<string, number>)['7']).toBeLessThan(
-      after.REF_RESERVE_BLOCK + 2,
-    );
+    expect((store.sallyport_ref_marks as Record<string, number>)['7']).toBe(1);
   });
 
   it('ignores a malformed snapshot and survives storage that refuses', async () => {
@@ -130,24 +165,23 @@ describe('ref counters across a worker restart', () => {
     await expect(w.persistRefMarks()).resolves.toBeUndefined();
   });
 
-  it('retries a refused write, so ids minted after it are covered across a restart', async () => {
+  it('retries a refused write, so the ids it was for are covered across a restart', async () => {
     let w = await boot();
     mint(w, 7, 1);
-    await w.persistRefMarks(); // mark 1025
+    await w.persistRefMarks(); // mark 1
     const set = vi.mocked(chrome.storage.local.set);
     set.mockRejectedValueOnce(new Error('quota'));
-    mint(w, 7, w.REF_RESERVE_BLOCK + 1); // crosses the block: reserves 2050, write refused
+    const refused = mint(w, 7, 20); // e2..e21, write refused
     await w.persistRefMarks();
-    const late = mint(w, 7, 500); // inside the reservation the refused write was for
+    expect((store.sallyport_ref_marks as Record<string, number>)['7']).toBe(1);
+    // The next call mints nothing past the refused snapshot, yet still writes.
     await w.persistRefMarks();
-    expect((store.sallyport_ref_marks as Record<string, number>)['7']).toBeGreaterThanOrEqual(
-      Math.max(...late),
-    );
+    expect((store.sallyport_ref_marks as Record<string, number>)['7']).toBe(Math.max(...refused));
 
     w = await boot();
     w.resetRefsForTab(7, w.refWatermark(7));
     const fresh = mint(w, 7, 5);
-    expect(Math.min(...fresh)).toBeGreaterThan(Math.max(...late));
+    expect(Math.min(...fresh)).toBeGreaterThan(Math.max(...refused));
   });
 
   it("a worker whose load failed never erases another tab's mark", async () => {
