@@ -9,17 +9,17 @@
  * call that mints ids on the new page). So every ref is stamped with the main
  * frame's loader id of the document it was minted in (refs.ts), and every
  * resolve compares it with the tab's current one — AFTER the resolve, BEFORE
- * the action (resolve.ts:refDocumentIsCurrent).
+ * the action (resolve.ts:refDocumentState).
  *
  * Chrome-mocked: the mock resolves ANY backendNodeId, which is exactly the
  * hostile case — only the loader id tells the documents apart.
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const TAB = 41;
 type Cmd = { method: string; params?: Record<string, unknown> };
 
-let loader: string | Error = 'L1';
+let loader: string | Error | 'hang' = 'L1';
 
 function installChrome(): Cmd[] {
   const sent: Cmd[] = [];
@@ -58,6 +58,7 @@ function installChrome(): Cmd[] {
         sent.push({ method, params });
         if (method === 'Page.getFrameTree') {
           if (loader instanceof Error) throw loader;
+          if (loader === 'hang') return new Promise(() => {}); // a renderer that never answers
           return { frameTree: { frame: { id: 'top', loaderId: loader } } };
         }
         if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
@@ -138,6 +139,53 @@ describe('a ref is bound to the document it was minted in', () => {
       'Page.getFrameTree failed',
     );
     expect(actions(sent)).toHaveLength(0);
+  });
+
+  it('fails closed as bad_ref when the answer is lost to a navigation mid-question', async () => {
+    const { sent, refs, dom } = await setup();
+    const ref = '@' + refs.newRef(TAB, 7, 'button', 'Delete account', 'L1');
+    loader = new Error('Inspected target navigated or closed');
+    await expect(dom.click({ selector: ref, tabId: TAB }, undefined)).rejects.toMatchObject({
+      code: 'bad_ref',
+      message: expect.stringContaining('could not confirm'),
+    });
+    expect(actions(sent)).toHaveLength(0);
+  });
+
+  // Page.getFrameTree is answered by the RENDERER: a hung page never answers,
+  // and an unbounded gate held the tab's call queue to the daemon's 60 s.
+  it('bounds the question by what the call has left, and fails closed when time runs out', async () => {
+    const { sent, refs, dom } = await setup();
+    const ref = '@' + refs.newRef(TAB, 7, 'button', 'Delete account', 'L1');
+    loader = 'hang';
+    const began = Date.now();
+    // 49.95 s of the 50 s budget already spent: 50 ms left for the question.
+    await expect(
+      dom.click({ selector: ref, tabId: TAB }, { startedAt: Date.now() - 49_950 }),
+    ).rejects.toMatchObject({
+      code: 'bad_ref',
+      message: expect.stringContaining('could not confirm'),
+    });
+    expect(Date.now() - began).toBeLessThan(2_000);
+    expect(actions(sent)).toHaveLength(0);
+  });
+
+  it('caps the question at REF_DOCUMENT_DEADLINE_MS even with budget to spare', async () => {
+    vi.useFakeTimers();
+    try {
+      const { sent, refs, dom } = await setup();
+      const { REF_DOCUMENT_DEADLINE_MS } = await import('../src/tools/resolve.js');
+      const ref = '@' + refs.newRef(TAB, 7, 'button', 'Delete account', 'L1');
+      loader = 'hang';
+      const pending = dom.click({ selector: ref, tabId: TAB }, { startedAt: Date.now() });
+      const rejected = expect(pending).rejects.toMatchObject({ code: 'bad_ref' });
+      await vi.advanceTimersByTimeAsync(REF_DOCUMENT_DEADLINE_MS + 10);
+      await rejected;
+      expect(REF_DOCUMENT_DEADLINE_MS).toBeLessThanOrEqual(5_000);
+      expect(actions(sent)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('never resolves a ref minted without a document stamp', async () => {

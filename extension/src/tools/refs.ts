@@ -13,8 +13,9 @@
  * a cross-process navigation the old id resolves to a LIVE node of the new
  * document (measured on Chrome 154: 41 of 41 old ids). Every resolve compares
  * this against the tab's current loader id and refuses a mismatch as `bad_ref`
- * (`resolve.ts:refDocumentIsCurrent`). `null` = the browser did not say at mint
- * time; such a ref never resolves (fail-closed). */
+ * (`resolve.ts:refDocumentState`). `null` = the browser did not say at mint
+ * time; such a ref's document is UNKNOWN at every use — an action refuses it
+ * (fail-closed), a wait reads the tick as unread, get_state says `unknown`. */
 export type RefInfo = {
   backendDOMNodeId: number;
   role: string;

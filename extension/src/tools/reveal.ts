@@ -149,8 +149,9 @@ async function revealWithin(
             containerLoaderId,
             container,
             'reveal',
+            budget.startedAt,
           )
-        : await resolveSelectorOrRef(tab.id!, container, 'reveal');
+        : await resolveSelectorOrRef(tab.id!, container, 'reveal', budget.startedAt);
     const scrollRes = await cdp<{
       result: {
         value?: { before: number; after: number; scrollHeight?: number; clientHeight?: number };

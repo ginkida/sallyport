@@ -99,10 +99,13 @@ describe('module graph', () => {
   it('keeps the leaf modules leaves — they are what the cycle-breaking rests on', () => {
     const graph = buildGraph();
     for (const leaf of ['tools/text', 'tools/resolve', 'tools/tab-resolve']) {
-      // A leaf may lean on errors/cdp/refs, but must never reach a tool module
-      // that could climb back up through snapshot/observe.
+      // A leaf may lean on errors/cdp/refs (and budget, itself import-free), but
+      // must never reach a tool module that could climb back up through
+      // snapshot/observe.
       for (const dep of graph.get(leaf) ?? []) {
-        expect(['tools/errors', 'tools/cdp', 'tools/refs', 'tools/text']).toContain(dep);
+        expect(['tools/errors', 'tools/cdp', 'tools/refs', 'tools/text', 'tools/budget']).toContain(
+          dep,
+        );
       }
     }
   });

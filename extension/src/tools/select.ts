@@ -335,7 +335,7 @@ export const selectOption: Tool = async (args, ctx) => {
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
-  const objectId = await resolveSelectorOrRef(tab.id!, selector, 'select_option');
+  const objectId = await resolveSelectorOrRef(tab.id!, selector, 'select_option', ctx?.startedAt);
 
   const out = await cdp<{ result: { value?: ApplyResult } }>(tab.id!, 'Runtime.callFunctionOn', {
     objectId,

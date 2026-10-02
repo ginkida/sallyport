@@ -212,7 +212,11 @@ describe('get_state batching over CDP', () => {
   type Cmd = { method: string; params?: Record<string, unknown> };
 
   function installChrome(
-    opts: { querySelectorThrows?: string; loaderId?: string; frameTreeThrows?: boolean } = {},
+    opts: {
+      querySelectorThrows?: string;
+      loaderId?: string;
+      frameTreeThrows?: boolean | string;
+    } = {},
   ): Cmd[] {
     const sent: Cmd[] = [];
     const store = new Map<string, unknown>();
@@ -256,6 +260,7 @@ describe('get_state batching over CDP', () => {
           }
           if (method === 'DOM.resolveNode') return { object: { objectId: 'obj-1' } };
           if (method === 'Page.getFrameTree') {
+            if (typeof opts.frameTreeThrows === 'string') throw new Error(opts.frameTreeThrows);
             if (opts.frameTreeThrows) throw new Error('Page.getFrameTree failed');
             return { frameTree: { frame: { loaderId: opts.loaderId ?? 'L1' } } };
           }
@@ -366,6 +371,58 @@ describe('get_state batching over CDP', () => {
     await expect(getState({ selector: a, tabId: TAB }, undefined)).rejects.toThrow(
       'Page.getFrameTree failed',
     );
+  });
+
+  // "Could not tell which document" is not absence: {exists:false} would tell a
+  // poll for "is the modal gone?" that it is, while the node may well be there.
+  it('answers exists:null / unknown for an @eN with no document stamp, reading nothing', async () => {
+    const sent = installChrome();
+    await allowApp();
+    const { newRef, clearRefsForTab } = await import('../src/tools/refs.js');
+    clearRefsForTab(TAB);
+    const a = '@' + newRef(TAB, 501, 'dialog', 'Saving', null);
+    const { getState } = await import('../src/tools/state.js');
+    const out = (await getState({ selector: a, tabId: TAB }, undefined)) as {
+      data: Record<string, unknown>;
+    };
+    expect(out.data).toEqual({ exists: null, reason: 'unknown', ref: a });
+    expect(sent.filter((c) => c.method === 'Runtime.callFunctionOn')).toHaveLength(0);
+  });
+
+  it('answers unknown when the frame-tree answer is lost to a navigation mid-question', async () => {
+    const sent = installChrome({ frameTreeThrows: 'Inspected target navigated or closed' });
+    await allowApp();
+    const { newRef, clearRefsForTab } = await import('../src/tools/refs.js');
+    clearRefsForTab(TAB);
+    const a = '@' + newRef(TAB, 501, 'dialog', 'Saving', 'L1');
+    const { getState } = await import('../src/tools/state.js');
+    const out = (await getState({ selector: [a, '#x'], tabId: TAB }, undefined)) as {
+      data: { elements: Array<Record<string, unknown>> };
+    };
+    expect(out.data.elements[0]).toMatchObject({ exists: null, reason: 'unknown', ref: a });
+    // The CSS entry is about the CURRENT document and needs no answer.
+    expect(out.data.elements[1]).toMatchObject({ selector: '#x', exists: true });
+    expect(sent.filter((c) => c.method === 'Runtime.callFunctionOn')).toHaveLength(1);
+  });
+
+  it('asks the tab which document it shows ONCE per call, after every resolve', async () => {
+    const sent = installChrome();
+    await allowApp();
+    const { newRef, clearRefsForTab } = await import('../src/tools/refs.js');
+    clearRefsForTab(TAB);
+    const refs = [501, 502, 503].map((id) => '@' + newRef(TAB, id, 'button', 'B', 'L1'));
+    const { getState } = await import('../src/tools/state.js');
+    const out = (await getState({ selector: [...refs, '#css'], tabId: TAB }, undefined)) as {
+      data: { elements: Array<{ exists: unknown }> };
+    };
+    expect(out.data.elements.every((e) => e.exists === true)).toBe(true);
+    const methods = sent.map((c) => c.method);
+    expect(methods.filter((m) => m === 'Page.getFrameTree')).toHaveLength(1);
+    // AFTER the last resolve (a resolve that reached a new document is then
+    // caught by the id read later), BEFORE the first probe reads anything.
+    const tree = methods.indexOf('Page.getFrameTree');
+    expect(tree).toBeGreaterThan(methods.lastIndexOf('DOM.resolveNode'));
+    expect(tree).toBeLessThan(methods.indexOf('Runtime.callFunctionOn'));
   });
 
   it('calls a malformed selector bad_args, but does NOT relabel a transient failure as one', async () => {

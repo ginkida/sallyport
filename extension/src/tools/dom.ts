@@ -609,7 +609,7 @@ export const click: Tool = async (args, ctx) => {
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
-  const objectId = await resolveSelectorOrRef(tab.id!, selector, 'click');
+  const objectId = await resolveSelectorOrRef(tab.id!, selector, 'click', ctx?.startedAt);
   const out = await cdp<{
     result?: { value?: ClickProbe };
     exceptionDetails?: { text?: string; exception?: { description?: string } };
@@ -819,7 +819,7 @@ export const fill: Tool = async (args, ctx) => {
   await ensureAllowed(tab.url);
   await attach(tab.id!);
 
-  const objectId = await resolveSelectorOrRef(tab.id!, selector, 'fill');
+  const objectId = await resolveSelectorOrRef(tab.id!, selector, 'fill', ctx?.startedAt);
 
   if (args.allowPassword !== true && (await targetIsPasswordField(tab.id!, objectId))) {
     throw new BridgeError(
@@ -1014,7 +1014,7 @@ async function emptyRead(tab: chrome.tabs.Tab): Promise<Record<string, unknown>>
   return { text: '', ...(frames.length ? { frames } : {}) };
 }
 
-export const readText: Tool = async (args) => {
+export const readText: Tool = async (args, ctx) => {
   const maxChars = parseMaxChars(args.maxChars);
   const offset = parseOffset(args.offset);
   const tab = await resolveTab(args);
@@ -1037,6 +1037,7 @@ export const readText: Tool = async (args) => {
       r.loaderId,
       args.ref,
       'read_text',
+      ctx?.startedAt,
     );
     const out = await cdp<{ result: { value?: string } }>(tab.id!, 'Runtime.callFunctionOn', {
       objectId,

@@ -19,14 +19,16 @@
  *    password-readback channel (#5);
  *  - mints NO refs — getRef only reads the per-tab map (#7);
  *  - fails closed: any resolve/probe failure reports {exists:false}, so a node
- *    that died mid-call can never masquerade as visible.
+ *    that died mid-call can never masquerade as visible; an @eN whose document
+ *    could not be confirmed reports {exists:null, reason:'unknown'} and is not
+ *    read at all.
  */
 
 import { attach, CALL_GROUP, cdp, looksLikeSelectorSyntaxError } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { getRef, isRef, type RefInfo } from './refs.js';
-import { refDocumentIsCurrent } from './resolve.js';
+import { classifyRefDocument, mainFrameLoaderId } from './resolve.js';
 import { resolveTab } from './tabs.js';
 import type { Tool } from './types.js';
 
@@ -176,6 +178,19 @@ type AbsentState = {
   ref?: string;
 };
 
+/** "Could not tell" — NOT absence. An `@eN` resolved to a node, but which
+ * document that node belongs to could not be confirmed: the ref carries no
+ * document stamp, or the tab did not say in time which document it shows
+ * (`resolve.ts:refDocumentState` → `unknown`). `exists:null`, not `false`: a
+ * poll for "is the modal gone?" must not read "we could not tell" as "yes".
+ * Nothing is read off the node. */
+type UnknownState = { exists: null; reason: 'unknown'; ref?: string };
+
+/** A resolved node, plus — for an `@eN` — the document stamp still to check.
+ * The check is deferred to the caller so a whole batch asks the tab ONCE which
+ * document it shows, after EVERY resolve (see `getState`). */
+type Resolved = { objectId: string; stamp?: string | null };
+
 /** Resolve a selector/@eN to a live objectId WITHOUT throwing on absence.
  * Returns the objectId on success, or an {exists:false} payload describing why
  * the element isn't there — the whole point of get_state is that a vanished
@@ -188,7 +203,7 @@ async function resolveForState(
   ref: string | undefined,
   refInfo: RefInfo | null,
   documentRoot: () => Promise<number>,
-): Promise<{ objectId: string } | AbsentState> {
+): Promise<Resolved | AbsentState> {
   if (isRef(selector)) {
     if (!refInfo) return { exists: false, reason: 'unknown_ref', ref };
     let objectId: string | null = null;
@@ -202,15 +217,8 @@ async function resolveForState(
       objectId = null;
     }
     if (!objectId) return { exists: false, reason: 'detached', ref };
-    // A ref from a document the tab has since navigated away from names nothing
-    // here — its old id may resolve to a live node of the NEW page (refs.ts
-    // `loaderId`). Checked AFTER the resolve, so a resolve that reached the new
-    // document is caught. Same answer as a ref never minted; a frame-tree read
-    // the browser refuses throws, because {exists:false} would be a claim.
-    if (!(await refDocumentIsCurrent(tabId, refInfo.loaderId))) {
-      return { exists: false, reason: 'unknown_ref', ref };
-    }
-    return { objectId };
+    // The document check is the caller's, AFTER this resolve (see getState).
+    return { objectId, stamp: refInfo.loaderId };
   }
 
   const root = await documentRoot();
@@ -245,22 +253,41 @@ async function resolveForState(
   return objectId ? { objectId } : { exists: false, reason: 'detached' };
 }
 
-/** Everything `get_state` reports about ONE selector. Never throws for an
- * absent node (that is the tool's whole point); an invalid CSS selector is the
- * one exception, and it is a permanent agent mistake rather than a page state. */
-async function probeOne(
-  tabId: number,
-  selector: string,
-  maxChars: number,
-  documentRoot: () => Promise<number>,
-): Promise<Record<string, unknown>> {
-  const ref = isRef(selector)
+function refLabel(selector: string): string | undefined {
+  return isRef(selector)
     ? '@' + (selector.startsWith('@') ? selector.slice(1) : selector)
     : undefined;
+}
+
+/** Everything `get_state` reports about ONE resolved selector. Never throws for
+ * an absent node (that is the tool's whole point).
+ *
+ * `documentNow` is the tab's main-frame loader id, read ONCE per call AFTER
+ * every resolve of the call (`null` = the tab would not say). A ref resolve
+ * that reached a new document is therefore caught: the id read later is the new
+ * one too. And a navigation after that read takes the resolved objects' context
+ * with it, so the probe below fails and reports `detached` — never the new
+ * page's node as the agent's. */
+async function probeResolved(
+  tabId: number,
+  selector: string,
+  resolved: Resolved | AbsentState,
+  documentNow: string | null,
+  maxChars: number,
+): Promise<Record<string, unknown>> {
+  const ref = refLabel(selector);
+  if ('exists' in resolved) return resolved;
   const refInfo = isRef(selector) ? getRef(tabId, selector) : null;
 
-  const resolved = await resolveForState(tabId, selector, ref, refInfo, documentRoot);
-  if ('exists' in resolved) return resolved;
+  if (resolved.stamp !== undefined) {
+    // A ref from a document the tab has since navigated away from names nothing
+    // here — its old id may resolve to a live node of the NEW page (refs.ts
+    // `loaderId`). Same answer as a ref never minted. A document we could not
+    // confirm is neither: `exists:null`, and nothing is read off the node.
+    const doc = classifyRefDocument(resolved.stamp, documentNow);
+    if (doc === 'navigated') return { exists: false, reason: 'unknown_ref', ref };
+    if (doc === 'unknown') return { exists: null, reason: 'unknown', ref } satisfies UnknownState;
+  }
 
   // Probe the live node. A failure here means it died between resolve and call
   // (SPA re-render) — fail closed to {exists:false}, never report visible.
@@ -312,7 +339,7 @@ function documentRootOnce(tabId: number): () => Promise<number> {
   };
 }
 
-export const getState: Tool = async (args) => {
+export const getState: Tool = async (args, ctx) => {
   const { selectors, batch } = parseStateSelectors(args.selector);
   const maxChars = parseStateMaxChars(args.maxChars);
   const tab = await resolveTab(args);
@@ -321,10 +348,6 @@ export const getState: Tool = async (args) => {
   const tabId = tab.id!;
   const documentRoot = documentRootOnce(tabId);
 
-  if (!batch) {
-    const data = await probeOne(tabId, selectors[0], maxChars, documentRoot);
-    return { tabId, url: tab.url, data };
-  }
   // SEQUENTIALLY, deliberately. What the batch buys is the one MCP call it
   // replaces — a whole model turn. Running the probes concurrently on top of
   // that would save tens of milliseconds of CDP latency while interleaving
@@ -333,9 +356,33 @@ export const getState: Tool = async (args) => {
   // this codebase does it, and nothing here can test it (the chrome-bound paths
   // are outside vitest). The shared document root above already removes the
   // bulk of the round-trips a naive loop would spend.
-  const elements: Array<Record<string, unknown>> = [];
+  //
+  // Three phases, so the tab is asked which document it shows ONCE per call
+  // rather than once per ref — and still AFTER every resolve, which is what
+  // makes one answer sound for all of them (see probeResolved).
+  const resolved: Array<Resolved | AbsentState> = [];
   for (const selector of selectors) {
-    elements.push({ selector, ...(await probeOne(tabId, selector, maxChars, documentRoot)) });
+    resolved.push(
+      await resolveForState(
+        tabId,
+        selector,
+        refLabel(selector),
+        isRef(selector) ? getRef(tabId, selector) : null,
+        documentRoot,
+      ),
+    );
   }
-  return { tabId, url: tab.url, data: { elements } };
+  const needsDocument = resolved.some((r) => !('exists' in r) && typeof r.stamp === 'string');
+  const documentNow = needsDocument ? await mainFrameLoaderId(tabId, ctx?.startedAt) : null;
+  const elements: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < selectors.length; i++) {
+    elements.push(await probeResolved(tabId, selectors[i], resolved[i], documentNow, maxChars));
+  }
+
+  if (!batch) return { tabId, url: tab.url, data: elements[0] };
+  return {
+    tabId,
+    url: tab.url,
+    data: { elements: elements.map((e, i) => ({ selector: selectors[i], ...e })) },
+  };
 };

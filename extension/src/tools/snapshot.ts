@@ -266,7 +266,7 @@ function shapeSnapshot(
   return { payload: { tree: capped.tree }, truncated: capped.truncated };
 }
 
-export const snapshot: Tool = async (args) => {
+export const snapshot: Tool = async (args, ctx) => {
   const mode = args.mode === 'a11y' || args.mode === 'dom' ? args.mode : 'auto';
   const compact = args.compact === true;
   const scope = typeof args.selector === 'string' && args.selector !== '' ? args.selector : null;
@@ -287,7 +287,7 @@ export const snapshot: Tool = async (args) => {
     // Document stamp first — before the scope is even resolved (see
     // buildSnapshotTree for why "before" is the safe side).
     const loaderId = await mintLoaderId(tab.id!);
-    const rootObjectId = await resolveSelectorOrRef(tab.id!, scope, 'snapshot');
+    const rootObjectId = await resolveSelectorOrRef(tab.id!, scope, 'snapshot', ctx?.startedAt);
     resetRefsForTab(tab.id!);
     const dom = await domSnapshot(tab.id!, loaderId, rootObjectId);
     const shaped = shapeSnapshot(dom.tree, compact);

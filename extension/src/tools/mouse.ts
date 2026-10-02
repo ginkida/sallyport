@@ -407,7 +407,12 @@ export const mouseClick: Tool = async (args, ctx) => {
     };
   }
 
-  const objectId = await resolveSelectorOrRef(tab.id!, target.selector, 'mouse_click');
+  const objectId = await resolveSelectorOrRef(
+    tab.id!,
+    target.selector,
+    'mouse_click',
+    ctx?.startedAt,
+  );
   const {
     point,
     hitTargetRef: aimedRef,
@@ -501,7 +506,7 @@ export const hover: Tool = async (args, ctx) => {
     };
   }
 
-  const objectId = await resolveSelectorOrRef(tab.id!, target.selector, 'hover');
+  const objectId = await resolveSelectorOrRef(tab.id!, target.selector, 'hover', ctx?.startedAt);
   const {
     point,
     hitTargetRef: aimedRef,

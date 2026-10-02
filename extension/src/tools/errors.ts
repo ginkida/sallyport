@@ -42,13 +42,28 @@ export function staleRefError(tool: string, ref: string): BridgeError {
  * The page navigated on its own (a link, a form submit, a script redirect) since
  * the snapshot. Its old backendNodeId may well still RESOLVE — a new renderer
  * process numbers its nodes from 1 again — but to a node of the new document, so
- * the refusal rests on the loader-id check (`resolve.ts:refDocumentIsCurrent`),
+ * the refusal rests on the loader-id check (`resolve.ts:refDocumentState`),
  * not on the node being missing. Same code and recovery as `staleRefError`. */
 export function navigatedRefError(tool: string, ref: string): BridgeError {
   return new BridgeError(
     'bad_ref',
     `${tool}: ref "${ref}" was issued for a different page than the one now in this tab ` +
       `(it navigated since the snapshot); run snapshot or find again for a fresh ref`,
+  );
+}
+
+/** A `@eN` whose document could not be confirmed: the ref carries no document
+ * stamp (the browser did not say at mint time), or the tab did not say in time
+ * which document it shows now (`resolve.ts:refDocumentState` → `unknown`).
+ * An action fails CLOSED on it — not knowing whether the node is the agent's
+ * element is never licence to act on it. Same code and recovery as the other
+ * ref failures; nothing was done. */
+export function unverifiedRefError(tool: string, ref: string): BridgeError {
+  return new BridgeError(
+    'bad_ref',
+    `${tool}: could not confirm that ref "${ref}" still belongs to the page in this tab ` +
+      `(the browser did not say which document it shows); nothing was done — run snapshot ` +
+      `or find again for a fresh ref`,
   );
 }
 

@@ -47,7 +47,7 @@ export function classifyUpload(
   return { applied: same ? 'yes' : 'no', accepted: held.names };
 }
 
-export const upload: Tool = async (args) => {
+export const upload: Tool = async (args, ctx) => {
   const selector = String(args.selector || '');
   if (!selector) throw new BridgeError('bad_args', 'upload: selector required');
   const rawPaths = args.paths;
@@ -62,7 +62,7 @@ export const upload: Tool = async (args) => {
   const tab = await resolveTab(args);
   await ensureAllowed(tab.url);
   await attach(tab.id!);
-  const objectId = await resolveSelectorOrRef(tab.id!, selector, 'upload');
+  const objectId = await resolveSelectorOrRef(tab.id!, selector, 'upload', ctx?.startedAt);
 
   // Confirm the target is actually <input type=file> before handing paths to
   // CDP. setFileInputFiles silently no-ops on a wrong element; a clear

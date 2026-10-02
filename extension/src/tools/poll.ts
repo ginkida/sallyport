@@ -17,7 +17,7 @@ import {
 import { BridgeError, invalidSelectorError, navigatedRefError, staleRefError } from './errors.js';
 import { ensureStillAllowed } from './gates.js';
 import { getRef, isRef } from './refs.js';
-import { assertRefDocument, refDocumentIsCurrent } from './resolve.js';
+import { refDocumentState } from './resolve.js';
 import { budgetLeft, OBSERVE_RESERVE_MS } from './budget.js';
 import { CREATE_QUIESCENCE_PROBE, OBSERVE_ELEMENT_FN } from './quiescence.js';
 
@@ -127,7 +127,8 @@ export function parseWaitFor(raw: unknown, tool: string): WaitSpec | null {
 }
 
 /** `unknown` = no trustworthy reading this tick (the probe threw in the page,
- * returned nonsense, or a navigation took its document away). A present-wait
+ * returned nonsense, a navigation took its document away, or an `@eN`'s
+ * document could not be confirmed — `resolve.ts:refDocumentState`). A present-wait
  * keeps waiting on it, and so must an absent-wait: absence was not shown.
  * `navigated` = an `@eN` from a document the tab no longer shows: its node is
  * gone for an absent-wait, and a `bad_ref` for a present one — whatever its old
@@ -211,8 +212,13 @@ async function selectorVisibility(tabId: number, selector: string): Promise<Sele
     const v = await nodeVisibility(tabId, { backendNodeId: r.backendDOMNodeId });
     if (v === 'destroyed') return v;
     // AFTER the box-model read (it may have reached the new document), and on
-    // EVERY tick: the page can navigate at any point of a 30 s wait.
-    return (await refDocumentIsCurrent(tabId, r.loaderId)) ? v : 'navigated';
+    // EVERY tick: the page can navigate at any point of a 30 s wait. A ref whose
+    // document cannot be confirmed (no stamp, no answer in time) is an UNREAD
+    // tick, not a navigated one: "navigated" counts as gone under `absent`, and
+    // a still-visible node must never be reported gone because we could not tell.
+    const doc = await refDocumentState(tabId, r.loaderId);
+    if (doc === 'unknown') return 'unknown';
+    return doc === 'current' ? v : 'navigated';
   }
   let v: unknown;
   try {
@@ -319,7 +325,12 @@ async function ensureRefStillExists(tabId: number, ref: string): Promise<void> {
     if (looksLikeMissingNodeError(e)) throw staleRefError('wait', ref);
     return; // fail-open, as above: the loop's own per-tick check still runs
   }
-  await assertRefDocument(tabId, r.loaderId, ref, 'wait');
+  // Only a PROVEN other document fails here; `unknown` falls through to the
+  // loop like any other unclassified answer (fail-open, as above) — the loop's
+  // own per-tick check reads it as an unread tick.
+  if ((await refDocumentState(tabId, r.loaderId)) === 'navigated') {
+    throw navigatedRefError('wait', ref);
+  }
 }
 
 /** Poll until the spec holds (AND across given conditions; `absent` inverts

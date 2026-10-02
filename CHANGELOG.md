@@ -20,7 +20,15 @@ uses [Semantic Versioning](https://semver.org/).
   tab shows another document; `get_state` answers
   `{exists:false, reason:'unknown_ref'}`, an absent-wait counts the node as
   gone. `pushState` keeps the loader id, so SPA routing keeps its refs. Costs
-  one `Page.getFrameTree` per ref resolve and per snapshot (no `Page.enable`).
+  one `Page.getFrameTree` per ref resolve and per snapshot (no `Page.enable`;
+  one per `get_state` call however many refs it checks). When the document
+  cannot be confirmed — a ref minted while the browser would not say, an answer
+  lost to a navigation committing, or a renderer that does not answer within
+  3 s (the question is bounded, and never outlives the call's budget) — the
+  answer is UNKNOWN, not "navigated": an action refuses it as `bad_ref`
+  ("could not confirm … nothing was done"), an absent-wait keeps polling
+  rather than report a still-visible node gone, and `get_state` answers
+  `{exists:null, reason:'unknown'}` rather than `{exists:false}`.
 - `@eN` numbering no longer restarts at `e1` on a live tab. A navigate,
   reload, history hop, viewport change or debugger detach (including the
   human's Cancel on the debugging bar) used to reset the counter, so the next

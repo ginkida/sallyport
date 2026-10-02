@@ -1425,6 +1425,67 @@ describe('pollFor — ticks that tell the truth', () => {
     await rejected;
   });
 
+  // "Could not tell which document" is UNKNOWN, never "navigated": under
+  // `absent`, navigated counts as gone, so a still-visible node used to be
+  // reported gone at once when its stamp was missing or the browser's answer
+  // was lost.
+  it('never reports a visible @eN with no document stamp as gone', async () => {
+    const { newRef } = await import('../src/tools/refs.js');
+    const ref = '@' + newRef(TAB, 84, 'dialog', 'Saving', null);
+    let boxes = 0;
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { loaderId: 'L1' } } };
+      if (method === 'DOM.getBoxModel') {
+        boxes++;
+        return { model: { width: 10, height: 10 } };
+      }
+      return {};
+    });
+    const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 1000, absent: true });
+    await vi.runAllTimersAsync();
+    expect(await pending).toMatchObject({ found: false, reason: 'timeout' });
+    expect(boxes).toBeGreaterThan(1); // every tick unread, the wait kept polling
+  });
+
+  it('reads a lost frame-tree answer as an unread tick, then decides on the next', async () => {
+    const { newRef } = await import('../src/tools/refs.js');
+    const ref = '@' + newRef(TAB, 85, 'dialog', 'Saving', 'L1');
+    let frameTrees = 0;
+    let boxes = 0;
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'Page.getFrameTree') {
+        if (frameTrees++ === 0) throw new Error('Inspected target navigated or closed');
+        return { frameTree: { frame: { loaderId: 'L1' } } };
+      }
+      if (method === 'DOM.getBoxModel') {
+        // Visible on the lost tick, hidden after.
+        if (boxes++ === 0) return { model: { width: 10, height: 10 } };
+        throw new Error('Could not compute box model.');
+      }
+      return {};
+    });
+    const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 2000, absent: true });
+    await vi.runAllTimersAsync();
+    const out = await pending;
+    expect(out).toMatchObject({ found: true });
+    expect(out.elapsedMs).toBeGreaterThanOrEqual(250); // not on the lost tick at 0
+  });
+
+  it('a present-wait on an unstamped @eN keeps waiting instead of failing as navigated', async () => {
+    const { newRef } = await import('../src/tools/refs.js');
+    const ref = '@' + newRef(TAB, 86, 'button', 'Pay', null);
+    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { loaderId: 'L1' } } };
+      if (method === 'DOM.describeNode') return { node: {} };
+      if (method === 'DOM.getBoxModel') return { model: { width: 10, height: 10 } };
+      return {};
+    });
+    const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 1000, absent: false });
+    await vi.runAllTimersAsync();
+    // Not found: a node we cannot place in this document is never "visible".
+    expect(await pending).toMatchObject({ found: false, reason: 'timeout' });
+  });
+
   it('reports how long a folded wait ran before it failed', async () => {
     let gets = 0;
     const tabsGet = chrome.tabs.get;

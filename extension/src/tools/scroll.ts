@@ -109,7 +109,7 @@ export const scroll: Tool = async (args, ctx) => {
   const tabId = tab.id!;
 
   if (spec.kind === 'into_view') {
-    const objectId = await resolveSelectorOrRef(tabId, spec.selector, 'scroll');
+    const objectId = await resolveSelectorOrRef(tabId, spec.selector, 'scroll', ctx?.startedAt);
     const out = await cdp<{ result: { value?: { x: number; y: number } } }>(
       tabId,
       'Runtime.callFunctionOn',
@@ -145,7 +145,7 @@ export const scroll: Tool = async (args, ctx) => {
   // mouse_click's `Runtime.evaluate{expression:'document'}`), no interpolation.
   let objectId: string;
   if (spec.selector) {
-    objectId = await resolveSelectorOrRef(tabId, spec.selector, 'scroll');
+    objectId = await resolveSelectorOrRef(tabId, spec.selector, 'scroll', ctx?.startedAt);
   } else {
     const ev = await cdp<{ result: { objectId?: string } }>(tabId, 'Runtime.evaluate', {
       expression: 'document.scrollingElement || document.documentElement || document.body',
