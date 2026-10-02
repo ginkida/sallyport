@@ -16,6 +16,7 @@ import {
   touchTab,
 } from './tools/ownership.js';
 import { releaseTabs } from './tools/release.js';
+import { loadRefMarks, persistRefMarks } from './tools/ref-store.js';
 import { evaluate } from './tools/evaluate.js';
 import { consoleTail } from './tools/console.js';
 import { handleDialog } from './tools/dialog.js';
@@ -128,6 +129,10 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
     if (expectedEpoch !== undefined && typeof callArgs.tabId === 'number') {
       confirmEpoch(callArgs.tabId, expectedEpoch);
     }
+    // `@eN` counters resume from the marks a previous worker persisted, so a
+    // worker restart cannot re-issue an id an agent still holds (#7). Memoised:
+    // only the first call of a worker's life waits on storage.
+    await loadRefMarks();
     const result = await onTab(
       typeof callArgs.tabId === 'number' ? callArgs.tabId : undefined,
       () => tool(callArgs, { client, startedAt }),
@@ -151,6 +156,10 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
       (result.data as Record<string, unknown>).openedTabs = openedTabs;
     }
     if (result.url !== undefined) audit.url = result.url;
+    // Every id in this result must be covered by a persisted mark before it
+    // leaves the extension (see `ref-store.ts`). A no-op unless the counter
+    // crossed its reservation.
+    await persistRefMarks();
     await appendAudit(audit);
     return result.data;
   } catch (e) {
@@ -181,6 +190,10 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
     ) {
       audit.args = redactAuditArgs(name, callArgs, { force: true });
     }
+    // An error carries no `@eN`, but the call may have reserved ids before it
+    // failed; writing the mark now keeps "persisted before handed out" true
+    // without depending on which result shapes can carry one.
+    await persistRefMarks();
     await appendAudit(audit);
     throw e;
   }

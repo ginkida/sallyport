@@ -26,7 +26,11 @@ uses [Semantic Versioning](https://semver.org/).
   human's Cancel on the debugging bar) used to reset the counter, so the next
   snapshot could re-issue an id the agent still held, naming a different
   element of the same page. The map is still wiped; the counter now restarts
-  only when the tab is closed.
+  only when the tab is closed. The same rebind followed a restart of the
+  extension's service worker (or an extension reload), which wiped the
+  in-memory counter while the page lived on: each tab's high-water mark is now
+  kept in `chrome.storage.local`, written before any id it covers is returned,
+  and a new worker counts on from it (ids jump by up to 1024 after a restart).
 
 ### Added
 

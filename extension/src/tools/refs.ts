@@ -25,6 +25,25 @@ export type RefInfo = {
 const refsByTab = new Map<number, Map<string, RefInfo>>();
 const refCounterByTab = new Map<number, number>();
 
+/** How far ahead of the counter a tab's persisted high-water mark runs.
+ *
+ * The maps above are worker memory, and an MV3 worker restart (or an extension
+ * reload) wipes them while the tab — and the document an agent's `@e5` was
+ * minted in — lives on. A counter that then started at `e1` again would let the
+ * next snapshot re-issue `@e5` on the SAME document, where the loader-id stamp
+ * cannot tell the two apart. So every id handed out is covered by a mark
+ * persisted before the result carrying it leaves the extension
+ * (`ref-store.ts`, awaited in `runTool`), and a new worker counts on from the
+ * mark. Reserving a block at a time keeps that to one storage write per
+ * `REF_RESERVE_BLOCK` ids; the price is that ids jump by up to a block after a
+ * restart. */
+export const REF_RESERVE_BLOCK = 1024;
+
+/** Per tab, the highest id the persisted mark covers. */
+const reservedByTab = new Map<number, number>();
+/** A reservation changed since the last `takeRefReservations`. */
+let reservationsDirty = false;
+
 export function newRef(
   tabId: number,
   backendDOMNodeId: number,
@@ -39,6 +58,10 @@ export function newRef(
   }
   const counter = (refCounterByTab.get(tabId) ?? 0) + 1;
   refCounterByTab.set(tabId, counter);
+  if (counter > (reservedByTab.get(tabId) ?? 0)) {
+    reservedByTab.set(tabId, counter + REF_RESERVE_BLOCK);
+    reservationsDirty = true;
+  }
   const id = `e${counter}`;
   map.set(id, { backendDOMNodeId, role, name, loaderId });
   return id;
@@ -56,7 +79,8 @@ export function isRef(s: string): boolean {
 /** Forget a tab's refs AND restart its numbering at `e1`.
  *
  * ONLY for a tab that no longer exists (`tabs.onRemoved`): its id can never be
- * named again, so there is no `@eN` an agent could still hold against it.
+ * named again, so there is no `@eN` an agent could still hold against it. Its
+ * persisted mark goes with it.
  *
  * Everything else that invalidates refs — a navigation, a reload, a history
  * hop, a viewport change, a debugger detach — uses `resetRefsForTab` and keeps
@@ -67,6 +91,39 @@ export function isRef(s: string): boolean {
 export function clearRefsForTab(tabId: number): void {
   refsByTab.delete(tabId);
   refCounterByTab.delete(tabId);
+  if (reservedByTab.delete(tabId)) reservationsDirty = true;
+}
+
+/** The marks to persist, when they changed since the last call; `null` when
+ * there is nothing new to write. The snapshot is taken synchronously, so the
+ * write that carries it is never older than any id already handed out. */
+export function takeRefReservations(): Record<string, number> | null {
+  if (!reservationsDirty) return null;
+  reservationsDirty = false;
+  return Object.fromEntries(reservedByTab);
+}
+
+/** Resume counting from marks a previous worker persisted.
+ *
+ * Only for tabs in `liveTabs` (a mark for a closed tab is dropped, and the
+ * next write forgets it). A tab's counter moves UP to its mark, never down:
+ * the next id is past every id the previous worker can have handed out. A
+ * malformed snapshot contributes nothing. */
+export function seedRefCounters(marks: unknown, liveTabs: ReadonlySet<number>): void {
+  if (!marks || typeof marks !== 'object' || Array.isArray(marks)) return;
+  for (const [key, value] of Object.entries(marks as Record<string, unknown>)) {
+    const tabId = Number(key);
+    if (!Number.isSafeInteger(tabId) || !Number.isSafeInteger(value) || (value as number) < 1) {
+      continue;
+    }
+    if (!liveTabs.has(tabId)) {
+      reservationsDirty = true;
+      continue;
+    }
+    const mark = value as number;
+    if ((refCounterByTab.get(tabId) ?? 0) < mark) refCounterByTab.set(tabId, mark);
+    if ((reservedByTab.get(tabId) ?? 0) < mark) reservedByTab.set(tabId, mark);
+  }
 }
 
 /** How many refs this tab has ever handed out — the point `resetRefsForTab` can
@@ -89,7 +146,8 @@ export function refWatermark(tabId: number): number {
  * the existing `bad_ref` / `unknown_ref` path the error taxonomy already tells
  * the agent how to recover from ("re-snapshot"). The cost is one or two extra
  * characters per ref; the counter restarts at `e1` only when the tab is closed
- * (`clearRefsForTab`).
+ * (`clearRefsForTab`), and a worker restart resumes it from the persisted mark
+ * (`REF_RESERVE_BLOCK`).
  *
  * `watermark` rewinds the counter — ONLY sound for ids that were never returned
  * to the agent. `buildSnapshotTree` mints, discards and re-mints internally (a11y
