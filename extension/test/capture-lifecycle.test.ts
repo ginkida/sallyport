@@ -412,6 +412,197 @@ describe('capture lifecycle', () => {
     expect(beforeCleanup.at(-1)?.body).toBe(payload); // old results are immutable snapshots
   });
 
+  /** Every CDP command sent so far, as `method` or `method(objectGroup)`, for one tab. */
+  function sent(tabId: number): string[] {
+    return sendCommand.mock.calls
+      .filter(([target]) => (target as { tabId?: number }).tabId === tabId)
+      .map(([, method, params]) => {
+        const group = (params as { objectGroup?: string } | undefined)?.objectGroup;
+        return group ? `${method as string}(${group})` : (method as string);
+      });
+  }
+
+  it('enables Network with bounded capture buffers and never touches durable messages', async () => {
+    const capture = await import('../src/tools/network-capture.js');
+    await capture.ensureNetworkCapture(1);
+    expect(sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Network.enable', {
+      maxTotalBufferSize: capture.NETWORK_MAX_TOTAL_BUFFER,
+      maxResourceBufferSize: capture.NETWORK_MAX_RESOURCE_BUFFER,
+    });
+    // An explicit enableDurableMessages:false would switch durable collection
+    // off for the whole profile.
+    const params = sendCommand.mock.calls[0][2] as Record<string, unknown>;
+    expect('enableDurableMessages' in params).toBe(false);
+  });
+
+  it('caps body reads in flight at eight across all tabs', async () => {
+    const capture = await import('../src/tools/network-capture.js');
+    expect(capture.NETWORK_MAX_BODY_READS).toBe(8);
+    expect(capture.NETWORK_MAX_BODY_READS_PER_TAB).toBe(4);
+    for (let tab = 0; tab < 3; tab++) await capture.ensureNetworkCapture(tab);
+    sendCommand.mockClear();
+    sendCommand.mockReturnValue(new Promise(() => undefined));
+    for (let tab = 0; tab < 3; tab++) {
+      for (let i = 0; i < capture.NETWORK_MAX_BODY_READS_PER_TAB; i++) response(tab, `r-${i}`);
+    }
+    // Two tabs fill the global cap; the third tab's reads wait.
+    expect(sendCommand).toHaveBeenCalledTimes(capture.NETWORK_MAX_BODY_READS);
+    expect(capture.readNetwork(2).every((row) => row.bodyPending)).toBe(true);
+  });
+
+  it.each([
+    ['No resource with given identifier found', 'evicted'],
+    ['No data found for resource with given identifier', 'evicted'],
+    ['Request content was evicted from inspector cache', 'evicted'],
+    ['Debugger is not attached to the tab with id: 1.', undefined],
+  ])('a body read rejected with "%s" reports reason %s', async (message, reason) => {
+    const capture = await import('../src/tools/network-capture.js');
+    await capture.ensureNetworkCapture(1);
+    sendCommand.mockRejectedValueOnce(new Error(message));
+    response(1);
+    await flush();
+    const [row] = capture.readNetwork(1);
+    expect(row.body).toBeUndefined();
+    expect(row.bodyPending).toBeUndefined();
+    expect(row.bodyOmissionReason).toBe(reason);
+    expect(row.bodyOmitted).toBe(reason ? true : undefined);
+  });
+
+  it('an eviction answer for a capture that already ended changes nothing', async () => {
+    const capture = await import('../src/tools/network-capture.js');
+    await capture.ensureNetworkCapture(1);
+    const body = deferred<object>();
+    sendCommand.mockReturnValueOnce(body.promise);
+    response(1);
+    const before = capture.readNetwork(1);
+    capture.clearNetwork(1);
+    await capture.ensureNetworkCapture(1);
+    body.reject(new Error('No resource with given identifier found'));
+    await flush();
+    expect(capture.readNetwork(1)).toEqual([]);
+    expect(before[0].bodyOmissionReason).toBeUndefined();
+  });
+
+  it('opt-out narrows the CDP footprint at once, on exactly the tabs that captured', async () => {
+    const network = await import('../src/tools/network-capture.js');
+    const consoleCapture = await import('../src/tools/console-capture.js');
+    (await import('../src/tools/capture-settings.js')).installCaptureSettingsListener();
+    await network.ensureNetworkCapture(1);
+    await network.ensureNetworkCapture(2);
+    await consoleCapture.ensureConsoleCapture(1);
+    sendCommand.mockClear();
+
+    changeSettings({ captureConsole: false, captureNetwork: false });
+    // Dispatched synchronously, before the handler returns.
+    expect(sent(1)).toEqual([
+      'Runtime.releaseObjectGroup(console)',
+      'Runtime.disable',
+      'Network.disable',
+    ]);
+    expect(sent(2)).toEqual(['Network.disable']);
+    // Never the shared-store wipe that would empty the human's DevTools console.
+    expect(sendCommand.mock.calls.some(([, m]) => m === 'Runtime.discardConsoleEntries')).toBe(
+      false,
+    );
+
+    // A second "off" has nothing left to revoke.
+    sendCommand.mockClear();
+    changeSettings({ captureConsole: false, captureNetwork: false });
+    expect(sendCommand).not.toHaveBeenCalled();
+  });
+
+  it('opt-out swallows a failing revoke (tab gone, not ours)', async () => {
+    const network = await import('../src/tools/network-capture.js');
+    const consoleCapture = await import('../src/tools/console-capture.js');
+    await network.ensureNetworkCapture(1);
+    await consoleCapture.ensureConsoleCapture(1);
+    sendCommand.mockRejectedValue(new Error('No tab with given id 1'));
+    await expect(network.releaseNetworkCapture(1)).resolves.toBeUndefined();
+    await expect(consoleCapture.releaseConsoleCapture(1)).resolves.toBeUndefined();
+  });
+
+  for (const kind of ['console', 'network'] as const) {
+    it(`${kind}: a late enable cannot outlive an opt-out`, async () => {
+      const capture =
+        kind === 'console'
+          ? await import('../src/tools/console-capture.js')
+          : await import('../src/tools/network-capture.js');
+      const enable =
+        'ensureConsoleCapture' in capture
+          ? capture.ensureConsoleCapture
+          : capture.ensureNetworkCapture;
+      (await import('../src/tools/capture-settings.js')).installCaptureSettingsListener();
+      const enabling = deferred<object>();
+      sendCommand.mockReturnValueOnce(enabling.promise);
+      const first = enable(1);
+      changeSettings({ captureConsole: false, captureNetwork: false });
+      enabling.resolve({});
+      await first;
+      // The disable went on the pipe AFTER the enable, so the session ends disabled.
+      const methods = sent(1);
+      const domain = kind === 'console' ? 'Runtime' : 'Network';
+      expect(methods.indexOf(`${domain}.enable`)).toBeLessThan(
+        methods.indexOf(`${domain}.disable`),
+      );
+      // ...and the generation token keeps the resolved enable from recording.
+      if (kind === 'console') {
+        emit(1, 'Runtime.consoleAPICalled', {
+          type: 'error',
+          args: [{ value: 'late' }],
+          stackTrace: { callFrames: [{ url: 'https://example.com/app.js' }] },
+        });
+      } else {
+        response(1);
+      }
+      await flush();
+      const read = 'readConsole' in capture ? capture.readConsole : capture.readNetwork;
+      expect(read(1)).toEqual([]);
+    });
+  }
+
+  describe("attach()'s off path", () => {
+    let attachDone: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      attachDone = vi.fn();
+      const g = globalThis as unknown as { chrome: Record<string, Record<string, unknown>> };
+      g.chrome.debugger.attach = vi.fn().mockResolvedValue(undefined);
+      g.chrome.storage.local = {
+        get: vi.fn().mockResolvedValue({ sallyport_settings: { keepAwake: false } }),
+      };
+    });
+
+    it('revokes once per attachment, again after a detach, and never waits for the renderer', async () => {
+      const cdp = await import('../src/tools/cdp.js');
+      // A renderer that never answers the revoke must not hold up the tool call.
+      sendCommand.mockImplementation((_t: unknown, method: string) =>
+        method === 'Runtime.disable' || method === 'Network.disable'
+          ? new Promise(() => undefined)
+          : Promise.resolve({}),
+      );
+      await cdp.attach(1).then(attachDone);
+      expect(attachDone).toHaveBeenCalled();
+      const revoke = ['Runtime.releaseObjectGroup(console)', 'Runtime.disable', 'Network.disable'];
+      expect(sent(1).filter((m) => revoke.includes(m))).toEqual(revoke);
+
+      sendCommand.mockClear();
+      await cdp.attach(1);
+      await cdp.attach(1);
+      expect(sent(1).filter((m) => revoke.includes(m))).toEqual([]);
+
+      await cdp.detach(1);
+      sendCommand.mockClear();
+      await cdp.attach(1);
+      expect(sent(1).filter((m) => revoke.includes(m))).toEqual(revoke);
+    });
+
+    it('never issues an enable while the settings are off', async () => {
+      const cdp = await import('../src/tools/cdp.js');
+      await cdp.attach(1);
+      expect(sent(1).some((m) => m === 'Runtime.enable' || m === 'Network.enable')).toBe(false);
+    });
+  });
+
   it.each([false, true])(
     'explicit detach cleans state without an onDetach event (already gone: %s)',
     async (alreadyGone) => {
@@ -435,7 +626,7 @@ describe('capture lifecycle', () => {
       // No browser event was emitted; the next attachment must enable again.
       sendCommand.mockClear();
       await capture.ensureNetworkCapture(1);
-      expect(sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Network.enable');
+      expect(sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Network.enable', expect.anything());
     },
   );
 });

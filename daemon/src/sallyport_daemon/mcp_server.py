@@ -522,7 +522,11 @@ TOOLS: list[Tool] = [
             "queue overflowed (>100 waiting) so this body was never read; filtering "
             "cannot recover it. bodyOmissionReason='cache_limit' means the retained-body "
             "cache limit was reached; metadata is kept but filtering cannot recover "
-            "it. Re-fetch that URL with fetch_in_page only if appropriate "
+            "it. bodyOmissionReason='evicted' means Chrome no longer held the body "
+            "when it was read — a response over ~4 MB decoded is never kept, and "
+            "older ones are pushed out once the tab's capture buffer fills; "
+            "re-reading cannot recover it. Re-fetch that URL with fetch_in_page "
+            "only if appropriate "
             "(signed or one-shot requests may not be replayable). Structured CDP "
             "event capture only — no JS eval. Domain must be in allowlist."
         ),

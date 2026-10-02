@@ -443,6 +443,16 @@ def test_no_tool_description_claims_last_used_fallback() -> None:
             assert needle not in desc, f"{tool.name}: stale wording {needle!r}"
 
 
+def test_network_tail_explains_every_body_omission_reason() -> None:
+    """Each `bodyOmissionReason` the extension can set (network-body-cache.ts's
+    `CapturedBody` union) needs its meaning in the description, or the agent
+    can't tell "read again shortly" from "this body is gone"."""
+    network_tail = next(t for t in TOOLS if t.name == "network_tail")
+    desc = network_tail.description or ""
+    for reason in ("capture_busy", "cache_limit", "evicted"):
+        assert f"bodyOmissionReason='{reason}'" in desc, reason
+
+
 # ---------------------------------------------------------------------------
 # _dispatch_call: error / format branches
 # ---------------------------------------------------------------------------

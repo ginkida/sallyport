@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   CONSOLE_MAX_ENTRIES,
@@ -181,5 +181,61 @@ describe('shapeConsoleEntry — a line that would poison the ring', () => {
       1,
     );
     expect(entry?.text).toBe('cut mid-emoji \uFFFD');
+  });
+});
+
+describe('releaseConsoleCapture', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  async function load() {
+    vi.resetModules();
+    const sendCommand = vi.fn().mockResolvedValue({});
+    vi.stubGlobal('chrome', { debugger: { sendCommand, onEvent: { addListener: vi.fn() } } });
+    const mod = await import('../src/tools/console-capture.js');
+    const methods = () =>
+      sendCommand.mock.calls.map(([, method, params]) => {
+        const group = (params as { objectGroup?: string } | undefined)?.objectGroup;
+        return group ? `${method as string}(${group})` : (method as string);
+      });
+    return { mod, sendCommand, methods };
+  }
+
+  it("releases the 'console' group BEFORE disabling — disable alone frees nothing", async () => {
+    const { mod, sendCommand, methods } = await load();
+    await mod.ensureConsoleCapture(1);
+    sendCommand.mockClear();
+    const done = mod.releaseConsoleCapture(1);
+    // Both on the pipe before either answer is awaited.
+    expect(methods()).toEqual(['Runtime.releaseObjectGroup(console)', 'Runtime.disable']);
+    await done;
+    expect(mod.isConsoleCaptureActive(1)).toBe(false);
+    expect(methods()).not.toContain('Runtime.discardConsoleEntries');
+  });
+
+  it('revokes once per attachment, and again once the attachment is cleared', async () => {
+    const { mod, sendCommand } = await load();
+    await mod.releaseConsoleCapture(1); // never enabled in this worker: still revoked once
+    await mod.releaseConsoleCapture(1);
+    expect(sendCommand).toHaveBeenCalledTimes(2);
+    mod.clearConsole(1); // detach / tab close
+    await mod.releaseConsoleCapture(1);
+    expect(sendCommand).toHaveBeenCalledTimes(4);
+    await mod.ensureConsoleCapture(1); // a re-enable makes the next off revoke again
+    await mod.releaseConsoleCapture(1);
+    expect(sendCommand).toHaveBeenCalledTimes(7);
+  });
+
+  it('never throws — not even with no chrome.debugger at all', async () => {
+    const { mod, sendCommand } = await load();
+    sendCommand.mockImplementation(() => {
+      throw new Error('sync failure');
+    });
+    await expect(mod.releaseConsoleCapture(1)).resolves.toBeUndefined();
+    vi.stubGlobal('chrome', {});
+    mod.clearConsole(1);
+    await expect(mod.releaseConsoleCapture(1)).resolves.toBeUndefined();
   });
 });

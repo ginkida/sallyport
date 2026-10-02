@@ -8,7 +8,7 @@ export interface CapturedBody {
    * and size remain available; bodyOmissionReason identifies capture pressure. */
   bodyOmitted?: boolean;
   /** Metadata survives when a body read or retained-payload limit is reached. */
-  bodyOmissionReason?: 'capture_busy' | 'cache_limit';
+  bodyOmissionReason?: 'capture_busy' | 'cache_limit' | 'evicted';
 }
 
 /** How a retained body is charged against the limits. The default counts UTF-16

@@ -164,6 +164,11 @@ const buffers = new Map<number, ConsoleEntry[]>();
 // A fresh token per attachment keeps a late enable failure from clearing a
 // newer capture on the same tab after detach/re-attach.
 const enabledTabs = new Map<number, symbol>();
+// Tabs whose CURRENT attachment has already been revoked by
+// releaseConsoleCapture — once per attachment, not once per call. Forgotten in
+// clearConsole (detach, tab close), so a new attachment, or this one after a
+// worker restart, is revoked again.
+const revokedTabs = new Set<number>();
 // attach() checks persisted settings before enabling. This additional latch
 // rejects an attach already in progress when the setting is switched off.
 let captureAllowed = true;
@@ -171,7 +176,7 @@ let captureAllowed = true;
 export function setConsoleCaptureAllowed(allowed: boolean): void {
   captureAllowed = allowed;
   if (!allowed) {
-    for (const tabId of enabledTabs.keys()) clearConsole(tabId);
+    for (const tabId of [...enabledTabs.keys()]) void releaseConsoleCapture(tabId);
   }
 }
 
@@ -210,11 +215,44 @@ export async function ensureConsoleCapture(tabId: number): Promise<void> {
   if (!captureAllowed || enabledTabs.has(tabId)) return;
   const generation = Symbol();
   enabledTabs.set(tabId, generation);
+  revokedTabs.delete(tabId);
   try {
     await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable');
   } catch {
     if (enabledTabs.get(tabId) === generation) clearConsole(tabId);
   }
+}
+
+/** Turn console capture OFF on a tab now: drop its buffer synchronously, then
+ * release the session's 'console' object group and send `Runtime.disable`, both
+ * best-effort and dispatched back to back before anything is awaited (so they
+ * follow any `Runtime.enable` already on the pipe). The order matters:
+ * `Runtime.disable` alone frees nothing — V8 keeps every argument logged since
+ * the enable in that group, unbounded, until it is released — while the release
+ * alone leaves the per-message event stream and the main-world contexts that
+ * `Runtime.enable` forces into every frame. NEVER `Runtime.discardConsoleEntries`:
+ * it wipes the page's shared console store, i.e. the human's own DevTools
+ * console too. No tool uses Runtime events or the 'console' group, so this is
+ * safe beside a call in flight. Called for every capturing tab when the popup
+ * setting is unchecked, and from `attach()`'s off path once per attachment
+ * (after a worker restart nothing records whether the surviving session still
+ * has Runtime enabled). Never throws. */
+export async function releaseConsoleCapture(tabId: number): Promise<void> {
+  if (revokedTabs.has(tabId) && !enabledTabs.has(tabId)) return;
+  clearConsole(tabId);
+  revokedTabs.add(tabId);
+  const send = (method: string, params?: Record<string, unknown>): Promise<unknown> => {
+    try {
+      return Promise.resolve(chrome.debugger.sendCommand({ tabId }, method, params));
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  };
+  // Both on the pipe before either answer is awaited.
+  await Promise.allSettled([
+    send('Runtime.releaseObjectGroup', { objectGroup: 'console' }),
+    send('Runtime.disable'),
+  ]);
 }
 
 /** Is console capture active on this tab in this worker's lifetime? The idle
@@ -230,6 +268,7 @@ export function isConsoleCaptureActive(tabId: number): boolean {
 export function clearConsole(tabId: number): void {
   buffers.delete(tabId);
   enabledTabs.delete(tabId);
+  revokedTabs.delete(tabId);
 }
 
 /** Snapshot a tab's captured entries (a copy, oldest→newest). */

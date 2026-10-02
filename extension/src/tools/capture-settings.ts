@@ -5,9 +5,13 @@ import { setNetworkCaptureAllowed } from './network-capture.js';
  *
  * Turning capture off must also reach idle tabs; waiting for their next tool
  * call could leave response bodies accumulating indefinitely. Clearing is
- * synchronous and invalidates pending reads before this handler returns. CDP
- * domains are left alone: Runtime may also serve other tools on the same
- * attachment. Turning capture ON only permits future attach calls. */
+ * synchronous and invalidates pending reads before this handler returns. The
+ * CDP side narrows at once too, best-effort, on every tab this worker enabled
+ * capture on: `Network.disable` frees the renderer's response buffer, and the
+ * 'console' object-group release + `Runtime.disable` free what V8 kept of every
+ * logged argument (no tool depends on either domain being enabled — Runtime
+ * commands work without `Runtime.enable`). Turning capture ON only permits
+ * future attach calls. */
 export function onSettingsChanged(
   changes: Record<string, { newValue?: unknown } | undefined>,
   area: string,

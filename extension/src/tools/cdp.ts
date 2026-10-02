@@ -1,8 +1,13 @@
 import { getSettings } from '../storage.js';
-import { clearConsole, ensureConsoleCapture, isConsoleCaptureActive } from './console-capture.js';
+import {
+  clearConsole,
+  ensureConsoleCapture,
+  isConsoleCaptureActive,
+  releaseConsoleCapture,
+} from './console-capture.js';
 import { clearDialogs, ensureDialogCapture, releaseDialogCapture } from './dialog-capture.js';
 import { BridgeError } from './errors.js';
-import { clearNetwork, ensureNetworkCapture } from './network-capture.js';
+import { clearNetwork, ensureNetworkCapture, releaseNetworkCapture } from './network-capture.js';
 import { clearRefsForTab } from './refs.js';
 import { onTab } from './tab-chain.js';
 
@@ -254,10 +259,15 @@ export async function attach(tabId: number): Promise<void> {
       await releaseKeepAwake(tabId);
       break;
   }
+  // Off: revoke once per attachment (the release helpers remember it), so a
+  // capture this worker never saw — a session that outlived a worker restart —
+  // still gets Network.disable / the 'console' release + Runtime.disable. Not
+  // awaited: nothing here depends on the answer, and those commands are
+  // renderer-answered, so a wedged page must not hold up the tool call.
   if (settings.captureConsole) await ensureConsoleCapture(tabId);
-  else clearConsole(tabId);
+  else void releaseConsoleCapture(tabId);
   if (settings.captureNetwork) await ensureNetworkCapture(tabId);
-  else clearNetwork(tabId);
+  else void releaseNetworkCapture(tabId);
   // Dialog handling ACTS on the page (unlike console/network, which only
   // observe), so unlike those two, turning it off must actively stop it —
   // same off-path shape as keep-awake's releaseKeepAwake below.

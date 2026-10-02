@@ -96,9 +96,25 @@ export const NETWORK_BODY_CACHE_TOTAL = 4 * NETWORK_RESPONSE_BUDGET;
 // RPCs can't be re-fetched). The queue is bounded by the ring size, since an
 // entry the ring has already evicted is never read; only an overflowing queue
 // answers capture_busy.
+// Eight in flight globally: each read makes the browser JSON-parse a body of up
+// to NETWORK_MAX_RESOURCE_BUFFER (decoded, UTF-16) on its UI thread and hand the
+// worker a copy before we clip it, so this bounds that transient — 32 in flight
+// was up to 32 such copies at once.
 export const NETWORK_MAX_BODY_READS_PER_TAB = 4;
-export const NETWORK_MAX_BODY_READS = 32;
+export const NETWORK_MAX_BODY_READS = 8;
 export const NETWORK_MAX_QUEUED_BODY_READS = NETWORK_MAX_ENTRIES;
+// The renderer's own response-body buffer for our session (`Network.enable`'s
+// maxTotalBufferSize / maxResourceBufferSize). Chrome's defaults are 200 MB /
+// 20 MB PER TAB, and the buffer fills with every resource type, not just the
+// XHR/fetch bodies we read — measured +124 MB on one dashboard tab against +14 MB
+// with limits. A resource larger than the per-resource limit is not kept at all
+// (Chrome stores it whole or not), and an old one is evicted once the total is
+// reached; either way getResponseBody then fails and the entry reports
+// bodyOmissionReason 'evicted'. The per-resource limit is counted in decoded
+// bytes (UTF-16 for non-Latin-1 text), so it stays far above NETWORK_MAX_BODY:
+// only bodies we would have clipped to a 256 KiB prefix anyway can be lost.
+export const NETWORK_MAX_TOTAL_BUFFER = 32_000_000;
+export const NETWORK_MAX_RESOURCE_BUFFER = 4_000_000;
 // Per-entry URL cap. Real API urls are well under this; it exists only so a
 // pathological giant query string can't dominate a result's wire size.
 export const NETWORK_MAX_URL = 4 * 1024;
@@ -132,6 +148,19 @@ export function clipUrl(url: string, max = NETWORK_MAX_URL): { url: string; trun
   if (url.length <= max) return { url, truncated: false };
   return { url: url.slice(0, max), truncated: true };
 }
+/** Did `Network.getResponseBody` fail because the renderer no longer holds the
+ * body? Chrome answers "No resource with given identifier found", "No data found
+ * for resource with given identifier" or "Request content was evicted from
+ * inspector cache" — the resource outgrew the capture buffer or was pushed out of
+ * it. Narrow on purpose: a detached debugger or a closed tab is not "evicted",
+ * it is a capture that ended, and keeps the plain metadata-only entry. Pure. */
+export function looksLikeEvictedBodyError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /no (?:resource|data found for resource) with given identifier|evicted from inspector cache/i.test(
+    msg,
+  );
+}
+
 const DEFAULT_NETWORK_LIMIT = 20;
 const NETWORK_MAX_PENDING = 512;
 
@@ -341,6 +370,12 @@ function pendingFor(tabId: number): Map<string, NetworkMeta> {
 // Tokens identify capture lifetimes, not just tab IDs: a body read or enable
 // failure from a detached session must never affect a later attachment.
 const enabledTabs = new Map<number, symbol>();
+// Tabs whose CURRENT attachment has already been sent Network.disable by
+// releaseNetworkCapture, so the attach() off path revokes once per attachment
+// rather than once per call. Forgotten in clearNetwork (detach, tab close), so
+// the next attachment — or this one after a worker restart, which empties the
+// set while the debugger session survives — is revoked again.
+const revokedTabs = new Set<number>();
 let captureAllowed = true;
 // In-flight body reads are counted as ACTUAL unresolved CDP calls, including
 // those from a cleared capture — repeated detach/re-enable must not bypass the
@@ -356,7 +391,7 @@ const bodyQueue = new Map<number, QueuedBodyRead[]>();
 export function setNetworkCaptureAllowed(allowed: boolean): void {
   captureAllowed = allowed;
   if (!allowed) {
-    for (const tabId of enabledTabs.keys()) clearNetwork(tabId);
+    for (const tabId of [...enabledTabs.keys()]) void releaseNetworkCapture(tabId);
   }
 }
 
@@ -420,8 +455,19 @@ async function runBodyRead({ requestId, tabId, entry, generation }: QueuedBodyRe
       bodyCache.retain(tabId, entry, clipped.body, buf.slice(0, index));
       if (entry.body !== undefined && clipped.truncated) entry.bodyTruncated = true;
     }
-  } catch {
-    // Body evicted, target gone, etc. Keep the already-recorded metadata.
+  } catch (e) {
+    // The renderer no longer has the body (outgrew or was pushed out of the
+    // capture buffer): say so, rather than leave a body-less entry that reads like
+    // "this response had no text". Anything else (target gone, debugger detached)
+    // keeps the plain metadata — the capture itself is ending.
+    if (
+      looksLikeEvictedBodyError(e) &&
+      enabledTabs.get(tabId) === generation &&
+      buffers.get(tabId)?.includes(entry)
+    ) {
+      entry.bodyOmitted = true;
+      entry.bodyOmissionReason = 'evicted';
+    }
   } finally {
     delete entry.bodyPending;
     bodyReads--;
@@ -514,10 +560,36 @@ export async function ensureNetworkCapture(tabId: number): Promise<void> {
   if (!captureAllowed || enabledTabs.has(tabId)) return;
   const generation = Symbol();
   enabledTabs.set(tabId, generation);
+  revokedTabs.delete(tabId);
   try {
-    await chrome.debugger.sendCommand({ tabId }, 'Network.enable');
+    // NOT enableDurableMessages: an explicit false switches durable collection
+    // off for the whole profile, not just this session.
+    await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {
+      maxTotalBufferSize: NETWORK_MAX_TOTAL_BUFFER,
+      maxResourceBufferSize: NETWORK_MAX_RESOURCE_BUFFER,
+    });
   } catch {
     if (enabledTabs.get(tabId) === generation) clearNetwork(tabId);
+  }
+}
+
+/** Turn capture OFF on a tab now: drop its buffers synchronously (any pending
+ * read is invalidated before this returns), then send a best-effort
+ * `Network.disable` so the renderer frees its response buffer and stops the
+ * Network.* event stream at once rather than at detach. Called for every
+ * capturing tab when the popup setting is unchecked, and from `attach()`'s off
+ * path — once per attachment, since after a worker restart nothing records
+ * whether the surviving session still has Network enabled. The command is sent
+ * before the first await, so it is ordered after any `Network.enable` already on
+ * the pipe and a late enable can't outlive it. Never throws. */
+export async function releaseNetworkCapture(tabId: number): Promise<void> {
+  if (revokedTabs.has(tabId) && !enabledTabs.has(tabId)) return;
+  clearNetwork(tabId);
+  revokedTabs.add(tabId);
+  try {
+    await chrome.debugger.sendCommand({ tabId }, 'Network.disable');
+  } catch {
+    // tab gone, not attached, or not ours — nothing to revoke
   }
 }
 
@@ -529,6 +601,7 @@ export function clearNetwork(tabId: number): void {
   bodyQueue.delete(tabId); // in-flight reads still count until Chrome answers
   buffers.delete(tabId);
   enabledTabs.delete(tabId);
+  revokedTabs.delete(tabId);
   pending.delete(tabId);
 }
 

@@ -371,3 +371,47 @@ describe('clipBody — surrogate-safe', () => {
     expect(out).toEqual({ body: 'a'.repeat(9), truncated: true });
   });
 });
+
+describe('looksLikeEvictedBodyError', () => {
+  it("recognises Chrome's three answers for a body it no longer holds", async () => {
+    const { looksLikeEvictedBodyError } = await import('../src/tools/network-capture.js');
+    for (const msg of [
+      'No resource with given identifier found',
+      'No data found for resource with given identifier',
+      'Request content was evicted from inspector cache',
+      // chrome.debugger can hand back the CDP error object serialised
+      '{"code":-32000,"message":"No resource with given identifier found"}',
+    ]) {
+      expect(looksLikeEvictedBodyError(new Error(msg)), msg).toBe(true);
+    }
+    expect(looksLikeEvictedBodyError('No data found for resource with given identifier')).toBe(
+      true,
+    );
+  });
+
+  it('leaves a capture that ENDED (detached, closed tab) unclassified', async () => {
+    const { looksLikeEvictedBodyError } = await import('../src/tools/network-capture.js');
+    for (const msg of [
+      'Debugger is not attached to the tab with id: 7.',
+      'No tab with given id 7.',
+      'Target closed',
+      'body evicted', // not Chrome's wording — the classifier stays narrow
+      '',
+    ]) {
+      expect(looksLikeEvictedBodyError(new Error(msg)), msg).toBe(false);
+    }
+  });
+});
+
+describe('capture buffer limits', () => {
+  it('stay far above the per-body clip and well below Chrome’s per-tab defaults', async () => {
+    const { NETWORK_MAX_RESOURCE_BUFFER, NETWORK_MAX_TOTAL_BUFFER } =
+      await import('../src/tools/network-capture.js');
+    // Chrome counts the per-resource limit in DECODED bytes, UTF-16 for
+    // non-Latin-1 text: a body we would keep whole must fit with room to spare.
+    expect(NETWORK_MAX_RESOURCE_BUFFER).toBeGreaterThanOrEqual(4 * 2 * NETWORK_MAX_BODY);
+    expect(NETWORK_MAX_TOTAL_BUFFER).toBeGreaterThanOrEqual(4 * NETWORK_MAX_RESOURCE_BUFFER);
+    expect(NETWORK_MAX_RESOURCE_BUFFER).toBeLessThan(20_000_000);
+    expect(NETWORK_MAX_TOTAL_BUFFER).toBeLessThan(200_000_000);
+  });
+});
