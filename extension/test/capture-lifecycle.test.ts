@@ -212,6 +212,28 @@ describe('capture lifecycle', () => {
     },
   );
 
+  it('network: a giant url is stored clipped, with the origin of the FULL url', async () => {
+    const capture = await import('../src/tools/network-capture.js');
+    await capture.ensureNetworkCapture(1);
+    const big = (host: string) =>
+      'https://' + 'u'.repeat(capture.NETWORK_MAX_URL + 100) + '@' + host + '/data';
+    emit(1, 'Network.requestWillBeSent', {
+      requestId: 'r',
+      type: 'Fetch',
+      request: { method: 'GET', url: big('first.example.com') },
+    });
+    // The redirect target is what the entry must be judged by.
+    emit(1, 'Network.responseReceived', {
+      requestId: 'r',
+      response: { url: big('api.example.com'), status: 200, mimeType: 'image/png' },
+    });
+    emit(1, 'Network.loadingFinished', { requestId: 'r', encodedDataLength: 10 });
+    const [entry] = capture.readNetwork(1);
+    expect(entry.origin).toBe('https://api.example.com');
+    expect(entry.url.length).toBe(capture.NETWORK_MAX_URL);
+    expect(entry.urlTruncated).toBe(true);
+  });
+
   it('opt-out invalidates a pending body even if capture is turned back on', async () => {
     const capture = await import('../src/tools/network-capture.js');
     (await import('../src/tools/capture-settings.js')).installCaptureSettingsListener();

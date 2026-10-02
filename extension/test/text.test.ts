@@ -7,6 +7,9 @@
  * failed. Pure, so all of this is testable without chrome.
  */
 
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
+
 import { describe, expect, it } from 'vitest';
 
 import { capText, parseMaxChars, parseOffset, wellFormedCut } from '../src/tools/text.js';
@@ -138,5 +141,57 @@ describe('wellFormedCut (page strings stored in capture rings)', () => {
 
   it('leaves a well-formed string alone', () => {
     expect(wellFormedCut('ok 😀', 100)).toEqual({ text: 'ok 😀', cut: false });
+  });
+
+  // The cut branch now returns a COPY (a UTF-8 round trip) instead of a V8
+  // slice of the parent. Same content, same well-formedness rule.
+  it('a cut keeps exactly the prefix, code unit for code unit', () => {
+    const parent = JSON.stringify({ d: 'é😀x'.repeat(50_000) });
+    const { text, cut } = wellFormedCut(parent, 100_001);
+    expect(cut).toBe(true);
+    // 100_001 lands after a high surrogate only if the pair straddles it;
+    // either way the result is the parent's own prefix.
+    expect(parent.startsWith(text)).toBe(true);
+    expect(text.length === 100_001 || text.length === 100_000).toBe(true);
+    expect(text.isWellFormed()).toBe(true);
+  });
+
+  it('a cut still turns a lone half inside the kept prefix into U+FFFD', () => {
+    const s = 'a\uD83Db\uDE00c' + 'z'.repeat(100);
+    const { text, cut } = wellFormedCut(s, 10);
+    expect(cut).toBe(true);
+    expect(text).toBe('a\uFFFDb\uFFFDc' + 'z'.repeat(5));
+    expect(() => canonicalJson({ m: text })).not.toThrow();
+  });
+
+  it('a cut keeps a leading byte-order mark (the copy must not eat it)', () => {
+    const s = '\uFEFF{"a":1}' + ' '.repeat(100);
+    expect(wellFormedCut(s, 8)).toEqual({ text: '\uFEFF{"a":1}', cut: true });
+  });
+
+  it('a cut ending on a high surrogate drops it rather than replacing it', () => {
+    const s = 'abc\uD83D\uDE00tail';
+    expect(wellFormedCut(s, 4)).toEqual({ text: 'abc', cut: true });
+  });
+
+  // The point of the copy: a stored prefix must not keep the whole parent
+  // alive. A V8 slice (`s.slice(0, n)`, n >= 13) does — 20 prefixes of 4 MiB
+  // parents held ~80 MiB; as copies they hold ~1 MiB. The gap is two orders of
+  // magnitude, so the threshold sits far from both outcomes.
+  it('a cut does not retain its parent string', () => {
+    setFlagsFromString('--expose-gc');
+    const gc = runInNewContext('gc') as () => void;
+    gc();
+    const base = process.memoryUsage().heapUsed;
+    const kept: string[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      // A fresh flat parent per iteration (JSON.stringify flattens).
+      const parent = JSON.stringify({ i, d: 'x'.repeat(4 * 1024 * 1024 + i) });
+      kept.push(wellFormedCut(parent, 64 * 1024).text);
+    }
+    gc();
+    const retainedMiB = (process.memoryUsage().heapUsed - base) / (1024 * 1024);
+    expect(kept).toHaveLength(20);
+    expect(retainedMiB).toBeLessThan(20);
   });
 });

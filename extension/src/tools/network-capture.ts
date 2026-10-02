@@ -143,10 +143,17 @@ export function entryWireBytes(entry: NetworkEntry): number {
 
 /** Clip a captured URL to NETWORK_MAX_URL, flagging truncation. Callers must take
  * `origin` from the UNCAPPED url first (invariant #3) — only the stored/filterable
- * url is trimmed. Pure. */
+ * url is trimmed. A clipped url is an independent copy (`wellFormedCut`), so the
+ * pending map and the ring never pin a page's multi-MiB query string. Pure. */
 export function clipUrl(url: string, max = NETWORK_MAX_URL): { url: string; truncated: boolean } {
   if (url.length <= max) return { url, truncated: false };
-  return { url: url.slice(0, max), truncated: true };
+  return { url: wellFormedCut(url, max).text, truncated: true };
+}
+
+/** Length-bound one of the other controllable string fields — an independent
+ * copy when cut, for the same reason as `clipUrl`. Pure. */
+function capField(s: string, max: number): string {
+  return s.length <= max ? s : wellFormedCut(s, max).text;
 }
 /** Did `Network.getResponseBody` fail because the renderer no longer holds the
  * body? Chrome answers "No resource with given identifier found", "No data found
@@ -175,6 +182,23 @@ export interface NetworkMeta {
   type: string;
   contentType: string;
   size: number;
+  /** Origin of the FULL url, taken before `url` was clipped for storage
+   * (`setMetaUrl`). Absent → derived from `url` at shaping time. */
+  origin?: string | null;
+  /** `url` was already clipped when it was stored. */
+  urlTruncated?: boolean;
+}
+
+/** Store `url` on pending metadata the way it will be shown: clipped (an
+ * independent copy, so the pending map doesn't hold a page's giant url for the
+ * request's lifetime), with the origin taken from the FULL url first — the
+ * fail-closed allowlist filter (invariant #3) must judge the real origin, never
+ * one re-parsed from a truncated string. */
+export function setMetaUrl(meta: NetworkMeta, url: string): void {
+  meta.origin = originFromUrl(url);
+  const clipped = clipUrl(url);
+  meta.url = clipped.url;
+  meta.urlTruncated = clipped.truncated;
 }
 
 /** Origin of a URL string, or null on anything that isn't a real
@@ -228,21 +252,23 @@ export function shapeNetworkEntry(meta: NetworkMeta, bodyText: string | null): N
   // real allowlist-passing origin is DNS-bounded to <=267 chars, far below the cap,
   // so the filter is never affected; the cap only bounds a pathological host string
   // and removes reliance on the external DNS bound.
-  const origin = originFromUrl(meta.url);
+  // Metadata stored through `setMetaUrl` already carries the full url's origin
+  // (its `url` may be clipped by now); otherwise `url` is still the full one.
+  const origin = meta.origin !== undefined ? meta.origin : originFromUrl(meta.url);
   const clippedUrl = clipUrl(meta.url);
   const entry: NetworkEntry = {
     ts: meta.ts,
     // method/contentType are page/server-controllable too; cap them so no single
     // metadata field can dominate the result's wire size (see NETWORK_MAX_META_FIELD).
-    method: meta.method.slice(0, NETWORK_MAX_META_FIELD),
+    method: capField(meta.method, NETWORK_MAX_META_FIELD),
     url: clippedUrl.url,
     status: meta.status,
     type: meta.type,
-    contentType: meta.contentType.slice(0, NETWORK_MAX_META_FIELD),
+    contentType: capField(meta.contentType, NETWORK_MAX_META_FIELD),
     size: meta.size,
-    origin: origin === null ? null : origin.slice(0, NETWORK_MAX_URL),
+    origin: origin === null ? null : capField(origin, NETWORK_MAX_URL),
   };
-  if (clippedUrl.truncated) entry.urlTruncated = true;
+  if (clippedUrl.truncated || meta.urlTruncated === true) entry.urlTruncated = true;
   if (typeof bodyText === 'string') {
     const { body, truncated } = clipBody(bodyText);
     entry.body = body;
@@ -502,15 +528,17 @@ function onNetworkEvent(source: { tabId?: number }, method: string, params?: unk
       if (oldest !== undefined) forTab.delete(oldest);
     }
     const req = p.request ?? {};
-    forTab.set(requestId, {
+    const rec: NetworkMeta = {
       ts: Date.now(),
-      method: typeof req.method === 'string' ? req.method : '',
-      url: typeof req.url === 'string' ? req.url : '',
+      method: typeof req.method === 'string' ? capField(req.method, NETWORK_MAX_META_FIELD) : '',
+      url: '',
       status: 0,
       type,
       contentType: '',
       size: 0,
-    });
+    };
+    setMetaUrl(rec, typeof req.url === 'string' ? req.url : '');
+    forTab.set(requestId, rec);
     return;
   }
 
@@ -520,7 +548,7 @@ function onNetworkEvent(source: { tabId?: number }, method: string, params?: unk
 
   if (method === 'Network.responseReceived') {
     const resp = p.response ?? {};
-    if (typeof resp.url === 'string') rec.url = resp.url; // final URL post-redirect
+    if (typeof resp.url === 'string') setMetaUrl(rec, resp.url); // final URL post-redirect
     if (typeof resp.status === 'number') rec.status = resp.status;
     if (typeof resp.mimeType === 'string') rec.contentType = resp.mimeType;
     return;

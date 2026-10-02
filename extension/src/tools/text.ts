@@ -119,21 +119,33 @@ export function capText(text: string, maxChars: number, offset = 0): CappedText 
  * (protocol.ts), so ONE stored in a capture ring fails every later read. */
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 
+const COPY_ENCODER = new TextEncoder();
+// ignoreBOM: KEEP a leading U+FEFF. The default decoder swallows it, which
+// would silently change a body that starts with one (JSON served with a BOM).
+const COPY_DECODER = new TextDecoder('utf-8', { ignoreBOM: true });
+
 /** Cut `s` to at most `max` code units WITHOUT splitting a surrogate pair, and
  * replace any lone half the page itself produced (a script that sliced an
  * emoji) with U+FFFD. For page strings stored in capture rings — console
- * lines, dialog messages, network bodies — where a bad entry would otherwise
- * make every later console_tail/handle_dialog/network_tail on that tab fail
- * as unserialisable_result until evicted. Pure. */
+ * lines, dialog messages, network bodies, urls — where a bad entry would
+ * otherwise make every later console_tail/handle_dialog/network_tail on that
+ * tab fail as unserialisable_result until evicted.
+ *
+ * A CUT result is an independent copy, not a slice. V8 represents
+ * `s.slice(0, n)` (n >= 13) as a SlicedString that points into `s` and keeps
+ * ALL of it alive: a 256 KiB network-body prefix stored in a ring pinned the
+ * whole multi-MiB response (measured: 20 bodies clipped to 256 KiB from 5 MiB
+ * parents held 100 MiB; as copies, 10 MiB) — so the capture caps bounded what
+ * was RETURNED, not what the worker held. Neither `toWellFormed` nor a
+ * no-match `replace` breaks that link (both hand back the same string), and
+ * `JSON.stringify` doesn't either; a UTF-8 round trip builds a fresh flat
+ * string. It also maps a lone half to U+FFFD, the same rule as below. Pure. */
 export function wellFormedCut(s: string, max: number): { text: string; cut: boolean } {
-  let text = s;
-  let cut = false;
-  if (text.length > max) {
+  if (s.length > max) {
     let end = max;
-    const c = text.charCodeAt(end - 1);
+    const c = s.charCodeAt(end - 1);
     if (c >= 0xd800 && c <= 0xdbff) end -= 1;
-    text = text.slice(0, end);
-    cut = true;
+    return { text: COPY_DECODER.decode(COPY_ENCODER.encode(s.slice(0, end))), cut: true };
   }
-  return { text: text.replace(LONE_SURROGATE, '\uFFFD'), cut };
+  return { text: s.replace(LONE_SURROGATE, '\uFFFD'), cut: false };
 }

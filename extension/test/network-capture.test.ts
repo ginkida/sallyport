@@ -15,6 +15,7 @@ import {
   NETWORK_RESPONSE_BUDGET,
   originFromUrl,
   parseNetworkArgs,
+  setMetaUrl,
   shapeNetworkEntry,
   type NetworkEntry,
   type NetworkMeta,
@@ -185,6 +186,58 @@ describe('clipUrl', () => {
     const { url, truncated } = clipUrl('https://x/' + 'a'.repeat(NETWORK_MAX_URL));
     expect(truncated).toBe(true);
     expect(url.length).toBe(NETWORK_MAX_URL);
+  });
+
+  it("a clipped url is the full url's own prefix", () => {
+    const full = 'https://api.example.com/q?' + 'k=v&'.repeat(5000);
+    const { url } = clipUrl(full);
+    expect(full.startsWith(url)).toBe(true);
+    expect(url.length).toBe(NETWORK_MAX_URL);
+  });
+});
+
+/** The pending map stores the url CLIPPED (an independent copy, so a page's
+ * giant query string isn't held for the request's lifetime) — which only works
+ * if the origin was taken from the FULL url first (invariant #3). */
+describe('setMetaUrl', () => {
+  // Userinfo long enough that the clip lands inside it: re-parsing the CLIPPED
+  // url would yield a different host than the one the request really went to.
+  const full = 'https://' + 'u'.repeat(NETWORK_MAX_URL + 100) + '@api.example.com/stat';
+
+  it('takes the origin from the full url, then stores the url clipped', () => {
+    const m = meta();
+    setMetaUrl(m, full);
+    expect(m.origin).toBe('https://api.example.com');
+    expect(originFromUrl(m.url)).not.toBe('https://api.example.com'); // why it matters
+    expect(m.url.length).toBe(NETWORK_MAX_URL);
+    expect(m.urlTruncated).toBe(true);
+  });
+
+  it('shaping keeps the full-url origin and the truncation flag', () => {
+    const m = meta();
+    setMetaUrl(m, full);
+    const e = shapeNetworkEntry(m, null);
+    expect(e.origin).toBe('https://api.example.com');
+    expect(e.url).toBe(m.url);
+    expect(e.urlTruncated).toBe(true);
+  });
+
+  it('a short url is stored as is, unflagged', () => {
+    const m = meta();
+    setMetaUrl(m, 'https://api.example.com/x');
+    expect(m).toMatchObject({
+      url: 'https://api.example.com/x',
+      origin: 'https://api.example.com',
+      urlTruncated: false,
+    });
+    expect(shapeNetworkEntry(m, null).urlTruncated).toBeUndefined();
+  });
+
+  it('an unparseable url stays fail-closed (null origin)', () => {
+    const m = meta();
+    setMetaUrl(m, '');
+    expect(m.origin).toBeNull();
+    expect(shapeNetworkEntry(m, null).origin).toBeNull();
   });
 });
 
