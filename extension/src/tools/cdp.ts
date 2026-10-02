@@ -620,6 +620,11 @@ interface TabHygiene {
   timerDue: number;
   /** A flush is waiting on the tab chain. */
   queued: boolean;
+  /** Created by the startup sweep for a session this worker has not proven to
+   * be its own (`getTargets`' `attached` is true for a tab only DevTools holds
+   * too). Its flush first sends one command and goes on only if that succeeds;
+   * otherwise the record is dropped. A call's `attach()` proves it as well. */
+  unproven: boolean;
 }
 
 const hygiene = new Map<number, TabHygiene>();
@@ -652,15 +657,25 @@ function newHygiene(): TabHygiene {
     timer: undefined,
     timerDue: 0,
     queued: false,
+    unproven: false,
   };
 }
 
-function hygieneFor(tabId: number): TabHygiene {
-  let st = hygiene.get(tabId);
-  if (!st) {
-    st = newHygiene();
-    hygiene.set(tabId, st);
-  }
+/** The tab's hygiene record, created only for a session that is OURS: a tab in
+ * `attached` (a successful `attach()` put it there, and every detach takes it
+ * out). `undefined` for anything else — a closed tab, or a tab whose session
+ * ended (the human's Cancel, an explicit detach) while a call still had
+ * commands in flight: such a tab is alive, so no removal event would ever drop
+ * a record created for it, and its timer would keep firing flushes into a
+ * session that is not there. The startup sweep's records are the one other
+ * source, and they prove themselves before flushing (`TabHygiene.unproven`). */
+function ownHygiene(tabId: number): TabHygiene | undefined {
+  if (removedTabs.has(tabId)) return undefined;
+  const existing = hygiene.get(tabId);
+  if (existing) return existing;
+  if (!attached.has(tabId)) return undefined;
+  const st = newHygiene();
+  hygiene.set(tabId, st);
   return st;
 }
 
@@ -673,10 +688,11 @@ interface Sent {
 
 function noteSend(tabId: number, method: string, rootSession: boolean): Sent {
   const token = ++nextToken;
-  // A closed tab gets a throwaway record nothing tracks: `noteSettle` ignores
-  // state that is not the tab's current entry.
-  if (removedTabs.has(tabId)) return { st: newHygiene(), token };
-  const st = hygieneFor(tabId);
+  // A tab whose session is not ours (closed, detached, never attached) gets a
+  // throwaway record nothing tracks: `noteSettle` ignores state that is not
+  // the tab's current entry, and no timer is armed for it.
+  const st = ownHygiene(tabId);
+  if (!st) return { st: newHygiene(), token };
   const now = Date.now();
   st.inFlight.set(token, now);
   st.lastActivity = now;
@@ -709,6 +725,17 @@ function noteSettle(tabId: number, { st, token }: Sent): void {
   scheduleHygiene(tabId, st);
 }
 
+/** Forget commands that have aged out as abandoned. Without this a command
+ * Chrome never answers stayed in `inFlight` for the rest of the attachment —
+ * ignored, but kept and iterated on every send and answer. Its late answer, if
+ * one ever comes, finds no send time and is therefore not activity — the same
+ * treatment it got while it was still listed. */
+function pruneAbandoned(st: TabHygiene, now: number): void {
+  for (const [token, sentAt] of st.inFlight) {
+    if (now - sentAt >= ABANDONED_COMMAND_MS) st.inFlight.delete(token);
+  }
+}
+
 /** The earliest moment the tab can be flushed: HYGIENE_IDLE_MS after its last
  * activity, and not before every command still in flight has either been
  * answered or aged out as abandoned. */
@@ -728,8 +755,9 @@ function isIdle(st: TabHygiene, now: number): boolean {
  * armed early enough is left alone — it re-checks when it fires; one armed
  * LATER (for a command that was then answered) is pulled in. */
 function scheduleHygiene(tabId: number, st: TabHygiene): void {
-  if (st.queued) return;
   const now = Date.now();
+  pruneAbandoned(st, now);
+  if (st.queued) return;
   const due = flushDueAt(st, now);
   if (st.timer !== undefined) {
     if (st.timerDue <= due) return;
@@ -759,7 +787,47 @@ async function flushIfStillIdle(tabId: number, st: TabHygiene): Promise<void> {
     scheduleHygiene(tabId, st);
     return;
   }
+  if (st.unproven && !attached.has(tabId)) {
+    // A sweep record: the session may be DevTools', not ours. Its first command
+    // is the proof — only an answer from our own session goes on to the rest.
+    if (!(await answers(tabId, 'Runtime.releaseObjectGroup', { objectGroup: CALL_GROUP }))) {
+      if (hygiene.get(tabId) === st) dropHygiene(tabId);
+      return;
+    }
+    if (hygiene.get(tabId) !== st) return;
+    st.unproven = false;
+    await flushHygiene(tabId, st, false);
+    return;
+  }
+  st.unproven = false;
   await flushHygiene(tabId, st);
+}
+
+/** Does our own session for the tab answer this command (within the flush
+ * bound)? Sent like the flush's commands — not activity, sets no flag. */
+async function answers(
+  tabId: number,
+  method: string,
+  params?: Record<string, unknown>,
+): Promise<boolean> {
+  let p: Promise<boolean>;
+  try {
+    p = Promise.resolve(chrome.debugger.sendCommand({ tabId }, method, params)).then(
+      () => true,
+      () => false,
+    );
+  } catch {
+    return false;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), HYGIENE_FLUSH_DEADLINE_MS);
+  });
+  try {
+    return await Promise.race([p, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Release what the idle tab no longer needs. Every command is SENT before
@@ -768,7 +836,7 @@ async function flushIfStillIdle(tabId: number, st: TabHygiene): Promise<void> {
  * split (an enable whose disable was never sent leaves the agent enabled,
  * re-attaching a full AXContext to every new document of the tab). Best-effort
  * throughout: errors are swallowed, the wait is bounded, nothing throws. */
-async function flushHygiene(tabId: number, st: TabHygiene): Promise<void> {
+async function flushHygiene(tabId: number, st: TabHygiene, releaseCallGroup = true): Promise<void> {
   const releaseAx = st.ax;
   const disableDom = st.dom;
   const releaseConsole = st.console || isConsoleCaptureActive(tabId);
@@ -786,7 +854,8 @@ async function flushHygiene(tabId: number, st: TabHygiene): Promise<void> {
     }
     sent.push(p.catch(() => undefined));
   };
-  send('Runtime.releaseObjectGroup', { objectGroup: CALL_GROUP });
+  // Already sent (and answered) as a sweep record's proof of ownership.
+  if (releaseCallGroup) send('Runtime.releaseObjectGroup', { objectGroup: CALL_GROUP });
   if (disableDom) send('DOM.disable');
   if (releaseAx) {
     // A bare disable is a no-op on an agent that was never enabled — and the
@@ -799,6 +868,13 @@ async function flushHygiene(tabId: number, st: TabHygiene): Promise<void> {
   // scoped to this session.
   if (releaseConsole) send('Runtime.releaseObjectGroup', { objectGroup: 'console' });
   await settleWithin(Promise.all(sent), HYGIENE_FLUSH_DEADLINE_MS);
+}
+
+/** Test hook: whether the tab has a hygiene record, and how many of its
+ * commands are still counted as in flight. */
+export function hygieneStateForTest(tabId: number): { inFlight: number } | undefined {
+  const st = hygiene.get(tabId);
+  return st ? { inFlight: st.inFlight.size } : undefined;
 }
 
 function dropHygiene(tabId: number): void {
@@ -815,18 +891,27 @@ function dropHygiene(tabId: number): void {
  * gets the full flush (all flags set, since nothing remembers which were used)
  * as soon as it is idle: at once for a tab nobody has driven since, through the
  * usual timer for one already in use again. `attached` there is also true for a
- * tab only DevTools holds — the commands then simply fail, since the debuggee
- * is not ours. Never throws. */
+ * tab only DevTools holds, so a record for a tab this worker has not attached
+ * starts UNPROVEN: its flush sends one command first and drops the record when
+ * that fails (the debuggee is not ours) — no state and no timer outlive the
+ * one attempt. Never throws. */
 export async function sweepStrandedHygiene(): Promise<void> {
   try {
     const targets = await chrome.debugger.getTargets();
     for (const target of targets) {
       if (!target.attached || typeof target.tabId !== 'number') continue;
-      const st = hygieneFor(target.tabId);
+      const tabId = target.tabId;
+      if (removedTabs.has(tabId)) continue;
+      let st = hygiene.get(tabId);
+      if (!st) {
+        st = newHygiene();
+        st.unproven = !attached.has(tabId);
+        hygiene.set(tabId, st);
+      }
       st.ax = true;
       st.dom = true;
       st.console = true;
-      scheduleHygiene(target.tabId, st);
+      scheduleHygiene(tabId, st);
     }
   } catch {
     // No debugger API, or getTargets refused — nothing to sweep.

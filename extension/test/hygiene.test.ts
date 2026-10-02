@@ -59,9 +59,19 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function load() {
+/** A fresh cdp.ts, with `attachTabs` attached through the real `attach()` —
+ * hygiene state is only ever kept for a session that is OURS, so a test that
+ * drives a tab must attach it first, as every tool does. What attach itself
+ * sends (keep-awake, the capture revocations) is cleared from `calls`. */
+async function load(attachTabs: number[] = [1, 2]) {
   const cdp = await import('../src/tools/cdp.js');
   const chain = await import('../src/tools/tab-chain.js');
+  const g = globalThis as unknown as { chrome: Record<string, Record<string, unknown>> };
+  g.chrome.debugger.attach = vi.fn().mockResolvedValue(undefined);
+  g.chrome.storage = { local: { get: vi.fn(async () => ({})) } };
+  for (const tabId of attachTabs) await cdp.attach(tabId);
+  await vi.advanceTimersByTimeAsync(0);
+  calls.length = 0;
   return { ...cdp, onTab: chain.onTab };
 }
 
@@ -218,6 +228,16 @@ describe('idle hygiene flush', () => {
     expect(flushed(mark2)).toEqual(['Runtime.releaseObjectGroup(sallyport-call)', 'DOM.disable']);
   });
 
+  it('forgets a never-answered command once it is abandoned, so the map stays bounded', async () => {
+    const { cdp, ABANDONED_COMMAND_MS, hygieneStateForTest } = await load([1]);
+    respond = (method) => (method === 'Runtime.evaluate' ? new Promise(() => undefined) : {});
+    for (let i = 0; i < 5; i++) void cdp(1, 'Runtime.evaluate', { awaitPromise: true });
+    expect(hygieneStateForTest(1)).toEqual({ inFlight: 5 });
+    await vi.advanceTimersByTimeAsync(ABANDONED_COMMAND_MS);
+    await cdp(1, 'DOM.getDocument');
+    expect(hygieneStateForTest(1)).toEqual({ inFlight: 0 });
+  });
+
   it('an abandoned command is flushed after even when it is the last thing the tab did', async () => {
     const { cdp, ABANDONED_COMMAND_MS } = await load();
     respond = () => new Promise(() => undefined);
@@ -243,7 +263,7 @@ describe('idle hygiene flush', () => {
   });
 
   it('activity inside the window pushes the flush back, with one timer per tab', async () => {
-    const { cdp } = await load();
+    const { cdp } = await load([1]);
     await cdp(1, 'DOM.getDocument');
     for (let i = 0; i < 5; i++) await cdp(1, 'DOM.describeNode');
     expect(vi.getTimerCount()).toBe(1);
@@ -388,7 +408,7 @@ describe('idle hygiene flush', () => {
   });
 
   it('a closed tab drops its timer', async () => {
-    const { cdp } = await load();
+    const { cdp } = await load([1]);
     await cdp(1, 'DOM.getDocument');
     expect(vi.getTimerCount()).toBe(1);
     for (const l of removedListeners) l(1);
@@ -399,11 +419,12 @@ describe('idle hygiene flush', () => {
   });
 
   it('a debugger detach (event or explicit) drops the timer', async () => {
-    const { cdp, detach } = await load();
+    const { attach, cdp, detach } = await load([1]);
     await cdp(1, 'DOM.getDocument');
     for (const l of detachListeners) l({ tabId: 1 }, 'canceled_by_user');
     expect(vi.getTimerCount()).toBe(0);
 
+    await attach(2);
     await cdp(2, 'Accessibility.getFullAXTree');
     await detach(2);
     const mark = calls.length;
@@ -412,7 +433,7 @@ describe('idle hygiene flush', () => {
   });
 
   it('a command answered after its tab was dropped does not resurrect the timer', async () => {
-    const { cdp } = await load();
+    const { cdp } = await load([1]);
     const slow = deferred<object>();
     respond = () => slow.promise;
     const pending = cdp(1, 'DOM.getDocument');
@@ -425,7 +446,7 @@ describe('idle hygiene flush', () => {
   it('a command sent after its tab closed leaves no state and arms no timer', async () => {
     // A call in flight when the human closes the tab: its finally still
     // releases its object group.
-    const { cdp, cdpSession } = await load();
+    const { cdp, cdpSession } = await load([1]);
     await cdp(1, 'DOM.getDocument');
     for (const l of removedListeners) l(1);
     expect(vi.getTimerCount()).toBe(0);
@@ -440,8 +461,32 @@ describe('idle hygiene flush', () => {
     expect(calls.slice(mark)).toEqual([]);
   });
 
+  // A detach that is not a removal leaves a LIVE tab: no removal event would
+  // ever drop state created for it, and its timer would keep flushing into a
+  // session that is no longer there.
+  it('a command sent after a detach (tab still open) leaves no state and arms no timer', async () => {
+    const { cdp, detach, hygieneStateForTest } = await load([1]);
+    await cdp(1, 'DOM.getDocument');
+    await detach(1);
+    expect(vi.getTimerCount()).toBe(0);
+    respond = () => Promise.reject(new Error('Debugger is not attached to the tab with id: 1.'));
+    await expect(cdp(1, 'Runtime.releaseObjectGroup', { objectGroup: 'x' })).rejects.toThrow();
+    expect(hygieneStateForTest(1)).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+    const mark = calls.length;
+    await vi.advanceTimersByTimeAsync(IDLE * 10);
+    expect(calls.slice(mark)).toEqual([]);
+  });
+
+  it('a tab this worker never attached gets no state and no timer', async () => {
+    const { cdp, hygieneStateForTest } = await load([]);
+    await cdp(9, 'DOM.getDocument');
+    expect(hygieneStateForTest(9)).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('attach on a tab that closes while settings are read configures nothing', async () => {
-    const { attach } = await load();
+    const { attach } = await load([]);
     const settings = deferred<Record<string, unknown>>();
     const g = globalThis as unknown as { chrome: Record<string, Record<string, unknown>> };
     g.chrome.debugger.attach = vi.fn().mockResolvedValue(undefined);
@@ -470,7 +515,7 @@ describe('idle hygiene flush', () => {
 
 describe('startup sweep', () => {
   it('fully flushes every tab still attached, at once, and skips the rest', async () => {
-    const { sweepStrandedHygiene } = await load();
+    const { sweepStrandedHygiene } = await load([]);
     getTargets.mockResolvedValue([
       { attached: true, tabId: 5, type: 'page' },
       { attached: false, tabId: 6, type: 'page' },
@@ -490,7 +535,9 @@ describe('startup sweep', () => {
   });
 
   it('a tab already driven again waits for its idle window, then gets the full flush', async () => {
-    const { cdp, sweepStrandedHygiene } = await load();
+    // A call after the worker restart attached tab 5 again (Chrome answers
+    // "already attached", which attach() takes as our own session).
+    const { cdp, sweepStrandedHygiene } = await load([5]);
     getTargets.mockResolvedValue([{ attached: true, tabId: 5, type: 'page' }]);
     await cdp(5, 'Page.getFrameTree');
     const mark = calls.length;
@@ -507,8 +554,49 @@ describe('startup sweep', () => {
     ]);
   });
 
+  // getTargets' `attached` is true for a tab only DevTools holds, too.
+  it('a tab whose session is not ours gets one probe, then no state and nothing more', async () => {
+    const { sweepStrandedHygiene, hygieneStateForTest } = await load([]);
+    getTargets.mockResolvedValue([
+      { attached: true, tabId: 5, type: 'page' },
+      { attached: true, tabId: 6, type: 'page' },
+    ]);
+    respond = (_m, _p, source) =>
+      source.tabId === 6
+        ? Promise.reject(new Error('Debugger is not attached to the tab with id: 6.'))
+        : {};
+    await sweepStrandedHygiene();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(flushed(0, 6)).toEqual(['Runtime.releaseObjectGroup(sallyport-call)']);
+    expect(hygieneStateForTest(6)).toBeUndefined();
+    // Ours (5) answered the probe and got the rest — without a second release.
+    expect(flushed(0, 5)).toEqual([
+      'Runtime.releaseObjectGroup(sallyport-call)',
+      'DOM.disable',
+      'Accessibility.enable',
+      'Accessibility.disable',
+      'Runtime.releaseObjectGroup(console)',
+    ]);
+    expectNoBareAxDisable();
+    expect(vi.getTimerCount()).toBe(0);
+    const mark = calls.length;
+    await vi.advanceTimersByTimeAsync(IDLE * 10);
+    expect(calls.slice(mark)).toEqual([]);
+  });
+
+  it('a probe the renderer never answers drops the record within the flush bound', async () => {
+    const { sweepStrandedHygiene, hygieneStateForTest, HYGIENE_FLUSH_DEADLINE_MS } = await load([]);
+    getTargets.mockResolvedValue([{ attached: true, tabId: 6, type: 'page' }]);
+    respond = () => new Promise(() => undefined);
+    await sweepStrandedHygiene();
+    await vi.advanceTimersByTimeAsync(HYGIENE_FLUSH_DEADLINE_MS);
+    expect(flushed(0, 6)).toEqual(['Runtime.releaseObjectGroup(sallyport-call)']);
+    expect(hygieneStateForTest(6)).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('never throws when the debugger API refuses', async () => {
-    const { sweepStrandedHygiene } = await load();
+    const { sweepStrandedHygiene } = await load([]);
     getTargets.mockRejectedValue(new Error('no'));
     await expect(sweepStrandedHygiene()).resolves.toBeUndefined();
     getTargets.mockImplementation(() => {

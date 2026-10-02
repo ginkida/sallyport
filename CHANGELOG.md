@@ -79,10 +79,14 @@ uses [Semantic Versioning](https://semver.org/).
   stays warm; the release happens between bursts, runs through the tab's call
   queue so it never lands inside a call, and waits at most 2 s on a hung page.
   Tabs still attached when the extension's worker restarts are swept on
-  start. A command Chrome never answers (an `evaluate` of a promise that never
-  settles, a screenshot of a minimised window) stops holding the release back
-  after 60 s, when the daemon has long given up on its call. Tool output is
-  unchanged.
+  start; a tab only DevTools holds (Chrome reports it attached too) gets one
+  probing command and is then left alone. A command Chrome never answers (an
+  `evaluate` of a promise that never settles, a screenshot of a minimised
+  window) stops holding the release back after 60 s, when the daemon has long
+  given up on its call, and is forgotten then. A tab whose debugger session
+  ended while it stayed open (the human's Cancel, a detach) keeps no release
+  state or timer, even when a late command of the call that was running
+  arrives after the detach. Tool output is unchanged.
 - Page objects a call resolves (a selector or `@eN` target, the probes of
   `get_state`, `read_text`, `scroll`, `mouse_click`, `evaluate`,
   `fetch_in_page`, `screenshot`, `set_viewport`, …) now go into one object
