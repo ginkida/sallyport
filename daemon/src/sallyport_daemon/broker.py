@@ -361,8 +361,8 @@ async def _serve_authenticated(
         # extension's `closeAgentTabsOnDisconnect` setting closes them instead.
         # Either way we ask the browser to stop DRIVING them (detach the
         # debugger, drop the focus emulation) — otherwise Chrome's "started
-        # debugging this browser" bar and the disabled back/forward cache
-        # outlive every session that ever ran.
+        # debugging this browser" bar and the focus emulation that keeps the
+        # page rendering as if visible outlive every session that ever ran.
         released = bridge.release_client(identity.id)
         if released:
             await bridge.release_tabs_in_browser(released)

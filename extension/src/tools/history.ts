@@ -186,12 +186,13 @@ export const historyGo: Tool = async (args, ctx) => {
   // started — url/status never change, so waitForHistoryTransition's
   // "nothing moved ⇒ already there" fast path and waitForLoad's "already
   // complete" fast path both read as success. Verify against `beforeUrl`
-  // (did we leave AT ALL), not an exact match to `target.url` — attaching
-  // CDP disables the back/forward cache, so a hop here is always a live
-  // network navigation and CAN legitimately redirect (session-gated pages
-  // bouncing to /login, http→https or www-normalizing redirects, …); an
-  // exact-match check would misreport a genuinely successful hop as
-  // cancelled. If the tab moved at all, trust it and report where it
+  // (did we leave AT ALL), not an exact match to `target.url` — a hop is
+  // served from the back/forward cache only when Chrome still holds an
+  // eligible entry for it (the cache is small, shrinks under memory pressure,
+  // and many pages are ineligible), otherwise it is a live network navigation
+  // that CAN legitimately redirect (session-gated pages bouncing to /login,
+  // http→https or www-normalizing redirects, …); an exact-match check would
+  // misreport a genuinely successful hop as cancelled. If the tab moved at all, trust it and report where it
   // ACTUALLY landed (getTabOrGone: the tab could vanish in this exact
   // window, e.g. a same-origin bounce that closes itself).
   const landed = await getTabOrGone(tab.id!);

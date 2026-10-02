@@ -317,14 +317,24 @@ export async function attach(tabId: number): Promise<void> {
  * already rely on — and strictly best-effort: failure degrades to the old
  * behaviour, never breaks the call. The effect ends at debugger detach.
  *
- * Deliberately NOT covered: paint. visibilityState stays 'hidden' and no
- * frames render, so `screenshot` still needs the tab actually visible
- * (`tab_not_visible` / bringToFront). Side effect worth knowing: a page
- * that believes it is active behaves like one (Telegram sends read
- * receipts / presence) — the popup setting "Keep automated tabs awake"
- * turns this off, and the next tool call then actively DISABLES the focus
- * emulation on the driven tab (see `releaseKeepAwake`), not merely stops
- * re-asserting it. */
+ * What focus emulation really does is more than "focused": Chrome implements
+ * it by taking a VISIBLE capturer handle on the tab
+ * (`EmulationHandler::SetFocusEmulationEnabled` → `IncrementCapturerCount`
+ * with stay_hidden=false), and a tab with a visible capturer is computed as
+ * visible. So while it is on, a background tab in an unfocused or occluded
+ * agent window reports visibilityState 'visible' and hasFocus() true, renders
+ * frames, runs rAF and is not timer-throttled — for the whole attachment,
+ * idle time between calls included, at a CPU/GPU cost on animated pages. That
+ * capturer is also what lets `screenshot` raster a background tab (see the
+ * note in screenshot.ts); an occluded or minimised window can still stall a
+ * capture (`tab_not_visible`). The handle is dropped by
+ * `setFocusEmulationEnabled{false}` or at detach.
+ *
+ * Side effect worth knowing: a page that believes it is active behaves like
+ * one (Telegram sends read receipts / presence) — the popup setting "Keep
+ * automated tabs awake" turns this off, and the next tool call then actively
+ * DISABLES the focus emulation on the driven tab (see `releaseKeepAwake`), not
+ * merely stops re-asserting it. */
 async function keepAwake(tabId: number): Promise<void> {
   try {
     await cdp(tabId, 'Page.setWebLifecycleState', { state: 'active' });
@@ -432,11 +442,13 @@ export async function releaseViewport(tabId: number, deadlineMs?: number): Promi
  * Nothing used to call this — `attach` had no counterpart at all — so every tab
  * an agent ever touched kept a CDP session until it closed or the human clicked
  * Cancel on the debugger banner (which detaches EVERY tab at once and breaks
- * whatever else is running). That left three things the human sees, long after
- * the agent that caused them is gone: Chrome's "started debugging this browser"
- * bar, a disabled back/forward cache on that tab, and a sticky
- * `setFocusEmulationEnabled` making the page believe it is focused. Detaching
- * clears all three — every CDP override ends with the session.
+ * whatever else is running). That left things the human pays for long after the
+ * agent that caused them is gone: Chrome's "started debugging this browser"
+ * bar, a sticky `setFocusEmulationEnabled` keeping the page focused and
+ * rendering as if visible (see `keepAwake`), whatever domains and state the
+ * session still holds, and Chrome counting the tab as DevTools-open, which
+ * keeps it out of memory-saver discards. Detaching ends all of it — every CDP
+ * override ends with the session (except the viewport, below).
  *
  * Best-effort by construction: a tab that is already gone, or was never
  * attached, is simply not our problem. Explicit detach clears our state too:

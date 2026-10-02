@@ -11,8 +11,9 @@
  * exactly the loss invariant #12 gates `close_tab` against, and for an
  * interactive session those tabs are usually the result the human wanted. What
  * we always stop is the DRIVING — the debugger session goes away, and with it
- * Chrome's "started debugging this browser" bar, the disabled back/forward cache
- * and the sticky focus emulation that makes the page report itself visible.
+ * Chrome's "started debugging this browser" bar, the sticky focus emulation that
+ * makes the page report itself visible and keeps it rendering, and the
+ * DevTools-open status that keeps the tab out of memory-saver discards.
  *
  * With `Settings.closeAgentTabsOnDisconnect` on, the tabs are CLOSED instead.
  * That switch is browser-global and cannot distinguish an ephemeral agent from

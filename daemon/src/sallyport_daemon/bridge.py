@@ -660,9 +660,9 @@ class Bridge:
 
         Fire-and-forget housekeeping, not a gate: it detaches the debugger and
         drops the focus emulation on tabs whose session is gone, so Chrome's
-        "started debugging this browser" bar, the disabled back/forward cache
-        and the "this tab thinks it is focused" override don't outlive the agent
-        that caused them. By DEFAULT the tabs themselves stay open and the human
+        "started debugging this browser" bar and the "this tab thinks it is
+        focused and visible" override don't outlive the agent that caused
+        them. By DEFAULT the tabs themselves stay open and the human
         decides what to do with them; the extension's
         `closeAgentTabsOnDisconnect` setting (popup, off by default) closes them
         instead — which is why the epoch travels with each id: a close is allowed

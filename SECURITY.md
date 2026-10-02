@@ -134,9 +134,9 @@ they are already signed into. The separation is ownership, never identity: there
 is no incognito/profile boundary here and adding one would break that premise.
 When a session disconnects its tabs stop being driven — the daemon fires an
 internal `_release_tabs` so the debugger detaches, ending Chrome's "started
-debugging this browser" bar, the disabled back/forward cache and the sticky focus
-emulation for tabs whose agent is gone. By DEFAULT the tabs themselves stay open;
-the popup's `closeAgentTabsOnDisconnect` (off by default) closes them instead.
+debugging this browser" bar and the sticky focus emulation (which keeps a page
+rendering as if visible) for tabs whose agent is gone. By DEFAULT the tabs
+themselves stay open; the popup's `closeAgentTabsOnDisconnect` (off by default) closes them instead.
 That switch is browser-global — the extension is identity-blind, so it cannot
 distinguish an ephemeral agent from an interactive one — and a close requires the
 daemon's recorded ownership epoch to match the extension's, so a recycled tab id
@@ -438,7 +438,14 @@ For *security-relevant* additions, also check:
    and enable the underlying domain (`Runtime.enable`, `Network.enable`,
    `Page.enable`, …)
    lazily — never on the unconditional `attach()` path, so the observable
-   CDP footprint only widens for users who asked for it. Buffer with a hard
+   CDP footprint only widens for users who asked for it. Bound the
+   BROWSER-side buffer too where the domain has one (`Network.enable`'s
+   `maxTotalBufferSize`/`maxResourceBufferSize` — Chrome's defaults are
+   200 MB / 20 MB per tab), and on opt-out revoke the domain best-effort
+   (`Network.disable`; release the `'console'` object group before
+   `Runtime.disable`, which alone frees nothing) — but never with a command
+   whose reach is wider than this session: `Runtime.discardConsoleEntries`
+   wipes the human's own DevTools console too. Buffer with a hard
    per-tab cap, clear on `tabs.onRemoved` / `debugger.onDetach`, and tag each
    captured item with its producing origin so reads can be filtered to the
    allowlist (fail-closed on an unknown origin — a tab can navigate
@@ -492,10 +499,10 @@ For *security-relevant* additions, also check:
    no error thrown). Verify the tangible outcome directly when there's a
    cheap, reliable way to, but pick the RIGHT comparison: `history_go`
    compares the tab's landed URL against where it STARTED (`beforeUrl`), not
-   an exact match against the assumed destination — attaching CDP disables
-   the back/forward cache, so the "did it finish" question always resolves
-   against a live navigation that can legitimately redirect, and an
-   exact-match check would misreport a real redirect as a cancelled action.
+   an exact match against the assumed destination — unless Chrome still holds
+   a back/forward-cache entry for it, the hop is a live navigation that can
+   legitimately redirect, and an exact-match check would misreport a real
+   redirect as a cancelled action.
    Report what actually happened (the observed landed URL), not the
    requested one.
 

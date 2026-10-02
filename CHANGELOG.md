@@ -28,6 +28,72 @@ uses [Semantic Versioning](https://semver.org/).
   element of the same page. The map is still wiped; the counter now restarts
   only when the tab is closed.
 
+### Added
+
+- `network_tail` reports `bodyOmissionReason: "evicted"` when Chrome no
+  longer held a response body by the time it was read: a response over about
+  4 MB decoded is never kept (see the buffer cap below), and older ones are
+  pushed out once the tab's capture buffer fills. The entry keeps its metadata;
+  re-reading cannot recover the body. This is the one agent-visible change of
+  the memory work below: such a response used to come back as a 256 KiB
+  prefix, now it comes back with no body.
+
+### Changed
+
+- Idle tabs give their browser memory back. A CDP session keeps what a call
+  turned on for the whole attachment, and several tools turn on expensive
+  things: any accessibility query (`snapshot`, `find`, `reveal`, `observe`,
+  and the focus checks of `fill`, `key_type` and `send_keys`) leaves Chrome
+  maintaining a full accessibility tree for the document (measured: +16–31 MB
+  on a static page, up to 80 → 464 MB on a churning single-page app, and DOM
+  updates up to 1.9× slower while it lives); any DOM lookup leaves the DOM
+  agent streaming every mutation into the extension; and the page objects a
+  call looked at stay pinned. Once a tab has had no CDP traffic for 10 s, the
+  extension now releases them: the per-call object group, the DOM agent (if
+  it was used), the accessibility tree (if it was built), and, while console
+  capture is on, the logged arguments Chrome keeps for it. A burst of calls
+  stays warm; the release happens between bursts, runs through the tab's call
+  queue so it never lands inside a call, and waits at most 2 s on a hung page.
+  Tabs still attached when the extension's worker restarts are swept on
+  start. Tool output is unchanged.
+- Page objects a call resolves (a selector or `@eN` target, the probes of
+  `get_state`, `read_text`, `scroll`, `mouse_click`, `evaluate`,
+  `fetch_in_page`, `screenshot`, `set_viewport`, …) now go into one object
+  group that the idle release frees. Before, each lived until its page's
+  context died or the debugger detached, which kept unmounted parts of a
+  single-page app alive (measured: +69k DOM nodes, +40 MB). `snapshot`'s DOM
+  probe and `mouse_click`'s aim probe also release their own group when the
+  page throws on the first command.
+- Network capture: Chrome's capture buffer is capped at 32 MB per tab and
+  4 MB per response (Chrome's defaults are 200 MB and 20 MB), and at most 8
+  body reads are in flight across all tabs (was 32; still 4 per tab).
+- Turning console or network capture off now frees the browser-side state at
+  once instead of at detach: `Network.disable`, and for the console a release
+  of the logged-argument group followed by `Runtime.disable` (which alone frees
+  nothing). A tab attached before a worker restart gets the same release on its
+  next call. The human's own DevTools console is never cleared.
+- Capture buffers (network bodies and urls, console lines, dialog messages)
+  store cut strings as independent copies. A 256 KiB body prefix used to keep
+  the whole multi-MiB response alive in the extension's worker, so the body
+  cache limits bounded what was returned, not what was held. A long url is
+  stored clipped, with its origin (which the allowlist filter reads) taken from
+  the full url.
+
+### Fixed
+
+- `fill`, `key_type` and `send_keys` no longer hang the call on a page that
+  never answers the focus check. The accessibility query runs under a deadline
+  (at most 5 s, never more than the call has left) and fails closed as
+  `focus_probe_failed` before anything is typed; an answer that arrives later
+  types nothing, and the attempted text is redacted in the audit log as for
+  any other focus refusal. The recovery hint for `focus_probe_failed` now
+  covers `fill` and says when a retry can help.
+- Documentation no longer claims that keep-awake leaves a background tab
+  hidden and unpainted, or that attaching the debugger disables the
+  back/forward cache. Keep-awake's focus emulation makes Chrome treat the tab
+  as visible: it renders and runs timers unthrottled while attached, which
+  is also what lets `screenshot` capture a background tab.
+
 ## [0.25.1] — 2026-10-01
 
 ### Security

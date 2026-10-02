@@ -257,7 +257,7 @@ the full model, including the tab-ownership and MCP-client-auth invariants.
 | `list_tabs` | No allowlist check — listing is free. |
 | `navigate` | Checks the *destination* URL against allowlist. `waitFor={selector?,text?,absent?,timeoutMs?}` polls after the load until the page is actually usable (SPAs render long after "loaded"). |
 | `reload` | Hard reload via `bypassCache=true`. Allowlist-gated; refs invalidate. |
-| `history_go` | Back/forward through the tab's session history — return to the previous page without knowing its URL. `direction='back'\|'forward'`, `steps` hops several entries in one jump (intermediate pages never load). The **landing** entry is allowlist-checked *before* anything moves (`Page.getNavigationHistory` → `Page.navigateToHistoryEntry`, no `evaluate`); too far → `no_history` with how far it does reach — neither error names the blocked page's host, to avoid an oracle over non-allowlisted browsing history. On a `timeout`, don't assume it failed: the hop can land before the load watchdog fires, so check with `read_text`/`snapshot` rather than blindly retrying. Conversely, if a `beforeunload` prompt cancels the hop (dismissed by default), that's caught too — `navigation_cancelled` instead of silently reporting success on a page the tab never actually reached (attaching CDP disables the back/forward cache, so the check tolerates a legitimate mid-hop redirect and reports wherever the tab actually landed, not just the requested entry's URL). Refs invalidate; optional `waitFor`. |
+| `history_go` | Back/forward through the tab's session history — return to the previous page without knowing its URL. `direction='back'\|'forward'`, `steps` hops several entries in one jump (intermediate pages never load). The **landing** entry is allowlist-checked *before* anything moves (`Page.getNavigationHistory` → `Page.navigateToHistoryEntry`, no `evaluate`); too far → `no_history` with how far it does reach — neither error names the blocked page's host, to avoid an oracle over non-allowlisted browsing history. On a `timeout`, don't assume it failed: the hop can land before the load watchdog fires, so check with `read_text`/`snapshot` rather than blindly retrying. Conversely, if a `beforeunload` prompt cancels the hop (dismissed by default), that's caught too — `navigation_cancelled` instead of silently reporting success on a page the tab never actually reached (a hop not served from the back/forward cache is a live navigation, so the check tolerates a legitimate mid-hop redirect and reports wherever the tab actually landed, not just the requested entry's URL). Refs invalidate; optional `waitFor`. |
 | `close_tab` | `tabId` required — no implicit fallback (closing the wrong tab loses work). |
 | `snapshot` | Accessibility tree with stable `@eN` refs (per-tab), pruned of layout noise. Cross-checks against a DOM walk (same refs) when the a11y tree looks suspiciously sparse — Telegram Web K and similar SPAs. `mode=auto\|a11y\|dom`; `compact=true` → flat list of actionable elements only; `selector` scopes to one subtree. |
 | _(embedded)_ `observe` | Optional on every tool that takes `waitFor`. Returns the page as it is once the action settled — `observe:{snapshot:'compact'}` or `{text:true}` → `observed:{source, elements\|tree, text?}` — so act→look is one call instead of two. Matters most after `navigate`/`reload`/`history_go`, which invalidate every `@eN` and thus made a follow-up snapshot unavoidable. Re-checks the allowlist against the page it is about to read, so a redirect off the allowlist comes back `skipped` with nothing read; a failure inside it never fails the action. |
@@ -294,8 +294,9 @@ There is no implicit "last touched tab" memo.
 
 Console/network capture starts on the next tool call after enabling it.
 Switching either setting off immediately clears that capture's buffers on
-all tabs. For `network_tail`, `bodyPending: true` means a body read is queued
-or still running; read again shortly. At most 4 body reads per tab and 32
+all tabs and switches the capture off in the browser as well. For
+`network_tail`, `bodyPending: true` means a body read is queued
+or still running; read again shortly. At most 4 body reads per tab and 8
 globally are in flight at once; the rest wait in a per-tab queue bounded by
 the 100-entry ring, so a burst of simultaneous responses still yields every
 body. Only when that queue overflows does a response keep its metadata but
@@ -305,8 +306,11 @@ body payloads are bounded across tabs — 10 MiB per tab and 40 MiB total,
 measured in the same wire bytes as the per-result budget — so older bodies
 within the same tab may be discarded; their metadata remains with
 `bodyOmissionReason: "cache_limit"`, and a tab cannot evict another tab's
-bodies. These limits cover cached body payloads, not Chrome's own buffers,
-transient decoding, metadata or total process memory.
+bodies. Chrome's own capture buffer is capped at 32 MB per tab and 4 MB per
+response (its defaults are 200 MB / 20 MB); a body Chrome no longer holds —
+one over the per-response cap, or pushed out by newer traffic — keeps its
+metadata with `bodyOmissionReason: "evicted"`. These limits cover body
+payloads, not transient decoding, metadata or total process memory.
 
 For agents running on a schedule, the cheap iteration shape is: `status`
 (skip everything if the extension is detached) → scoped reads
@@ -413,7 +417,7 @@ Claude Code, and ask it to do anything web-shaped. Watch the popup's
 | `unsafe_path` (from `upload`) | Path contains `..`, isn't absolute, or resolves outside the sandbox (default `~/Downloads/sallyport/`). Stage the file via `save_to_file` first (writes to the sandbox), then upload. Widen the sandbox via `SALLYPORT_DOWNLOAD_DIR` if you really need to upload from elsewhere. |
 | `not_visible` (from `mouse_click`) | Element has zero size — likely `display:none` or detached. Snapshot again; if it's hidden by design, drive the toggle that reveals it. |
 | `mouse_click` reports `covered: true` | Another node sits on top of the target at every probe point. The result includes `hitTarget` (what ate the click) and `hitTargetRef` — an `@eN` for that node; click it directly, or aim manually with `mouse_click x= y=`. |
-| Automation stalls when the browser window is in the background | Chrome freezes background tabs and fully-occluded windows. The bridge keeps driven tabs awake automatically (popup → **Advanced → keep automated tabs awake**, default on; note the page then believes it is focused — e.g. Telegram sends read receipts). If a page must stay alive *before* the bridge attaches, add its site under `chrome://settings/performance` → "Always keep these sites active", or run a dedicated automation profile with `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling`. |
+| Automation stalls when the browser window is in the background | Chrome freezes background tabs and fully-occluded windows. The bridge keeps driven tabs awake automatically (popup → **Advanced → keep automated tabs awake**, default on; note the page then believes it is focused and visible — e.g. Telegram sends read receipts — and keeps rendering while attached, which costs CPU on animated pages). If a page must stay alive *before* the bridge attaches, add its site under `chrome://settings/performance` → "Always keep these sites active", or run a dedicated automation profile with `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling`. |
 | `tab_not_visible` (from `screenshot`) | The tab produced no frame within 8s. `screenshot` already activates an agent tab inside its own un-focused window, so this means the window is **fully** occluded or minimised, or the display is asleep (macOS reports every window occluded once displays sleep). Keep a sliver of the agent window visible, or use `snapshot`/`read_text` (no frame needed) or `print_to_pdf` (renders a hidden tab). Check **keep automated tabs awake** is on — turning it off also stops the tab painting. `bringToFront=true` works in standalone and steals focus; it's refused in broker mode. |
 | Several sessions feel slower than one | They share one browser: up to 8 calls run at once, then calls queue. A call that waits out the queue fails `busy` (safe to retry — it was never sent). Back off exponentially: `maxConcurrentCalls` is a constant, and there is deliberately no per-caller contention signal (it would be a live read on how busy the other sessions are). |
 | A session lost its browser tools mid-run | Its broker went away. The session says so and exits non-zero; start it again (a new one starts a fresh broker). `sallyport-daemon doctor` shows the current state. |
