@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-10-02
+
 ### Security
 
 - An `@eN` ref could act on an element of a DIFFERENT page (present in every
@@ -27,7 +29,9 @@ uses [Semantic Versioning](https://semver.org/).
   3 s (the question is bounded, and never outlives the call's budget) — the
   answer is UNKNOWN, not "navigated": an action refuses it as `bad_ref`
   ("could not confirm … nothing was done"), an absent-wait keeps polling
-  rather than report a still-visible node gone, and `get_state` answers
+  rather than report a still-visible node gone, a present-wait on a ref that
+  was minted without a stamp refuses at once (it could never be confirmed, so
+  waiting would only end in a retry-inviting `timeout`), and `get_state` answers
   `{exists:null, reason:'unknown'}` rather than `{exists:false}`.
 - `@eN` numbering no longer restarts at `e1` on a live tab. A navigate,
   reload, history hop, viewport change or debugger detach (including the
@@ -3159,7 +3163,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.25.1...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/ginkida/sallyport/compare/v0.25.1...v0.26.0
 [0.25.1]: https://github.com/ginkida/sallyport/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/ginkida/sallyport/compare/v0.24.1...v0.25.0
 [0.24.1]: https://github.com/ginkida/sallyport/compare/v0.24.0...v0.24.1
