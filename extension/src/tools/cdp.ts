@@ -1,9 +1,10 @@
 import { getSettings } from '../storage.js';
-import { clearConsole, ensureConsoleCapture } from './console-capture.js';
+import { clearConsole, ensureConsoleCapture, isConsoleCaptureActive } from './console-capture.js';
 import { clearDialogs, ensureDialogCapture, releaseDialogCapture } from './dialog-capture.js';
 import { BridgeError } from './errors.js';
 import { clearNetwork, ensureNetworkCapture } from './network-capture.js';
 import { clearRefsForTab } from './refs.js';
+import { onTab } from './tab-chain.js';
 
 // How long the teardown path waits for a tab to give its viewport emulation
 // back before detaching anyway. Generous for a healthy renderer, short enough
@@ -160,6 +161,7 @@ export function getEmulatedDsf(tabId: number): number | undefined {
 export function resetAttachedTabs(): void {
   attached.clear();
   emulatedDsf.clear();
+  for (const tabId of [...hygiene.keys()]) dropHygiene(tabId);
 }
 
 /** Decide what keep-awake should do for a tab on this attach: (re-)ENABLE the
@@ -205,6 +207,7 @@ function clearTabState(tabId: number): void {
   clearNetwork(tabId);
   clearDialogs(tabId);
   emulatedDsf.delete(tabId);
+  dropHygiene(tabId);
 }
 
 if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
@@ -432,17 +435,285 @@ export async function cdp<T = unknown>(
   method: string,
   params?: Record<string, unknown>,
 ): Promise<T> {
-  return (await chrome.debugger.sendCommand({ tabId }, method, params)) as unknown as T;
+  const st = noteSend(tabId, method, true);
+  try {
+    return (await chrome.debugger.sendCommand({ tabId }, method, params)) as unknown as T;
+  } finally {
+    noteSettle(tabId, st);
+  }
 }
 
 /** Send a command to a flat child protocol session (notably an OOPIF target)
  * while retaining the root tab as the debuggee. Chrome exposes sessionId on
- * DebuggerSession for exactly this routing. */
+ * DebuggerSession for exactly this routing.
+ *
+ * Counts as activity on the tab (the idle flush must not land inside a call
+ * that is walking a child frame) but sets no hygiene flags: the flush speaks to
+ * the ROOT session, and a child session's agents die with its
+ * `Target.detachFromTarget` — the caller pairs its own Accessibility state
+ * before that (`releaseChildAx`). */
 export async function cdpSession<T = unknown>(
   tabId: number,
   sessionId: string,
   method: string,
   params?: Record<string, unknown>,
 ): Promise<T> {
-  return (await chrome.debugger.sendCommand({ tabId, sessionId }, method, params)) as unknown as T;
+  const st = noteSend(tabId, method, false);
+  try {
+    return (await chrome.debugger.sendCommand(
+      { tabId, sessionId },
+      method,
+      params,
+    )) as unknown as T;
+  } finally {
+    noteSettle(tabId, st);
+  }
+}
+
+/** Free a child session's AXContext before it is detached.
+ *
+ * Same reason as the idle flush's pair: any Accessibility call leaves a
+ * full-document AXContext behind, a bare `Accessibility.disable` is a no-op on
+ * an agent that was never `enable`d, and a detached child session's context
+ * otherwise lives until the renderer happens to garbage-collect it. Enable and
+ * disable are SENT back to back without awaiting the enable — the pipe keeps
+ * their order, and an awaited enable that then timed out would leave the agent
+ * enabled, which is worse than what we started with. Best-effort and bounded:
+ * a wedged child renderer must not hold the call. Never throws. */
+export async function releaseChildAx(tabId: number, sessionId: string): Promise<void> {
+  const pending = [
+    cdpSession(tabId, sessionId, 'Accessibility.enable'),
+    cdpSession(tabId, sessionId, 'Accessibility.disable'),
+  ].map((p) => p.catch(() => undefined));
+  await settleWithin(Promise.all(pending), CHILD_AX_RELEASE_DEADLINE_MS);
+}
+
+// --- idle hygiene -----------------------------------------------------------
+//
+// What a CDP session leaves enabled outlives the call that enabled it, for the
+// whole attachment: any Accessibility.* call leaves a full-document AXContext
+// (tens of MB on a big page, and every DOM mutation then pays to keep it
+// current), any DOM.* call leaves the DOM agent streaming mutation events into
+// this worker, remote objects in the per-call group pin whatever they point at
+// (an unmounted SPA subtree included), and an opted-in console capture keeps
+// every logged argument in the session's 'console' group. None of that is
+// needed between calls.
+//
+// Released on IDLE, not per call: a per-call release turns every next call's
+// first Accessibility query into a cold rebuild (fill on a 54k-node AX tree:
+// 15 → 176 ms), and with `observe` that is nearly every call. A burst stays
+// warm; the gap after it is freed.
+//
+// Idleness is CDP activity, not the tab chain alone: a tabId-less call (the
+// standalone active-tab fallback, a create-own navigate) bypasses the chain,
+// and the flush must never land inside it — so nothing fires while a command
+// for the tab is in flight, or within HYGIENE_IDLE_MS of the last one sent or
+// answered. The flush ALSO runs through the chain, so a queued call finishes
+// first, and re-checks idleness there.
+//
+// The flush sends its commands with chrome.debugger.sendCommand directly, so
+// they neither count as activity (it would re-arm itself forever) nor set
+// flags. Its state is per tab and synchronously mutated, like `attached`.
+
+/** Object group every remote object a single tool call mints belongs to, unless
+ * the call manages its own group. Released by the idle flush — nothing may need
+ * such an object after the call that minted it returns. */
+export const CALL_GROUP = 'sallyport-call';
+
+/** A tab with no CDP activity for this long gets its hygiene flush. */
+export const HYGIENE_IDLE_MS = 10_000;
+
+/** The whole flush stops waiting after this. Its commands are answered by the
+ * renderer, and a wedged one (an unanswered dialog, a runaway script) must not
+ * hold the tab chain. */
+export const HYGIENE_FLUSH_DEADLINE_MS = 2_000;
+
+/** Bound on the OOPIF child-session AX pair (`releaseChildAx`). */
+const CHILD_AX_RELEASE_DEADLINE_MS = 1_000;
+
+interface TabHygiene {
+  /** When a command for this tab was last sent or answered. */
+  lastActivity: number;
+  /** Commands sent through cdp()/cdpSession() and not yet answered. */
+  inFlight: number;
+  /** An Accessibility query ran on the root session since the last flush. */
+  ax: boolean;
+  /** A DOM.* command ran on the root session since the last flush. */
+  dom: boolean;
+  /** Release the 'console' group even if this worker never saw capture on the
+   * tab — set by the startup sweep, which cannot know. */
+  console: boolean;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  /** A flush is waiting on the tab chain. */
+  queued: boolean;
+}
+
+const hygiene = new Map<number, TabHygiene>();
+
+function hygieneFor(tabId: number): TabHygiene {
+  let st = hygiene.get(tabId);
+  if (!st) {
+    st = {
+      lastActivity: 0,
+      inFlight: 0,
+      ax: false,
+      dom: false,
+      console: false,
+      timer: undefined,
+      queued: false,
+    };
+    hygiene.set(tabId, st);
+  }
+  return st;
+}
+
+function noteSend(tabId: number, method: string, rootSession: boolean): TabHygiene {
+  const st = hygieneFor(tabId);
+  st.inFlight += 1;
+  st.lastActivity = Date.now();
+  if (rootSession) {
+    if (
+      method.startsWith('Accessibility.') &&
+      method !== 'Accessibility.enable' &&
+      method !== 'Accessibility.disable'
+    ) {
+      st.ax = true;
+    } else if (method.startsWith('DOM.') && method !== 'DOM.disable') {
+      st.dom = true;
+    }
+  }
+  return st;
+}
+
+function noteSettle(tabId: number, st: TabHygiene): void {
+  st.inFlight = Math.max(0, st.inFlight - 1);
+  // The tab's state was dropped (closed, detached) while this was in flight.
+  if (hygiene.get(tabId) !== st) return;
+  st.lastActivity = Date.now();
+  if (st.inFlight === 0) scheduleHygiene(tabId, st);
+}
+
+function isIdle(st: TabHygiene, now: number): boolean {
+  return st.inFlight === 0 && now - st.lastActivity >= HYGIENE_IDLE_MS;
+}
+
+/** Arm the tab's one timer for when it will have been idle long enough. A
+ * timer already armed is left alone — it re-checks when it fires. */
+function scheduleHygiene(tabId: number, st: TabHygiene): void {
+  if (st.timer !== undefined || st.queued) return;
+  const wait = Math.max(0, st.lastActivity + HYGIENE_IDLE_MS - Date.now());
+  st.timer = setTimeout(() => {
+    st.timer = undefined;
+    if (hygiene.get(tabId) !== st) return;
+    // A command in flight re-arms the timer when it is answered.
+    if (st.inFlight > 0) return;
+    if (!isIdle(st, Date.now())) {
+      scheduleHygiene(tabId, st);
+      return;
+    }
+    st.queued = true;
+    void onTab(tabId, () => flushIfStillIdle(tabId, st));
+  }, wait);
+}
+
+async function flushIfStillIdle(tabId: number, st: TabHygiene): Promise<void> {
+  st.queued = false;
+  if (hygiene.get(tabId) !== st || st.inFlight > 0) return;
+  // A call queued ahead of us on the chain just ran: its burst is not over.
+  if (!isIdle(st, Date.now())) {
+    scheduleHygiene(tabId, st);
+    return;
+  }
+  await flushHygiene(tabId, st);
+}
+
+/** Release what the idle tab no longer needs. Every command is SENT before
+ * anything is awaited — one ordered burst on the pipe, so no command a later
+ * call sends can land between them, and the Accessibility pair can never be
+ * split (an enable whose disable was never sent leaves the agent enabled,
+ * re-attaching a full AXContext to every new document of the tab). Best-effort
+ * throughout: errors are swallowed, the wait is bounded, nothing throws. */
+async function flushHygiene(tabId: number, st: TabHygiene): Promise<void> {
+  const releaseAx = st.ax;
+  const disableDom = st.dom;
+  const releaseConsole = st.console || isConsoleCaptureActive(tabId);
+  st.ax = false;
+  st.dom = false;
+  st.console = false;
+
+  const sent: Promise<unknown>[] = [];
+  const send = (method: string, params?: Record<string, unknown>): void => {
+    let p: Promise<unknown>;
+    try {
+      p = Promise.resolve(chrome.debugger.sendCommand({ tabId }, method, params));
+    } catch (e) {
+      p = Promise.reject(e);
+    }
+    sent.push(p.catch(() => undefined));
+  };
+  send('Runtime.releaseObjectGroup', { objectGroup: CALL_GROUP });
+  if (disableDom) send('DOM.disable');
+  if (releaseAx) {
+    // A bare disable is a no-op on an agent that was never enabled — and the
+    // queries that built the context never enable it. Only the pair frees it.
+    send('Accessibility.enable');
+    send('Accessibility.disable');
+  }
+  // NOT Runtime.discardConsoleEntries: that wipes the browser-wide console
+  // store, the human's own DevTools console included. Releasing the group is
+  // scoped to this session.
+  if (releaseConsole) send('Runtime.releaseObjectGroup', { objectGroup: 'console' });
+  await settleWithin(Promise.all(sent), HYGIENE_FLUSH_DEADLINE_MS);
+}
+
+function dropHygiene(tabId: number): void {
+  const st = hygiene.get(tabId);
+  if (st?.timer !== undefined) clearTimeout(st.timer);
+  hygiene.delete(tabId);
+}
+
+/** Flush the tabs a previous worker left attached.
+ *
+ * An MV3 worker restart wipes every timer and flag above while the debugger
+ * session — and the AXContext, DOM agent and object groups it holds — survives
+ * it. On worker start, every tab `chrome.debugger.getTargets` reports attached
+ * gets the full flush (all flags set, since nothing remembers which were used)
+ * as soon as it is idle: at once for a tab nobody has driven since, through the
+ * usual timer for one already in use again. `attached` there is also true for a
+ * tab only DevTools holds — the commands then simply fail, since the debuggee
+ * is not ours. Never throws. */
+export async function sweepStrandedHygiene(): Promise<void> {
+  try {
+    const targets = await chrome.debugger.getTargets();
+    for (const target of targets) {
+      if (!target.attached || typeof target.tabId !== 'number') continue;
+      const st = hygieneFor(target.tabId);
+      st.ax = true;
+      st.dom = true;
+      st.console = true;
+      scheduleHygiene(target.tabId, st);
+    }
+  } catch {
+    // No debugger API, or getTargets refused — nothing to sweep.
+  }
+}
+
+/** Wait for `p` or `ms`, whichever is first; never rejects. The loser is not
+ * cancelled — this bounds how long WE wait, not what Chrome does. */
+async function settleWithin(p: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  try {
+    await Promise.race([
+      p.then(
+        () => undefined,
+        () => undefined,
+      ),
+      deadline,
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

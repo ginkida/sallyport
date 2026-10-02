@@ -1,4 +1,4 @@
-import { attach, cdp, cdpSession } from './cdp.js';
+import { attach, cdp, cdpSession, releaseChildAx } from './cdp.js';
 import { BridgeError } from './errors.js';
 import {
   collectFrameIds,
@@ -267,6 +267,11 @@ export async function ensureFocusUsable(
       );
       return await inspectAxNodes(ax.nodes, sessionId);
     } finally {
+      // The query above left a full-document AXContext in the child renderer
+      // (even when it then failed), which the detach below does not free — it
+      // lingers until that renderer's GC — and a bare disable would not
+      // either. Cleanup, not part of the verdict: bounded, never throws.
+      await releaseChildAx(tabId, sessionId);
       try {
         await cdp(tabId, 'Target.detachFromTarget', { sessionId });
       } catch {

@@ -217,6 +217,14 @@ export async function ensureConsoleCapture(tabId: number): Promise<void> {
   }
 }
 
+/** Is console capture active on this tab in this worker's lifetime? The idle
+ * hygiene flush (cdp.ts) asks, because `Runtime.enable` makes V8 retain every
+ * logged argument in the session's 'console' object group, unbounded, until
+ * that group is released. */
+export function isConsoleCaptureActive(tabId: number): boolean {
+  return enabledTabs.has(tabId);
+}
+
 /** Drop a tab's buffer + enabled flag — wired into tabs.onRemoved /
  * debugger.onDetach (cdp.ts) so capture state never outlives the tab. */
 export function clearConsole(tabId: number): void {

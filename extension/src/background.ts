@@ -29,7 +29,7 @@ import {
 import { loadEpochs, persistEpochs, reconcileWithLiveTabs } from './tools/ownership-store.js';
 import { wasJustCreated } from './tools/agent-window.js';
 import { closeAgentTabs, listAgentTabs } from './agent-tabs.js';
-import { releaseKeepAwakeEverywhere } from './tools/cdp.js';
+import { releaseKeepAwakeEverywhere, sweepStrandedHygiene } from './tools/cdp.js';
 import { installCaptureSettingsListener } from './tools/capture-settings.js';
 
 // Capture opt-out must reach idle tabs, not just the next driven one — so the
@@ -38,6 +38,12 @@ import { installCaptureSettingsListener } from './tools/capture-settings.js';
 // `from '…'` edges, so a bare side-effect import would hide this from the
 // acyclicity gate.
 installCaptureSettingsListener();
+
+// A worker restart forgets which attached tabs still hold an AXContext, an
+// enabled DOM agent or per-call object groups — the debugger session outlives
+// the worker, and so does all of that. Flush every tab still attached to us as
+// soon as it is idle. Best-effort and never throws.
+void sweepStrandedHygiene();
 
 async function updateBadge(snapshot: StatusSnapshot): Promise<void> {
   const { paused } = await getSettings();

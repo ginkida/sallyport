@@ -84,6 +84,18 @@ describe('module graph', () => {
     expect(findCycles(buildGraph())).toEqual([]);
   });
 
+  it('keeps the tab chain a true leaf, shared by runTool and the idle flush', () => {
+    const graph = buildGraph();
+    // cdp.ts schedules its hygiene flush on the chain the tool calls run on;
+    // cdp.ts is imported by nearly every tool, so the chain can import NOTHING
+    // local — not even errors — or that edge is one step from a cycle.
+    expect(graph.get('tools/tab-chain')).toEqual([]);
+    expect(graph.get('tools')).toContain('tools/tab-chain');
+    expect(graph.get('tools/cdp')).toContain('tools/tab-chain');
+    // The worker-start sweep is wired with a NAMED import, so this edge is seen.
+    expect(graph.get('background')).toContain('tools/cdp');
+  });
+
   it('keeps the leaf modules leaves — they are what the cycle-breaking rests on', () => {
     const graph = buildGraph();
     for (const leaf of ['tools/text', 'tools/resolve', 'tools/tab-resolve']) {

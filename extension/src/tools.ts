@@ -37,6 +37,7 @@ import { getState } from './tools/state.js';
 import { closeTab, listTabs, navigate, reload } from './tools/tabs.js';
 import { upload } from './tools/upload.js';
 import { setViewport } from './tools/viewport.js';
+import { onTab } from './tools/tab-chain.js';
 import { waitFor } from './tools/wait.js';
 import type { Tool } from './tools/types.js';
 
@@ -82,42 +83,6 @@ export const TOOL_NAMES = Object.keys(tools);
 const internalTools: Record<string, Tool> = {
   _release_tabs: releaseTabs,
 };
-
-/** Per-tab serialisation of tool bodies.
- *
- * Calls now overlap (the daemon runs one lane per session, and the connection
- * no longer queues them), and per-tab state is emphatically NOT safe for two
- * concurrent calls on the SAME tab: `buildSnapshotTree` resets that tab's refs
- * mid-flight, and snapshot/mouse release a shared CDP object group in their
- * `finally` — a second call would have its handles freed under it and its `@eN`
- * refs renumbered.
- *
- * It is defence-in-depth EVERYWHERE, not a load-bearing gate: the daemon's
- * per-client lane is what actually serialises, and since ownership is exclusive
- * per client (invariant #13) "one call per client" already implies "one call
- * per tab". Standalone is a single lane too, so it is uncontended there as
- * well. The point is that this file is the one chokepoint every tool passes
- * through, so a future change that widens daemon concurrency cannot silently
- * corrupt per-tab state (refs, snapshot/mouse object groups) before anyone
- * notices. It costs nothing when uncontended. */
-const tabChains = new Map<number, Promise<unknown>>();
-
-function onTab<T>(tabId: number | undefined, run: () => Promise<T>): Promise<T> {
-  if (typeof tabId !== 'number') return run();
-  const prior = tabChains.get(tabId) ?? Promise.resolve();
-  const next = prior.then(run, run);
-  // Never let a rejection break the chain for later calls, and drop the entry
-  // once the tab goes quiet so the map doesn't grow with every tab ever driven.
-  const settled = next.then(
-    () => undefined,
-    () => undefined,
-  );
-  tabChains.set(tabId, settled);
-  void settled.then(() => {
-    if (tabChains.get(tabId) === settled) tabChains.delete(tabId);
-  });
-  return next;
-}
 
 export async function runTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   const startedAt = Date.now();

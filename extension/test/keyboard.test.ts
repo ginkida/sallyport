@@ -144,6 +144,7 @@ describe('ensureNotPasswordField — CDP focus walk', () => {
         return { node: { nodeName: 'INPUT', attributes: ['type', 'password'] } };
       }
       if (method === 'DOM.describeNode') return { node: { nodeName: 'IFRAME', attributes: [] } };
+      if (method.startsWith('Accessibility.') && source?.sessionId === 'child-session') return {};
       if (method === 'Target.detachFromTarget') return {};
       throw new Error(`unexpected command: ${method}`);
     });
@@ -155,7 +156,50 @@ describe('ensureNotPasswordField — CDP focus walk', () => {
       method: 'Accessibility.getFullAXTree',
       sessionId: 'child-session',
     });
-    expect(calls.at(-1)).toEqual({ method: 'Target.detachFromTarget', sessionId: undefined });
+    // The child's AXContext is freed by the enable+disable PAIR (a bare
+    // disable is a no-op), sent back to back, before the session goes away.
+    expect(calls.slice(-3)).toEqual([
+      { method: 'Accessibility.enable', sessionId: 'child-session' },
+      { method: 'Accessibility.disable', sessionId: 'child-session' },
+      { method: 'Target.detachFromTarget', sessionId: undefined },
+    ]);
+  });
+
+  it('pairs the child session AX state even when its query failed, and keeps the verdict', async () => {
+    const calls: Array<{ method: string; sessionId?: string }> = [];
+    installCdpResponder((method, params, source) => {
+      calls.push({ method, sessionId: source?.sessionId });
+      if (method === 'Page.getFrameTree') {
+        return { frameTree: { frame: { id: 'top' }, childFrames: [{ frame: { id: 'oopif' } }] } };
+      }
+      if (method === 'Accessibility.getFullAXTree' && source?.sessionId === 'child-session') {
+        throw new Error('child renderer gone');
+      }
+      if (method === 'Accessibility.getFullAXTree' && params?.frameId === 'top') {
+        return { nodes: [focusedAxNode(10)] };
+      }
+      if (method === 'Accessibility.getFullAXTree') throw new Error('not in this target');
+      if (method === 'Target.getTargets') {
+        return { targetInfos: [{ targetId: 'oopif', type: 'iframe' }] };
+      }
+      if (method === 'Target.attachToTarget') return { sessionId: 'child-session' };
+      // The pair itself failing must change nothing either.
+      if (method.startsWith('Accessibility.')) throw new Error('child renderer gone');
+      if (method === 'DOM.describeNode') {
+        return { node: { nodeName: 'INPUT', attributes: ['type', 'text'] } };
+      }
+      if (method === 'Target.detachFromTarget') return {};
+      throw new Error(`unexpected command: ${method}`);
+    });
+
+    await expect(ensureNotPasswordField(1, false, 'key_type')).rejects.toMatchObject({
+      code: 'focus_probe_failed',
+    });
+    expect(calls.slice(-3)).toEqual([
+      { method: 'Accessibility.enable', sessionId: 'child-session' },
+      { method: 'Accessibility.disable', sessionId: 'child-session' },
+      { method: 'Target.detachFromTarget', sessionId: undefined },
+    ]);
   });
 
   it('blocks a password input exposed by AX inside a closed shadow root', async () => {
