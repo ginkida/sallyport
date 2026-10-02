@@ -789,13 +789,26 @@ async function flushIfStillIdle(tabId: number, st: TabHygiene): Promise<void> {
   }
   if (st.unproven && !attached.has(tabId)) {
     // A sweep record: the session may be DevTools', not ours. Its first command
-    // is the proof — only an answer from our own session goes on to the rest.
-    if (!(await answers(tabId, 'Runtime.releaseObjectGroup', { objectGroup: CALL_GROUP }))) {
-      if (hygiene.get(tabId) === st) dropHygiene(tabId);
+    // is the proof. A REJECTION is the "not ours" answer (our extension holds
+    // no session there, so Chrome refuses at once); a command that merely goes
+    // unanswered within the bound reached a session — ours — whose renderer is
+    // busy (an open alert(), a long task), and that is exactly the tab whose
+    // stranded state this sweep exists to free, so it counts as proof.
+    const proof = await answers(tabId, 'Runtime.releaseObjectGroup', { objectGroup: CALL_GROUP });
+    if (hygiene.get(tabId) !== st) return;
+    if (proof === 'rejected') {
+      dropHygiene(tabId);
       return;
     }
-    if (hygiene.get(tabId) !== st) return;
     st.unproven = false;
+    // The proof was awaited, so the idle check above is stale: a tabId-less
+    // call (standalone active-tab fallback) bypasses the chain and may have
+    // started meanwhile. Never disable DOM or pair AX under it — wait for its
+    // burst to end; the flags stay set for that later flush.
+    if (!isIdle(st, Date.now())) {
+      scheduleHygiene(tabId, st);
+      return;
+    }
     await flushHygiene(tabId, st, false);
     return;
   }
@@ -803,25 +816,26 @@ async function flushIfStillIdle(tabId: number, st: TabHygiene): Promise<void> {
   await flushHygiene(tabId, st);
 }
 
-/** Does our own session for the tab answer this command (within the flush
- * bound)? Sent like the flush's commands — not activity, sets no flag. */
+/** Does our own session for the tab take this command? `answered` / `rejected`
+ * / `timeout` (no answer within the flush bound). Sent like the flush's
+ * commands — not activity, sets no flag. */
 async function answers(
   tabId: number,
   method: string,
   params?: Record<string, unknown>,
-): Promise<boolean> {
-  let p: Promise<boolean>;
+): Promise<'answered' | 'rejected' | 'timeout'> {
+  let p: Promise<'answered' | 'rejected'>;
   try {
     p = Promise.resolve(chrome.debugger.sendCommand({ tabId }, method, params)).then(
-      () => true,
-      () => false,
+      () => 'answered' as const,
+      () => 'rejected' as const,
     );
   } catch {
-    return false;
+    return 'rejected';
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => resolve(false), HYGIENE_FLUSH_DEADLINE_MS);
+  const deadline = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), HYGIENE_FLUSH_DEADLINE_MS);
   });
   try {
     return await Promise.race([p, deadline]);

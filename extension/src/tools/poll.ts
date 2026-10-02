@@ -14,7 +14,13 @@ import {
   looksLikeMissingNodeError,
   looksLikeSelectorSyntaxError,
 } from './cdp.js';
-import { BridgeError, invalidSelectorError, navigatedRefError, staleRefError } from './errors.js';
+import {
+  BridgeError,
+  invalidSelectorError,
+  navigatedRefError,
+  staleRefError,
+  unverifiedRefError,
+} from './errors.js';
 import { ensureStillAllowed } from './gates.js';
 import { getRef, isRef } from './refs.js';
 import { refDocumentState } from './resolve.js';
@@ -319,6 +325,12 @@ async function ensureRefStillExists(tabId: number, ref: string): Promise<void> {
       `wait: unknown ref "${ref}" for tab ${tabId} — run snapshot first`,
     );
   }
+  // A ref minted with NO document stamp can never be confirmed on any tick, so a
+  // present-wait on it would run out the whole budget and answer `timeout` —
+  // the one reason that means "retrying longer may help". That is a permanent
+  // property of the ref, not of the page: refuse it now, like an action would.
+  // (An `absent` wait never comes here; it still ends when the node is gone.)
+  if (r.loaderId === null) throw unverifiedRefError('wait', ref);
   try {
     await cdp(tabId, 'DOM.describeNode', { backendNodeId: r.backendDOMNodeId });
   } catch (e) {

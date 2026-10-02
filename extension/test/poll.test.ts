@@ -1471,19 +1471,24 @@ describe('pollFor — ticks that tell the truth', () => {
     expect(out.elapsedMs).toBeGreaterThanOrEqual(250); // not on the lost tick at 0
   });
 
-  it('a present-wait on an unstamped @eN keeps waiting instead of failing as navigated', async () => {
+  it('a present-wait on an unstamped @eN fails at once as bad_ref instead of running out the clock', async () => {
     const { newRef } = await import('../src/tools/refs.js');
     const ref = '@' + newRef(TAB, 86, 'button', 'Pay', null);
-    vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
+    const send = vi.spyOn(chrome.debugger, 'sendCommand').mockImplementation(async (_t, method) => {
       if (method === 'Page.getFrameTree') return { frameTree: { frame: { loaderId: 'L1' } } };
       if (method === 'DOM.describeNode') return { node: {} };
       if (method === 'DOM.getBoxModel') return { model: { width: 10, height: 10 } };
       return {};
     });
     const pending = pollFor(TAB, { selector: ref, text: null, timeoutMs: 1000, absent: false });
+    const caught = pending.catch((e: unknown) => e);
     await vi.runAllTimersAsync();
-    // Not found: a node we cannot place in this document is never "visible".
-    expect(await pending).toMatchObject({ found: false, reason: 'timeout' });
+    const err = await caught;
+    // A stamp-less ref is permanent: `timeout` would tell the agent to retry.
+    expect(err).toMatchObject({ code: 'bad_ref' });
+    expect(String((err as Error).message)).toContain('nothing was done');
+    // Refused before any tick probed the node.
+    expect(send.mock.calls.some((c) => c[1] === 'DOM.getBoxModel')).toBe(false);
   });
 
   it('reports how long a folded wait ran before it failed', async () => {

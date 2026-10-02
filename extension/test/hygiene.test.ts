@@ -584,15 +584,62 @@ describe('startup sweep', () => {
     expect(calls.slice(mark)).toEqual([]);
   });
 
-  it('a probe the renderer never answers drops the record within the flush bound', async () => {
-    const { sweepStrandedHygiene, hygieneStateForTest, HYGIENE_FLUSH_DEADLINE_MS } = await load([]);
+  // An unanswered probe reached a session — a DevTools-only tab REJECTS at
+  // once — so it is ours with a busy renderer (an open alert(), a long task):
+  // exactly the stranded state the sweep exists to free.
+  it('a probe the renderer never answers still frees the stranded state, within the bound', async () => {
+    const { sweepStrandedHygiene, HYGIENE_FLUSH_DEADLINE_MS } = await load([]);
     getTargets.mockResolvedValue([{ attached: true, tabId: 6, type: 'page' }]);
     respond = () => new Promise(() => undefined);
     await sweepStrandedHygiene();
     await vi.advanceTimersByTimeAsync(HYGIENE_FLUSH_DEADLINE_MS);
-    expect(flushed(0, 6)).toEqual(['Runtime.releaseObjectGroup(sallyport-call)']);
-    expect(hygieneStateForTest(6)).toBeUndefined();
+    expect(flushed(0, 6)).toEqual([
+      'Runtime.releaseObjectGroup(sallyport-call)',
+      'DOM.disable',
+      'Accessibility.enable',
+      'Accessibility.disable',
+      'Runtime.releaseObjectGroup(console)',
+    ]);
+    expectNoBareAxDisable();
+    // The burst's own wait is bounded too: the chain is not held forever.
+    await vi.advanceTimersByTimeAsync(HYGIENE_FLUSH_DEADLINE_MS);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  // The proof is AWAITED, and a tabId-less call (standalone active-tab
+  // fallback) bypasses the chain — so idleness must be re-checked after it, or
+  // DOM.disable / the AX pair would land in the middle of that call (#8).
+  it('a call that starts while the probe is out defers the rest of the flush to its idle window', async () => {
+    const { cdp, sweepStrandedHygiene } = await load([]);
+    getTargets.mockResolvedValue([{ attached: true, tabId: 6, type: 'page' }]);
+    let answerProbe: (() => void) | undefined;
+    respond = (method, params) =>
+      method === 'Runtime.releaseObjectGroup' &&
+      (params as { objectGroup?: string } | undefined)?.objectGroup === 'sallyport-call' &&
+      answerProbe === undefined
+        ? new Promise<void>((resolve) => {
+            answerProbe = resolve;
+          })
+        : {};
+    await sweepStrandedHygiene();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(flushed(0, 6)).toEqual(['Runtime.releaseObjectGroup(sallyport-call)']);
+    // A call on the tab begins (no tabId → not queued behind the flush).
+    await cdp(6, 'DOM.getDocument');
+    answerProbe!();
+    await vi.advanceTimersByTimeAsync(0);
+    const mark = calls.length;
+    expect(flushed(mark, 6)).toEqual([]);
+    expect(calls.map((c) => c.method)).not.toContain('DOM.disable');
+    await vi.advanceTimersByTimeAsync(IDLE);
+    expect(flushed(mark, 6)).toEqual([
+      'Runtime.releaseObjectGroup(sallyport-call)',
+      'DOM.disable',
+      'Accessibility.enable',
+      'Accessibility.disable',
+      'Runtime.releaseObjectGroup(console)',
+    ]);
+    expectNoBareAxDisable();
   });
 
   it('never throws when the debugger API refuses', async () => {
