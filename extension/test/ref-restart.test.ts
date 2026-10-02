@@ -129,6 +129,58 @@ describe('ref counters across a worker restart', () => {
     mint(w, 7, 1);
     await expect(w.persistRefMarks()).resolves.toBeUndefined();
   });
+
+  it('retries a refused write, so ids minted after it are covered across a restart', async () => {
+    let w = await boot();
+    mint(w, 7, 1);
+    await w.persistRefMarks(); // mark 1025
+    const set = vi.mocked(chrome.storage.local.set);
+    set.mockRejectedValueOnce(new Error('quota'));
+    mint(w, 7, w.REF_RESERVE_BLOCK + 1); // crosses the block: reserves 2050, write refused
+    await w.persistRefMarks();
+    const late = mint(w, 7, 500); // inside the reservation the refused write was for
+    await w.persistRefMarks();
+    expect((store.sallyport_ref_marks as Record<string, number>)['7']).toBeGreaterThanOrEqual(
+      Math.max(...late),
+    );
+
+    w = await boot();
+    w.resetRefsForTab(7, w.refWatermark(7));
+    const fresh = mint(w, 7, 5);
+    expect(Math.min(...fresh)).toBeGreaterThan(Math.max(...late));
+  });
+
+  it("a worker whose load failed never erases another tab's mark", async () => {
+    let w = await boot();
+    const held = mint(w, 8, 10);
+    await w.persistRefMarks();
+
+    const get = vi.mocked(chrome.storage.local.get);
+    get.mockRejectedValueOnce(new Error('io'));
+    w = await boot(); // this worker's load fails
+    mint(w, 7, 3);
+    await w.persistRefMarks();
+    expect((store.sallyport_ref_marks as Record<string, number>)['8']).toBeGreaterThanOrEqual(
+      Math.max(...held),
+    );
+
+    w = await boot();
+    w.resetRefsForTab(8, w.refWatermark(8));
+    expect(Math.min(...mint(w, 8, 5))).toBeGreaterThan(Math.max(...held));
+  });
+
+  it('retries a failed load on the next call instead of memoising the failure', async () => {
+    const before = await boot();
+    const held = mint(before, 7, 5);
+    await before.persistRefMarks();
+
+    const get = vi.mocked(chrome.storage.local.get);
+    get.mockRejectedValueOnce(new Error('io'));
+    const w = await boot(); // first load fails
+    await w.loadRefMarks(); // next call: retried, succeeds
+    w.resetRefsForTab(7, w.refWatermark(7));
+    expect(Math.min(...mint(w, 7, 5))).toBeGreaterThan(Math.max(...held));
+  });
 });
 
 describe('runTool', () => {

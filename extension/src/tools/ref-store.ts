@@ -12,9 +12,15 @@
  *
  * `runTool` awaits `loadRefMarks` before any tool runs and `persistRefMarks`
  * before a result leaves the extension. Best-effort: a storage failure must not
- * fail a tool call, so it is swallowed (the counters then behave as before). */
+ * fail a tool call, so it is swallowed — but never made STICKY. A refused load
+ * is retried by the next call, and a refused write re-arms itself so the next
+ * call writes again; memoising either failure kept the protection off for up to
+ * a whole reservation block of later ids. And until a load has succeeded this
+ * worker writes nothing: its snapshot holds only the tabs IT touched, and the
+ * write replaces the stored map whole, so it would erase every other live
+ * tab's mark — a loss a later, healthy worker would then inherit. */
 
-import { seedRefCounters, takeRefReservations } from './refs.js';
+import { markRefReservationsDirty, seedRefCounters, takeRefReservations } from './refs.js';
 
 const STORE_KEY = 'sallyport_ref_marks';
 
@@ -23,33 +29,61 @@ function storageArea(): chrome.storage.StorageArea | undefined {
 }
 
 let loading: Promise<void> | undefined;
+/** A load has completed: the stored marks are folded into this worker's, so a
+ * write of its snapshot drops nothing but closed tabs. */
+let loaded = false;
 
-/** Resume this worker's counters from the persisted marks. Memoised: every
- * call after the first waits on the same load. Never rejects. */
+/** Resume this worker's counters from the persisted marks. Memoised once it
+ * succeeds; a failed load is forgotten so the next call tries again. Never
+ * rejects. */
 export function loadRefMarks(): Promise<void> {
-  loading ??= (async () => {
-    const area = storageArea();
-    if (!area) return;
-    try {
-      const got = await area.get(STORE_KEY);
-      const marks = (got as Record<string, unknown>)[STORE_KEY];
-      if (marks === undefined) return;
+  if (loading) return loading;
+  // The reset runs in a `.then`, so always after `loading` is assigned below and
+  // never against a newer attempt.
+  const attempt: Promise<void> = readMarks().then((ok) => {
+    if (ok) loaded = true;
+    else if (loading === attempt) loading = undefined;
+  });
+  loading = attempt;
+  return attempt;
+}
+
+/** One load attempt; `false` when storage or tabs refused (never rejects). */
+async function readMarks(): Promise<boolean> {
+  const area = storageArea();
+  if (!area) return true; // nothing to load from, nothing a write could erase
+  try {
+    const got = await area.get(STORE_KEY);
+    const marks = (got as Record<string, unknown>)[STORE_KEY];
+    if (marks !== undefined) {
       const live = new Set<number>();
       for (const t of await chrome.tabs.query({})) if (typeof t.id === 'number') live.add(t.id);
       seedRefCounters(marks, live);
-    } catch {
-      // storage or tabs unavailable — count from where this worker stands
     }
-  })();
-  return loading;
+    return true;
+  } catch {
+    // storage or tabs unavailable — count from where this worker stands, and
+    // let the next call try again
+    return false;
+  }
 }
 
 let lastWrite: Promise<void> = Promise.resolve();
 
 /** Write the marks if they changed, and wait for the newest write either way:
  * a call whose ids were covered by ANOTHER call's write must not return before
- * that write lands. Never rejects. */
+ * that write lands. Never rejects.
+ *
+ * A worker whose load has not succeeded yet first retries it, and writes
+ * nothing if it fails again (the reservations stay dirty for the next call). */
 export function persistRefMarks(): Promise<void> {
+  if (!loaded) {
+    return (async () => {
+      await loadRefMarks();
+      if (loaded) await persistRefMarks();
+      else await lastWrite;
+    })();
+  }
   const marks = takeRefReservations();
   const area = storageArea();
   if (marks && area) {
@@ -57,7 +91,8 @@ export function persistRefMarks(): Promise<void> {
       try {
         await area.set({ [STORE_KEY]: marks });
       } catch {
-        // best-effort — see the module comment
+        // best-effort — see the module comment; the next call writes again
+        markRefReservationsDirty();
       }
     })();
   }
@@ -67,5 +102,6 @@ export function persistRefMarks(): Promise<void> {
 /** Forget the memoised load (test hook). */
 export function resetRefStore(): void {
   loading = undefined;
+  loaded = false;
   lastWrite = Promise.resolve();
 }

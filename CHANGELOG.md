@@ -31,6 +31,12 @@ uses [Semantic Versioning](https://semver.org/).
   in-memory counter while the page lived on: each tab's high-water mark is now
   kept in `chrome.storage.local`, written before any id it covers is returned,
   and a new worker counts on from it (ids jump by up to 1024 after a restart).
+  A storage failure at that seam no longer outlasts the call it hit: a refused
+  write is retried by the next call (it used to leave up to 1024 later ids with
+  no persisted mark), a refused load is retried instead of memoised for the
+  worker's life, and a worker that never loaded writes nothing — its snapshot
+  held only the tabs it had touched and replaced the stored map whole, erasing
+  every other live tab's mark for later workers too.
 
 ### Added
 

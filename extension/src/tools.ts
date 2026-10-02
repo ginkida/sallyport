@@ -130,8 +130,8 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
       confirmEpoch(callArgs.tabId, expectedEpoch);
     }
     // `@eN` counters resume from the marks a previous worker persisted, so a
-    // worker restart cannot re-issue an id an agent still holds (#7). Memoised:
-    // only the first call of a worker's life waits on storage.
+    // worker restart cannot re-issue an id an agent still holds (#7). Memoised
+    // once it succeeds: after that no call waits on storage here.
     await loadRefMarks();
     const result = await onTab(
       typeof callArgs.tabId === 'number' ? callArgs.tabId : undefined,

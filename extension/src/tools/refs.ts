@@ -103,6 +103,17 @@ export function takeRefReservations(): Record<string, number> | null {
   return Object.fromEntries(reservedByTab);
 }
 
+/** Re-arm the write after a persisted snapshot was refused (`ref-store.ts`).
+ * `takeRefReservations` clears the flag before the write runs, and `newRef`
+ * only sets it again once a whole reserved block is used up — so without this a
+ * refused write would leave up to `REF_RESERVE_BLOCK` later ids covered by no
+ * persisted mark. Reservations only grow (a closed tab's mark is the one that
+ * shrinks, and the next snapshot drops it anyway), so the retry carries a
+ * superset of what was refused. */
+export function markRefReservationsDirty(): void {
+  reservationsDirty = true;
+}
+
 /** Resume counting from marks a previous worker persisted.
  *
  * Only for tabs in `liveTabs` (a mark for a closed tab is dropped, and the
