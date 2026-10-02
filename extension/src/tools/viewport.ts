@@ -53,7 +53,7 @@
  * provably does not restore the tab's real size on its own.
  */
 
-import { attach, cdp, recordEmulatedDsf, releaseViewport } from './cdp.js';
+import { attach, CALL_GROUP, cdp, recordEmulatedDsf, releaseViewport } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { clearRefsForTab } from './refs.js';
@@ -506,6 +506,7 @@ async function readViewport(tabId: number): Promise<ViewportReading | null> {
     const out = await cdp<{ result: { value?: ViewportReading } }>(tabId, 'Runtime.evaluate', {
       expression: VIEWPORT_PROBE,
       returnByValue: true,
+      objectGroup: CALL_GROUP,
     });
     return out.result.value ?? null;
   } catch {

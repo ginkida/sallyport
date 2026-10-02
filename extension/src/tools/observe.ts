@@ -47,7 +47,7 @@ import {
   type CompactElement,
 } from './axtree.js';
 import { budgetLeft } from './budget.js';
-import { cdp } from './cdp.js';
+import { CALL_GROUP, cdp } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { buildSnapshotTree } from './snapshot.js';
@@ -140,6 +140,7 @@ async function pageText(tabId: number, maxChars: number): Promise<CappedText> {
   if (!q.nodeId) return { text: '' };
   const resolved = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
     nodeId: q.nodeId,
+    objectGroup: CALL_GROUP,
   });
   if (!resolved.object.objectId) return { text: '' };
   const out = await cdp<{ result: { value?: string } }>(tabId, 'Runtime.callFunctionOn', {

@@ -22,7 +22,7 @@
  *    that died mid-call can never masquerade as visible.
  */
 
-import { attach, cdp, looksLikeSelectorSyntaxError } from './cdp.js';
+import { attach, CALL_GROUP, cdp, looksLikeSelectorSyntaxError } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { getRef, isRef, type RefInfo } from './refs.js';
@@ -194,6 +194,7 @@ async function resolveForState(
     try {
       const resolved = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
         backendNodeId: refInfo.backendDOMNodeId,
+        objectGroup: CALL_GROUP,
       });
       objectId = resolved.object.objectId ?? null;
     } catch {
@@ -225,6 +226,7 @@ async function resolveForState(
   try {
     const resolved = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
       nodeId,
+      objectGroup: CALL_GROUP,
     });
     objectId = resolved.object.objectId ?? null;
   } catch {

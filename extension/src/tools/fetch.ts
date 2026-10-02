@@ -1,4 +1,4 @@
-import { attach, cdp } from './cdp.js';
+import { attach, CALL_GROUP, cdp } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { resolveTab } from './tabs.js';
@@ -199,6 +199,7 @@ export const fetchInPage: Tool = async (args, ctx) => {
       expression: expr,
       returnByValue: true,
       awaitPromise: true,
+      objectGroup: CALL_GROUP,
     }),
     deadlineMs,
     () =>

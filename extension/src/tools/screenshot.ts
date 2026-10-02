@@ -1,5 +1,5 @@
 import { isAgentWindow } from './agent-window.js';
-import { attach, cdp, getEmulatedDsf } from './cdp.js';
+import { attach, CALL_GROUP, cdp, getEmulatedDsf } from './cdp.js';
 import { computeClip, pixelScale, type PixelScale, type Region } from './clip.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
@@ -193,6 +193,7 @@ async function readPixelScale(tabId: number, metrics: LayoutMetrics): Promise<Pi
     const out = await cdp<{ result: { value?: unknown } }>(tabId, 'Runtime.evaluate', {
       expression: DPR_PROBE,
       returnByValue: true,
+      objectGroup: CALL_GROUP,
     });
     const v = Number(out.result.value);
     if (Number.isFinite(v) && v > 0) fromPage = v;

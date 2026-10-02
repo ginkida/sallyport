@@ -5,7 +5,7 @@ import {
   type ClickPoint,
   type PointInfo,
 } from './aim.js';
-import { attach, cdp } from './cdp.js';
+import { attach, CALL_GROUP, cdp } from './cdp.js';
 import { parseObserve, runObserve } from './observe.js';
 import { resolveSelectorOrRef } from './resolve.js';
 import { BridgeError } from './errors.js';
@@ -187,18 +187,20 @@ async function aimAtElement(
   hitBackendNodeId: number | null;
 }> {
   const GROUP = 'sallyport_mouse';
-  const probe = await cdp<{
-    result: { objectId?: string };
-    exceptionDetails?: { text: string };
-  }>(tabId, 'Runtime.callFunctionOn', {
-    objectId,
-    functionDeclaration: CLICK_POINT_PROBE,
-    objectGroup: GROUP,
-  });
-  if (probe.exceptionDetails || !probe.result.objectId) {
-    throw new BridgeError('not_found', `${tool}: could not measure element`);
-  }
+  // The probe runs INSIDE the try: one that throws in the page still mints its
+  // exception object into GROUP, and only the finally releases it.
   try {
+    const probe = await cdp<{
+      result: { objectId?: string };
+      exceptionDetails?: { text: string };
+    }>(tabId, 'Runtime.callFunctionOn', {
+      objectId,
+      functionDeclaration: CLICK_POINT_PROBE,
+      objectGroup: GROUP,
+    });
+    if (probe.exceptionDetails || !probe.result.objectId) {
+      throw new BridgeError('not_found', `${tool}: could not measure element`);
+    }
     const infoRes = await cdp<{ result: { value?: Omit<ClickPoint, 'hitEl'> } }>(
       tabId,
       'Runtime.callFunctionOn',
@@ -265,6 +267,7 @@ async function validateViewportPoint(
 ): Promise<PointInfo | null> {
   const docEval = await cdp<{ result: { objectId?: string } }>(tabId, 'Runtime.evaluate', {
     expression: 'document',
+    objectGroup: CALL_GROUP,
   });
   let info: PointInfo | null = null;
   if (docEval.result.objectId) {

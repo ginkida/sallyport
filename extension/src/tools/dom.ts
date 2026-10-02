@@ -1,4 +1,4 @@
-import { attach, cdp } from './cdp.js';
+import { attach, CALL_GROUP, cdp } from './cdp.js';
 import { pageFrameOrigins } from './frames.js';
 import { BridgeError, staleRefError } from './errors.js';
 import { ensureAllowed } from './gates.js';
@@ -268,6 +268,7 @@ async function bindFillTarget(tabId: number, objectId: string): Promise<FillTarg
   }
   const resolved = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
     backendNodeId: body.backendNodeId,
+    objectGroup: CALL_GROUP,
   });
   if (!resolved.object.objectId) {
     throw new BridgeError('focus_probe_failed', 'fill: could not reach the editor body');
@@ -740,6 +741,7 @@ async function readTarget(
   try {
     const { object } = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
       backendNodeId: writeNode,
+      objectGroup: CALL_GROUP,
     });
     return object.objectId ?? fallback;
   } catch {
@@ -1010,6 +1012,7 @@ export const readText: Tool = async (args) => {
   if (!bodyQ.nodeId) return { tabId: tab.id, url: tab.url, data: await emptyRead(tab) };
   const resolved = await cdp<{ object: { objectId?: string } }>(tab.id!, 'DOM.resolveNode', {
     nodeId: bodyQ.nodeId,
+    objectGroup: CALL_GROUP,
   });
   if (!resolved.object.objectId) {
     return { tabId: tab.id, url: tab.url, data: await emptyRead(tab) };

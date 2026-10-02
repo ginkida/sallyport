@@ -8,7 +8,7 @@
  * the action tools without a cycle.
  */
 
-import { cdp, looksLikeMissingNodeError, looksLikeSelectorSyntaxError } from './cdp.js';
+import { CALL_GROUP, cdp, looksLikeMissingNodeError, looksLikeSelectorSyntaxError } from './cdp.js';
 import { BridgeError, invalidSelectorError, staleRefError } from './errors.js';
 import { getRef, isRef } from './refs.js';
 
@@ -29,6 +29,7 @@ export async function resolveBackendNode(
   try {
     resolved = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
       backendNodeId,
+      objectGroup: CALL_GROUP,
     });
   } catch (e) {
     if (looksLikeMissingNodeError(e)) throw staleRefError(tool, label);
@@ -71,6 +72,7 @@ export async function resolveSelectorOrRef(
   }
   const resolved = await cdp<{ object: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
     nodeId: q.nodeId,
+    objectGroup: CALL_GROUP,
   });
   if (!resolved.object.objectId) {
     throw new BridgeError('not_found', `${tool}: could not resolve element`);

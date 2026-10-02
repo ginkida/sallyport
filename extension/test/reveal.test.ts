@@ -12,6 +12,8 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { CALL_GROUP } from '../src/tools/cdp.js';
+
 type Cmd = { method: string; params?: Record<string, unknown> };
 
 let reveal: typeof import('../src/tools/reveal.js').reveal;
@@ -175,9 +177,11 @@ describe('reveal with an @eN container', () => {
     expect(out.data.steps).toBe(2);
     const resolves = sent.filter((c) => c.method === 'DOM.resolveNode');
     expect(resolves).toHaveLength(2);
-    // …and by the browser-owned id, never by a nodeId from the wiped ref map.
+    // …and by the browser-owned id, never by a nodeId from the wiped ref map —
+    // into the per-call group, so the per-pass handles are released on idle
+    // instead of each pinning the list as it was on that pass.
     for (const r of resolves) {
-      expect(r.params).toEqual({ backendNodeId: CONTAINER_BACKEND_ID });
+      expect(r.params).toEqual({ backendNodeId: CONTAINER_BACKEND_ID, objectGroup: CALL_GROUP });
     }
   });
 

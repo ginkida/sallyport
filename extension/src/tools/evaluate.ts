@@ -1,4 +1,4 @@
-import { attach, cdp } from './cdp.js';
+import { attach, CALL_GROUP, cdp } from './cdp.js';
 import { BridgeError } from './errors.js';
 import { ensureEvaluateAllowed } from './gates.js';
 import { resolveTab } from './tabs.js';
@@ -29,6 +29,7 @@ export const evaluate: Tool = async (args, ctx) => {
       expression: code,
       returnByValue: true,
       awaitPromise: true,
+      objectGroup: CALL_GROUP,
     }),
     deadlineMs,
     () =>

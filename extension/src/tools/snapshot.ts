@@ -37,24 +37,26 @@ async function domSnapshot(
   rootObjectId?: string,
 ): Promise<{ tree: TreeNode[]; truncated: boolean }> {
   const GROUP = 'sallyport_snapshot';
-  const ev = rootObjectId
-    ? await cdp<{
-        result: { objectId?: string };
-        exceptionDetails?: { text: string; exception?: { description?: string } };
-      }>(tabId, 'Runtime.callFunctionOn', {
-        objectId: rootObjectId,
-        functionDeclaration: DOM_SUBTREE_PROBE,
-        objectGroup: GROUP,
-      })
-    : await cdp<{
-        result: { objectId?: string };
-        exceptionDetails?: { text: string; exception?: { description?: string } };
-      }>(tabId, 'Runtime.evaluate', { expression: DOM_TREE_PROBE, objectGroup: GROUP });
-  if (ev.exceptionDetails || !ev.result.objectId) {
-    const msg = ev.exceptionDetails?.exception?.description ?? ev.exceptionDetails?.text ?? '';
-    throw new BridgeError('snapshot_failed', `snapshot: DOM probe failed ${msg}`.trim());
-  }
+  // The probe itself runs INSIDE the try: a probe that throws in the page still
+  // mints its exception object into GROUP, and only the finally releases it.
   try {
+    const ev = rootObjectId
+      ? await cdp<{
+          result: { objectId?: string };
+          exceptionDetails?: { text: string; exception?: { description?: string } };
+        }>(tabId, 'Runtime.callFunctionOn', {
+          objectId: rootObjectId,
+          functionDeclaration: DOM_SUBTREE_PROBE,
+          objectGroup: GROUP,
+        })
+      : await cdp<{
+          result: { objectId?: string };
+          exceptionDetails?: { text: string; exception?: { description?: string } };
+        }>(tabId, 'Runtime.evaluate', { expression: DOM_TREE_PROBE, objectGroup: GROUP });
+    if (ev.exceptionDetails || !ev.result.objectId) {
+      const msg = ev.exceptionDetails?.exception?.description ?? ev.exceptionDetails?.text ?? '';
+      throw new BridgeError('snapshot_failed', `snapshot: DOM probe failed ${msg}`.trim());
+    }
     const treeRes = await cdp<{ result: { value?: Omit<DomTreeResult, 'els'> } }>(
       tabId,
       'Runtime.callFunctionOn',

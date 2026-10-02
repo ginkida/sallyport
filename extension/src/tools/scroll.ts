@@ -16,7 +16,7 @@
  * Scrolling never resets the @eN ref space (#7 untouched).
  */
 
-import { attach, cdp } from './cdp.js';
+import { attach, CALL_GROUP, cdp } from './cdp.js';
 import { resolveSelectorOrRef } from './resolve.js';
 import { BridgeError } from './errors.js';
 import { ensureAllowed, ensureStillAllowed } from './gates.js';
@@ -149,6 +149,7 @@ export const scroll: Tool = async (args, ctx) => {
   } else {
     const ev = await cdp<{ result: { objectId?: string } }>(tabId, 'Runtime.evaluate', {
       expression: 'document.scrollingElement || document.documentElement || document.body',
+      objectGroup: CALL_GROUP,
     });
     if (!ev.result.objectId) {
       throw new BridgeError('not_found', 'scroll: page has no scrolling element');
