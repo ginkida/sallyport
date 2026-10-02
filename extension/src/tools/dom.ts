@@ -1,3 +1,4 @@
+import { boundedProbe, raceDeadline } from './budget.js';
 import { attach, CALL_GROUP, cdp } from './cdp.js';
 import { pageFrameOrigins } from './frames.js';
 import { BridgeError, staleRefError } from './errors.js';
@@ -72,6 +73,10 @@ export async function targetIsPasswordField(tabId: number, objectId: string): Pr
 //     WRITE node — must hold text and, without allowPassword, not be a
 //     password field. A real element holding focus is also what stops a
 //     pending autofocus from moving it: autofocus only fires when nothing is.
+//     The query is answered by the renderer, so it runs under a deadline
+//     (`boundedProbe`: ≤ FOCUS_PROBE_DEADLINE_MS, never more than the call has
+//     left); an unanswered one is `focus_probe_failed` before the insert, and
+//     an answer arriving after that arms nothing.
 //  3. the guard itself — capture `beforeinput` listeners in an ISOLATED world
 //     (page prototype overrides don't reach it) at EVERY root on the write
 //     node's path: its own shadow root, each enclosing one, and the window.
@@ -107,11 +112,20 @@ type FillTarget = {
   editorFrame: boolean;
 };
 
-async function releaseGuardGroup(tabId: number): Promise<void> {
+/** How long a refused arm waits for its group release: the renderer that just
+ * failed to answer the guard's AX query may not answer this either, and the
+ * refusal must not inherit the hang it is reporting. The command is still
+ * sent, so a renderer that recovers releases the group anyway. */
+const GUARD_RELEASE_DEADLINE_MS = 1_000;
+
+async function releaseGuardGroup(tabId: number, boundMs?: number): Promise<void> {
   try {
-    await cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: FILL_GUARD_GROUP });
+    const sent = cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: FILL_GUARD_GROUP });
+    await (boundMs === undefined
+      ? sent
+      : raceDeadline(sent, boundMs, () => new Error('guard release timed out')));
   } catch {
-    // a navigation already released it
+    // a navigation already released it (or the renderer is not answering)
   }
 }
 
@@ -380,11 +394,12 @@ async function armFillGuard(
   tabId: number,
   target: FillTarget,
   allowPassword: boolean,
+  startedAt: number | undefined,
 ): Promise<FillGuard> {
   try {
-    return await armFillGuardInner(tabId, target, allowPassword);
+    return await armFillGuardInner(tabId, target, allowPassword, startedAt);
   } catch (e) {
-    await releaseGuardGroup(tabId);
+    await releaseGuardGroup(tabId, GUARD_RELEASE_DEADLINE_MS);
     throw e;
   }
 }
@@ -393,14 +408,25 @@ async function armFillGuardInner(
   tabId: number,
   target: FillTarget,
   allowPassword: boolean,
+  startedAt: number | undefined,
 ): Promise<FillGuard> {
   const frameId = target.frameId ?? (await mainFrameId(tabId));
-  const { nodes } = await cdp<{
-    nodes?: Array<{
-      backendDOMNodeId?: number;
-      properties?: Array<{ name?: string; value?: { value?: unknown } }>;
-    }>;
-  }>(tabId, 'Accessibility.queryAXTree', { objectId: target.objectId });
+  const { nodes } = await boundedProbe(
+    () =>
+      cdp<{
+        nodes?: Array<{
+          backendDOMNodeId?: number;
+          properties?: Array<{ name?: string; value?: { value?: unknown } }>;
+        }>;
+      }>(tabId, 'Accessibility.queryAXTree', { objectId: target.objectId }),
+    startedAt,
+    () =>
+      new BridgeError(
+        'focus_probe_failed',
+        'fill: the page did not answer the focus check in time (busy or hung), so the ' +
+          `target could not be verified — ${NOTHING_TYPED}; retry once the page responds`,
+      ),
+  );
   const focused = [
     ...new Set(
       (nodes ?? [])
@@ -823,7 +849,12 @@ export const fill: Tool = async (args, ctx) => {
     ensureFocusLanded(prep.result.value?.focused);
     let writeNode: number | null = null;
     if (value !== '') {
-      const guard = await armFillGuard(tab.id!, target, args.allowPassword === true);
+      const guard = await armFillGuard(
+        tab.id!,
+        target,
+        args.allowPassword === true,
+        ctx?.startedAt,
+      );
       writeNode = guard.writeNode;
       await guardedInsert(tab.id!, guard, value);
     }
@@ -926,7 +957,12 @@ export const fill: Tool = async (args, ctx) => {
     ensureFocusLanded(fbPrep.result.value?.focused);
     let fbWriteNode: number | null = null;
     if (value !== '') {
-      const guard = await armFillGuard(tab.id!, target, args.allowPassword === true);
+      const guard = await armFillGuard(
+        tab.id!,
+        target,
+        args.allowPassword === true,
+        ctx?.startedAt,
+      );
       fbWriteNode = guard.writeNode;
       await guardedInsert(tab.id!, guard, value);
     }

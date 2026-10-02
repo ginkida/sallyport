@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 import {
   budgetLeft,
   CALL_BUDGET_MS,
+  FOCUS_PROBE_DEADLINE_MS,
+  focusProbeDeadlineMs,
   loadTimeoutMs,
   MIN_LOAD_TIMEOUT_MS,
   OBSERVE_RESERVE_MS,
@@ -58,5 +60,22 @@ describe('stepDeadlineMs / raceDeadline (a page step that may never settle)', ()
   it('rejects with the given error when the step never settles', async () => {
     const never = new Promise<number>(() => {});
     await expect(raceDeadline(never, 20, () => new Error('late'))).rejects.toThrow('late');
+  });
+});
+
+describe('focusProbeDeadlineMs (a typing gate query the renderer may never answer)', () => {
+  it('is the probe ceiling for a fresh or unstamped call', () => {
+    expect(focusProbeDeadlineMs(undefined, 0)).toBe(FOCUS_PROBE_DEADLINE_MS);
+    expect(focusProbeDeadlineMs(0, 0)).toBe(FOCUS_PROBE_DEADLINE_MS);
+  });
+
+  it('never exceeds what the call has left, and is 0 once it has nothing', () => {
+    expect(focusProbeDeadlineMs(0, CALL_BUDGET_MS - 2_000)).toBe(2_000);
+    expect(focusProbeDeadlineMs(0, CALL_BUDGET_MS)).toBe(0);
+    expect(focusProbeDeadlineMs(0, CALL_BUDGET_MS + 9_000)).toBe(0);
+  });
+
+  it('is well inside the daemon’s 60 s, so a refusal is not an extension_timeout', () => {
+    expect(FOCUS_PROBE_DEADLINE_MS).toBeLessThan(60_000 - CALL_BUDGET_MS);
   });
 });

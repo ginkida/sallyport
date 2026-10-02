@@ -181,8 +181,10 @@ passwords are not retained at rest or surfaced by the popup's Export.
 The same redaction applies when a typing call is REJECTED for touching
 (or possibly touching) a password field — both the confirmed
 `password_field` case and the fail-closed `focus_probe_failed` case (the
-CDP frame/AX/DOM focus walk returned incomplete data, so the field couldn't
-be ruled out), and `fill`'s target-binding refusals (`not_focusable`,
+CDP frame/AX/DOM focus walk returned incomplete data, or the page did not
+answer one of its accessibility queries within the gate's deadline — at most
+5 s, never more than the call has left — so the field couldn't be ruled out;
+nothing is typed, and a late answer arms nothing), and `fill`'s target-binding refusals (`not_focusable`,
 `no_editable_focus`, `focus_moved`, `wrong_element`), each of which fires
 where the text could have been heading for a field nobody vetted — so an
 attempted credential doesn't leak

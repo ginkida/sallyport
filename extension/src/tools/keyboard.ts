@@ -1,3 +1,4 @@
+import { boundedProbe } from './budget.js';
 import { attach, cdp, cdpSession, releaseChildAx } from './cdp.js';
 import { BridgeError } from './errors.js';
 import {
@@ -96,7 +97,12 @@ export function segmentTypesText(seg: string): boolean {
   }
 }
 
-async function dispatchKeys(tabId: number, keysStr: string, allowPassword: boolean): Promise<void> {
+async function dispatchKeys(
+  tabId: number,
+  keysStr: string,
+  allowPassword: boolean,
+  startedAt: number | undefined,
+): Promise<void> {
   const os = await getOs();
   const modKey = os === 'mac' ? MODIFIERS.cmd : MODIFIERS.ctrl;
   const segments = keysStr.trim().split(/\s+/);
@@ -110,7 +116,7 @@ async function dispatchKeys(tabId: number, keysStr: string, allowPassword: boole
     // character — `<mover> secret` can never land the credential in a password
     // field the up-front probe never saw, and the throw fires force-redaction.
     if (s > 0 && segmentTypesText(seg)) {
-      await ensureNotPasswordField(tabId, allowPassword, 'send_keys');
+      await ensureNotPasswordField(tabId, allowPassword, 'send_keys', startedAt);
     }
     const parts = seg
       .split('+')
@@ -184,13 +190,18 @@ async function dispatchKeys(tabId: number, keysStr: string, allowPassword: boole
  * document; Accessibility.getFullAXTree identifies each frame's focused node
  * (including closed shadow descendants); DOM.describeNode reads the real tag
  * and attributes. Any missing/malformed frame, focus, backend id, or DOM node
- * fails closed as focus_probe_failed rather than pretending typing is safe. */
+ * fails closed as focus_probe_failed rather than pretending typing is safe —
+ * and so does an AX query the page leaves unanswered: each one runs under
+ * `boundedProbe` (at most FOCUS_PROBE_DEADLINE_MS, never more than the call has
+ * left, counted from `startedAt`), so a hung renderer costs a prompt refusal
+ * instead of the whole call, and an answer that arrives after it changes
+ * nothing — the gate has already thrown, so nothing is typed. */
 export async function ensureFocusUsable(
   tabId: number,
-  opts: { allowPassword: boolean; requireTypable: boolean },
+  opts: { allowPassword: boolean; requireTypable: boolean; startedAt?: number },
   tool: string,
 ): Promise<void> {
-  const { allowPassword, requireTypable } = opts;
+  const { allowPassword, requireTypable, startedAt } = opts;
   // Nothing to establish: the caller opted into password fields and the tool
   // does not need an editable target (send_keys drives global hotkeys too).
   if (allowPassword && !requireTypable) return;
@@ -206,6 +217,17 @@ export async function ensureFocusUsable(
         'or inspect the field with snapshot/get_state',
     );
   };
+  // A BridgeError, so the frame loop below rethrows it instead of reading it as
+  // "this frame lives in another target" and walking on.
+  const timedOut = (): BridgeError =>
+    new BridgeError(
+      'focus_probe_failed',
+      `${tool}: the page did not answer the focus check in time (busy or hung), so the ` +
+        'focused field could not be verified and nothing was typed — retry once the page ' +
+        'responds, or use fill',
+    );
+  const axTree = (send: () => Promise<{ nodes?: unknown }>): Promise<{ nodes?: unknown }> =>
+    boundedProbe(send, startedAt, timedOut);
   type TargetInfo = { targetId?: unknown; type?: unknown };
   let targetInfos: TargetInfo[] | null = null;
 
@@ -260,10 +282,8 @@ export async function ensureFocusUsable(
     if (typeof attached.sessionId !== 'string' || !attached.sessionId) return fail();
     const sessionId = attached.sessionId;
     try {
-      const ax = await cdpSession<{ nodes?: unknown }>(
-        tabId,
-        sessionId,
-        'Accessibility.getFullAXTree',
+      const ax = await axTree(() =>
+        cdpSession<{ nodes?: unknown }>(tabId, sessionId, 'Accessibility.getFullAXTree'),
       );
       return await inspectAxNodes(ax.nodes, sessionId);
     } finally {
@@ -290,9 +310,9 @@ export async function ensureFocusUsable(
     for (const frameId of frameIds) {
       let result: { sawFocus: boolean };
       try {
-        const ax = await cdp<{ nodes?: unknown }>(tabId, 'Accessibility.getFullAXTree', {
-          frameId,
-        });
+        const ax = await axTree(() =>
+          cdp<{ nodes?: unknown }>(tabId, 'Accessibility.getFullAXTree', { frameId }),
+        );
         result = await inspectAxNodes(ax.nodes);
       } catch (error) {
         if (error instanceof BridgeError) throw error;
@@ -340,8 +360,9 @@ export async function ensureNotPasswordField(
   tabId: number,
   allowPassword: boolean,
   tool: string,
+  startedAt?: number,
 ): Promise<void> {
-  await ensureFocusUsable(tabId, { allowPassword, requireTypable: false }, tool);
+  await ensureFocusUsable(tabId, { allowPassword, requireTypable: false, startedAt }, tool);
 }
 
 export const keyType: Tool = async (args, ctx) => {
@@ -354,7 +375,7 @@ export const keyType: Tool = async (args, ctx) => {
   await attach(tab.id!);
   await ensureFocusUsable(
     tab.id!,
-    { allowPassword: args.allowPassword === true, requireTypable: true },
+    { allowPassword: args.allowPassword === true, requireTypable: true, startedAt: ctx?.startedAt },
     'key_type',
   );
   await cdp(tab.id!, 'Input.insertText', { text });
@@ -383,8 +404,8 @@ export const sendKeys: Tool = async (args, ctx) => {
   await ensureAllowed(tab.url);
   await attach(tab.id!);
   const allowPassword = args.allowPassword === true;
-  await ensureNotPasswordField(tab.id!, allowPassword, 'send_keys');
-  await dispatchKeys(tab.id!, keys, allowPassword);
+  await ensureNotPasswordField(tab.id!, allowPassword, 'send_keys', ctx?.startedAt);
+  await dispatchKeys(tab.id!, keys, allowPassword, ctx?.startedAt);
   // `send_keys 'Enter'` IS the submit of most search/login flows, so it was the
   // one action tool guaranteed to be followed by a wait_for. Same shared engine
   // as click/fill; a failure inside the wait stays non-fatal, so the keystrokes

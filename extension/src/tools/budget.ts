@@ -62,3 +62,33 @@ export async function raceDeadline<T>(
     clearTimeout(timer);
   }
 }
+
+/** Ceiling on one accessibility query of a typing gate (fill's guard,
+ * key_type/send_keys's per-frame focus walk). Those queries are answered by the
+ * RENDERER, so a page that is busy or hung leaves them pending forever, and the
+ * gate then holds the tab's call queue until the daemon gives up — reporting
+ * `extension_timeout`, "may still be running", for a call that typed nothing.
+ * Past the deadline the gate fails CLOSED (`focus_probe_failed`) before any
+ * text is sent. */
+export const FOCUS_PROBE_DEADLINE_MS = 5_000;
+
+/** How long the next focus-probe query may take: FOCUS_PROBE_DEADLINE_MS, or
+ * what the call has left if less — never more. 0 means the call has nothing
+ * left, and the query is not worth sending. Pure. */
+export function focusProbeDeadlineMs(startedAt: number | undefined, now: number): number {
+  return Math.min(FOCUS_PROBE_DEADLINE_MS, budgetLeft(startedAt, now));
+}
+
+/** Run one focus-probe query under `focusProbeDeadlineMs`. `send` is only
+ * called when there is time left to wait for it, so an overdrawn call sends
+ * nothing. A late answer resolves into nothing: the caller has already thrown
+ * `onTimeout()` and left the gate. */
+export function boundedProbe<T>(
+  send: () => Promise<T>,
+  startedAt: number | undefined,
+  onTimeout: () => Error,
+): Promise<T> {
+  const ms = focusProbeDeadlineMs(startedAt, Date.now());
+  if (ms <= 0) return Promise.reject(onTimeout());
+  return raceDeadline(send(), ms, onTimeout);
+}

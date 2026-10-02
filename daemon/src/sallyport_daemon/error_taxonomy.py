@@ -286,10 +286,13 @@ _ERROR_HINTS: Mapping[str, str] = MappingProxyType(
             "regardless, arm handle_dialog to accept the NEXT beforeunload first."
         ),
         "focus_probe_failed": (
-            "retryable=no; key_type/send_keys couldn't verify the focused field is safe to type "
-            "into (the CDP frame/AX/DOM focus walk returned incomplete data) — use fill instead "
-            "with an explicit field selector/ref, or inspect the field first with "
-            "snapshot/get_state."
+            "retryable=maybe; fill/key_type/send_keys couldn't verify where the text would go "
+            "(the CDP frame/AX/DOM focus walk returned incomplete data, or the page did not "
+            "answer it in time — busy or hung) — when the message says the page did not "
+            "answer, retry once it responds (check it with read_text/snapshot first); "
+            "otherwise use fill with an explicit field selector/ref, or inspect the field "
+            "with snapshot/get_state. If fill says the text was sent, check the field before "
+            "retrying."
         ),
         "error": (
             "retryable=maybe; an unclassified tool failure (the message carries whatever detail "

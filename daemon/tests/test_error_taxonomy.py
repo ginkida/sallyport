@@ -128,3 +128,17 @@ def test_domain_not_allowed_names_the_mid_call_drift() -> None:
     assert hint is not None
     assert "DURING the call" in hint
     assert "navigate back" in hint
+
+
+def test_focus_probe_failed_hint_covers_fill_and_the_unanswered_probe() -> None:
+    """focus_probe_failed is thrown by fill as well as key_type/send_keys, and
+    since the typing gates' AX queries run under a deadline it also means "the
+    page did not answer in time" — a busy page, worth one retry once it
+    responds. A hint naming only key_type/send_keys and saying retryable=no
+    sent the agent away from a call that would have worked."""
+    hint = format_error_hint("focus_probe_failed")
+    assert hint is not None
+    for tool in ("fill", "key_type", "send_keys"):
+        assert tool in hint
+    assert "retryable=no" not in hint
+    assert "in time" in hint
