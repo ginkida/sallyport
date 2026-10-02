@@ -48,13 +48,17 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `network_tail` reports `bodyOmissionReason: "evicted"` when Chrome no
-  longer held a response body by the time it was read: a response over about
-  4 MB decoded is never kept (see the buffer cap below), and older ones are
-  pushed out once the tab's capture buffer fills. The entry keeps its metadata;
-  re-reading cannot recover the body. This is the one agent-visible change of
-  the memory work below: such a response used to come back as a 256 KiB
-  prefix, now it comes back with no body.
+- `network_tail` reports `bodyOmissionReason: "unavailable"` when Chrome
+  holds no body for a response: it was dropped from the capture buffer (a
+  response over about 10 MB decoded is never kept — about 5 MB if it contains
+  any non-Latin-1 text, which Chrome stores as UTF-16 — and older ones are
+  pushed out once the tab's buffer fills; see the buffer cap below), or none
+  was ever stored (typically an empty response). The entry keeps its metadata;
+  re-reading cannot recover the body, and the tool description now says to
+  re-fetch only a request that is safe to repeat, never a POST or a signed
+  one-shot call. This is the one agent-visible change of the memory work
+  below: a response past the cap used to come back as a 256 KiB prefix, now it
+  comes back with no body.
 
 ### Changed
 
@@ -85,8 +89,8 @@ uses [Semantic Versioning](https://semver.org/).
   single-page app alive (measured: +69k DOM nodes, +40 MB). `snapshot`'s DOM
   probe and `mouse_click`'s aim probe also release their own group when the
   page throws on the first command.
-- Network capture: Chrome's capture buffer is capped at 32 MB per tab and
-  4 MB per response (Chrome's defaults are 200 MB and 20 MB), and at most 8
+- Network capture: Chrome's capture buffer is capped at 48 MB per tab and
+  10 MB per response (Chrome's defaults are 200 MB and 20 MB), and at most 16
   body reads are in flight across all tabs (was 32; still 4 per tab).
 - Turning console or network capture off now frees the browser-side state at
   once instead of at detach: `Network.disable`, and for the console a release

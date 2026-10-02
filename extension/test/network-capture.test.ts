@@ -425,9 +425,11 @@ describe('clipBody — surrogate-safe', () => {
   });
 });
 
-describe('looksLikeEvictedBodyError', () => {
-  it("recognises Chrome's three answers for a body it no longer holds", async () => {
-    const { looksLikeEvictedBodyError } = await import('../src/tools/network-capture.js');
+describe('looksLikeUnavailableBodyError', () => {
+  // Not all three mean "evicted": "No data found" is a record with no content
+  // ever stored (an empty body, typically) — hence the reason 'unavailable'.
+  it("recognises Chrome's three answers for a body it does not hold", async () => {
+    const { looksLikeUnavailableBodyError } = await import('../src/tools/network-capture.js');
     for (const msg of [
       'No resource with given identifier found',
       'No data found for resource with given identifier',
@@ -435,15 +437,15 @@ describe('looksLikeEvictedBodyError', () => {
       // chrome.debugger can hand back the CDP error object serialised
       '{"code":-32000,"message":"No resource with given identifier found"}',
     ]) {
-      expect(looksLikeEvictedBodyError(new Error(msg)), msg).toBe(true);
+      expect(looksLikeUnavailableBodyError(new Error(msg)), msg).toBe(true);
     }
-    expect(looksLikeEvictedBodyError('No data found for resource with given identifier')).toBe(
+    expect(looksLikeUnavailableBodyError('No data found for resource with given identifier')).toBe(
       true,
     );
   });
 
   it('leaves a capture that ENDED (detached, closed tab) unclassified', async () => {
-    const { looksLikeEvictedBodyError } = await import('../src/tools/network-capture.js');
+    const { looksLikeUnavailableBodyError } = await import('../src/tools/network-capture.js');
     for (const msg of [
       'Debugger is not attached to the tab with id: 7.',
       'No tab with given id 7.',
@@ -451,7 +453,7 @@ describe('looksLikeEvictedBodyError', () => {
       'body evicted', // not Chrome's wording — the classifier stays narrow
       '',
     ]) {
-      expect(looksLikeEvictedBodyError(new Error(msg)), msg).toBe(false);
+      expect(looksLikeUnavailableBodyError(new Error(msg)), msg).toBe(false);
     }
   });
 });
@@ -466,5 +468,18 @@ describe('capture buffer limits', () => {
     expect(NETWORK_MAX_TOTAL_BUFFER).toBeGreaterThanOrEqual(4 * NETWORK_MAX_RESOURCE_BUFFER);
     expect(NETWORK_MAX_RESOURCE_BUFFER).toBeLessThan(20_000_000);
     expect(NETWORK_MAX_TOTAL_BUFFER).toBeLessThan(200_000_000);
+  });
+
+  it('keep a multi-MB JSON with one non-Latin-1 character (stored as UTF-16) whole', async () => {
+    const { NETWORK_MAX_RESOURCE_BUFFER, NETWORK_MAX_TOTAL_BUFFER } =
+      await import('../src/tools/network-capture.js');
+    // A 4.5 MB dashboard payload with one Cyrillic label is 9 MB decoded: it
+    // must still be held, so network_tail returns its 256 KiB prefix rather
+    // than no body at all (the 4 MB cap dropped it at ~2 MB raw).
+    expect(NETWORK_MAX_RESOURCE_BUFFER).toBeGreaterThanOrEqual(2 * 4_500_000);
+    expect(NETWORK_MAX_RESOURCE_BUFFER).toBe(10_000_000);
+    expect(NETWORK_MAX_TOTAL_BUFFER).toBe(48_000_000);
+    // Still 4× under Chrome's 200 MB default.
+    expect(NETWORK_MAX_TOTAL_BUFFER * 4).toBeLessThanOrEqual(200_000_000);
   });
 });

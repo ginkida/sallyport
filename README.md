@@ -296,7 +296,7 @@ Console/network capture starts on the next tool call after enabling it.
 Switching either setting off immediately clears that capture's buffers on
 all tabs and switches the capture off in the browser as well. For
 `network_tail`, `bodyPending: true` means a body read is queued
-or still running; read again shortly. At most 4 body reads per tab and 8
+or still running; read again shortly. At most 4 body reads per tab and 16
 globally are in flight at once; the rest wait in a per-tab queue bounded by
 the 100-entry ring, so a burst of simultaneous responses still yields every
 body. Only when that queue overflows does a response keep its metadata but
@@ -306,10 +306,14 @@ body payloads are bounded across tabs — 10 MiB per tab and 40 MiB total,
 measured in the same wire bytes as the per-result budget — so older bodies
 within the same tab may be discarded; their metadata remains with
 `bodyOmissionReason: "cache_limit"`, and a tab cannot evict another tab's
-bodies. Chrome's own capture buffer is capped at 32 MB per tab and 4 MB per
-response (its defaults are 200 MB / 20 MB); a body Chrome no longer holds —
-one over the per-response cap, or pushed out by newer traffic — keeps its
-metadata with `bodyOmissionReason: "evicted"`. These limits cover body
+bodies. Chrome's own capture buffer is capped at 48 MB per tab and 10 MB per
+response, counted decoded — a body with any non-Latin-1 character is stored as
+UTF-16, so for it the per-response cap is ~5 MB raw (Chrome's defaults are
+200 MB / 20 MB). A body Chrome does not hold — over the per-response cap,
+pushed out by newer traffic, or never stored at all (typically an empty
+response) — keeps its metadata with `bodyOmissionReason: "unavailable"`;
+re-fetch it with `fetch_in_page` only when the request is safe to repeat (an
+idempotent GET), never a POST or a signed one-shot call. These limits cover body
 payloads, not transient decoding, metadata or total process memory.
 
 For agents running on a schedule, the cheap iteration shape is: `status`

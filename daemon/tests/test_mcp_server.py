@@ -449,8 +449,13 @@ def test_network_tail_explains_every_body_omission_reason() -> None:
     can't tell "read again shortly" from "this body is gone"."""
     network_tail = next(t for t in TOOLS if t.name == "network_tail")
     desc = network_tail.description or ""
-    for reason in ("capture_busy", "cache_limit", "evicted"):
+    for reason in ("capture_busy", "cache_limit", "unavailable"):
         assert f"bodyOmissionReason='{reason}'" in desc, reason
+    # 'unavailable' also covers a body Chrome never stored (an empty response),
+    # so the old name 'evicted' was a misleading claim — and it must not invite
+    # replaying a request that changes server state.
+    assert "bodyOmissionReason='evicted'" not in desc
+    assert "never repeat a POST" in desc
 
 
 # ---------------------------------------------------------------------------

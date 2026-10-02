@@ -96,12 +96,14 @@ export const NETWORK_BODY_CACHE_TOTAL = 4 * NETWORK_RESPONSE_BUDGET;
 // RPCs can't be re-fetched). The queue is bounded by the ring size, since an
 // entry the ring has already evicted is never read; only an overflowing queue
 // answers capture_busy.
-// Eight in flight globally: each read makes the browser JSON-parse a body of up
-// to NETWORK_MAX_RESOURCE_BUFFER (decoded, UTF-16) on its UI thread and hand the
+// Sixteen in flight globally: each read makes the browser JSON-parse a body of
+// up to NETWORK_MAX_RESOURCE_BUFFER (decoded) on its UI thread and hand the
 // worker a copy before we clip it, so this bounds that transient — 32 in flight
-// was up to 32 such copies at once.
+// was up to 32 such copies at once, and 8 left a dashboard's burst queued long
+// enough for its bodies to be pushed out of the tab's buffer before they were
+// read.
 export const NETWORK_MAX_BODY_READS_PER_TAB = 4;
-export const NETWORK_MAX_BODY_READS = 8;
+export const NETWORK_MAX_BODY_READS = 16;
 export const NETWORK_MAX_QUEUED_BODY_READS = NETWORK_MAX_ENTRIES;
 // The renderer's own response-body buffer for our session (`Network.enable`'s
 // maxTotalBufferSize / maxResourceBufferSize). Chrome's defaults are 200 MB /
@@ -110,11 +112,16 @@ export const NETWORK_MAX_QUEUED_BODY_READS = NETWORK_MAX_ENTRIES;
 // with limits. A resource larger than the per-resource limit is not kept at all
 // (Chrome stores it whole or not), and an old one is evicted once the total is
 // reached; either way getResponseBody then fails and the entry reports
-// bodyOmissionReason 'evicted'. The per-resource limit is counted in decoded
-// bytes (UTF-16 for non-Latin-1 text), so it stays far above NETWORK_MAX_BODY:
-// only bodies we would have clipped to a 256 KiB prefix anyway can be lost.
-export const NETWORK_MAX_TOTAL_BUFFER = 32_000_000;
-export const NETWORK_MAX_RESOURCE_BUFFER = 4_000_000;
+// bodyOmissionReason 'unavailable'. The per-resource limit is counted in DECODED
+// bytes, and a string with a single non-Latin-1 character is stored as UTF-16 —
+// two bytes per character — so a mostly-ASCII JSON with one Cyrillic label hits
+// it at HALF its raw size. 10 MB keeps such a body up to ~5 MB raw (and an ASCII
+// one up to ~10 MB), i.e. everything network_tail would return as a 256 KiB
+// prefix in practice; 48 MB total holds several of them while staying 4× under
+// Chrome's 200 MB default. A body past either cap is better fetched again with
+// fetch_in_page (saveAs) where the request is safe to replay.
+export const NETWORK_MAX_TOTAL_BUFFER = 48_000_000;
+export const NETWORK_MAX_RESOURCE_BUFFER = 10_000_000;
 // Per-entry URL cap. Real API urls are well under this; it exists only so a
 // pathological giant query string can't dominate a result's wire size.
 export const NETWORK_MAX_URL = 4 * 1024;
@@ -155,13 +162,21 @@ export function clipUrl(url: string, max = NETWORK_MAX_URL): { url: string; trun
 function capField(s: string, max: number): string {
   return s.length <= max ? s : wellFormedCut(s, max).text;
 }
-/** Did `Network.getResponseBody` fail because the renderer no longer holds the
- * body? Chrome answers "No resource with given identifier found", "No data found
- * for resource with given identifier" or "Request content was evicted from
- * inspector cache" — the resource outgrew the capture buffer or was pushed out of
- * it. Narrow on purpose: a detached debugger or a closed tab is not "evicted",
- * it is a capture that ended, and keeps the plain metadata-only entry. Pure. */
-export function looksLikeEvictedBodyError(e: unknown): boolean {
+/** Did `Network.getResponseBody` fail because the renderer holds no body for
+ * this response? Chrome answers one of three things, and they do NOT all mean
+ * eviction:
+ *  - "Request content was evicted from inspector cache" — dropped: over the
+ *    per-resource limit, or pushed out once the tab's buffer filled;
+ *  - "No resource with given identifier found" — the record itself is gone
+ *    (cleared by a main-frame navigation);
+ *  - "No data found for resource with given identifier" — the record exists but
+ *    no content was ever stored for it; the common case is a response with an
+ *    EMPTY body (Chrome stores nothing for zero bytes).
+ * Hence the honest reason `unavailable`, not `evicted`: the body cannot be read
+ * back, which is all the agent can act on. Narrow on purpose: a detached
+ * debugger or a closed tab is a capture that ended, and keeps the plain
+ * metadata-only entry. Pure. */
+export function looksLikeUnavailableBodyError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
   return /no (?:resource|data found for resource) with given identifier|evicted from inspector cache/i.test(
     msg,
@@ -482,17 +497,18 @@ async function runBodyRead({ requestId, tabId, entry, generation }: QueuedBodyRe
       if (entry.body !== undefined && clipped.truncated) entry.bodyTruncated = true;
     }
   } catch (e) {
-    // The renderer no longer has the body (outgrew or was pushed out of the
-    // capture buffer): say so, rather than leave a body-less entry that reads like
-    // "this response had no text". Anything else (target gone, debugger detached)
-    // keeps the plain metadata — the capture itself is ending.
+    // The renderer holds no body for it (dropped from the capture buffer, or
+    // never stored — see looksLikeUnavailableBodyError): say so, rather than
+    // leave a body-less entry that reads like nothing was attempted. Anything
+    // else (target gone, debugger detached) keeps the plain metadata — the
+    // capture itself is ending.
     if (
-      looksLikeEvictedBodyError(e) &&
+      looksLikeUnavailableBodyError(e) &&
       enabledTabs.get(tabId) === generation &&
       buffers.get(tabId)?.includes(entry)
     ) {
       entry.bodyOmitted = true;
-      entry.bodyOmissionReason = 'evicted';
+      entry.bodyOmissionReason = 'unavailable';
     }
   } finally {
     delete entry.bodyPending;

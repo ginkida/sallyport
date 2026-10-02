@@ -457,25 +457,25 @@ describe('capture lifecycle', () => {
     expect('enableDurableMessages' in params).toBe(false);
   });
 
-  it('caps body reads in flight at eight across all tabs', async () => {
+  it('caps body reads in flight at sixteen across all tabs', async () => {
     const capture = await import('../src/tools/network-capture.js');
-    expect(capture.NETWORK_MAX_BODY_READS).toBe(8);
+    expect(capture.NETWORK_MAX_BODY_READS).toBe(16);
     expect(capture.NETWORK_MAX_BODY_READS_PER_TAB).toBe(4);
-    for (let tab = 0; tab < 3; tab++) await capture.ensureNetworkCapture(tab);
+    for (let tab = 0; tab < 5; tab++) await capture.ensureNetworkCapture(tab);
     sendCommand.mockClear();
     sendCommand.mockReturnValue(new Promise(() => undefined));
-    for (let tab = 0; tab < 3; tab++) {
+    for (let tab = 0; tab < 5; tab++) {
       for (let i = 0; i < capture.NETWORK_MAX_BODY_READS_PER_TAB; i++) response(tab, `r-${i}`);
     }
-    // Two tabs fill the global cap; the third tab's reads wait.
+    // Four tabs fill the global cap; the fifth tab's reads wait.
     expect(sendCommand).toHaveBeenCalledTimes(capture.NETWORK_MAX_BODY_READS);
-    expect(capture.readNetwork(2).every((row) => row.bodyPending)).toBe(true);
+    expect(capture.readNetwork(4).every((row) => row.bodyPending)).toBe(true);
   });
 
   it.each([
-    ['No resource with given identifier found', 'evicted'],
-    ['No data found for resource with given identifier', 'evicted'],
-    ['Request content was evicted from inspector cache', 'evicted'],
+    ['No resource with given identifier found', 'unavailable'],
+    ['No data found for resource with given identifier', 'unavailable'],
+    ['Request content was evicted from inspector cache', 'unavailable'],
     ['Debugger is not attached to the tab with id: 1.', undefined],
   ])('a body read rejected with "%s" reports reason %s', async (message, reason) => {
     const capture = await import('../src/tools/network-capture.js');
@@ -490,7 +490,7 @@ describe('capture lifecycle', () => {
     expect(row.bodyOmitted).toBe(reason ? true : undefined);
   });
 
-  it('an eviction answer for a capture that already ended changes nothing', async () => {
+  it('an unavailable-body answer for a capture that already ended changes nothing', async () => {
     const capture = await import('../src/tools/network-capture.js');
     await capture.ensureNetworkCapture(1);
     const body = deferred<object>();
