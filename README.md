@@ -220,8 +220,8 @@ What you get:
   list — your tabs or another agent's. `list_tabs` shows a session only its own.
 - **It won't steal your focus.** Each session's tabs live in its own un-focused,
   muted window, and the window you were using is re-focused if Chrome tries to
-  raise the new one (only if Chrome had focus — it never pulls a backgrounded
-  Chrome to the front). Screenshots work there too, without foregrounding
+  raise the new one (only if the new window really took focus — it never pulls
+  a backgrounded Chrome to the front). Screenshots work there too, without foregrounding
   anything. An agent closing or navigating away from its own tab never raises a
   "Leave site?" / "Close site?" prompt — Chrome would bring the agent window to
   the front to show it and wait for your click — while your own tabs keep it.

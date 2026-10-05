@@ -22,10 +22,11 @@ import {
 } from './ownership.js';
 import { persistEpochs, reapAgentTabs } from './ownership-store.js';
 import {
-  closeTabQuietly,
+  closeAgentTab,
   disarmBeforeUnload,
-  mayCloseQuietly,
   mayLeaveQuietly,
+  rearmIfSameDocument,
+  type Disarmed,
 } from './quiet-leave.js';
 import { createAgentTab } from './agent-window.js';
 import type { Tool } from './types.js';
@@ -204,6 +205,7 @@ export const navigate: Tool = async (args, ctx) => {
   const createOwn = newTab || (isBrokerMode() && typeof args.tabId !== 'number');
   let tab: chrome.tabs.Tab;
   let created = false;
+  let disarmed: Disarmed | null = null;
   if (createOwn) {
     tab = await openTab(url, ctx?.client);
     created = true;
@@ -250,7 +252,7 @@ export const navigate: Tool = async (args, ctx) => {
       // would raise the agent window over whatever the human is doing and hold
       // the navigation until they answer it (quiet-leave.ts). A human tab
       // keeps the prompt.
-      if (mayLeaveQuietly(tab.id!)) await disarmBeforeUnload(tab.id!, ctx?.startedAt);
+      if (mayLeaveQuietly(tab.id!)) disarmed = await disarmBeforeUnload(tab.id!, ctx?.startedAt);
       await chrome.tabs.update(tab.id!, { url });
     }
   }
@@ -285,6 +287,9 @@ export const navigate: Tool = async (args, ctx) => {
     }
     loaded = false;
   }
+  // A `#hash` navigate stays in the same document: give the page back the leave
+  // guard removed above, or it would live on without it.
+  if (disarmed) await rearmIfSameDocument(tab.id!, disarmed, ctx?.startedAt);
   // "Did not reach complete" is usually NOT "nothing to read": one hanging
   // pixel or long-poll keeps a rendered page 'loading' forever. Only a page
   // that has not COMMITTED (url '' / about:blank, the address still in
@@ -373,12 +378,11 @@ export const closeTab: Tool = async (args) => {
   const tab = await getTabOrGone(tabId);
   const ownAgentTab = isBrokerMode() && getEpoch(tabId) !== undefined;
   if (!ownAgentTab) await ensureAllowed(tab.url);
-  // Our own tab closes WITHOUT its beforeunload prompt: Chrome raises the
+  // An agent tab closes WITHOUT its beforeunload prompt: Chrome raises the
   // agent window to show one (focus theft) and the close waits on a human.
-  // Not for a tab the human engaged with, nor any non-agent tab — there the
+  // Not a tab the human engaged with, nor any non-agent tab — there the
   // prompt may be guarding something a person typed (quiet-leave.ts).
-  if (ownAgentTab && mayCloseQuietly(tabId)) await closeTabQuietly(tabId);
-  else await chrome.tabs.remove(tabId);
+  await closeAgentTab(tabId);
   return { tabId, url: tab.url, data: { closed: tabId } };
 };
 

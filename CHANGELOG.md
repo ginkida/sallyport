@@ -19,8 +19,11 @@ uses [Semantic Versioning](https://semver.org/).
   Chrome raises the window before the answer lands (measured on Chrome 154). For
   a tab the agent created and you have not engaged with, closes now go through
   `Target.closeTarget`, which skips `beforeunload` (unload still runs), and
-  in-place navigations first remove the page's `beforeunload` listeners. The
-  page's own `beforeunload` logic does not run on those paths. Your tabs, and an
+  in-place navigations first remove the page's `beforeunload` listeners (put
+  back if the navigation stays in the same document — a `#hash`, a pushState
+  history entry). The page's own `beforeunload` logic does not run on those
+  paths. The tab reaper never falls back to a prompt-raising removal: a tab it
+  cannot close quietly stays open. Your tabs, and an
   agent tab you activated or dragged into your own window, keep Chrome's
   prompt. Without a debugger foothold (DevTools open on the tab) it falls back
   to the previous behaviour; a link click or form submit that leaves a page is
@@ -28,8 +31,8 @@ uses [Semantic Versioning](https://semver.org/).
 - Creating an agent window no longer brings a backgrounded Chrome to the front.
   If the new window took focus, the previously focused window was re-focused —
   even when that window only was the last one used and you were in another app,
-  in which case focusing it activated Chrome. It is now re-focused only when it
-  actually had focus.
+  in which case focusing it activated Chrome. It is now re-focused only when the
+  new window really holds focus (Chrome is then already the frontmost app).
 
 ## [0.26.0] — 2026-10-02
 

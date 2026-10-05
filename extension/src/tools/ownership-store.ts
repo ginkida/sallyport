@@ -24,7 +24,7 @@ import {
   reconcileEpochs,
   serializeEpochs,
 } from './ownership.js';
-import { closeTabQuietly, mayCloseQuietly } from './quiet-leave.js';
+import { closeAgentTab, pageTargets } from './quiet-leave.js';
 
 const STORE_KEY = 'sallyport_epochs';
 
@@ -66,9 +66,10 @@ export async function reconcileWithLiveTabs(): Promise<void> {
  *
  * `chrome.tabs.remove` resolves only once the tab is GONE, and a page with a
  * `beforeunload` handler can hold that open indefinitely (the dialog is browser
- * UI; with dialog handling off, nobody answers it). The quiet close avoids the
- * prompt for our own tabs, but falls back to exactly that removal when it has
- * no debugger foothold. This runs on the create
+ * UI; with dialog handling off, nobody answers it). The reaper therefore closes
+ * QUIETLY ONLY (`closeAgentTab` with `quietOnly`) and never uses that removal;
+ * the deadline bounds the quiet attempt (a debugger attach, the close, the
+ * wait for `tabs.onRemoved`). This runs on the create
  * path, so an unbounded wait would hang the agent's `navigate` behind a page
  * nobody is looking at. */
 const EVICT_DEADLINE_MS = 2000;
@@ -97,6 +98,7 @@ export async function reapAgentTabs(session?: string): Promise<number[]> {
   if (doomed.length === 0) return [];
 
   const closed: number[] = [];
+  const targets = await pageTargets();
   await Promise.all(
     doomed.map(async (tabId) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -105,12 +107,13 @@ export async function reapAgentTabs(session?: string): Promise<number[]> {
       });
       try {
         const outcome = await Promise.race([
-          // Quietly: an evicted tab with a beforeunload handler would otherwise
-          // raise its agent window over the human's work (quiet-leave.ts).
-          // planEviction never picks a human-engaged tab; the check is a
-          // second, local answer to the same question.
-          (mayCloseQuietly(tabId) ? closeTabQuietly(tabId) : chrome.tabs.remove(tabId)).then(
-            () => 'closed' as const,
+          // QUIET ONLY: an evicted tab with a beforeunload handler would
+          // otherwise raise its agent window over the human's work to ask
+          // (quiet-leave.ts). Housekeeping never pays for itself with focus
+          // theft — a tab that cannot go quietly is kept, not removed with a
+          // prompt (and nothing is left running that could raise one later).
+          closeAgentTab(tabId, { quietOnly: true, targets }).then((outcome) =>
+            outcome === 'quiet' ? ('closed' as const) : ('kept' as const),
           ),
           deadline,
         ]);

@@ -29,7 +29,7 @@ import {
   mintEpoch,
   setBrokerMode,
 } from '../src/tools/ownership.js';
-import { resetAgentWindow } from '../src/tools/agent-window.js';
+import { resetAgentWindow, shouldRestoreFocus } from '../src/tools/agent-window.js';
 import { resetAttachedTabs } from '../src/tools/cdp.js';
 
 type MockTab = { id: number; url: string; status?: string; windowId?: number };
@@ -193,7 +193,12 @@ function installChromeMock(opts: {
       },
       getTargets() {
         return Promise.resolve(
-          [...byId.keys()].map((tabId) => ({ id: `T${tabId}`, tabId, attached: false })),
+          [...byId.keys()].map((tabId) => ({
+            id: `T${tabId}`,
+            tabId,
+            type: 'page',
+            attached: false,
+          })),
         );
       },
       sendCommand(target: { tabId: number }, method: string, params?: Record<string, unknown>) {
@@ -208,6 +213,12 @@ function installChromeMock(opts: {
         }
         if (method === 'Runtime.evaluate' && params?.expression === 'window') {
           return Promise.resolve({ result: { objectId: 'window-1' } });
+        }
+        if (
+          method === 'Runtime.callFunctionOn' &&
+          String(params?.functionDeclaration).includes('return this.onbeforeunload')
+        ) {
+          return Promise.resolve({ result: { type: 'function', objectId: 'idl-1' } });
         }
         if (method === 'DOMDebugger.getEventListeners') {
           return Promise.resolve({
@@ -235,7 +246,12 @@ function installChromeMock(opts: {
         return Promise.resolve({ id: winId, tabs: [tab] });
       },
       get(windowId: number) {
-        if (windows.has(windowId)) return Promise.resolve({ id: windowId });
+        if (windows.has(windowId)) {
+          return Promise.resolve({
+            id: windowId,
+            focused: (opts.chromeFocused ?? true) && focusedWindowId === windowId,
+          });
+        }
         return Promise.reject(new Error('no such window'));
       },
       getLastFocused() {
@@ -1044,6 +1060,28 @@ describe('navigate — the tab reaper (maxAgentTabs)', () => {
     expect(agentTabIds()).toEqual(new Set([1000, 1001]));
   });
 
+  it('never falls back to a prompt-raising tabs.remove: a tab that cannot go quietly is kept', async () => {
+    const calls = await primed({}, 2);
+    setBrokerMode(true);
+    await navigate({ url: ALLOW }, { client: 'alpha' }); // 999
+    await navigate({ url: ALLOW }, { client: 'alpha' }); // 1000
+    // No quiet route any more (DevTools now holds the tab, say).
+    const dbg = (
+      globalThis as unknown as {
+        chrome: { debugger: { sendCommand: (...a: unknown[]) => unknown } };
+      }
+    ).chrome.debugger;
+    const real = dbg.sendCommand;
+    dbg.sendCommand = (target, method, params) =>
+      method === 'Target.closeTarget'
+        ? Promise.reject(new Error('Debugger is not attached to the tab'))
+        : real(target, method, params);
+    await navigate({ url: ALLOW }, { client: 'alpha' }); // 1001: 999 should go, cannot
+    expect(calls.removed).toEqual([]);
+    expect(calls.closedQuietly).toEqual([]);
+    expect(agentTabIds()).toEqual(new Set([999, 1000, 1001])); // kept, still sweepable
+  });
+
   it('never retires a tab a DIFFERENT live session owns', async () => {
     const calls = await primed({}, 1);
     setBrokerMode(true);
@@ -1116,13 +1154,23 @@ describe('no beforeunload prompt for the agent own tab (focus theft)', () => {
     expect(calls.closedQuietly).toEqual([]);
   });
 
-  it('close_tab keeps the prompt in standalone (not an agent tab)', async () => {
+  it('close_tab keeps the prompt for a tab no agent created (standalone)', async () => {
     const calls = installChromeMock({ tabs: [{ id: 7, url: 'https://allowed.example/form' }] });
     await setAllowlist(ALLOWED);
-    mintEpoch(7); // a leftover epoch must not matter outside broker mode
     await closeTab({ tabId: 7 });
     expect(calls.removed).toEqual([7]);
     expect(calls.closedQuietly).toEqual([]);
+  });
+
+  it('close_tab follows the same rule as every other close: an agent tab goes quietly', async () => {
+    // One policy (quiet-leave.ts:closeAgentTab) for close_tab, the reaper,
+    // _release_tabs and the sweep — an epoch the human never engaged with.
+    const calls = installChromeMock({ tabs: [{ id: 7, url: 'https://allowed.example/form' }] });
+    await setAllowlist(ALLOWED);
+    mintEpoch(7);
+    await closeTab({ tabId: 7 });
+    expect(calls.closedQuietly).toEqual([7]);
+    expect(calls.removed).toEqual([]);
   });
 
   it('falls back to tabs.remove when there is no debugger foothold', async () => {
@@ -1154,6 +1202,61 @@ describe('no beforeunload prompt for the agent own tab (focus theft)', () => {
       calls.cdp.findIndex((c) => c.method === '(tabs.update)'),
     );
     expect(calls.update).toEqual([{ tabId: 7, url: ALLOW }]);
+  });
+
+  it('a #hash navigate stays in the document, so the leave guard is put back', async () => {
+    // Same loader id before and after (the mock never changes it): the page
+    // did not leave, and must not live on without its beforeunload guard.
+    const calls = await brokerTab();
+    const dbg = (
+      globalThis as unknown as {
+        chrome: { debugger: { sendCommand: (...a: unknown[]) => Promise<unknown> } };
+      }
+    ).chrome.debugger;
+    const real = dbg.sendCommand;
+    dbg.sendCommand = (target, method, params) =>
+      method === 'Page.getFrameTree'
+        ? (calls.cdp.push({ tabId: 7, method }),
+          Promise.resolve({ frameTree: { frame: { id: 'F', loaderId: 'L1' } } }))
+        : real(target, method, params);
+    await navigate({ url: 'https://allowed.example/form#section', tabId: 7 });
+    const fns = calls.cdp
+      .filter((c) => c.method === 'Runtime.callFunctionOn')
+      .map((c) => String(c.params?.functionDeclaration));
+    expect(fns.some((f) => f.includes('addEventListener'))).toBe(true);
+    expect(fns.some((f) => f.includes('this.onbeforeunload = fn'))).toBe(true);
+    const add = calls.cdp.find((c) =>
+      String(c.params?.functionDeclaration).includes('addEventListener'),
+    );
+    // The IDL handler travels along so it is restored as a handler, not re-added.
+    expect(add?.params?.arguments).toEqual([
+      { objectId: 'h-1' },
+      { value: false },
+      { objectId: 'idl-1' },
+    ]);
+    // ...and only after the navigation.
+    expect(calls.cdp.indexOf(add!)).toBeGreaterThan(
+      calls.cdp.findIndex((c) => c.method === '(tabs.update)'),
+    );
+  });
+
+  it('a navigate that changes document puts nothing back', async () => {
+    const calls = await brokerTab();
+    const dbg = (
+      globalThis as unknown as {
+        chrome: { debugger: { sendCommand: (...a: unknown[]) => Promise<unknown> } };
+      }
+    ).chrome.debugger;
+    const real = dbg.sendCommand;
+    let loader = 0;
+    dbg.sendCommand = (target, method, params) =>
+      method === 'Page.getFrameTree'
+        ? Promise.resolve({ frameTree: { frame: { id: 'F', loaderId: `L${++loader}` } } })
+        : real(target, method, params);
+    await navigate({ url: ALLOW, tabId: 7 });
+    expect(
+      calls.cdp.some((c) => String(c.params?.functionDeclaration).includes('addEventListener')),
+    ).toBe(false);
   });
 
   it('reload of the agent own tab disarms too', async () => {
@@ -1219,6 +1322,17 @@ describe('agent window — focus restore never activates a Chrome that was in th
     setBrokerMode(true);
     await navigate({ url: ALLOW }, { client: 'alpha' });
     expect(calls.windowsFocus).toEqual([{ windowId: 1, focused: true }]);
+  });
+
+  it('shouldRestoreFocus: only a different, TRULY focused new window', () => {
+    expect(shouldRestoreFocus(1, { id: 2, focused: true })).toBe(true);
+    // Backgrounded Chrome, new window not really focused: touch nothing.
+    expect(shouldRestoreFocus(1, { id: 2, focused: false })).toBe(false);
+    expect(shouldRestoreFocus(1, { id: 2 })).toBe(false);
+    // Same window, or nothing to go back to: no-op.
+    expect(shouldRestoreFocus(2, { id: 2, focused: true })).toBe(false);
+    expect(shouldRestoreFocus(undefined, { id: 2, focused: true })).toBe(false);
+    expect(shouldRestoreFocus(1, undefined)).toBe(false);
   });
 
   it('does nothing when focused:false was honoured', async () => {

@@ -127,9 +127,10 @@ fallback) are what an agent normally sees. `--no-broker` /
 `SALLYPORT_NO_BROKER=1` restores single-session standalone behaviour.
 
 Each session's tabs open in **its own** non-focused window, muted, with the
-human's previously-focused window restored afterwards — only when Chrome
-actually had focus, since focusing a window of a Chrome the human was not using
-would bring the whole app to the front (macOS). Those are ordinary
+human's previously-focused window restored afterwards — only when the new
+window really took focus (Chrome is then already frontmost); focusing a window
+of a Chrome the human was not using would bring the whole app to the front
+(macOS). Those are ordinary
 windows in the human's profile — same cookie jar, same logins — because the
 point of driving the user's own browser is that an agent inherits the sessions
 they are already signed into. The separation is ownership, never identity: there
@@ -402,12 +403,17 @@ its window, even when a CDP client answers the dialog at once; on macOS the
 whole app comes to the front, and the close or navigation waits for a human
 click. So for a tab the agent CREATED and the human has not engaged with
 (`quiet-leave.ts:mayCloseQuietly`), the prompt is never raised: every close
-(`close_tab`, the tab reaper, `_release_tabs`' close, the popup sweep) goes
-through `Target.closeTarget`, which closes without running `beforeunload`
-(unload still runs — what Puppeteer's `page.close()` does), and an in-place
+(`close_tab`, the tab reaper, `_release_tabs`' close, the popup sweep — one
+helper, `closeAgentTab`) goes through `Target.closeTarget` on the tab's own
+PAGE target, which closes without running `beforeunload` (unload still runs —
+what Puppeteer's `page.close()` does), and an in-place
 `navigate`/`reload`/`history_go` first removes the main frame's `beforeunload`
-listeners (`DOMDebugger.getEventListeners` + two fixed functions, handler passed
-as a structured argument). What that means and what it doesn't:
+listeners (`DOMDebugger.getEventListeners`; each listener by the object the page
+REGISTERED — a `handleEvent` object, a bound function — plus the
+`onbeforeunload` IDL handler, through fixed functions with the handler passed as
+a structured argument). If the navigation stays in the same document (a
+`#hash`, a pushState history entry — same main-frame loader id), exactly those
+listeners and the handler are put back. What that means and what it doesn't:
 
 - **The page's own `beforeunload` logic does not run** on those paths — a
   last-moment draft save or analytics beacon tied to it is skipped. Leaving is
@@ -418,7 +424,9 @@ as a structured argument). What that means and what it doesn't:
   their typing.
 - **Best effort, falls back to the old behaviour.** No debugger foothold
   (DevTools open on the tab, a page extensions may not debug) → plain
-  `chrome.tabs.remove`, and the prompt can appear. A page frozen on an
+  `chrome.tabs.remove`, and the prompt can appear — except for the tab reaper,
+  which only ever closes quietly: a housekeeping close is never worth a raised
+  window, so such a tab is simply not evicted that time. A page frozen on an
   `alert()` gets `DISARM_DEADLINE_MS` (1.5 s) and then navigates with its
   listeners in place. The removal runs in the page's main world, so a page that
   replaced `removeEventListener` keeps its prompt — it can only annoy, never

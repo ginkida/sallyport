@@ -72,7 +72,7 @@ function installChromeMock(opts: { removeFails?: Set<number>; quietClose?: boole
       ...(opts.quietClose
         ? {
             async getTargets() {
-              return [11, 12].map((tabId) => ({ id: `T${tabId}`, tabId }));
+              return [11, 12].map((tabId) => ({ id: `T${tabId}`, tabId, type: 'page' }));
             },
             async attach() {},
             async sendCommand(target: { tabId: number }, method: string) {

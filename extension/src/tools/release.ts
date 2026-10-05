@@ -27,7 +27,7 @@ import { getSettings } from '../storage.js';
 import { detach } from './cdp.js';
 import { dropEpoch, getEpoch, markOrphanedTab } from './ownership.js';
 import { persistEpochs } from './ownership-store.js';
-import { closeTabQuietly, mayCloseQuietly } from './quiet-leave.js';
+import { closeAgentTab, pageTargets, type PageTargets } from './quiet-leave.js';
 import type { Tool } from './types.js';
 
 /** What to do with a disconnected session's tab.
@@ -87,6 +87,7 @@ const RELEASE_CONCURRENCY = 8;
 async function releaseOne(
   entry: ReleaseEntry,
   action: 'close' | 'hand-back',
+  targets?: PageTargets,
 ): Promise<{ released: boolean; closed: boolean; dropped: boolean }> {
   const { tabId } = entry;
   const minted = getEpoch(tabId);
@@ -102,8 +103,7 @@ async function releaseOne(
     // which would hold this release until someone answered it
     // (quiet-leave.ts). A tab the human engaged with keeps its prompt.
     try {
-      if (mayCloseQuietly(tabId)) await closeTabQuietly(tabId);
-      else await chrome.tabs.remove(tabId);
+      await closeAgentTab(tabId, { targets });
       return { released: true, closed: true, dropped: dropEpoch(tabId) };
     } catch {
       // Still there (or already gone). Fall back to handing it back, and KEEP
@@ -144,10 +144,12 @@ export const releaseTabs: Tool = async (args) => {
   let released = 0;
   let closed = 0;
   let changed = false;
+  // One target lookup for the whole release, not one per tab.
+  const targets = action === 'close' ? await pageTargets() : undefined;
 
   for (let i = 0; i < entries.length; i += RELEASE_CONCURRENCY) {
     const batch = entries.slice(i, i + RELEASE_CONCURRENCY);
-    const outcomes = await Promise.all(batch.map((entry) => releaseOne(entry, action)));
+    const outcomes = await Promise.all(batch.map((entry) => releaseOne(entry, action, targets)));
     for (const outcome of outcomes) {
       if (outcome.released) released++;
       if (outcome.closed) closed++;

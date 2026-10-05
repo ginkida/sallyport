@@ -149,6 +149,8 @@ const server = createServer((req, res) => {
       '<!doctype html><title>Unsaved</title>' +
         '<input id="draft" style="position:absolute;left:10px;top:10px;width:200px;height:30px">' +
         '<script>addEventListener("beforeunload", (e) => { e.preventDefault(); e.returnValue = ""; });' +
+        // A handleEvent OBJECT: removeEventListener must be handed the object.
+        'addEventListener("beforeunload", { handleEvent(e) { e.preventDefault(); } }, true);' +
         'onbeforeunload = () => "unsaved";</script>',
     );
   } else if (req.url?.startsWith('/pwframe')) {
@@ -239,7 +241,7 @@ try {
         import './src/background.ts';
         import { mintEpoch, markHumanTab, markOrphanedTab } from './src/tools/ownership.ts';
         import { attach } from './src/tools/cdp.ts';
-        import { closeTabQuietly, disarmBeforeUnload } from './src/tools/quiet-leave.ts';
+        import { closeAgentTab, disarmBeforeUnload, rearmIfSameDocument } from './src/tools/quiet-leave.ts';
         // Focus theft: a beforeunload prompt makes Chrome ACTIVATE the tab and
         // FOCUS its window. The agent's own tab must leave without raising one.
         globalThis.quietLeaveTest = async (base) => {
@@ -273,20 +275,46 @@ try {
             events.length = 0;
             out.controlRemove = await settled(chrome.tabs.remove(control), 1500);
             out.controlEvents = [...events];
-            out.controlCleanup = await bounded(closeTabQuietly(control), 5000, 'cleanup');
+            // The prompt ACTIVATED the tab in a focused window, which reads as the
+            // human engaging with it — one more thing the old behaviour got wrong
+            // — so it is no longer quietly closable; close its target directly.
+            const controlTarget = (await chrome.debugger.getTargets()).find(
+              (t) => t.tabId === control && t.type === 'page',
+            );
+            await chrome.debugger
+              .sendCommand({ tabId: control }, 'Target.closeTarget', { targetId: controlTarget.id })
+              .catch(() => {});
+            await sleep(200);
+            out.controlGone = !(await exists(control));
             const closing = await dirtyTab();
             events.length = 0;
-            out.close = await bounded(closeTabQuietly(closing), 5000, 'quiet close');
+            out.close = await bounded(closeAgentTab(closing), 5000, 'quiet close');
             out.closeGone = !(await exists(closing));
             out.closeEvents = [...events];
             const leaving = await dirtyTab();
+            const send = (method, params) => chrome.debugger.sendCommand({ tabId: leaving }, method, params);
+            const count = async () => {
+              const { result } = await send('Runtime.evaluate', { expression: 'window', objectGroup: 'smoke' });
+              const { listeners } = await send('DOMDebugger.getEventListeners', { objectId: result.objectId });
+              await send('Runtime.releaseObjectGroup', { objectGroup: 'smoke' });
+              return listeners.filter((l) => l.type === 'beforeunload').length;
+            };
+            // A same-document navigate (#hash) must hand the page its guard back.
+            out.listenersBefore = await count();
+            const hashDisarm = await disarmBeforeUnload(leaving);
+            out.listenersDisarmed = await count();
+            await chrome.tabs.update(leaving, { url: base + '/beforeunload#later' });
+            for (let i = 0; i < 60 && !(await chrome.tabs.get(leaving)).url.endsWith('#later'); i++) await sleep(50);
+            out.rearmed = await rearmIfSameDocument(leaving, hashDisarm);
+            out.listenersRearmed = await count();
+            out.idlBack = (await send('Runtime.evaluate', { expression: 'typeof onbeforeunload', returnByValue: true })).result.value;
             events.length = 0;
-            out.disarmed = await disarmBeforeUnload(leaving);
+            out.disarmed = (await disarmBeforeUnload(leaving))?.handlers.length ?? 0;
             await chrome.tabs.update(leaving, { url: base + '/?left' });
             for (let i = 0; i < 60 && !(await chrome.tabs.get(leaving)).url.endsWith('/?left'); i++) await sleep(50);
             out.leftUrl = (await chrome.tabs.get(leaving)).url;
             out.quietEvents = [...events];
-            await closeTabQuietly(leaving);
+            await closeAgentTab(leaving);
           } finally {
             chrome.tabs.onActivated.removeListener(onActivated);
             chrome.windows.onFocusChanged.removeListener(onFocus);
@@ -695,13 +723,21 @@ try {
     q.controlEvents.some((e) => e.startsWith('activated:')),
     JSON.stringify(q),
   );
-  assert.equal(q.controlCleanup, 'quiet', JSON.stringify(q));
+  assert.ok(q.controlGone, JSON.stringify(q));
   // The agent's own tab closes and navigates away with no prompt, nothing
   // activated, no window focused.
   assert.equal(q.close, 'quiet', JSON.stringify(q));
   assert.ok(q.closeGone, JSON.stringify(q));
   assert.deepEqual(q.closeEvents, [], JSON.stringify(q));
-  assert.ok(q.disarmed >= 1, JSON.stringify(q));
+  assert.ok(q.disarmed >= 3, JSON.stringify(q));
+  // The IDL handler is reported too (3 = listener + handleEvent object + IDL),
+  // every one of them goes — the object only by its originalHandler — and a
+  // same-document navigate puts back exactly what was there, no duplicate.
+  assert.equal(q.listenersBefore, 3, JSON.stringify(q));
+  assert.equal(q.listenersDisarmed, 0, JSON.stringify(q));
+  assert.equal(q.rearmed, true, JSON.stringify(q));
+  assert.equal(q.listenersRearmed, 3, JSON.stringify(q));
+  assert.equal(q.idlBack, 'function', JSON.stringify(q));
   assert.ok(q.leftUrl.endsWith('/?left'), JSON.stringify(q));
   assert.deepEqual(q.quietEvents, [], JSON.stringify(q));
   console.log(

@@ -178,7 +178,8 @@ TOOLS: list[Tool] = [
             "closed tab answers tab_gone. Call close_tab when you are done with a tab. "
             "Navigating a tab you created away from its page raises no 'Leave site?' "
             "prompt (unless the human has used that tab): its beforeunload handlers "
-            "are removed first, so whatever the page does on leave does not run. "
+            "are removed first, so whatever the page does on leave does not run "
+            "(a #hash navigate stays in the page and gets them back). "
             "waitFor polls after the "
             "load until a selector/text shows up — on SPAs 'loaded' rarely means "
             "'rendered', so prefer navigate+waitFor over navigate then wait_for. "
@@ -214,9 +215,9 @@ TOOLS: list[Tool] = [
             "allowlist, otherwise the call fails with domain_not_allowed "
             "(prevents an agent from closing non-allowlisted tabs it can "
             "still see via list_tabs). A tab you created (broker mode) is exempt "
-            "from that check and, unless the human has used it, closes without its "
-            "'Leave site?' prompt — the page's beforeunload handlers do not run, so "
-            "unsaved input on it is discarded."
+            "from that check. Any tab an agent created closes, unless the human has "
+            "used it, without its 'Leave site?' prompt — the page's beforeunload "
+            "handlers do not run, so unsaved input on it is discarded."
         ),
         inputSchema={
             "type": "object",
@@ -239,7 +240,9 @@ TOOLS: list[Tool] = [
             "session expired and the app bounced you to a login page. Refs are "
             "invalidated, so pass observe:{snapshot:'compact'} to get fresh ones "
             "back here rather than spending a snapshot call on it. A tab you "
-            "created reloads without a 'Leave site?' prompt."
+            "created reloads without a 'Leave site?' prompt (unless the human has "
+            "used that tab): its beforeunload handlers are removed first, so "
+            "whatever the page does on leave does not run."
         ),
         inputSchema={
             "type": "object",
@@ -270,7 +273,10 @@ TOOLS: list[Tool] = [
             "fire a load at all. On a timeout, do NOT assume the hop failed — "
             "it may have already landed before the load watchdog fired; "
             "check where you are with read_text/snapshot before retrying. "
-            "A tab you created leaves its page without a 'Leave site?' prompt. "
+            "A tab you created (and the human has not used) leaves its page "
+            "without a 'Leave site?' prompt: its beforeunload handlers are "
+            "removed first, so whatever the page does on leave does not run "
+            "(they are put back if the hop stays in the same document). "
             "On any other tab, if a beforeunload prompt on the page you're leaving "
             "gets dismissed (the default unless you armed handle_dialog to "
             "accept it), the hop is verified to have actually happened before "

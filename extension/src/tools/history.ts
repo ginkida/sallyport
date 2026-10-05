@@ -34,7 +34,7 @@ import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { getEpoch, isBrokerMode } from './ownership.js';
 import { parseObserve, runObserve } from './observe.js';
-import { disarmBeforeUnload, mayLeaveQuietly } from './quiet-leave.js';
+import { disarmBeforeUnload, mayLeaveQuietly, rearmIfSameDocument } from './quiet-leave.js';
 import { loadTimeoutMs } from './budget.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { resetRefsForTab } from './refs.js';
@@ -182,10 +182,15 @@ export const historyGo: Tool = async (args, ctx) => {
   // a prompt would raise the agent window over the human's work. Everywhere
   // else a prompt can still cancel the hop, which is what the
   // navigation_cancelled check below is for.
-  if (mayLeaveQuietly(tab.id!)) await disarmBeforeUnload(tab.id!, ctx?.startedAt);
+  const disarmed = mayLeaveQuietly(tab.id!)
+    ? await disarmBeforeUnload(tab.id!, ctx?.startedAt)
+    : null;
   await cdp(tab.id!, 'Page.navigateToHistoryEntry', { entryId: target.id });
   await waitForHistoryTransition(tab.id!, beforeUrl);
   await waitForLoad(tab.id!, 'history_go', loadTimeoutMs(ctx?.startedAt, Date.now()));
+  // A same-document hop (pushState history) never left the page: give it back
+  // the leave guard removed above.
+  if (disarmed) await rearmIfSameDocument(tab.id!, disarmed, ctx?.startedAt);
   // The hop can be CANCELLED without either of the above noticing: a
   // beforeunload prompt that gets dismissed (handle_dialog's own default
   // policy, or a human clicking Cancel) leaves the tab exactly where it

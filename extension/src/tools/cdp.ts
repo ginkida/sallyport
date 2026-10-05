@@ -136,6 +136,15 @@ export function looksLikeLostContextError(e: unknown): boolean {
  * set stays accurate without polling. */
 const attached = new Set<number>();
 
+/** Does THIS worker hold `tabId`'s debugger session? Read-only view of
+ * `attached` for a caller that must not guess from Chrome's "already
+ * attached" (which another client's session — DevTools — answers too).
+ * Ephemeral like the set: after a worker restart a surviving session reads
+ * false until the next `attach`. */
+export function isAttached(tabId: number): boolean {
+  return attached.has(tabId);
+}
+
 /** The device scale factor `set_viewport` is emulating on a tab, when it is.
  *
  * `screenshot` needs it: the returned image is sized by the EMULATED ratio,

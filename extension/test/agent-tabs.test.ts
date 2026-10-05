@@ -104,7 +104,7 @@ describe('sweep closes agent-only tabs without the beforeunload prompt', () => {
         },
       },
       debugger: {
-        getTargets: async () => [1, 2].map((tabId) => ({ id: `T${tabId}`, tabId })),
+        getTargets: async () => [1, 2].map((tabId) => ({ id: `T${tabId}`, tabId, type: 'page' })),
         attach: async () => undefined,
         detach: async () => undefined,
         sendCommand: async (target: { tabId: number }, method: string) => {

@@ -159,6 +159,8 @@ function installHistoryChromeMock(opts: {
   redirectTo?: string;
   /** Every CDP method sent, in order. */
   log?: string[];
+  /** The main frame's loader id `Page.getFrameTree` reports, if any. */
+  loaderId?: string;
 }): void {
   const store = new Map<string, unknown>();
   let currentTab: MockTab = { ...opts.tab, status: opts.tab.status ?? 'complete' };
@@ -225,6 +227,9 @@ function installHistoryChromeMock(opts: {
         opts.log?.push(method);
         if (method === 'Runtime.evaluate' && params?.expression === 'window') {
           return Promise.resolve({ result: { objectId: 'window-1' } });
+        }
+        if (method === 'Page.getFrameTree' && opts.loaderId) {
+          return Promise.resolve({ frameTree: { frame: { id: 'F', loaderId: opts.loaderId } } });
         }
         if (method === 'DOMDebugger.getEventListeners') {
           return Promise.resolve({
@@ -333,13 +338,14 @@ describe('historyGo — the agent own tab hops without a beforeunload prompt', (
     clearAllEpochs();
   });
 
-  async function run(setup: () => void): Promise<string[]> {
+  async function run(setup: () => void, loaderId?: string): Promise<string[]> {
     const log: string[] = [];
     installHistoryChromeMock({
       tab: { id: 1, url: 'https://allowed.example/current' },
       navHistory,
       hopSucceeds: true,
       log,
+      ...(loaderId ? { loaderId } : {}),
     });
     await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
     setup();
@@ -368,5 +374,16 @@ describe('historyGo — the agent own tab hops without a beforeunload prompt', (
       markHumanTab(1);
     });
     expect(log).not.toContain('DOMDebugger.getEventListeners');
+  });
+
+  it('a same-document hop (pushState history) gets its leave guard back', async () => {
+    // The loader id is the same before and after: the page never left.
+    const log = await run(() => {
+      setBrokerMode(true);
+      mintEpoch(1, 'alpha');
+    }, 'L1');
+    const hop = log.indexOf('Page.navigateToHistoryEntry');
+    const after = log.slice(hop);
+    expect(after.filter((m) => m === 'Runtime.callFunctionOn').length).toBeGreaterThan(0);
   });
 });
