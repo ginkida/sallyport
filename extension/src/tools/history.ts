@@ -34,7 +34,7 @@ import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { getEpoch, isBrokerMode } from './ownership.js';
 import { parseObserve, runObserve } from './observe.js';
-import { disarmBeforeUnload, mayLeaveQuietly, rearmIfSameDocument } from './quiet-leave.js';
+import { disarmBeforeUnload, quietLeaveApproved, rearmIfSameDocument } from './quiet-leave.js';
 import { loadTimeoutMs } from './budget.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { resetRefsForTab } from './refs.js';
@@ -182,15 +182,20 @@ export const historyGo: Tool = async (args, ctx) => {
   // a prompt would raise the agent window over the human's work. Everywhere
   // else a prompt can still cancel the hop, which is what the
   // navigation_cancelled check below is for.
-  const disarmed = mayLeaveQuietly(tab.id!)
+  const disarmed = (await quietLeaveApproved(tab.id!))
     ? await disarmBeforeUnload(tab.id!, ctx?.startedAt)
     : null;
-  await cdp(tab.id!, 'Page.navigateToHistoryEntry', { entryId: target.id });
-  await waitForHistoryTransition(tab.id!, beforeUrl);
-  await waitForLoad(tab.id!, 'history_go', loadTimeoutMs(ctx?.startedAt, Date.now()));
-  // A same-document hop (pushState history) never left the page: give it back
-  // the leave guard removed above.
-  if (disarmed) await rearmIfSameDocument(tab.id!, disarmed, ctx?.startedAt);
+  try {
+    await cdp(tab.id!, 'Page.navigateToHistoryEntry', { entryId: target.id });
+    await waitForHistoryTransition(tab.id!, beforeUrl);
+    await waitForLoad(tab.id!, 'history_go', loadTimeoutMs(ctx?.startedAt, Date.now()));
+  } finally {
+    // On every path out, a throw included: a same-document hop (pushState
+    // history) or one that never happened left the page where it was — give
+    // it back the leave guard removed above, minus what the page dropped
+    // itself on the way (quiet-leave.ts). No-op on a new document.
+    await rearmIfSameDocument(tab.id!, disarmed);
+  }
   // The hop can be CANCELLED without either of the above noticing: a
   // beforeunload prompt that gets dismissed (handle_dialog's own default
   // policy, or a human clicking Cancel) leaves the tab exactly where it

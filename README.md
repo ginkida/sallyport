@@ -224,7 +224,8 @@ What you get:
   a backgrounded Chrome to the front). Screenshots work there too, without foregrounding
   anything. An agent closing or navigating away from its own tab never raises a
   "Leave site?" / "Close site?" prompt — Chrome would bring the agent window to
-  the front to show it and wait for your click — while your own tabs keep it.
+  the front to show it and wait for your click — while your own tabs, and an
+  agent tab you used or have in front of you, keep it.
 - **You can see who did what.** The popup's Audit tab tags every row with the
   session (its folder name by default), and its **Agent tabs** section lists what
   each session left open, with a one-click sweep.

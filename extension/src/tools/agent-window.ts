@@ -46,6 +46,18 @@ let loading: Promise<void> | null = null;
  * concurrent create-own navigates would otherwise each pass the null check and
  * each create a window, permanently orphaning one of them. */
 const creating = new Map<string, Promise<chrome.windows.Window>>();
+/** Every window creation, ACROSS sessions, runs one after another. The focus
+ * restore in `createWindowFor` reads "the window the human had" before its
+ * create and hands focus back after it; two sessions' creations interleaved
+ * would let the second read the FIRST one's freshly raised agent window as
+ * the human's — and hand focus back to it, over the human's real window. */
+let creationChain: Promise<unknown> = Promise.resolve();
+
+function serialiseCreation<T>(work: () => Promise<T>): Promise<T> {
+  const run = creationChain.then(work, work);
+  creationChain = run.catch(() => undefined);
+  return run;
+}
 
 function slot(session?: string): string {
   return session ?? '';
@@ -192,7 +204,7 @@ export async function createAgentTab(url: string, session?: string): Promise<chr
   let pending = creating.get(key);
   const isCreator = pending === undefined;
   if (pending === undefined) {
-    pending = createWindowFor(key, url);
+    pending = serialiseCreation(() => createWindowFor(key, url));
     creating.set(key, pending);
     void pending.catch(() => undefined).then(() => creating.delete(key));
   }
@@ -229,8 +241,18 @@ export async function agentWindowIds(): Promise<Set<number>> {
  * at face value and make the session's first tab permanently un-reapable. A
  * window the human deliberately raised is never one we made a moment ago. */
 export function wasJustCreated(windowId: number, graceMs: number): boolean {
+  return graceRemainingMs(windowId, graceMs) > 0;
+}
+
+/** How much of `graceMs` is left for a window WE created (0 = none: not ours,
+ * or the grace is over). A focus event discounted by `wasJustCreated` is not
+ * proof the human is elsewhere — they may have clicked into the window inside
+ * the grace, or the window may have stayed in front — so background.ts looks
+ * again once this has run out: still focused then is the human's. */
+export function graceRemainingMs(windowId: number, graceMs: number): number {
   const at = createdAt.get(windowId);
-  return at !== undefined && Date.now() - at < graceMs;
+  if (at === undefined) return 0;
+  return Math.max(0, graceMs - (Date.now() - at));
 }
 
 /** Whether `windowId` is one of ours. `screenshot` uses this to decide whether
@@ -248,4 +270,5 @@ export function resetAgentWindow(): void {
   loading = null;
   creating.clear();
   createdAt.clear();
+  creationChain = Promise.resolve();
 }

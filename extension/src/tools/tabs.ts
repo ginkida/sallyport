@@ -24,7 +24,8 @@ import { persistEpochs, reapAgentTabs } from './ownership-store.js';
 import {
   closeAgentTab,
   disarmBeforeUnload,
-  mayLeaveQuietly,
+  isFragmentNavigation,
+  quietLeaveApproved,
   rearmIfSameDocument,
   type Disarmed,
 } from './quiet-leave.js';
@@ -251,9 +252,16 @@ export const navigate: Tool = async (args, ctx) => {
       // The agent's own tab: leave without Chrome's "Leave site?" prompt, which
       // would raise the agent window over whatever the human is doing and hold
       // the navigation until they answer it (quiet-leave.ts). A human tab
-      // keeps the prompt.
-      if (mayLeaveQuietly(tab.id!)) disarmed = await disarmBeforeUnload(tab.id!, ctx?.startedAt);
-      await chrome.tabs.update(tab.id!, { url });
+      // keeps the prompt; a `#hash` navigate raises none and is left alone.
+      if (!isFragmentNavigation(current, url) && (await quietLeaveApproved(tab.id!))) {
+        disarmed = await disarmBeforeUnload(tab.id!, ctx?.startedAt);
+      }
+      try {
+        await chrome.tabs.update(tab.id!, { url });
+      } catch (e) {
+        await rearmIfSameDocument(tab.id!, disarmed);
+        throw e;
+      }
     }
   }
   // Ownership epoch (broker mode only): a created tab mints a fresh epoch (the
@@ -286,10 +294,12 @@ export const navigate: Tool = async (args, ctx) => {
       throw e;
     }
     loaded = false;
+  } finally {
+    // On EVERY path out, a throw included: a navigation that never committed
+    // (or was cancelled) left the page where it was, and it gets back the
+    // leave guard removed above — no-op on a new document.
+    await rearmIfSameDocument(tab.id!, disarmed);
   }
-  // A `#hash` navigate stays in the same document: give the page back the leave
-  // guard removed above, or it would live on without it.
-  if (disarmed) await rearmIfSameDocument(tab.id!, disarmed, ctx?.startedAt);
   // "Did not reach complete" is usually NOT "nothing to read": one hanging
   // pixel or long-poll keeps a rendered page 'loading' forever. Only a page
   // that has not COMMITTED (url '' / about:blank, the address still in
@@ -402,9 +412,18 @@ export const reload: Tool = async (args, ctx) => {
   // must not block the reload the agent actually asked for.
   await bestEffortAttach(tab.id!);
   // Same as navigate: an agent's own tab reloads without a "Leave site?" prompt.
-  if (mayLeaveQuietly(tab.id!)) await disarmBeforeUnload(tab.id!, ctx?.startedAt);
-  await chrome.tabs.reload(tab.id!, { bypassCache });
-  await waitForLoad(tab.id!, 'reload', loadTimeoutMs(ctx?.startedAt, Date.now()));
+  const disarmed = (await quietLeaveApproved(tab.id!))
+    ? await disarmBeforeUnload(tab.id!, ctx?.startedAt)
+    : null;
+  try {
+    await chrome.tabs.reload(tab.id!, { bypassCache });
+    await waitForLoad(tab.id!, 'reload', loadTimeoutMs(ctx?.startedAt, Date.now()));
+  } finally {
+    // A reload that did not happen — cancelled by a child frame's prompt, a
+    // dismissed "Confirm Form Resubmission", a load that never came — leaves
+    // the same document, which gets its guard back. No-op after a real reload.
+    await rearmIfSameDocument(tab.id!, disarmed);
+  }
   // A reload invalidates any refs we may have built for this tab, and any
   // pending dialog arm (see the identical note in navigate).
   resetRefsForTab(tab.id!);

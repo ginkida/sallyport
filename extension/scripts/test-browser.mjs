@@ -148,10 +148,15 @@ const server = createServer((req, res) => {
     res.end(
       '<!doctype html><title>Unsaved</title>' +
         '<input id="draft" style="position:absolute;left:10px;top:10px;width:200px;height:30px">' +
-        '<script>addEventListener("beforeunload", (e) => { e.preventDefault(); e.returnValue = ""; });' +
+        '<script>const guard = (e) => { e.preventDefault(); e.returnValue = ""; };' +
+        'addEventListener("beforeunload", guard);' +
         // A handleEvent OBJECT: removeEventListener must be handed the object.
         'addEventListener("beforeunload", { handleEvent(e) { e.preventDefault(); } }, true);' +
-        'onbeforeunload = () => "unsaved";</script>',
+        'onbeforeunload = () => "unsaved";' +
+        // What an SPA router does when the editor route unmounts.
+        'window.dropGuard = () => removeEventListener("beforeunload", guard);' +
+        // Back/forward-cache restores are told apart from fresh loads.
+        'window.__shows = []; addEventListener("pageshow", (e) => __shows.push(e.persisted));</script>',
     );
   } else if (req.url?.startsWith('/pwframe')) {
     res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -307,13 +312,31 @@ try {
             for (let i = 0; i < 60 && !(await chrome.tabs.get(leaving)).url.endsWith('#later'); i++) await sleep(50);
             out.rearmed = await rearmIfSameDocument(leaving, hashDisarm);
             out.listenersRearmed = await count();
-            out.idlBack = (await send('Runtime.evaluate', { expression: 'typeof onbeforeunload', returnByValue: true })).result.value;
+            const value = async (expression) => (await send('Runtime.evaluate', { expression, returnByValue: true })).result.value;
+            out.idlBack = await value('typeof onbeforeunload');
+            // The watch is down again: no shadow left on the page's window.
+            out.shadowLeft = await value('Object.prototype.hasOwnProperty.call(window, "removeEventListener")');
+            // The page drops a guard itself while it is down (an SPA route
+            // change): the restore must not bring that one back.
+            const spaDisarm = await disarmBeforeUnload(leaving);
+            await value('history.pushState(null, "", location.pathname + "?list"); dropGuard(); 1');
+            out.spaRearmed = await rearmIfSameDocument(leaving, spaDisarm);
+            out.listenersAfterSpa = await count();
+            await value('addEventListener("beforeunload", guard); history.replaceState(null, "", location.pathname + "#later"); 1');
             events.length = 0;
-            out.disarmed = (await disarmBeforeUnload(leaving))?.handlers.length ?? 0;
+            out.disarmed = (await disarmBeforeUnload(leaving))?.count ?? 0;
             await chrome.tabs.update(leaving, { url: base + '/?left' });
             for (let i = 0; i < 60 && !(await chrome.tabs.get(leaving)).url.endsWith('/?left'); i++) await sleep(50);
             out.leftUrl = (await chrome.tabs.get(leaving)).url;
             out.quietEvents = [...events];
+            // Back to the disarmed document: from the back/forward cache it is
+            // the SAME document, and it must come back with its guard.
+            await chrome.tabs.goBack(leaving);
+            for (let i = 0; i < 60 && !(await chrome.tabs.get(leaving)).url.endsWith('#later'); i++) await sleep(50);
+            for (let i = 0; i < 40 && (await chrome.tabs.get(leaving)).status !== 'complete'; i++) await sleep(50);
+            out.backShows = await value('JSON.stringify(__shows)');
+            out.listenersAfterBack = await count();
+            out.idlAfterBack = await value('typeof onbeforeunload');
             await closeAgentTab(leaving);
           } finally {
             chrome.tabs.onActivated.removeListener(onActivated);
@@ -738,6 +761,14 @@ try {
   assert.equal(q.rearmed, true, JSON.stringify(q));
   assert.equal(q.listenersRearmed, 3, JSON.stringify(q));
   assert.equal(q.idlBack, 'function', JSON.stringify(q));
+  assert.equal(q.shadowLeft, false, JSON.stringify(q));
+  // A guard the page dropped itself while it was down stays dropped.
+  assert.equal(q.spaRearmed, true, JSON.stringify(q));
+  assert.equal(q.listenersAfterSpa, 2, JSON.stringify(q));
+  // A disarmed document restored from the back/forward cache has its guard.
+  assert.equal(q.backShows, '[false,true]', JSON.stringify(q));
+  assert.equal(q.listenersAfterBack, 3, JSON.stringify(q));
+  assert.equal(q.idlAfterBack, 'function', JSON.stringify(q));
   assert.ok(q.leftUrl.endsWith('/?left'), JSON.stringify(q));
   assert.deepEqual(q.quietEvents, [], JSON.stringify(q));
   console.log(

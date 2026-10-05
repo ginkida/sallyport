@@ -27,7 +27,7 @@ import {
   setBrokerMode,
 } from './tools/ownership.js';
 import { loadEpochs, persistEpochs, reconcileWithLiveTabs } from './tools/ownership-store.js';
-import { wasJustCreated } from './tools/agent-window.js';
+import { graceRemainingMs } from './tools/agent-window.js';
 import { closeAgentTabs, listAgentTabs } from './agent-tabs.js';
 import { releaseKeepAwakeEverywhere, sweepStrandedHygiene } from './tools/cdp.js';
 import { installCaptureSettingsListener } from './tools/capture-settings.js';
@@ -217,19 +217,35 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
 // "this is mine now", and the reason ownership never keys on windowId.
 chrome.tabs.onAttached.addListener((tabId) => noteHumanInterest(tabId));
 
+async function noteActiveTabOf(windowId: number): Promise<void> {
+  try {
+    const [active] = await chrome.tabs.query({ active: true, windowId });
+    noteHumanInterest(active?.id);
+  } catch {
+    // window/tab gone between the event and the query
+  }
+}
+
 chrome.windows?.onFocusChanged.addListener((windowId) => {
   // WINDOW_ID_NONE: focus left Chrome entirely.
   if (windowId === chrome.windows.WINDOW_ID_NONE) return;
   if (agentTabIds().size === 0) return; // nothing of ours to mark (standalone)
-  if (wasJustCreated(windowId, HUMAN_FOCUS_GRACE_MS)) return;
-  void (async () => {
-    try {
-      const [active] = await chrome.tabs.query({ active: true, windowId });
-      noteHumanInterest(active?.id);
-    } catch {
-      // window/tab gone between the event and the query
-    }
-  })();
+  const grace = graceRemainingMs(windowId, HUMAN_FOCUS_GRACE_MS);
+  if (grace > 0) {
+    // Focus on a window we created a moment ago is discounted — but NOT
+    // forgotten: if the window still holds focus once the grace is over, the
+    // human is in it (they clicked into it inside the grace, or it stayed in
+    // front of them), and its active tab — already active, so no
+    // onActivated will ever come — is theirs. Otherwise the tab would stay
+    // quietly closable while a person types into it.
+    setTimeout(() => {
+      void (async () => {
+        if (await windowIsFocused(windowId)) await noteActiveTabOf(windowId);
+      })();
+    }, grace + 50);
+    return;
+  }
+  void noteActiveTabOf(windowId);
 });
 
 chrome.runtime.onStartup.addListener(() => void bootBridge());

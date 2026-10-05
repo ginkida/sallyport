@@ -29,10 +29,15 @@ import {
   mintEpoch,
   setBrokerMode,
 } from '../src/tools/ownership.js';
-import { resetAgentWindow, shouldRestoreFocus } from '../src/tools/agent-window.js';
+import {
+  graceRemainingMs,
+  resetAgentWindow,
+  shouldRestoreFocus,
+} from '../src/tools/agent-window.js';
 import { resetAttachedTabs } from '../src/tools/cdp.js';
+import { DISARM_FN, PREPARE_LEAVE_FN, REARM_FN } from '../src/tools/quiet-leave.js';
 
-type MockTab = { id: number; url: string; status?: string; windowId?: number };
+type MockTab = { id: number; url: string; status?: string; windowId?: number; active?: boolean };
 
 type Calls = {
   update: Array<{ tabId: number; url: string }>;
@@ -80,7 +85,8 @@ function installChromeMock(opts: {
   };
   const removedListeners = new Set<(id: number) => void>();
   const byId = new Map<number, MockTab>();
-  const windows = new Set<number>();
+  // Window 1 is the human's own (getLastFocused's default answer).
+  const windows = new Set<number>([1]);
   let nextTabId = 999;
   let nextWindowId = 5000;
   let focusedWindowId = 1;
@@ -216,9 +222,12 @@ function installChromeMock(opts: {
         }
         if (
           method === 'Runtime.callFunctionOn' &&
-          String(params?.functionDeclaration).includes('return this.onbeforeunload')
+          params?.functionDeclaration === PREPARE_LEAVE_FN
         ) {
-          return Promise.resolve({ result: { type: 'function', objectId: 'idl-1' } });
+          return Promise.resolve({ result: { type: 'object', objectId: 'state-1' } });
+        }
+        if (method === 'Runtime.callFunctionOn' && params?.functionDeclaration === REARM_FN) {
+          return Promise.resolve({ result: { type: 'boolean', value: true } });
         }
         if (method === 'DOMDebugger.getEventListeners') {
           return Promise.resolve({
@@ -1129,12 +1138,26 @@ describe('no beforeunload prompt for the agent own tab (focus theft)', () => {
     return calls;
   }
 
-  const disarmed = (calls: Calls) =>
+  const fnCalls = (calls: Calls, fn: string) =>
     calls.cdp.filter(
-      (c) =>
-        c.method === 'Runtime.callFunctionOn' &&
-        String(c.params?.functionDeclaration).includes('removeEventListener'),
+      (c) => c.method === 'Runtime.callFunctionOn' && c.params?.functionDeclaration === fn,
     );
+  const disarmed = (calls: Calls) => fnCalls(calls, DISARM_FN);
+  const rearmed = (calls: Calls) => fnCalls(calls, REARM_FN);
+  type Dbg = { sendCommand: (...a: unknown[]) => Promise<unknown> };
+  type TabsUpdate = (...a: unknown[]) => Promise<unknown>;
+  const dbg = () => (globalThis as unknown as { chrome: { debugger: Dbg } }).chrome.debugger;
+  /** Page.getFrameTree answers these loader ids in turn (the last one repeats). */
+  function loaders(calls: Calls, ...ids: string[]) {
+    const real = dbg().sendCommand;
+    dbg().sendCommand = (target, method, params) => {
+      if (method !== 'Page.getFrameTree') return real(target, method, params);
+      calls.cdp.push({ tabId: 7, method: 'Page.getFrameTree' });
+      const loaderId = ids.length > 1 ? ids.shift() : ids[0];
+      return Promise.resolve({ frameTree: { frame: { id: 'F', loaderId } } });
+    };
+  }
+  const indexOf = (calls: Calls, method: string) => calls.cdp.findIndex((c) => c.method === method);
 
   it('close_tab closes its own tab through Target.closeTarget, never tabs.remove', async () => {
     const calls = await brokerTab();
@@ -1186,87 +1209,120 @@ describe('no beforeunload prompt for the agent own tab (focus theft)', () => {
   it('navigate in place removes the page beforeunload listeners BEFORE moving the tab', async () => {
     const calls = await brokerTab();
     await navigate({ url: ALLOW, tabId: 7 });
-    const removal = disarmed(calls);
-    expect(removal).toHaveLength(1);
+    const prepare = fnCalls(calls, PREPARE_LEAVE_FN);
+    expect(prepare).toHaveLength(1);
     // The handler travels as a structured argument, never interpolated.
-    expect(removal[0].params?.arguments).toEqual([{ objectId: 'h-1' }, { value: false }]);
-    expect(
-      calls.cdp.some(
-        (c) =>
-          c.method === 'Runtime.callFunctionOn' &&
-          String(c.params?.functionDeclaration).includes('onbeforeunload = null'),
-      ),
-    ).toBe(true);
+    expect(prepare[0].params?.arguments).toEqual([{ objectId: 'h-1' }, { value: false }]);
+    expect(disarmed(calls)[0].params?.objectId).toBe('state-1');
     // ...and only then the navigation: the listener must be gone when Chrome asks.
-    expect(calls.cdp.indexOf(removal[0])).toBeLessThan(
-      calls.cdp.findIndex((c) => c.method === '(tabs.update)'),
-    );
+    expect(calls.cdp.indexOf(disarmed(calls)[0])).toBeLessThan(indexOf(calls, '(tabs.update)'));
     expect(calls.update).toEqual([{ tabId: 7, url: ALLOW }]);
   });
 
-  it('a #hash navigate stays in the document, so the leave guard is put back', async () => {
-    // Same loader id before and after (the mock never changes it): the page
-    // did not leave, and must not live on without its beforeunload guard.
+  it('a #hash navigate raises no prompt in Chrome, so it is not disarmed at all', async () => {
+    // Disarming one would only risk the restore: the SPA's own route change
+    // runs in between, on the same document.
     const calls = await brokerTab();
-    const dbg = (
-      globalThis as unknown as {
-        chrome: { debugger: { sendCommand: (...a: unknown[]) => Promise<unknown> } };
-      }
-    ).chrome.debugger;
-    const real = dbg.sendCommand;
-    dbg.sendCommand = (target, method, params) =>
-      method === 'Page.getFrameTree'
-        ? (calls.cdp.push({ tabId: 7, method }),
-          Promise.resolve({ frameTree: { frame: { id: 'F', loaderId: 'L1' } } }))
-        : real(target, method, params);
     await navigate({ url: 'https://allowed.example/form#section', tabId: 7 });
-    const fns = calls.cdp
-      .filter((c) => c.method === 'Runtime.callFunctionOn')
-      .map((c) => String(c.params?.functionDeclaration));
-    expect(fns.some((f) => f.includes('addEventListener'))).toBe(true);
-    expect(fns.some((f) => f.includes('this.onbeforeunload = fn'))).toBe(true);
-    const add = calls.cdp.find((c) =>
-      String(c.params?.functionDeclaration).includes('addEventListener'),
-    );
-    // The IDL handler travels along so it is restored as a handler, not re-added.
-    expect(add?.params?.arguments).toEqual([
-      { objectId: 'h-1' },
-      { value: false },
-      { objectId: 'idl-1' },
-    ]);
-    // ...and only after the navigation.
-    expect(calls.cdp.indexOf(add!)).toBeGreaterThan(
-      calls.cdp.findIndex((c) => c.method === '(tabs.update)'),
-    );
+    expect(calls.cdp.some((c) => c.method === 'DOMDebugger.getEventListeners')).toBe(false);
+    expect(calls.update).toEqual([{ tabId: 7, url: 'https://allowed.example/form#section' }]);
+  });
+
+  it('a navigate that stays on the same document gets the guard back, after the move', async () => {
+    const calls = await brokerTab();
+    loaders(calls, 'L1');
+    await navigate({ url: ALLOW, tabId: 7 });
+    expect(rearmed(calls)).toHaveLength(1);
+    expect(calls.cdp.indexOf(rearmed(calls)[0])).toBeGreaterThan(indexOf(calls, '(tabs.update)'));
   });
 
   it('a navigate that changes document puts nothing back', async () => {
     const calls = await brokerTab();
-    const dbg = (
-      globalThis as unknown as {
-        chrome: { debugger: { sendCommand: (...a: unknown[]) => Promise<unknown> } };
-      }
-    ).chrome.debugger;
-    const real = dbg.sendCommand;
-    let loader = 0;
-    dbg.sendCommand = (target, method, params) =>
-      method === 'Page.getFrameTree'
-        ? Promise.resolve({ frameTree: { frame: { id: 'F', loaderId: `L${++loader}` } } })
-        : real(target, method, params);
+    loaders(calls, 'L1', 'L2');
     await navigate({ url: ALLOW, tabId: 7 });
-    expect(
-      calls.cdp.some((c) => String(c.params?.functionDeclaration).includes('addEventListener')),
-    ).toBe(false);
+    expect(disarmed(calls)).toHaveLength(1);
+    expect(rearmed(calls)).toEqual([]);
+  });
+
+  it('a navigate that THROWS still gives the guard back (the page never left)', async () => {
+    const calls = await brokerTab();
+    loaders(calls, 'L1');
+    const tabs = (
+      globalThis as unknown as {
+        chrome: { tabs: { get: (id: number, cb?: (t?: unknown) => void) => unknown } };
+      }
+    ).chrome.tabs;
+    const realGet = tabs.get;
+    let moved = false;
+    const realUpdate = (globalThis as unknown as { chrome: { tabs: { update: TabsUpdate } } })
+      .chrome.tabs.update;
+    (globalThis as unknown as { chrome: { tabs: { update: TabsUpdate } } }).chrome.tabs.update = (
+      ...a: unknown[]
+    ) => {
+      moved = true;
+      return realUpdate(...a);
+    };
+    // The load watcher loses the tab after the move: waitForLoad throws.
+    tabs.get = (id, cb) => (cb && moved ? cb(undefined) : realGet(id, cb));
+    await expect(navigate({ url: ALLOW, tabId: 7 })).rejects.toMatchObject({ code: 'tab_gone' });
+    expect(rearmed(calls)).toHaveLength(1);
+  });
+
+  it('a tabs.update that rejects still gives the guard back', async () => {
+    const calls = await brokerTab();
+    loaders(calls, 'L1');
+    (globalThis as unknown as { chrome: { tabs: { update: TabsUpdate } } }).chrome.tabs.update =
+      () => Promise.reject(new Error('Cannot navigate'));
+    await expect(navigate({ url: ALLOW, tabId: 7 })).rejects.toThrow(/Cannot navigate/);
+    expect(disarmed(calls)).toHaveLength(1);
+    expect(rearmed(calls)).toHaveLength(1);
   });
 
   it('reload of the agent own tab disarms too', async () => {
     const calls = await brokerTab();
     await reload({ tabId: 7 });
-    const removal = disarmed(calls);
-    expect(removal).toHaveLength(1);
-    expect(calls.cdp.indexOf(removal[0])).toBeLessThan(
-      calls.cdp.findIndex((c) => c.method === '(tabs.reload)'),
-    );
+    expect(disarmed(calls)).toHaveLength(1);
+    expect(calls.cdp.indexOf(disarmed(calls)[0])).toBeLessThan(indexOf(calls, '(tabs.reload)'));
+  });
+
+  it('a reload that did not happen gives the guard back; a real one does not', async () => {
+    // Cancelled by a child frame's prompt, a dismissed form resubmission: the
+    // same document — the old code dropped the disarm result on the floor.
+    let calls = await brokerTab();
+    loaders(calls, 'L1');
+    await reload({ tabId: 7 });
+    expect(rearmed(calls)).toHaveLength(1);
+    expect(calls.cdp.indexOf(rearmed(calls)[0])).toBeGreaterThan(indexOf(calls, '(tabs.reload)'));
+    clearAllEpochs();
+    calls = await brokerTab();
+    loaders(calls, 'L1', 'L2');
+    await reload({ tabId: 7 });
+    expect(rearmed(calls)).toEqual([]);
+  });
+
+  it('the tab the human has in front of them keeps its prompt', async () => {
+    // Active in the focused window: a person may be typing there with no event
+    // ever having marked the tab theirs.
+    const calls = installChromeMock({
+      tabs: [
+        {
+          id: 7,
+          url: 'https://allowed.example/form',
+          status: 'complete',
+          active: true,
+          windowId: 1,
+        },
+      ],
+    });
+    await setAllowlist(ALLOWED);
+    setBrokerMode(true);
+    mintEpoch(7, 'alpha');
+    await navigate({ url: ALLOW, tabId: 7 });
+    await reload({ tabId: 7 });
+    expect(calls.cdp.some((c) => c.method === 'DOMDebugger.getEventListeners')).toBe(false);
+    await closeTab({ tabId: 7 });
+    expect(calls.removed).toEqual([7]);
+    expect(calls.closedQuietly).toEqual([]);
   });
 
   it('a HUMAN tab keeps its prompt: standalone navigate/reload touch no listener', async () => {
@@ -1333,6 +1389,47 @@ describe('agent window — focus restore never activates a Chrome that was in th
     expect(shouldRestoreFocus(2, { id: 2, focused: true })).toBe(false);
     expect(shouldRestoreFocus(undefined, { id: 2, focused: true })).toBe(false);
     expect(shouldRestoreFocus(1, undefined)).toBe(false);
+  });
+
+  it("two sessions' first windows never hand focus to each other's agent window", async () => {
+    // A's restore decision waits on windows.get; B starts meanwhile, while A's
+    // window holds the focus it took. Interleaved, B read A's agent window as
+    // "the window the human had" and handed focus back to it.
+    const calls = installChromeMock({ chromeFocused: true, createStealsFocus: true });
+    await setAllowlist(ALLOWED);
+    setBrokerMode(true);
+    type Win = { get: (id: number) => Promise<unknown> };
+    const w = (globalThis as unknown as { chrome: { windows: Win } }).chrome.windows;
+    const realGet = w.get;
+    let first = true;
+    w.get = async (id: number) => {
+      if (first) {
+        first = false;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return realGet(id);
+    };
+    const a = navigate({ url: ALLOW }, { client: 'alpha' });
+    await new Promise((r) => setTimeout(r, 20));
+    const b = navigate({ url: ALLOW }, { client: 'beta' });
+    await Promise.all([a, b]);
+    expect(calls.windowsCreate).toHaveLength(2);
+    expect(calls.windowsFocus).toEqual([
+      { windowId: 1, focused: true },
+      { windowId: 1, focused: true },
+    ]);
+  });
+
+  it('graceRemainingMs counts down only for a window we created', async () => {
+    installChromeMock({ chromeFocused: true });
+    await setAllowlist(ALLOWED);
+    setBrokerMode(true);
+    await navigate({ url: ALLOW }, { client: 'alpha' });
+    const left = graceRemainingMs(5000, 2000);
+    expect(left).toBeGreaterThan(1500);
+    expect(left).toBeLessThanOrEqual(2000);
+    expect(graceRemainingMs(1, 2000)).toBe(0); // the human's own window
+    expect(graceRemainingMs(5000, 0)).toBe(0);
   });
 
   it('does nothing when focused:false was honoured', async () => {

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { resetAttachedTabs } from '../src/tools/cdp.js';
+import { DISARM_FN, PREPARE_LEAVE_FN, REARM_FN } from '../src/tools/quiet-leave.js';
 import { BridgeError } from '../src/tools/errors.js';
 import {
   historyGo,
@@ -161,6 +162,10 @@ function installHistoryChromeMock(opts: {
   log?: string[];
   /** The main frame's loader id `Page.getFrameTree` reports, if any. */
   loaderId?: string;
+  /** `Page.navigateToHistoryEntry` is refused. */
+  hopThrows?: boolean;
+  /** The functionDeclaration of every `Runtime.callFunctionOn`, in order. */
+  fns?: string[];
 }): void {
   const store = new Map<string, unknown>();
   let currentTab: MockTab = { ...opts.tab, status: opts.tab.status ?? 'complete' };
@@ -225,6 +230,15 @@ function installHistoryChromeMock(opts: {
       },
       sendCommand(_target: { tabId: number }, method: string, params?: Record<string, unknown>) {
         opts.log?.push(method);
+        if (method === 'Runtime.callFunctionOn') {
+          opts.fns?.push(String(params?.functionDeclaration));
+          if (params?.functionDeclaration === PREPARE_LEAVE_FN) {
+            return Promise.resolve({ result: { type: 'object', objectId: 'state-1' } });
+          }
+          if (params?.functionDeclaration === REARM_FN) {
+            return Promise.resolve({ result: { type: 'boolean', value: true } });
+          }
+        }
         if (method === 'Runtime.evaluate' && params?.expression === 'window') {
           return Promise.resolve({ result: { objectId: 'window-1' } });
         }
@@ -240,6 +254,7 @@ function installHistoryChromeMock(opts: {
           return Promise.resolve(opts.navHistory);
         }
         if (method === 'Page.navigateToHistoryEntry') {
+          if (opts.hopThrows) return Promise.reject(new Error('No entry with passed id'));
           if (opts.hopSucceeds) {
             const entry = opts.navHistory.entries.find((e) => e.id === params?.entryId);
             const landedUrl = opts.redirectTo ?? entry?.url;
@@ -338,7 +353,12 @@ describe('historyGo — the agent own tab hops without a beforeunload prompt', (
     clearAllEpochs();
   });
 
-  async function run(setup: () => void, loaderId?: string): Promise<string[]> {
+  async function run(
+    setup: () => void,
+    loaderId?: string,
+    fns?: string[],
+    more: { hopThrows?: boolean } = {},
+  ): Promise<string[]> {
     const log: string[] = [];
     installHistoryChromeMock({
       tab: { id: 1, url: 'https://allowed.example/current' },
@@ -346,6 +366,8 @@ describe('historyGo — the agent own tab hops without a beforeunload prompt', (
       hopSucceeds: true,
       log,
       ...(loaderId ? { loaderId } : {}),
+      ...(fns ? { fns } : {}),
+      ...more,
     });
     await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
     setup();
@@ -360,9 +382,9 @@ describe('historyGo — the agent own tab hops without a beforeunload prompt', (
     });
     const removed = log.indexOf('DOMDebugger.getEventListeners');
     expect(removed).toBeGreaterThan(-1);
-    expect(log.lastIndexOf('Runtime.callFunctionOn')).toBeLessThan(
-      log.indexOf('Page.navigateToHistoryEntry'),
-    );
+    // prepare + disarm both go out before the hop (a restore may follow it).
+    const hop = log.indexOf('Page.navigateToHistoryEntry');
+    expect(log.slice(0, hop).filter((m) => m === 'Runtime.callFunctionOn')).toHaveLength(2);
   });
 
   it('leaves a human tab (standalone) and a human-engaged agent tab alone', async () => {
@@ -385,5 +407,21 @@ describe('historyGo — the agent own tab hops without a beforeunload prompt', (
     const hop = log.indexOf('Page.navigateToHistoryEntry');
     const after = log.slice(hop);
     expect(after.filter((m) => m === 'Runtime.callFunctionOn').length).toBeGreaterThan(0);
+  });
+
+  it('a hop that THROWS still gives the guard back — the page never left', async () => {
+    const fns: string[] = [];
+    await expect(
+      run(
+        () => {
+          setBrokerMode(true);
+          mintEpoch(1, 'alpha');
+        },
+        'L1',
+        fns,
+        { hopThrows: true },
+      ),
+    ).rejects.toThrow(/No entry/);
+    expect(fns).toEqual([PREPARE_LEAVE_FN, DISARM_FN, REARM_FN]);
   });
 });
