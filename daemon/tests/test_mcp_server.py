@@ -443,6 +443,19 @@ def test_no_tool_description_claims_last_used_fallback() -> None:
             assert needle not in desc, f"{tool.name}: stale wording {needle!r}"
 
 
+def test_quiet_leave_descriptions_say_the_onbeforeunload_handler_does_not_run() -> None:
+    """A quiet leave (quiet-leave.ts:PREPARE_LEAVE_FN) lifts the page's
+    `onbeforeunload` IDL handler off — it does not run at all for that leave.
+    Telling the agent "its beforeunload handlers still run" promised a draft
+    save in `window.onbeforeunload = …` that never happens."""
+    for name in ("navigate", "reload", "history_go"):
+        desc = next(t for t in TOOLS if t.name == name).description or ""
+        assert "beforeunload handlers still run" not in desc, name
+        assert "addEventListener still run" in desc, name
+        assert "onbeforeunload handler" in desc, name
+        assert "does NOT run" in desc, name
+
+
 def test_network_tail_explains_every_body_omission_reason() -> None:
     """Each `bodyOmissionReason` the extension can set (network-body-cache.ts's
     `CapturedBody` union) needs its meaning in the description, or the agent

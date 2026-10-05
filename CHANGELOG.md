@@ -22,14 +22,20 @@ uses [Semantic Versioning](https://semver.org/).
   in-place navigations first make the page's `beforeunload` handlers unable to
   cancel the leave: they stay registered and still run (a draft save in one
   still happens), but `preventDefault()` and `returnValue` are swallowed for
-  that event, and the `onbeforeunload` handler is lifted off for the leave. The
+  that event, and an `onbeforeunload` handler is lifted off for the leave and
+  does not run (the agent-facing tool descriptions say so). The
   page's listeners are never removed, so a zone.js (Angular) page keeps its
   guard intact, a `once` listener stays one-shot, and a guard the page drops
   meanwhile — by `removeEventListener` or by aborting its `AbortSignal` — stays
-  dropped. Wherever the page stays — a pushState history entry, a navigation or
-  reload that threw, never committed or was cancelled — it gets its say back,
-  and a page left for another one gets it back if it returns from the
-  back/forward cache. A `#hash` navigate is not touched: Chrome raises no
+  dropped. The disarm covers that one leave only: the page has its guard back
+  as soon as Chrome has asked it, so if you close the tab or follow a link from
+  it while the navigation is still pending (a slow server, a 204, a download),
+  you get the prompt; and a copy of the disarm the page wrapped, cached or froze
+  in place stops working at the restore instead of keeping the page unable to
+  ask for good. Wherever the page stays — a pushState history entry, a
+  navigation or reload that threw, never committed or was cancelled — it gets
+  its say back, and a page left for another one gets it back if it returns
+  from the back/forward cache. A `#hash` navigate is not touched: Chrome raises no
   prompt for it. A disarm that misses its deadline never lands later behind the
   agent's back. The tab reaper never falls back to a prompt-raising removal: a
   tab it cannot close quietly stays open. Your tabs, an agent tab you activated or dragged into your own

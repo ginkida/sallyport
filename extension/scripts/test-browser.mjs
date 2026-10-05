@@ -162,6 +162,17 @@ const server = createServer((req, res) => {
         // Back/forward-cache restores are told apart from fresh loads.
         'window.__shows = []; addEventListener("pageshow", (e) => __shows.push(e.persisted));</script>',
     );
+  } else if (req.url?.startsWith('/slow')) {
+    // A navigation that stays pending: the old document stays on screen.
+    setTimeout(() => {
+      if (res.writableEnded || res.destroyed) return;
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<!doctype html><title>Slow</title><p>slow</p>');
+    }, 4000);
+  } else if (req.url?.startsWith('/nocontent')) {
+    // A navigation that never commits: the tab stays on its document.
+    res.writeHead(204);
+    res.end();
   } else if (req.url?.startsWith('/muxguard')) {
     // What zone.js (Angular) does to EventTarget: ONE native callback per
     // event type, the page's handlers kept in its own task list. A quiet leave
@@ -388,6 +399,32 @@ try {
             for (let i = 0; i < 60 && !(await chrome.tabs.get(mux)).url.endsWith('/?muxleft'); i++) await sleep(50);
             out.muxLeftUrl = (await chrome.tabs.get(mux)).url;
             out.muxEvents = [...events];
+            // The disarm covers ONE leave. A navigation that never commits
+            // (204) leaves the page on its document — guarded again without
+            // any restore from our side.
+            const stays = await dirtyTab();
+            await disarmBeforeUnload(stays);
+            out.staysDisarmed = await valueOn(stays)(pristine);
+            await chrome.tabs.update(stays, { url: base + '/nocontent' });
+            await sleep(1000);
+            out.staysUrl = (await chrome.tabs.get(stays)).url;
+            out.staysPristine = await valueOn(stays)(pristine);
+            await closeAgentTab(stays);
+            // And while a slow navigation is still pending, the human closing
+            // the tab gets the prompt: the guard is back on the old document.
+            const pending = await dirtyTab();
+            await disarmBeforeUnload(pending);
+            await chrome.tabs.update(pending, { url: base + '/slow' });
+            await sleep(700);
+            out.pendingStillOld = (await chrome.tabs.get(pending)).url.includes('/beforeunload');
+            out.pendingRemove = await settled(chrome.tabs.remove(pending), 1500);
+            const pendingTarget = (await chrome.debugger.getTargets()).find(
+              (t) => t.tabId === pending && t.type === 'page',
+            );
+            if (pendingTarget)
+              await chrome.debugger
+                .sendCommand({ tabId: pending }, 'Target.closeTarget', { targetId: pendingTarget.id })
+                .catch(() => {});
             await closeAgentTab(mux);
             await closeAgentTab(leaving);
           } finally {
@@ -809,7 +846,8 @@ try {
   // Disarming leaves every listener registered (only the IDL handler is
   // lifted off), and a same-document navigate gives back exactly that.
   assert.equal(q.listenersBefore, 4, JSON.stringify(q));
-  assert.equal(q.listenersDisarmed, 3, JSON.stringify(q));
+  // Disarmed: the IDL handler is off, the disarm's one-shot restore is on.
+  assert.equal(q.listenersDisarmed, 4, JSON.stringify(q));
   assert.equal(q.pristineDisarmed, false, JSON.stringify(q));
   assert.equal(q.rearmed, true, JSON.stringify(q));
   assert.equal(q.listenersRearmed, 4, JSON.stringify(q));
@@ -833,6 +871,13 @@ try {
   assert.deepEqual(q.muxEvents, [], JSON.stringify(q));
   assert.ok(q.leftUrl.endsWith('/?left'), JSON.stringify(q));
   assert.deepEqual(q.quietEvents, [], JSON.stringify(q));
+  // One leave only: a 204 leaves the document guarded again on its own, and a
+  // close during a still-pending navigation prompts.
+  assert.equal(q.staysDisarmed, false, JSON.stringify(q));
+  assert.ok(q.staysUrl.includes('/beforeunload'), JSON.stringify(q));
+  assert.equal(q.staysPristine, true, JSON.stringify(q));
+  assert.equal(q.pendingStillOld, true, JSON.stringify(q));
+  assert.equal(q.pendingRemove, 'pending', JSON.stringify(q));
   console.log(
     'PASS: an agent tab with a beforeunload handler closes and navigates without a prompt',
   );

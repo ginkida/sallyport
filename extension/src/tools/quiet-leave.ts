@@ -25,13 +25,17 @@
  *    return value the browser applies natively, out of JS's reach) is lifted
  *    off for the duration. ONE fixed function literal does it, with no
  *    arguments at all — no agent input reaches the page (invariant #4's shape;
- *    `PREPARE_LEAVE_FN`). Whatever happens next, the caller hands the result
- *    back to `rearmIfSameDocument` in a `finally`: if the tab is still on the
- *    SAME document (a pushState history entry, a navigation that never
- *    committed, a cancelled reload) the page gets its prototypes and its IDL
- *    handler back; and if the document went into the back/forward cache, it
- *    restores itself on `pageshow` when it comes back. A `#hash` navigate is
- *    not disarmed at all — Chrome runs no `beforeunload` for it.
+ *    `PREPARE_LEAVE_FN`). The disarm covers ONE leave: the page restores
+ *    itself a task after the leave's own `beforeunload` dispatch, so a
+ *    navigation that stays pending (a slow server, a 204, a download) does not
+ *    leave the human's next close or link click unguarded. Whatever happens
+ *    next, the caller hands the result back to `rearmIfSameDocument` in a
+ *    `finally` for the paths with no dispatch: if the tab is still on the SAME
+ *    document (a pushState history entry, a navigation that was never issued)
+ *    the page gets its prototypes and its IDL handler back; and if the
+ *    document went into the back/forward cache, it restores itself on
+ *    `pageshow` when it comes back. A `#hash` navigate is not disarmed at
+ *    all — Chrome runs no `beforeunload` for it.
  *    The page's listener LIST is never touched. Removing and re-adding its
  *    listeners (what this did first) cannot be undone faithfully: the re-add
  *    goes through the page's own `addEventListener`, which a listener
@@ -282,18 +286,35 @@ async function tryQuietClose(tabId: number, targets?: PageTargets): Promise<bool
  *    listeners stay registered and run — they just cannot cancel the leave.
  *    While the IDL handler is off, a write to `onbeforeunload` (an accessor
  *    over the browser's own) marks it as the page's decision.
+ *  - the shadows bite only while the disarm is in force: once `restore()` has
+ *    run they behave exactly like the originals. The descriptors are put back
+ *    too, but a page can hold on to a shadow in ways no restore can reach — a
+ *    wrapper it installed over ours meanwhile, a reference it cached, a
+ *    prototype it froze — and every one of those would otherwise have kept the
+ *    document unable to cancel a leave for the rest of its life.
+ *  - the disarm covers ONE leave: it adds a `beforeunload` listener of its own
+ *    that schedules `restore()` as a task. Chrome decides "prompt or not" as
+ *    soon as the dispatch returns, so the agent's own leave is quiet — and the
+ *    guard is back for whatever happens while that navigation is still pending
+ *    (a slow server, a 204 or a download that never commits): the human
+ *    closing the tab or following a link then gets the prompt. A page that
+ *    stops propagation before our listener runs leaves it to the caller's
+ *    restore.
  *  - `restore()` (once) puts the prototypes' own descriptors back — never over
- *    one the page installed itself meanwhile — and the IDL handler unless the
- *    page wrote one since. Before `disarm()` it is a cancel: a disarm arriving
- *    after it does nothing.
+ *    one the page installed itself meanwhile — takes its own listeners off,
+ *    and the IDL handler back unless the page wrote one since. Before
+ *    `disarm()` it is a cancel: a disarm arriving after it does nothing.
  *  - a `pageshow` listener calls `restore()` when the document comes back from
- *    the back/forward cache: a cross-document leave freezes this very document
- *    — still disarmed — and a later Back revives it. A `beforeunload` listener
- *    does not keep a page out of that cache, and nothing on the extension side
- *    runs at that moment (the human's own Back button counts).
+ *    the back/forward cache: a cross-document leave can freeze this very
+ *    document before the scheduled restore ran, and a later Back revives it. A
+ *    `beforeunload` listener does not keep a page out of that cache, and
+ *    nothing on the extension side runs at that moment (the human's own Back
+ *    button counts).
  *
- * Main-world code, so a page can see the shadows while they exist (sub-second,
- * agent tabs only) and can defeat them (a `preventDefault` it saved earlier,
+ * Main-world code, so a page can see the shadows while they exist (agent tabs
+ * only — from the disarm until the leave's own `beforeunload` dispatch is over,
+ * or, where none is dispatched, until the caller's restore after its load wait)
+ * and can defeat them (a `preventDefault` it saved earlier,
  * `document.body.onbeforeunload`): at worst its own prompt is raised as before
  * or its IDL handler is not given back — it reaches nothing else. A page with
  * no `Event`/`BeforeUnloadEvent` to shadow gets `null`: no quiet leave. Every
@@ -308,6 +329,7 @@ export const PREPARE_LEAVE_FN = `function () {
   if (!pdDesc || typeof pdDesc.value !== 'function' || !rvDesc || !rvDesc.get || !rvDesc.set ||
       !typeDesc || !typeDesc.get) return null;
   var pd = pdDesc.value, typeOf = typeDesc.get, add = w.addEventListener, remove = w.removeEventListener;
+  var later = w.setTimeout;
   var desc, o = w;
   while (o && !(desc = Object.getOwnPropertyDescriptor(o, 'onbeforeunload'))) o = Object.getPrototypeOf(o);
   var accessor = !!(desc && desc.get && desc.set);
@@ -315,17 +337,20 @@ export const PREPARE_LEAVE_FN = `function () {
   var getIdl = function () { return accessor ? desc.get.call(w) : w.onbeforeunload; };
   var setIdl = function (v) { if (accessor) desc.set.call(w, v); else w.onbeforeunload = v; };
   var s = { armed: false, done: false, idl: null, idlTouched: false };
+  var live = function () { return s.armed && !s.done; };
   var noCancel = function preventDefault() {
-    var t = null;
-    try { t = typeOf.call(this); } catch (e) {}
-    if (t === 'beforeunload') return;
+    if (live()) {
+      var t = null;
+      try { t = typeOf.call(this); } catch (e) {}
+      if (t === 'beforeunload') return;
+    }
     return pd.apply(this, arguments);
   };
   var noReturn = {
     configurable: true,
     enumerable: rvDesc.enumerable,
     get: function () { return rvDesc.get.call(this); },
-    set: function (v) {}
+    set: function (v) { if (!live()) rvDesc.set.call(this, v); }
   };
   var hookIdl = accessor ? {
     configurable: true,
@@ -335,8 +360,10 @@ export const PREPARE_LEAVE_FN = `function () {
   } : null;
   var restore;
   var onShow = function (e) { if (e && e.persisted === true) restore(); };
+  var onLeave = function () { try { later.call(w, restore, 0); } catch (e) {} };
   var unhook = function () {
     try { remove.call(w, 'pageshow', onShow); } catch (e) {}
+    try { remove.call(w, 'beforeunload', onLeave); } catch (e) {}
     try {
       var p = Object.getOwnPropertyDescriptor(E, 'preventDefault');
       if (p && p.value === noCancel) Object.defineProperty(E, 'preventDefault', pdDesc);
@@ -373,6 +400,7 @@ export const PREPARE_LEAVE_FN = `function () {
       try { Object.defineProperty(B, 'returnValue', noReturn); } catch (e) {}
       if (hookIdl) try { Object.defineProperty(w, 'onbeforeunload', hookIdl); } catch (e) {}
       try { add.call(w, 'pageshow', onShow); } catch (e) {}
+      if (typeof later === 'function') try { add.call(w, 'beforeunload', onLeave); } catch (e) {}
       try {
         var cur = getIdl();
         if (typeof cur === 'function') { s.idl = cur; setIdl(null); }
@@ -505,9 +533,13 @@ const REARM_LOADER_PEEK_MS = 500;
  * new one the call simply fails, and on the same one it is what keeps the
  * guard from being lost.
  *
+ * A navigation that was actually issued normally finds the page already
+ * restored by itself (one task after the leave's `beforeunload` dispatch, see
+ * `PREPARE_LEAVE_FN`) — this is the backstop for the paths with no dispatch.
+ *
  * Not clamped to the call's budget: it is what puts back a page's own guard,
  * bounded by `DISARM_DEADLINE_MS`, and once sent it runs even if nobody waits.
- * Never throws. Returns whether it restored. */
+ * Never throws. Returns whether it restored (false when the page already had). */
 export async function rearmIfSameDocument(
   tabId: number,
   disarmed: Disarmed | null,

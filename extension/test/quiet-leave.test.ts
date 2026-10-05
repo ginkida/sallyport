@@ -106,6 +106,9 @@ describe('PREPARE_LEAVE_FN, run standalone', () => {
     });
     const nativeCancel = (e: PEvent) => (e._cancelled = true); // C++, no JS involved
     const list: Entry[] = [];
+    // The page's task queue: a timer runs only when the test says the
+    // current dispatch is over.
+    const tasks: Array<() => void> = [];
     let idl: unknown = null;
     const capOf = (o: Opts) => (typeof o === 'boolean' ? o : !!o?.capture);
     const drop = (entry: Entry) => {
@@ -129,6 +132,10 @@ describe('PREPARE_LEAVE_FN, run standalone', () => {
     Object.assign(w, {
       Event: PEvent,
       BeforeUnloadEvent: PBeforeUnloadEvent,
+      setTimeout(fn: () => void) {
+        tasks.push(fn);
+        return tasks.length;
+      },
       addEventListener(type: string, fn: Listener, o?: Opts) {
         const capture = capOf(o);
         if (list.some((e) => e.type === type && e.fn === fn && e.capture === capture)) return;
@@ -170,6 +177,10 @@ describe('PREPARE_LEAVE_FN, run standalone', () => {
         dispatch(e);
       },
       count: (type = 'beforeunload') => list.filter((e) => e.type === type).length,
+      /** The dispatch is over: run the tasks it queued. */
+      runTasks() {
+        for (const fn of tasks.splice(0)) fn();
+      },
     };
   }
   const prepare = new Function(`return (${PREPARE_LEAVE_FN})`)() as (
@@ -224,8 +235,115 @@ describe('PREPARE_LEAVE_FN, run standalone', () => {
     // handler (whose return value the browser applies natively) is lifted off.
     expect(t.hits).toEqual(['plain', 'object']);
     expect(t.w.onbeforeunload).toBeNull();
-    // The page's listener LIST is never touched.
+    // The page's own registrations are never touched; the disarm only adds
+    // its one-shot restore after them.
+    expect(t.list.filter((e) => e.type === 'beforeunload').map((e) => e.capture)).toEqual([
+      false,
+      true,
+      false,
+    ]);
+  });
+
+  it('covers ONE leave: the page has its guard back once that dispatch is over', () => {
+    // A navigation that stays pending (a slow server, a 204, a download) keeps
+    // the old document on screen; a close or link click by the human then
+    // must prompt again.
+    const t = setup();
+    t.ctl.disarm();
+    // A listener the page adds AFTER the disarm runs after the restore's own
+    // one — the restore must wait for the dispatch to end, not run inside it.
+    t.w.addEventListener('beforeunload', (e) =>
+      (e as { preventDefault: () => void }).preventDefault(),
+    );
+    expect(t.leave()).toBe(false); // the agent's leave: quiet
+    expect(t.w.onbeforeunload).toBeNull();
+    t.runTasks();
+    expect(t.w.onbeforeunload).toBe(t.idl);
+    expect(t.leave()).toBe(true); // the human's next one asks
+    expect(t.count()).toBe(3); // the page's two + its later one; ours is gone
+    expect(t.ctl.restore()).toBe(false); // the caller's rearm finds it done
+  });
+
+  it('a page with no setTimeout still disarms (restored by the caller only)', () => {
+    const t = setup();
+    delete (t.w as Record<string, unknown>).setTimeout;
+    const ctl = prepareReported(t);
+    ctl.disarm();
+    expect(t.leave()).toBe(false);
     expect(t.count()).toBe(2);
+    expect(ctl.restore()).toBe(true);
+    expect(t.leave()).toBe(true);
+  });
+
+  describe('a shadow the page holds on to stops biting once restored', () => {
+    // Restore puts a descriptor back only over our exact shadow. Whatever copy
+    // of it outlives the window must fall back to the original, or the
+    // document can never cancel a leave again.
+    function cancelOnly() {
+      const page = fakePage();
+      page.w.addEventListener('beforeunload', (e) =>
+        (e as { preventDefault: () => void }).preventDefault(),
+      );
+      return { ...page, ctl: prepareReported(page) };
+    }
+    const E = (t: ReturnType<typeof cancelOnly>) =>
+      t.PEvent.prototype as unknown as Record<string, unknown>;
+
+    it('a wrapper the page installed over preventDefault meanwhile', () => {
+      const t = cancelOnly();
+      t.ctl.disarm();
+      const inner = E(t).preventDefault as (...a: unknown[]) => unknown;
+      E(t).preventDefault = function (this: unknown, ...a: unknown[]) {
+        return inner.apply(this, a);
+      };
+      expect(t.leave()).toBe(false);
+      expect(t.ctl.restore()).toBe(true);
+      expect(t.leave()).toBe(true);
+    });
+
+    it('a preventDefault the page cached meanwhile and reinstalls later', () => {
+      const t = cancelOnly();
+      t.ctl.disarm();
+      const cached = E(t).preventDefault;
+      t.ctl.restore();
+      E(t).preventDefault = cached;
+      expect(t.leave()).toBe(true);
+    });
+
+    it('a prototype the page froze meanwhile', () => {
+      const t = cancelOnly();
+      t.ctl.disarm();
+      Object.freeze(t.PEvent.prototype);
+      Object.freeze(t.PBeforeUnloadEvent.prototype);
+      t.ctl.restore();
+      expect(t.leave()).toBe(true);
+      // and returnValue too, through the shadow the freeze kept in place
+      const e = new t.PBeforeUnloadEvent();
+      (e as unknown as { returnValue: string }).returnValue = 'unsaved';
+      expect(e._rv).toBe('unsaved');
+    });
+
+    it('a wrapper the page installed over the returnValue setter meanwhile', () => {
+      const page = fakePage();
+      page.w.addEventListener(
+        'beforeunload',
+        (e) => ((e as { returnValue: unknown }).returnValue = 'unsaved'),
+      );
+      const ctl = prepareReported(page);
+      ctl.disarm();
+      const B = page.PBeforeUnloadEvent.prototype;
+      const d = Object.getOwnPropertyDescriptor(B, 'returnValue')!;
+      Object.defineProperty(B, 'returnValue', {
+        configurable: true,
+        get: d.get,
+        set(v: unknown) {
+          d.set!.call(this, v);
+        },
+      });
+      expect(page.leave()).toBe(false);
+      ctl.restore();
+      expect(page.leave()).toBe(true);
+    });
   });
 
   it('only a beforeunload event loses its cancel: any other preventDefault still works', () => {
@@ -289,24 +407,25 @@ describe('PREPARE_LEAVE_FN, run standalone', () => {
     // zone.js registers ONE native callback per type and keeps the page's
     // handlers in its own task list. Routed through it, the old remove/re-add
     // lost the guard (the re-add was "existing", so never native) or ran it
-    // hundreds of times. Now neither is ever called for beforeunload.
+    // hundreds of times. Now the page's own listener is never passed to
+    // either; only the disarm's own one-shot goes in and comes out again.
     const page = fakePage();
     const nativeAdd = page.w.addEventListener;
     const nativeRemove = page.w.removeEventListener;
     const tasks = new Map<string, Listener[]>();
-    const calls: string[] = [];
+    const calls: Array<{ op: string; fn: Listener }> = [];
     const shared = function (this: unknown, e: unknown) {
       for (const fn of [...(tasks.get((e as { type: string }).type) ?? [])])
         (fn as (e: unknown) => unknown).call(this, e);
     };
     page.w.addEventListener = (type, fn, o) => {
-      calls.push('add:' + type);
+      if (type === 'beforeunload') calls.push({ op: 'add', fn });
       const list = tasks.get(type) ?? [];
       if (list.length === 0) nativeAdd(type, shared, o);
       tasks.set(type, [...list, fn]);
     };
     page.w.removeEventListener = (type, fn, o) => {
-      calls.push('remove:' + type);
+      if (type === 'beforeunload') calls.push({ op: 'remove', fn });
       const list = tasks.get(type) ?? [];
       if (!list.includes(fn)) return nativeRemove(type, fn, o); // zone's fallthrough
       const next = list.filter((x) => x !== fn);
@@ -314,16 +433,20 @@ describe('PREPARE_LEAVE_FN, run standalone', () => {
       if (next.length === 0) nativeRemove(type, shared, o);
     };
     let fired = 0;
-    page.w.addEventListener('beforeunload', (e) => {
+    const guard = (e: unknown) => {
       fired++;
       (e as { preventDefault: () => void }).preventDefault();
-    });
+    };
+    page.w.addEventListener('beforeunload', guard);
     calls.length = 0;
     const ctl = prepareReported(page);
     ctl.disarm();
     expect(page.leave()).toBe(false);
     ctl.restore();
-    expect(calls.filter((c) => c.endsWith(':beforeunload'))).toEqual([]);
+    expect(calls.some((c) => c.fn === guard)).toBe(false);
+    expect(calls.map((c) => c.op)).toEqual(['add', 'remove']);
+    expect(calls[0].fn).toBe(calls[1].fn);
+    expect(tasks.get('beforeunload')).toEqual([guard]);
     expect(page.count()).toBe(1); // the native registration is untouched
     fired = 0;
     expect(page.leave()).toBe(true);

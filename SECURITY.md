@@ -415,7 +415,15 @@ takes no arguments): for an event whose browser-owned `type` is `beforeunload`,
 `BeforeUnloadEvent.prototype.returnValue` setter swallows its write, and the
 `onbeforeunload` IDL handler — whose return value the browser applies natively,
 out of JS's reach — is lifted off. The page's listeners stay registered and still
-run. Its listener LIST is never touched: an earlier version removed and re-added
+run. The disarm covers ONE leave: it adds a `beforeunload` listener of its own
+that schedules the restore as a task, i.e. right after the dispatch Chrome
+decides "prompt or not" on — so while that navigation is still pending (a slow
+server, a 204, a download that never commits) the old document already has its
+guard back, and a person who closes the tab or follows a link from it then is
+asked. And the shadows bite only while the disarm is in force: once restored
+they behave exactly like the originals, so a copy the page wrapped, cached or
+froze in place in the meantime cannot keep the document unable to cancel a
+leave. Its listener LIST is never touched: an earlier version removed and re-added
 the listeners, which could not be undone faithfully — the re-add went through
 the page's own `addEventListener`, which a listener multiplexer (zone.js, i.e.
 Angular) patches, so the guard was silently lost or ran hundreds of times; it
@@ -426,11 +434,11 @@ or not (measured, Chrome 154), so the page's ones run first. A `#hash` navigate
 is left alone — Chrome raises no prompt for it. The rest is about giving the
 guard back wherever the page stays:
 
-- **Every path out restores.** `navigate`/`reload`/`history_go` hand the result
-  to `rearmIfSameDocument` in a `finally` — a navigation that threw, never
-  committed or was cancelled (a child frame's prompt, a dismissed form
-  resubmission) leaves the same document, which gets its prototypes and its IDL
-  handler back. Only a main-frame loader id that is KNOWN and DIFFERENT skips
+- **Every path out restores.** A leave that dispatches `beforeunload` restores
+  the page from inside it (above). For the paths that dispatch none — a
+  same-document hop, a navigation that was never issued — and as a backstop,
+  `navigate`/`reload`/`history_go` hand the result to `rearmIfSameDocument` in
+  a `finally`: the same document gets its prototypes and its IDL handler back. Only a main-frame loader id that is KNOWN and DIFFERENT skips
   the restore; an unknown one still sends it (the in-page handle is bound to its
   document, so on a new one the call just fails).
 - **What the page changes itself stands.** Its listeners were never removed, so
@@ -474,17 +482,26 @@ What that means and what it doesn't:
   window, so such a tab is simply not evicted that time. A page frozen on an
   `alert()` gets `DISARM_DEADLINE_MS` (1.5 s) and then navigates with its
   handlers intact. The disarm runs in the page's main world, so the page can see
-  the shadowed prototypes while they exist (sub-second, agent tabs only) and
-  can keep its prompt — a `preventDefault` it saved before the disarm, a
-  `document.body.onbeforeunload` write the accessor does not see: it can only
-  annoy, never reach anything. A CHILD frame's handlers are not disarmed.
+  the shadowed prototypes while they exist (agent tabs only — from the disarm
+  until the leave's own `beforeunload` dispatch is over; where none is
+  dispatched, or a listener of the page stops propagation before ours runs,
+  until the call's restore after its load wait, up to the ~30 s load watchdog;
+  a document that went into the back/forward cache first stays disarmed there
+  until its `pageshow`) and can keep its prompt — a `preventDefault` it saved
+  before the disarm, a `document.body.onbeforeunload` write the accessor does
+  not see. Page code that runs in that window can trigger our restore early (a
+  synthetic `beforeunload`), which only gives the page back its own prompt.
+  What it cannot do is make the loss permanent: a shadow it wraps, caches or
+  freezes in place stops biting at the restore. A CHILD frame's handlers are
+  not disarmed.
 - **Not covered: navigations the page starts.** A `click` on a link or a form
   submit is a navigation the renderer begins, and the agent's own tool calls
   give no reliable point to intervene before it; such a prompt still raises the
   tab. An `onbeforeunload` handler the page sets again after the disarm and
   before the navigation commits still prompts too. And an extension worker that
-  dies between the disarm and the restore (the restore lives in that call)
-  leaves the document disarmed for the rest of its life.
+  dies between the disarm and the navigation (nothing then dispatches
+  `beforeunload` and the call's restore never runs) leaves the document
+  disarmed for the rest of its life.
 
 ### Broker mode: there is no per-session allowlist, and one would not be a boundary
 
