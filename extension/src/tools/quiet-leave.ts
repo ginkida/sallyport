@@ -506,6 +506,7 @@ export async function disarmBeforeUnload(
   const ms = Math.min(DISARM_DEADLINE_MS, budgetLeft(startedAt, Date.now()));
   if (ms <= 0) return null;
   const token: DisarmToken = { abandoned: false, sent: null };
+  await cancelPendingNavigation(tabId);
   try {
     return await raceDeadline(
       disarmInner(tabId, token, startedAt),
@@ -515,6 +516,26 @@ export async function disarmBeforeUnload(
   } catch {
     token.abandoned = true;
     return token.sent;
+  }
+}
+
+/** A cross-document navigation still PENDING on the tab (a previous navigate
+ * on a server that never answers, then a retry) makes DevTools hold every
+ * renderer-bound `Runtime.*` command until it commits — so the disarm would
+ * miss its deadline, and the new navigation would raise the prompt on the
+ * still-current, re-guarded document. `Page.stopLoading` is answered by the
+ * browser and cancels that navigation, releasing the held commands. Only when
+ * one is pending (`pendingUrl`): on a committed page it would needlessly stop
+ * subresource loads. The agent is about to navigate this tab anyway, so the
+ * pending navigation was going to be replaced regardless. Best-effort. */
+export async function cancelPendingNavigation(tabId: number): Promise<boolean> {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.pendingUrl) return false;
+    await raceDeadline(cdp(tabId, 'Page.stopLoading'), DISARM_DEADLINE_MS, () => new Error('stop'));
+    return true;
+  } catch {
+    return false;
   }
 }
 

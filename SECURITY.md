@@ -481,7 +481,10 @@ What that means and what it doesn't:
   which only ever closes quietly: a housekeeping close is never worth a raised
   window, so such a tab is simply not evicted that time. A page frozen on an
   `alert()` gets `DISARM_DEADLINE_MS` (1.5 s) and then navigates with its
-  handlers intact. The disarm runs in the page's main world, so the page can see
+  handlers intact. A cross-document navigation still PENDING on the tab makes
+  DevTools hold every renderer-bound command until it commits, so before the
+  disarm a pending one (`pendingUrl`) is cancelled with the browser-answered
+  `Page.stopLoading` — the agent is about to replace it anyway. The disarm runs in the page's main world, so the page can see
   the shadowed prototypes while they exist (agent tabs only — from the disarm
   until the leave's own `beforeunload` dispatch is over; where none is
   dispatched, or a listener of the page stops propagation before ours runs,

@@ -37,7 +37,10 @@ uses [Semantic Versioning](https://semver.org/).
   its say back, and a page left for another one gets it back if it returns
   from the back/forward cache. A `#hash` navigate is not touched: Chrome raises no
   prompt for it. A disarm that misses its deadline never lands later behind the
-  agent's back. The tab reaper never falls back to a prompt-raising removal: a
+  agent's back. A navigation still pending on the tab (a retry after a
+  navigate stuck on a server that never answered) is stopped first, since
+  Chrome holds the page's commands until it commits and the disarm could not
+  land otherwise. The tab reaper never falls back to a prompt-raising removal: a
   tab it cannot close quietly stays open. Your tabs, an agent tab you activated or dragged into your own
   window, and the tab you have in front of you (the active tab of the focused
   window — typing there fires no event that would mark the tab yours) keep

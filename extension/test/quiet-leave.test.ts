@@ -541,7 +541,7 @@ function stubChrome(opts: {
   /** Runs when Target.closeTarget arrives (e.g. a concurrent tool attaching). */
   onClose?: () => Promise<void>;
   /** The tab's own state as `chrome.tabs.get` reports it. */
-  tab?: { active?: boolean; windowId?: number };
+  tab?: { active?: boolean; windowId?: number; pendingUrl?: string };
   /** `chrome.windows.get(...).focused`; undefined = no windows API at all. */
   windowFocused?: boolean;
   /** Answers a command before the defaults do (undefined = fall through). */
@@ -833,6 +833,21 @@ describe('disarmBeforeUnload / rearmIfSameDocument', () => {
     expect(calls.map((c) => c.params?.functionDeclaration)).toEqual([PREPARE_LEAVE_FN, DISARM_FN]);
     expect(calls[0].params).toEqual({ objectId: 'win', functionDeclaration: PREPARE_LEAVE_FN });
     expect(calls[1].params).toEqual({ objectId: 'state', functionDeclaration: DISARM_FN });
+  });
+
+  // A retry after a navigate stuck on a hanging server: DevTools holds every
+  // Runtime command until the pending navigation commits, so the disarm would
+  // miss its deadline and the retry would raise the prompt. Page.stopLoading
+  // (browser-answered) cancels it first.
+  it('cancels a still-pending navigation before disarming, and only then', async () => {
+    let io = stubChrome({ loaderIds: ['L1'], tab: { pendingUrl: 'https://hang.example/' } });
+    expect(await disarmBeforeUnload(7)).not.toBeNull();
+    const methods = io.sent.map((s) => s.method);
+    expect(methods[0]).toBe('Page.stopLoading');
+    expect(methods.indexOf('Page.stopLoading')).toBeLessThan(methods.indexOf('Runtime.evaluate'));
+    io = stubChrome({ loaderIds: ['L1'] });
+    await disarmBeforeUnload(7);
+    expect(io.sent.map((s) => s.method)).not.toContain('Page.stopLoading');
   });
 
   it('touches nothing when the page has no beforeunload listener', async () => {
