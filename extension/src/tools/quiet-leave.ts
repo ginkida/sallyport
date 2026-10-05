@@ -17,22 +17,32 @@
  *  - closing: `Target.closeTarget` on the tab's own target. Chrome closes the
  *    page without running `beforeunload` (unload/pagehide still run) — the
  *    same thing Puppeteer's `page.close()` does by default.
- *  - navigating (navigate/reload/history_go in place): the main frame's
- *    `beforeunload` listeners are removed right before the navigation, found
- *    with `DOMDebugger.getEventListeners` and removed through ONE fixed
- *    function literal with the handlers passed as structured arguments — no
- *    agent input reaches the page (invariant #4's shape; `PREPARE_LEAVE_FN`).
- *    Whatever happens next, the caller hands the result back to
- *    `rearmIfSameDocument` in a `finally`: if the tab is still on the SAME
- *    document (a pushState history entry, a navigation that never committed,
- *    a cancelled reload) the page gets back what it did not remove itself
- *    meanwhile; and if the document went into the back/forward cache, it
+ *  - navigating (navigate/reload/history_go in place): right before the
+ *    navigation, the page's `beforeunload` handlers are made unable to CANCEL
+ *    the leave — they stay registered and still run (a last-moment draft save
+ *    happens), but `preventDefault()` and a `returnValue` write are swallowed
+ *    for a beforeunload event, and the `onbeforeunload` IDL handler (whose
+ *    return value the browser applies natively, out of JS's reach) is lifted
+ *    off for the duration. ONE fixed function literal does it, with no
+ *    arguments at all — no agent input reaches the page (invariant #4's shape;
+ *    `PREPARE_LEAVE_FN`). Whatever happens next, the caller hands the result
+ *    back to `rearmIfSameDocument` in a `finally`: if the tab is still on the
+ *    SAME document (a pushState history entry, a navigation that never
+ *    committed, a cancelled reload) the page gets its prototypes and its IDL
+ *    handler back; and if the document went into the back/forward cache, it
  *    restores itself on `pageshow` when it comes back. A `#hash` navigate is
  *    not disarmed at all — Chrome runs no `beforeunload` for it.
+ *    The page's listener LIST is never touched. Removing and re-adding its
+ *    listeners (what this did first) cannot be undone faithfully: the re-add
+ *    goes through the page's own `addEventListener`, which a listener
+ *    multiplexer (zone.js — Angular) patches, so the guard was lost or ran
+ *    hundreds of times; it loses `once`; and a listener the page dropped by
+ *    aborting its `AbortSignal` meanwhile came back with no signal left to
+ *    remove it. Left in place, all of that stays the browser's business.
  *    CDP has no "navigate without beforeunload" and no way to suppress the
- *    native dialog; registering a stopping listener from an isolated world
- *    does not work either (window listeners run in registration order, so the
- *    page's own ones already ran).
+ *    native dialog; a stopping listener does not work either (window
+ *    listeners run in registration order, capture or not — measured, Chrome
+ *    154 — so the page's own ones already ran).
  *
  * WHO it applies to is the point: `mayLeaveQuietly` — a tab the agent CREATED
  * (a minted epoch) that the human has NOT engaged with — and that is not, at
@@ -46,7 +56,7 @@
  * an agent was driving, leaving is what the agent asked for.
  *
  * Every step is best-effort and bounded: anything that fails falls back to the
- * plain path (`chrome.tabs.remove`, or navigating with the listeners in place),
+ * plain path (`chrome.tabs.remove`, or navigating with the page's handlers intact),
  * i.e. at worst today's behaviour, never a refusal. */
 
 import { budgetLeft, raceDeadline } from './budget.js';
@@ -257,63 +267,65 @@ async function tryQuietClose(tabId: number, targets?: PageTargets): Promise<bool
   return false;
 }
 
-/** The page half of a quiet leave, ONE fixed literal (invariant #4's shape: the
- * handlers arrive as structured `callFunctionOn` arguments — `handler,
- * capture` pairs by objectId — and nothing an agent sent is interpolated).
- * `this` is the page's window. It changes nothing by itself: it returns a
- * private controller object (reachable only through the CDP handle, never
- * from the page) whose `disarm()` takes the guard away and whose `restore()`
- * gives back what the PAGE did not take away itself in the meantime:
+/** The page half of a quiet leave, ONE fixed literal with no arguments
+ * (invariant #4's shape: nothing an agent sent reaches the page). `this` is the
+ * page's window. It changes nothing by itself: it returns a private controller
+ * object (reachable only through the CDP handle, never from the page) whose
+ * `disarm()` takes the guard's teeth out and whose `restore()` gives them back:
  *
- *  - `disarm()` removes every listener it was handed (by the object the page
- *    REGISTERED — a `handleEvent` object, a bound function) and clears the
- *    `onbeforeunload` IDL handler, which `removeEventListener` cannot reach.
- *    For as long as the guard is down it watches the page's own hands: a
- *    `removeEventListener('beforeunload', fn)` on the window (an own-property
- *    shadow of the inherited method, forwarding to it) or a write to
- *    `onbeforeunload` (an accessor over the browser's own) marks that handler
- *    as the page's decision. An SPA route change inside the document
- *    (pushState/hash) is exactly where a page drops its guard on purpose — an
- *    editor unmounting — and that removal, a no-op on a listener already gone,
- *    would otherwise be undone by `restore()`.
- *  - `restore()` (once) takes the watch down, re-adds what the page did not
- *    remove, and puts the IDL handler back unless the page wrote one since.
- *    Before `disarm()` it is a cancel: a disarm arriving after it does
- *    nothing.
+ *  - `disarm()` shadows `Event.prototype.preventDefault` (a no-op for an event
+ *    whose browser-owned `type` is `beforeunload`, the original for anything
+ *    else) and `BeforeUnloadEvent.prototype.returnValue` (the setter swallows;
+ *    the legacy `Event.prototype.returnValue = false` path is shadowed by it
+ *    for these events), and lifts the `onbeforeunload` IDL handler off: the
+ *    browser applies its return value natively, past any JS. The page's
+ *    listeners stay registered and run — they just cannot cancel the leave.
+ *    While the IDL handler is off, a write to `onbeforeunload` (an accessor
+ *    over the browser's own) marks it as the page's decision.
+ *  - `restore()` (once) puts the prototypes' own descriptors back — never over
+ *    one the page installed itself meanwhile — and the IDL handler unless the
+ *    page wrote one since. Before `disarm()` it is a cancel: a disarm arriving
+ *    after it does nothing.
  *  - a `pageshow` listener calls `restore()` when the document comes back from
  *    the back/forward cache: a cross-document leave freezes this very document
- *    — listeners removed — and a later Back revives it. A `beforeunload`
- *    listener does not keep a page out of that cache, and nothing on the
- *    extension side runs at that moment (the human's own Back button counts).
+ *    — still disarmed — and a later Back revives it. A `beforeunload` listener
+ *    does not keep a page out of that cache, and nothing on the extension side
+ *    runs at that moment (the human's own Back button counts).
  *
- * Main-world code, so a page can see the shadow while it exists (sub-second,
- * agent tabs only) and can defeat the bookkeeping (calling the prototype's
- * method directly, `document.body.onbeforeunload`): at worst its own guard
- * comes back when it meant to drop it, or stays gone — it reaches nothing
- * else. Every step that might throw on a hostile page is fenced, so `disarm`
- * never half-installs a watch it cannot take down. Self-contained (run
+ * Main-world code, so a page can see the shadows while they exist (sub-second,
+ * agent tabs only) and can defeat them (a `preventDefault` it saved earlier,
+ * `document.body.onbeforeunload`): at worst its own prompt is raised as before
+ * or its IDL handler is not given back — it reaches nothing else. A page with
+ * no `Event`/`BeforeUnloadEvent` to shadow gets `null`: no quiet leave. Every
+ * step that might throw on a hostile page is fenced. Self-contained (run
  * standalone by the tests). */
 export const PREPARE_LEAVE_FN = `function () {
-  var w = this, add = w.addEventListener, remove = w.removeEventListener;
-  var list = [], i;
-  for (i = 0; i + 1 < arguments.length; i += 2)
-    list.push({ fn: arguments[i], capture: arguments[i + 1] === true, pageRemoved: false });
+  var w = this, E = w.Event && w.Event.prototype, B = w.BeforeUnloadEvent && w.BeforeUnloadEvent.prototype;
+  if (!E || !B) return null;
+  var pdDesc = Object.getOwnPropertyDescriptor(E, 'preventDefault');
+  var rvDesc = Object.getOwnPropertyDescriptor(B, 'returnValue');
+  var typeDesc = Object.getOwnPropertyDescriptor(E, 'type');
+  if (!pdDesc || typeof pdDesc.value !== 'function' || !rvDesc || !rvDesc.get || !rvDesc.set ||
+      !typeDesc || !typeDesc.get) return null;
+  var pd = pdDesc.value, typeOf = typeDesc.get, add = w.addEventListener, remove = w.removeEventListener;
   var desc, o = w;
   while (o && !(desc = Object.getOwnPropertyDescriptor(o, 'onbeforeunload'))) o = Object.getPrototypeOf(o);
   var accessor = !!(desc && desc.get && desc.set);
   var ownIdl = Object.getOwnPropertyDescriptor(w, 'onbeforeunload');
-  var ownRemove = Object.getOwnPropertyDescriptor(w, 'removeEventListener');
   var getIdl = function () { return accessor ? desc.get.call(w) : w.onbeforeunload; };
   var setIdl = function (v) { if (accessor) desc.set.call(w, v); else w.onbeforeunload = v; };
   var s = { armed: false, done: false, idl: null, idlTouched: false };
-  var hookRemove = function (type, fn, opts) {
-    var self = this == null ? w : this;
-    if (self === w && type === 'beforeunload') {
-      var cap = typeof opts === 'boolean' ? opts : !!(opts && opts.capture);
-      for (var j = 0; j < list.length; j++)
-        if (list[j].fn === fn && list[j].capture === cap) list[j].pageRemoved = true;
-    }
-    return remove.apply(self, arguments);
+  var noCancel = function preventDefault() {
+    var t = null;
+    try { t = typeOf.call(this); } catch (e) {}
+    if (t === 'beforeunload') return;
+    return pd.apply(this, arguments);
+  };
+  var noReturn = {
+    configurable: true,
+    enumerable: rvDesc.enumerable,
+    get: function () { return rvDesc.get.call(this); },
+    set: function (v) {}
   };
   var hookIdl = accessor ? {
     configurable: true,
@@ -326,11 +338,12 @@ export const PREPARE_LEAVE_FN = `function () {
   var unhook = function () {
     try { remove.call(w, 'pageshow', onShow); } catch (e) {}
     try {
-      var r = Object.getOwnPropertyDescriptor(w, 'removeEventListener');
-      if (r && r.value === hookRemove) {
-        if (ownRemove) Object.defineProperty(w, 'removeEventListener', ownRemove);
-        else delete w.removeEventListener;
-      }
+      var p = Object.getOwnPropertyDescriptor(E, 'preventDefault');
+      if (p && p.value === noCancel) Object.defineProperty(E, 'preventDefault', pdDesc);
+    } catch (e) {}
+    try {
+      var r = Object.getOwnPropertyDescriptor(B, 'returnValue');
+      if (r && r.set === noReturn.set) Object.defineProperty(B, 'returnValue', rvDesc);
     } catch (e) {}
     try {
       var d = Object.getOwnPropertyDescriptor(w, 'onbeforeunload');
@@ -345,10 +358,7 @@ export const PREPARE_LEAVE_FN = `function () {
     s.done = true;
     if (!s.armed) return false;
     unhook();
-    for (var j = 0; j < list.length; j++)
-      if (!list[j].pageRemoved && list[j].fn !== s.idl)
-        add.call(w, 'beforeunload', list[j].fn, { capture: list[j].capture });
-    if (s.idl && !s.idlTouched && getIdl() == null) setIdl(s.idl);
+    try { if (s.idl && !s.idlTouched && getIdl() == null) setIdl(s.idl); } catch (e) {}
     return true;
   };
   return {
@@ -356,61 +366,47 @@ export const PREPARE_LEAVE_FN = `function () {
       if (s.armed || s.done) return;
       s.armed = true;
       try {
-        Object.defineProperty(w, 'removeEventListener', {
-          configurable: true, writable: true, enumerable: false, value: hookRemove
+        Object.defineProperty(E, 'preventDefault', {
+          configurable: true, writable: true, enumerable: pdDesc.enumerable, value: noCancel
         });
       } catch (e) {}
+      try { Object.defineProperty(B, 'returnValue', noReturn); } catch (e) {}
       if (hookIdl) try { Object.defineProperty(w, 'onbeforeunload', hookIdl); } catch (e) {}
       try { add.call(w, 'pageshow', onShow); } catch (e) {}
-      var cur = getIdl();
-      if (typeof cur === 'function') { s.idl = cur; setIdl(null); }
-      for (var j = 0; j < list.length; j++)
-        remove.call(w, 'beforeunload', list[j].fn, { capture: list[j].capture });
+      try {
+        var cur = getIdl();
+        if (typeof cur === 'function') { s.idl = cur; setIdl(null); }
+      } catch (e) {}
     },
     restore: restore
   };
 }`;
 
-/** Takes the guard away; `this` is the controller `PREPARE_LEAVE_FN` made. */
+/** Takes the guard's teeth out; `this` is the controller `PREPARE_LEAVE_FN` made. */
 export const DISARM_FN = 'function() { this.disarm(); }';
 
-/** Gives back what the page did not remove itself; true if it ran now. */
+/** Gives them back; true if it ran now. */
 export const REARM_FN = 'function() { return this.restore(); }';
 
-type ListenerInfo = {
-  type?: unknown;
-  useCapture?: unknown;
-  handler?: { objectId?: unknown };
-  originalHandler?: { objectId?: unknown };
-};
-
-/** The `beforeunload` listeners worth removing: well-formed entries only.
- * `originalHandler` first — it is the REGISTERED object (a `handleEvent`
- * object, the bound function), which is what `removeEventListener` matches;
- * `handler` is the function Chrome would call. Pure. */
-export function beforeUnloadHandlers(
-  listeners: unknown,
-): Array<{ objectId: string; capture: boolean }> {
-  if (!Array.isArray(listeners)) return [];
-  const out: Array<{ objectId: string; capture: boolean }> = [];
-  for (const l of listeners as ListenerInfo[]) {
-    if (!l || l.type !== 'beforeunload') continue;
-    const original = l.originalHandler?.objectId;
-    const objectId = typeof original === 'string' ? original : l.handler?.objectId;
-    if (typeof objectId !== 'string') continue;
-    out.push({ objectId, capture: l.useCapture === true });
+/** How many `beforeunload` registrations the main frame's window holds (the
+ * IDL handler counts — Chrome reports it among the listeners). Pure. */
+export function beforeUnloadCount(listeners: unknown): number {
+  if (!Array.isArray(listeners)) return 0;
+  let n = 0;
+  for (const l of listeners as Array<{ type?: unknown } | null>) {
+    if (l && l.type === 'beforeunload') n++;
   }
-  return out;
+  return n;
 }
 
-/** What `disarmBeforeUnload` took away, for `rearmIfSameDocument`: the handle
+/** What `disarmBeforeUnload` did, for `rearmIfSameDocument`: the handle
  * of the in-page controller (`PREPARE_LEAVE_FN`), in `CALL_GROUP`, which
  * nothing frees while the call holds the tab. The page keeps its own
  * reference for the back/forward-cache path, so the handle's release later
  * costs that path nothing. */
 export type Disarmed = {
   stateId: string;
-  /** How many `beforeunload` registrations were taken (the IDL handler counts). */
+  /** How many `beforeunload` registrations the page held (the IDL handler counts). */
   count: number;
   /** The document it happened in (null = the browser would not say). */
   loaderId: string | null;
@@ -441,9 +437,9 @@ async function disarmInner(
     objectId: windowId,
     objectGroup: CALL_GROUP,
   });
-  const handlers = beforeUnloadHandlers(listeners);
+  const count = beforeUnloadCount(listeners);
   // An IDL handler is reported here too, so nothing listed means nothing to do.
-  if (handlers.length === 0) return null;
+  if (count === 0) return null;
   const loaderId = await mainFrameLoaderId(tabId, startedAt).catch(() => null);
   if (token.abandoned) return null;
   const prepared = await cdp<{ result?: { objectId?: string }; exceptionDetails?: unknown }>(
@@ -452,29 +448,29 @@ async function disarmInner(
     {
       objectId: windowId,
       functionDeclaration: PREPARE_LEAVE_FN,
-      arguments: handlers.flatMap((h) => [{ objectId: h.objectId }, { value: h.capture }]),
     },
   );
   const stateId = prepared.result?.objectId;
   if (!stateId || prepared.exceptionDetails) return null;
   if (token.abandoned) return null;
-  const disarmed: Disarmed = { stateId, count: handlers.length, loaderId };
+  const disarmed: Disarmed = { stateId, count, loaderId };
   token.sent = disarmed;
   await cdp(tabId, 'Runtime.callFunctionOn', { objectId: stateId, functionDeclaration: DISARM_FN });
   return disarmed;
 }
 
-/** Remove the main frame's `beforeunload` listeners so the navigation about to
- * be issued on `tabId` raises no prompt. Only for a tab `quietLeaveApproved`
+/** Make the main frame's `beforeunload` handlers unable to cancel the
+ * navigation about to be issued on `tabId`, so it raises no prompt. Only for a tab `quietLeaveApproved`
  * approved; the caller has already attached. Never throws, bounded by
  * `DISARM_DEADLINE_MS` and by what the call has left: on any failure the
  * navigation simply goes ahead as it always did. Returns the handle to give it
- * back with (null = nothing was, or ever will be, removed), and the caller
+ * back with (null = nothing was, or ever will be, changed), and the caller
  * MUST hand it to `rearmIfSameDocument` on every path out — success, a thrown
  * navigation, a cancelled one — in a `finally`.
  *
  * Main frame only — a CHILD frame's listener can still prompt (crossing into
- * frames would need per-frame contexts and OOPIF sessions). */
+ * frames would need per-frame contexts and OOPIF sessions). So can a handler
+ * that cancels through a `preventDefault` it saved before the disarm. */
 export async function disarmBeforeUnload(
   tabId: number,
   startedAt?: number,
@@ -500,9 +496,9 @@ const REARM_LOADER_PEEK_MS = 500;
 
 /** After the navigation — on EVERY path, thrown and cancelled ones included:
  * if the tab is still on the SAME document (a `#hash`, a same-document history
- * hop, a navigation that never committed, a cancelled reload), give back what
- * `disarmBeforeUnload` removed, minus what the page removed itself meanwhile
- * (`PREPARE_LEAVE_FN`). A loader id that is known on both sides and differs
+ * hop, a navigation that never committed, a cancelled reload), give the page
+ * back what `disarmBeforeUnload` changed (`PREPARE_LEAVE_FN`) — its listeners
+ * were never touched, so whatever it added or removed meanwhile stands. A loader id that is known on both sides and differs
  * means the document is gone (or frozen in the back/forward cache, where its
  * own `pageshow` hook restores it) — nothing sent. An UNKNOWN one does not
  * stop the restore: the controller handle is bound to its document, so on a

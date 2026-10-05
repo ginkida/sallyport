@@ -19,24 +19,27 @@ uses [Semantic Versioning](https://semver.org/).
   Chrome raises the window before the answer lands (measured on Chrome 154). For
   a tab the agent created and you have not engaged with, closes now go through
   `Target.closeTarget`, which skips `beforeunload` (unload still runs), and
-  in-place navigations first remove the page's `beforeunload` listeners. They
-  are given back on every path where the page stays — a pushState history
-  entry, a navigation or reload that threw, never committed or was cancelled —
-  minus any the page removed itself in the meantime (an SPA dropping an
-  editor's guard on a route change keeps it dropped), and a page left for
-  another one gets them back if it returns from the back/forward cache. A
-  `#hash` navigate is not touched: Chrome raises no prompt for it. A removal
-  that misses its deadline never lands later behind the agent's back. The
-  page's own `beforeunload` logic does not run on those paths. The tab reaper
-  never falls back to a prompt-raising removal: a tab it cannot close quietly
-  stays open. Your tabs, an agent tab you activated or dragged into your own
+  in-place navigations first make the page's `beforeunload` handlers unable to
+  cancel the leave: they stay registered and still run (a draft save in one
+  still happens), but `preventDefault()` and `returnValue` are swallowed for
+  that event, and the `onbeforeunload` handler is lifted off for the leave. The
+  page's listeners are never removed, so a zone.js (Angular) page keeps its
+  guard intact, a `once` listener stays one-shot, and a guard the page drops
+  meanwhile — by `removeEventListener` or by aborting its `AbortSignal` — stays
+  dropped. Wherever the page stays — a pushState history entry, a navigation or
+  reload that threw, never committed or was cancelled — it gets its say back,
+  and a page left for another one gets it back if it returns from the
+  back/forward cache. A `#hash` navigate is not touched: Chrome raises no
+  prompt for it. A disarm that misses its deadline never lands later behind the
+  agent's back. The tab reaper never falls back to a prompt-raising removal: a
+  tab it cannot close quietly stays open. Your tabs, an agent tab you activated or dragged into your own
   window, and the tab you have in front of you (the active tab of the focused
   window — typing there fires no event that would mark the tab yours) keep
-  Chrome's prompt; a focus on a just-created agent window that is still there
-  once the 2 s grace is over now marks its tab yours. Without a debugger
-  foothold (DevTools open on the tab) it falls back to the previous behaviour;
-  a link click or form submit that leaves a page is not covered
-  (SECURITY.md).
+  Chrome's prompt; an agent window that still holds focus once the 2 s grace
+  after its creation is over marks its tab yours — including a session's very
+  first window, before any agent tab existed. Without a debugger foothold
+  (DevTools open on the tab) it falls back to the previous behaviour; a link
+  click or form submit that leaves a page is not covered (SECURITY.md).
 - Creating an agent window no longer brings a backgrounded Chrome to the front.
   If the new window took focus, the previously focused window was re-focused —
   even when that window only was the last one used and you were in another app,

@@ -18,16 +18,9 @@ import {
 } from './storage.js';
 import { badgeFromStatus } from './badge.js';
 import { extractHostname } from './format.js';
-import {
-  adoptOpenedTab,
-  agentTabIds,
-  dropEpoch,
-  getEpoch,
-  markHumanTab,
-  setBrokerMode,
-} from './tools/ownership.js';
+import { adoptOpenedTab, dropEpoch, setBrokerMode } from './tools/ownership.js';
 import { loadEpochs, persistEpochs, reconcileWithLiveTabs } from './tools/ownership-store.js';
-import { graceRemainingMs } from './tools/agent-window.js';
+import { installHumanInterestListeners } from './human-interest.js';
 import { closeAgentTabs, listAgentTabs } from './agent-tabs.js';
 import { releaseKeepAwakeEverywhere, sweepStrandedHygiene } from './tools/cdp.js';
 import { installCaptureSettingsListener } from './tools/capture-settings.js';
@@ -168,85 +161,9 @@ chrome.tabs.onCreated.addListener((tab) => {
   if (adoptOpenedTab(tab.id, tab.openerTabId)) void persistEpochs();
 });
 
-// -------------------------------------------------------------------------
-// "The human looked at this one" — the tab reaper's stop sign.
-//
-// `maxAgentTabs` lets the reaper close agent tabs to keep the browser from
-// filling up (ownership.ts:planEviction). The one thing it must never do is
-// close a tab a person is actually using, and the browser already tells us
-// which those are: a tab the human ACTIVATED in a window they have in front of
-// them, or one they dragged into a window of their own. The mark is one-way —
-// nothing ever clears it — because "I looked at this once" is a permanent fact
-// about that tab, and being wrong in this direction only costs one tab.
-//
-// The focused-window condition is what makes this usable rather than noise:
-// `screenshot` makes an agent tab active INSIDE its own unfocused window (that
-// is why it costs no focus), which fires exactly the same event. Without the
-// check, the agent would immortalise its own tabs by screenshotting them.
-// -------------------------------------------------------------------------
-
-/** How long after we create an agent window a focus event on it is discounted
- * (see agent-window.ts:wasJustCreated). */
-const HUMAN_FOCUS_GRACE_MS = 2000;
-
-function noteHumanInterest(tabId: number | undefined): void {
-  if (typeof tabId !== 'number') return;
-  if (markHumanTab(tabId)) void persistEpochs();
-}
-
-async function windowIsFocused(windowId: number): Promise<boolean> {
-  try {
-    return (await chrome.windows.get(windowId))?.focused === true;
-  } catch {
-    return false; // window gone — nothing to conclude
-  }
-}
-
-chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
-  // Cheap synchronous bail FIRST. This fires on every tab switch the human
-  // makes, all day, and in standalone the owned set is always empty — asking
-  // the browser about the window before asking our own map would put a chrome
-  // round-trip on a hot path that answers "not ours" essentially every time.
-  if (getEpoch(tabId) === undefined) return;
-  void (async () => {
-    if (await windowIsFocused(windowId)) noteHumanInterest(tabId);
-  })();
-});
-
-// Dragged out of the agent window into one of the human's own — an unambiguous
-// "this is mine now", and the reason ownership never keys on windowId.
-chrome.tabs.onAttached.addListener((tabId) => noteHumanInterest(tabId));
-
-async function noteActiveTabOf(windowId: number): Promise<void> {
-  try {
-    const [active] = await chrome.tabs.query({ active: true, windowId });
-    noteHumanInterest(active?.id);
-  } catch {
-    // window/tab gone between the event and the query
-  }
-}
-
-chrome.windows?.onFocusChanged.addListener((windowId) => {
-  // WINDOW_ID_NONE: focus left Chrome entirely.
-  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
-  if (agentTabIds().size === 0) return; // nothing of ours to mark (standalone)
-  const grace = graceRemainingMs(windowId, HUMAN_FOCUS_GRACE_MS);
-  if (grace > 0) {
-    // Focus on a window we created a moment ago is discounted — but NOT
-    // forgotten: if the window still holds focus once the grace is over, the
-    // human is in it (they clicked into it inside the grace, or it stayed in
-    // front of them), and its active tab — already active, so no
-    // onActivated will ever come — is theirs. Otherwise the tab would stay
-    // quietly closable while a person types into it.
-    setTimeout(() => {
-      void (async () => {
-        if (await windowIsFocused(windowId)) await noteActiveTabOf(windowId);
-      })();
-    }, grace + 50);
-    return;
-  }
-  void noteActiveTabOf(windowId);
-});
+// "The human looked at this one" — the reaper's stop sign and what keeps an
+// agent tab's beforeunload prompt (human-interest.ts).
+installHumanInterestListeners();
 
 chrome.runtime.onStartup.addListener(() => void bootBridge());
 chrome.runtime.onInstalled.addListener(() => void bootBridge());

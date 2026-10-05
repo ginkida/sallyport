@@ -64,7 +64,7 @@ the "Tools" table for per-tool notes. Quick reference:
 | Daemon ↔ extension authenticity | HMAC-SHA256, ts±30 s, 4096-nonce cache | `daemon/.../protocol.py`, `extension/src/crypto.ts` |
 | Network exposure | Loopback-only bind (`refuse_non_loopback`) | `daemon/.../__main__.py` |
 | Domain scope | Allowlist enforced before every DOM tool | `extension/src/allowlist.ts`, `extension/src/tools/gates.ts` |
-| Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, `snapshot`'s DOM-fallback walker, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation; `set_viewport`'s viewport read-back; `screenshot`'s one-word `window.devicePixelRatio` read, used only to RAISE a browser-owned size bound, never to lower it; the one `beforeunload`-removal function an agent's own tab runs before it navigates — the handlers travel as structured arguments) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `domtree.ts`, `aim.ts`, `viewport.ts`, `screenshot.ts`, `quiet-leave.ts`. `print_to_pdf` runs NO page JS at all — structured CDP only |
+| Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, `snapshot`'s DOM-fallback walker, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation; `set_viewport`'s viewport read-back; `screenshot`'s one-word `window.devicePixelRatio` read, used only to RAISE a browser-owned size bound, never to lower it; the one argument-less function an agent's own tab runs before it navigates, which stops its `beforeunload` handlers from cancelling the leave) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `domtree.ts`, `aim.ts`, `viewport.ts`, `screenshot.ts`, `quiet-leave.ts`. `print_to_pdf` runs NO page JS at all — structured CDP only |
 | Password input | `fill` reads `type` via browser DOM, then binds the write to its target: after `focus()` the browser's AX tree must show focus inside the target's subtree (through closed shadow roots, never into a frame), and an isolated-world guard cancels the insert at `beforeinput`/`textInput` if the focus chain has left the field (limits below); a frame is refused unless its whole document is an editor on an allowlisted origin; `key_type`/`send_keys` enumerate frames (temporary flat child sessions for OOPIFs), locate focused AX nodes through closed shadow DOM, then inspect browser-owned DOM attributes | `extension/src/tools/dom.ts`, `focus.ts`, `keyboard.ts` |
 | Element refs (`@eN`) | Per-tab map; ids are monotonic per tab and restart at `e1` only when the tab closes (a detach, navigation or re-snapshot wipes the map but keeps counting; an extension worker restart or reload resumes from the exact high-water mark — the highest id handed out — persisted in `chrome.storage.local` before any id it covers is handed out, so a restart re-issues no id and skips none), so a held ref MISSES instead of re-binding. Best-effort at that one seam: if storage refuses, a restarted worker counts from `e1` again. A refusal is never sticky — a refused load is retried by the next call, a refused write re-arms so the next call writes again, and a worker that has not managed to load writes nothing rather than replace the stored marks of tabs it never touched. Each ref is stamped with the main-frame loader id of the document it was minted in and refused as `bad_ref` once the tab shows another document — after a navigation the PAGE starts into a new renderer process, an old backendNodeId resolves to a live node of the new page | `extension/src/tools/refs.ts`, `ref-store.ts`, `resolve.ts:refDocumentState` |
 | Closing tabs | Allowlist-gated like other DOM tools, EXCEPT a tab the caller created in broker mode: the daemon has already proved ownership, which is a stronger answer to "may I destroy this tab" (and without it an agent tab that redirected off-allowlist could never be closed by its owner) | `extension/src/tools/tabs.ts:closeTab` |
@@ -408,35 +408,43 @@ right now (`inFrontOfHuman`), the prompt is never raised: every close
 helper, `closeAgentTab`) goes through `Target.closeTarget` on the tab's own
 PAGE target, which closes without running `beforeunload` (unload still runs —
 what Puppeteer's `page.close()` does), and an in-place
-`navigate`/`reload`/`history_go` first removes the main frame's `beforeunload`
-listeners (`DOMDebugger.getEventListeners`; each listener by the object the page
-REGISTERED — a `handleEvent` object, a bound function — plus the
-`onbeforeunload` IDL handler, through ONE fixed function with the handlers
-passed as structured arguments, `PREPARE_LEAVE_FN`). A `#hash` navigate is left
-alone — Chrome raises no prompt for it. The rest is about giving the guard
-back wherever the page stays:
+`navigate`/`reload`/`history_go` first makes the main frame's `beforeunload`
+handlers unable to CANCEL the leave (`PREPARE_LEAVE_FN`, ONE fixed function that
+takes no arguments): for an event whose browser-owned `type` is `beforeunload`,
+`Event.prototype.preventDefault` becomes a no-op and the
+`BeforeUnloadEvent.prototype.returnValue` setter swallows its write, and the
+`onbeforeunload` IDL handler — whose return value the browser applies natively,
+out of JS's reach — is lifted off. The page's listeners stay registered and still
+run. Its listener LIST is never touched: an earlier version removed and re-added
+the listeners, which could not be undone faithfully — the re-add went through
+the page's own `addEventListener`, which a listener multiplexer (zone.js, i.e.
+Angular) patches, so the guard was silently lost or ran hundreds of times; it
+dropped `once`; and a listener the page removed by aborting its `AbortSignal`
+came back with no signal left to remove it. A stopping listener of our own is
+no alternative: Chrome runs a window's listeners in registration order, capture
+or not (measured, Chrome 154), so the page's ones run first. A `#hash` navigate
+is left alone — Chrome raises no prompt for it. The rest is about giving the
+guard back wherever the page stays:
 
 - **Every path out restores.** `navigate`/`reload`/`history_go` hand the result
   to `rearmIfSameDocument` in a `finally` — a navigation that threw, never
   committed or was cancelled (a child frame's prompt, a dismissed form
-  resubmission) leaves the same document, which gets its guard back. Only a
-  main-frame loader id that is KNOWN and DIFFERENT skips the restore; an
-  unknown one still sends it (the in-page handle is bound to its document, so
-  on a new one the call just fails).
-- **What the page removed itself stays removed.** While the guard is down the
-  page's own `removeEventListener('beforeunload', …)` on the window and writes
-  to `onbeforeunload` are recorded (an own-property shadow of the inherited
-  method and an accessor over the browser's own, both taken down by the
-  restore), so an SPA route change that drops an editor's guard is not undone.
-  A page can defeat that bookkeeping (calling the prototype's method, writing
-  `document.body.onbeforeunload`): at worst its own guard comes back or stays
-  gone — it reaches nothing else.
+  resubmission) leaves the same document, which gets its prototypes and its IDL
+  handler back. Only a main-frame loader id that is KNOWN and DIFFERENT skips
+  the restore; an unknown one still sends it (the in-page handle is bound to its
+  document, so on a new one the call just fails).
+- **What the page changes itself stands.** Its listeners were never removed, so
+  whatever it adds or removes meanwhile — `removeEventListener`, an aborted
+  signal, a `once` listener firing — is the browser's own bookkeeping. A write
+  to `onbeforeunload` while it is lifted off is recorded (an accessor over the
+  browser's own, taken down by the restore) and wins over the restore. The
+  restore never puts a prototype descriptor back over one the page installed
+  itself in the meantime.
 - **The back/forward cache.** A `beforeunload` listener does not keep a page
-  out of it, so a document left with its guard down can come back — through
-  `history_go` or the human's own Back button — with the same JS heap. The
-  removal installs a `pageshow` listener that restores the guard when the
-  document returns `persisted`.
-- **A removal that misses its deadline never lands late.** The disarm is
+  out of it, so a document left disarmed can come back — through `history_go`
+  or the human's own Back button — with the same JS heap. The disarm installs a
+  `pageshow` listener that restores the document when it returns `persisted`.
+- **A disarm that misses its deadline never lands late.** The disarm is
   bounded (`DISARM_DEADLINE_MS`), and a bound does not cancel CDP work already
   under way: past it nothing that changes the page is sent any more, and once
   the one mutating command has gone out the caller gets its handle anyway, so
@@ -444,36 +452,39 @@ back wherever the page stays:
 
 What that means and what it doesn't:
 
-- **The page's own `beforeunload` logic does not run** on those paths — a
-  last-moment draft save or analytics beacon tied to it is skipped. Leaving is
-  what the agent asked for.
+- **The page's own `beforeunload` logic still runs** — a last-moment draft
+  save or analytics beacon in a listener happens — except an `onbeforeunload`
+  IDL handler, which is off for the leave. Only the cancel is taken away.
 - **A human tab keeps Chrome's prompt**: anything without an epoch (the
   human's own tabs, the standalone active-tab fallback), an agent tab the
   human activated or dragged into their own window, and the agent tab that is
   the ACTIVE tab of the FOCUSED window at that moment — a person can type into
   that one without any event marking it theirs (the first tab of an agent
   window that took focus anyway, clicked into inside the 2 s grace that
-  discounts our own window creation). A focus on such a window that is still
-  there once the grace is over marks its active tab the human's. There the
-  prompt may guard their typing. This is best-effort on browser-observed
-  signals, not a guarantee: a person who clicked into a fresh agent window,
-  typed, and left Chrome all within the grace is not seen.
+  discounts our own window creation). Every agent window we create is looked at
+  again once that grace is over (armed by the creation itself, so it holds for
+  a session's very first window too): still focused, its active tab is marked
+  the human's. There the prompt may guard their typing. This is best-effort on
+  browser-observed signals, not a guarantee: a person who clicked into a fresh
+  agent window, typed, and left Chrome all within the grace is not seen.
 - **Best effort, falls back to the old behaviour.** No debugger foothold
   (DevTools open on the tab, a page extensions may not debug) → plain
   `chrome.tabs.remove`, and the prompt can appear — except for the tab reaper,
   which only ever closes quietly: a housekeeping close is never worth a raised
   window, so such a tab is simply not evicted that time. A page frozen on an
   `alert()` gets `DISARM_DEADLINE_MS` (1.5 s) and then navigates with its
-  listeners in place. The removal runs in the page's main world, so a page that
-  replaced `removeEventListener` keeps its prompt — it can only annoy, never
-  reach anything. A CHILD frame's listener is not removed.
+  handlers intact. The disarm runs in the page's main world, so the page can see
+  the shadowed prototypes while they exist (sub-second, agent tabs only) and
+  can keep its prompt — a `preventDefault` it saved before the disarm, a
+  `document.body.onbeforeunload` write the accessor does not see: it can only
+  annoy, never reach anything. A CHILD frame's handlers are not disarmed.
 - **Not covered: navigations the page starts.** A `click` on a link or a form
   submit is a navigation the renderer begins, and the agent's own tool calls
   give no reliable point to intervene before it; such a prompt still raises the
-  tab. Same for a `beforeunload` listener the page registers again after the
-  removal and before the navigation commits. And an extension worker that dies
-  between the removal and the restore (the restore lives in that call) leaves
-  the page without its guard for the rest of that document's life.
+  tab. An `onbeforeunload` handler the page sets again after the disarm and
+  before the navigation commits still prompts too. And an extension worker that
+  dies between the disarm and the restore (the restore lives in that call)
+  leaves the document disarmed for the rest of its life.
 
 ### Broker mode: there is no per-session allowlist, and one would not be a boundary
 

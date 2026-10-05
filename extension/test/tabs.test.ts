@@ -1206,15 +1206,15 @@ describe('no beforeunload prompt for the agent own tab (focus theft)', () => {
     expect(calls.closedQuietly).toEqual([]);
   });
 
-  it('navigate in place removes the page beforeunload listeners BEFORE moving the tab', async () => {
+  it('navigate in place disarms the page beforeunload guard BEFORE moving the tab', async () => {
     const calls = await brokerTab();
     await navigate({ url: ALLOW, tabId: 7 });
     const prepare = fnCalls(calls, PREPARE_LEAVE_FN);
     expect(prepare).toHaveLength(1);
-    // The handler travels as a structured argument, never interpolated.
-    expect(prepare[0].params?.arguments).toEqual([{ objectId: 'h-1' }, { value: false }]);
+    // The fixed literal takes no arguments at all — nothing reaches the page.
+    expect(prepare[0].params?.arguments).toBeUndefined();
     expect(disarmed(calls)[0].params?.objectId).toBe('state-1');
-    // ...and only then the navigation: the listener must be gone when Chrome asks.
+    // ...and only then the navigation: the guard must be toothless when Chrome asks.
     expect(calls.cdp.indexOf(disarmed(calls)[0])).toBeLessThan(indexOf(calls, '(tabs.update)'));
     expect(calls.update).toEqual([{ tabId: 7, url: ALLOW }]);
   });

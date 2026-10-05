@@ -150,13 +150,37 @@ const server = createServer((req, res) => {
         '<input id="draft" style="position:absolute;left:10px;top:10px;width:200px;height:30px">' +
         '<script>const guard = (e) => { e.preventDefault(); e.returnValue = ""; };' +
         'addEventListener("beforeunload", guard);' +
-        // A handleEvent OBJECT: removeEventListener must be handed the object.
-        'addEventListener("beforeunload", { handleEvent(e) { e.preventDefault(); } }, true);' +
+        // A capture-phase handleEvent OBJECT that cancels by returnValue alone.
+        'addEventListener("beforeunload", { handleEvent(e) { e.returnValue = "unsaved"; } }, true);' +
         'onbeforeunload = () => "unsaved";' +
+        // The modern cleanup: torn down by aborting its signal, which never
+        // goes through removeEventListener.
+        'window.ac = new AbortController();' +
+        'addEventListener("beforeunload", (e) => e.preventDefault(), { signal: ac.signal });' +
         // What an SPA router does when the editor route unmounts.
-        'window.dropGuard = () => removeEventListener("beforeunload", guard);' +
+        'window.dropGuard = () => { removeEventListener("beforeunload", guard); ac.abort(); };' +
         // Back/forward-cache restores are told apart from fresh loads.
         'window.__shows = []; addEventListener("pageshow", (e) => __shows.push(e.persisted));</script>',
+    );
+  } else if (req.url?.startsWith('/muxguard')) {
+    // What zone.js (Angular) does to EventTarget: ONE native callback per
+    // event type, the page's handlers kept in its own task list. A quiet leave
+    // that routed its bookkeeping through these methods lost the guard.
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(
+      '<!doctype html><title>Mux</title>' +
+        '<input id="draft" style="position:absolute;left:10px;top:10px;width:200px;height:30px">' +
+        '<script>(() => { const P = EventTarget.prototype, add = P.addEventListener,' +
+        ' rem = P.removeEventListener, tasks = new Map();' +
+        ' const shared = function (e) { for (const fn of [...(tasks.get(e.type) || [])]) fn.call(this, e); };' +
+        ' P.addEventListener = function (type, fn, o) { if (this !== window) return add.call(this, type, fn, o);' +
+        '  const l = tasks.get(type) || []; if (!l.length) add.call(this, type, shared, o); tasks.set(type, [...l, fn]); };' +
+        ' P.removeEventListener = function (type, fn, o) { if (this !== window) return rem.call(this, type, fn, o);' +
+        '  const l = tasks.get(type) || []; if (!l.includes(fn)) return rem.call(this, type, fn, o);' +
+        '  const n = l.filter((x) => x !== fn); tasks.set(type, n); if (!n.length) rem.call(this, type, shared, o); };' +
+        '})();' +
+        'window.__fired = 0;' +
+        'addEventListener("beforeunload", (e) => { __fired++; e.preventDefault(); e.returnValue = ""; });</script>',
     );
   } else if (req.url?.startsWith('/pwframe')) {
     res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -261,8 +285,8 @@ try {
           chrome.windows.onFocusChanged.addListener(onFocus);
           const win = await chrome.windows.create({ url: base + '/?agent-window', focused: false });
           // An agent tab in the BACKGROUND of its window, with a gesture on it.
-          const dirtyTab = async () => {
-            const tab = await chrome.tabs.create({ windowId: win.id, url: base + '/beforeunload', active: false });
+          const dirtyTab = async (path = '/beforeunload') => {
+            const tab = await chrome.tabs.create({ windowId: win.id, url: base + path, active: false });
             for (let i = 0; i < 100 && (await chrome.tabs.get(tab.id)).status !== 'complete'; i++) await sleep(50);
             await attach(tab.id);
             // The capture test turned keep-awake off; a hidden tab takes no input without it.
@@ -297,27 +321,38 @@ try {
             out.closeGone = !(await exists(closing));
             out.closeEvents = [...events];
             const leaving = await dirtyTab();
-            const send = (method, params) => chrome.debugger.sendCommand({ tabId: leaving }, method, params);
-            const count = async () => {
+            const sendTo = (tabId) => (method, params) => chrome.debugger.sendCommand({ tabId }, method, params);
+            const countOn = (tabId) => async () => {
+              const send = sendTo(tabId);
               const { result } = await send('Runtime.evaluate', { expression: 'window', objectGroup: 'smoke' });
               const { listeners } = await send('DOMDebugger.getEventListeners', { objectId: result.objectId });
               await send('Runtime.releaseObjectGroup', { objectGroup: 'smoke' });
               return listeners.filter((l) => l.type === 'beforeunload').length;
             };
+            const valueOn = (tabId) => async (expression) =>
+              (await sendTo(tabId)('Runtime.evaluate', { expression, returnByValue: true })).result.value;
+            const count = countOn(leaving);
+            const value = valueOn(leaving);
+            const pristine =
+              'String(Event.prototype.preventDefault).includes("[native code]") && ' +
+              'String(Object.getOwnPropertyDescriptor(BeforeUnloadEvent.prototype, "returnValue").set).includes("[native code]") && ' +
+              'String(Object.getOwnPropertyDescriptor(window, "onbeforeunload").set).includes("[native code]")';
             // A same-document navigate (#hash) must hand the page its guard back.
             out.listenersBefore = await count();
             const hashDisarm = await disarmBeforeUnload(leaving);
+            // The listeners stay; only the IDL handler is lifted off.
             out.listenersDisarmed = await count();
+            out.pristineDisarmed = await value(pristine);
             await chrome.tabs.update(leaving, { url: base + '/beforeunload#later' });
             for (let i = 0; i < 60 && !(await chrome.tabs.get(leaving)).url.endsWith('#later'); i++) await sleep(50);
             out.rearmed = await rearmIfSameDocument(leaving, hashDisarm);
             out.listenersRearmed = await count();
-            const value = async (expression) => (await send('Runtime.evaluate', { expression, returnByValue: true })).result.value;
             out.idlBack = await value('typeof onbeforeunload');
-            // The watch is down again: no shadow left on the page's window.
-            out.shadowLeft = await value('Object.prototype.hasOwnProperty.call(window, "removeEventListener")');
-            // The page drops a guard itself while it is down (an SPA route
-            // change): the restore must not bring that one back.
+            // Nothing of ours is left on the page: native prototypes again.
+            out.pristineBack = await value(pristine);
+            // The page drops its guards itself while they are disarmed (an SPA
+            // route change: one by removeEventListener, one by aborting its
+            // signal) — a restore must not bring either back.
             const spaDisarm = await disarmBeforeUnload(leaving);
             await value('history.pushState(null, "", location.pathname + "?list"); dropGuard(); 1');
             out.spaRearmed = await rearmIfSameDocument(leaving, spaDisarm);
@@ -337,6 +372,23 @@ try {
             out.backShows = await value('JSON.stringify(__shows)');
             out.listenersAfterBack = await count();
             out.idlAfterBack = await value('typeof onbeforeunload');
+            out.pristineAfterBack = await value(pristine);
+            // A page whose EventTarget methods multiplex (zone.js): the guard
+            // survives a same-document disarm/restore — one native listener,
+            // run once — and still leaves quietly.
+            const mux = await dirtyTab('/muxguard');
+            const muxValue = valueOn(mux);
+            out.muxBefore = await countOn(mux)();
+            out.muxRearmed = await rearmIfSameDocument(mux, await disarmBeforeUnload(mux));
+            out.muxAfter = await countOn(mux)();
+            out.muxFired = await muxValue('__fired = 0; dispatchEvent(new Event("beforeunload", { cancelable: true })); __fired');
+            events.length = 0;
+            await disarmBeforeUnload(mux);
+            await chrome.tabs.update(mux, { url: base + '/?muxleft' });
+            for (let i = 0; i < 60 && !(await chrome.tabs.get(mux)).url.endsWith('/?muxleft'); i++) await sleep(50);
+            out.muxLeftUrl = (await chrome.tabs.get(mux)).url;
+            out.muxEvents = [...events];
+            await closeAgentTab(mux);
             await closeAgentTab(leaving);
           } finally {
             chrome.tabs.onActivated.removeListener(onActivated);
@@ -753,22 +805,32 @@ try {
   assert.ok(q.closeGone, JSON.stringify(q));
   assert.deepEqual(q.closeEvents, [], JSON.stringify(q));
   assert.ok(q.disarmed >= 3, JSON.stringify(q));
-  // The IDL handler is reported too (3 = listener + handleEvent object + IDL),
-  // every one of them goes — the object only by its originalHandler — and a
-  // same-document navigate puts back exactly what was there, no duplicate.
-  assert.equal(q.listenersBefore, 3, JSON.stringify(q));
-  assert.equal(q.listenersDisarmed, 0, JSON.stringify(q));
+  // 4 = listener + capture handleEvent object + signal-bound listener + IDL.
+  // Disarming leaves every listener registered (only the IDL handler is
+  // lifted off), and a same-document navigate gives back exactly that.
+  assert.equal(q.listenersBefore, 4, JSON.stringify(q));
+  assert.equal(q.listenersDisarmed, 3, JSON.stringify(q));
+  assert.equal(q.pristineDisarmed, false, JSON.stringify(q));
   assert.equal(q.rearmed, true, JSON.stringify(q));
-  assert.equal(q.listenersRearmed, 3, JSON.stringify(q));
+  assert.equal(q.listenersRearmed, 4, JSON.stringify(q));
   assert.equal(q.idlBack, 'function', JSON.stringify(q));
-  assert.equal(q.shadowLeft, false, JSON.stringify(q));
-  // A guard the page dropped itself while it was down stays dropped.
+  assert.equal(q.pristineBack, true, JSON.stringify(q));
+  // Guards the page dropped itself while disarmed — removeEventListener AND an
+  // aborted signal — stay dropped.
   assert.equal(q.spaRearmed, true, JSON.stringify(q));
   assert.equal(q.listenersAfterSpa, 2, JSON.stringify(q));
   // A disarmed document restored from the back/forward cache has its guard.
   assert.equal(q.backShows, '[false,true]', JSON.stringify(q));
   assert.equal(q.listenersAfterBack, 3, JSON.stringify(q));
   assert.equal(q.idlAfterBack, 'function', JSON.stringify(q));
+  assert.equal(q.pristineAfterBack, true, JSON.stringify(q));
+  // zone.js-style multiplexing: the guard is intact and runs exactly once.
+  assert.equal(q.muxBefore, 1, JSON.stringify(q));
+  assert.equal(q.muxRearmed, true, JSON.stringify(q));
+  assert.equal(q.muxAfter, 1, JSON.stringify(q));
+  assert.equal(q.muxFired, 1, JSON.stringify(q));
+  assert.ok(q.muxLeftUrl.endsWith('/?muxleft'), JSON.stringify(q));
+  assert.deepEqual(q.muxEvents, [], JSON.stringify(q));
   assert.ok(q.leftUrl.endsWith('/?left'), JSON.stringify(q));
   assert.deepEqual(q.quietEvents, [], JSON.stringify(q));
   console.log(

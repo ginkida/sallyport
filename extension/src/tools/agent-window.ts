@@ -53,6 +53,14 @@ const creating = new Map<string, Promise<chrome.windows.Window>>();
  * the human's — and hand focus back to it, over the human's real window. */
 let creationChain: Promise<unknown> = Promise.resolve();
 
+/** Told about every agent window the moment `windows.create` answers
+ * (background.ts → human-interest.ts:watchCreatedWindow). One listener. */
+let createdListener: ((windowId: number) => void) | null = null;
+
+export function onAgentWindowCreated(listener: ((windowId: number) => void) | null): void {
+  createdListener = listener;
+}
+
 function serialiseCreation<T>(work: () => Promise<T>): Promise<T> {
   const run = creationChain.then(work, work);
   creationChain = run.catch(() => undefined);
@@ -119,6 +127,21 @@ async function createWindowFor(session: string, url: string): Promise<chrome.win
     // surface the rare failure explicitly instead of crashing below.
     throw new BridgeError('window_create_failed', 'could not create the agent window');
   }
+  if (win.id !== undefined) {
+    // Recorded BEFORE any further await: the window's own focus event may be
+    // handled at the next one, and must already read as ours (`wasJustCreated`).
+    // Prune first: entries are only consulted for a couple of seconds after a
+    // create, so anything older is dead weight in a worker that may run for
+    // hours.
+    const now = Date.now();
+    for (const [id, at] of createdAt) if (now - at > CREATED_AT_TTL_MS) createdAt.delete(id);
+    createdAt.set(win.id, now);
+    try {
+      createdListener?.(win.id);
+    } catch {
+      // a listener's failure is not the create's
+    }
+  }
   if (previous !== undefined && win.id !== undefined && win.id !== previous) {
     try {
       const now = await chrome.windows.get(win.id);
@@ -131,12 +154,6 @@ async function createWindowFor(session: string, url: string): Promise<chrome.win
   }
   if (win.id !== undefined) {
     windowBySession.set(session, win.id);
-    // Prune first: entries are only consulted for a couple of seconds after a
-    // create (`wasJustCreated`), so anything older is dead weight in a worker
-    // that may run for hours.
-    const now = Date.now();
-    for (const [id, at] of createdAt) if (now - at > CREATED_AT_TTL_MS) createdAt.delete(id);
-    createdAt.set(win.id, now);
     await persistWindows();
   }
   return win;

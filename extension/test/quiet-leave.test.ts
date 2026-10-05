@@ -3,7 +3,7 @@ import {
   DISARM_FN,
   PREPARE_LEAVE_FN,
   REARM_FN,
-  beforeUnloadHandlers,
+  beforeUnloadCount,
   closeAgentTab,
   disarmBeforeUnload,
   inFrontOfHuman,
@@ -39,131 +39,295 @@ describe('who may leave without the prompt', () => {
   });
 });
 
-describe('beforeUnloadHandlers', () => {
-  it('keeps well-formed beforeunload entries only, capture read strictly', () => {
+describe('beforeUnloadCount', () => {
+  it('counts well-formed beforeunload entries only (the IDL handler is one)', () => {
     expect(
-      beforeUnloadHandlers([
+      beforeUnloadCount([
         { type: 'beforeunload', useCapture: true, handler: { objectId: 'a' } },
-        { type: 'beforeunload', useCapture: 'yes', handler: { objectId: 'b' } },
-        { type: 'beforeunload' }, // no handler object (objectGroup not honoured)
+        { type: 'beforeunload', useCapture: false },
         { type: 'unload', handler: { objectId: 'c' } },
         null,
         'junk',
       ]),
-    ).toEqual([
-      { objectId: 'a', capture: true },
-      { objectId: 'b', capture: false },
-    ]);
-    expect(beforeUnloadHandlers(undefined)).toEqual([]);
-  });
-
-  it('prefers originalHandler — the REGISTERED object removeEventListener matches', () => {
-    // A handleEvent object or a bound function: `handler` is the function
-    // Chrome calls, `originalHandler` what the page passed to addEventListener.
-    expect(
-      beforeUnloadHandlers([
-        {
-          type: 'beforeunload',
-          useCapture: false,
-          handler: { objectId: 'fn' },
-          originalHandler: { objectId: 'obj' },
-        },
-        { type: 'beforeunload', useCapture: false, handler: { objectId: 'plain' } },
-      ]),
-    ).toEqual([
-      { objectId: 'obj', capture: false },
-      { objectId: 'plain', capture: false },
-    ]);
+    ).toBe(2);
+    expect(beforeUnloadCount(undefined)).toBe(0);
+    expect(beforeUnloadCount({ length: 3 })).toBe(0);
   });
 });
 
 describe('PREPARE_LEAVE_FN, run standalone', () => {
-  // A stand-in for the page's window: an EventTarget whose `onbeforeunload` is
-  // an accessor, as the browser's own is.
-  type Win = EventTarget & { onbeforeunload: unknown };
+  type Listener = ((e: unknown) => unknown) | { handleEvent: (e: unknown) => unknown };
+  type Opts = boolean | { capture?: boolean; once?: boolean; signal?: AbortSignal } | undefined;
+  type Entry = { type: string; fn: Listener; capture: boolean; once: boolean };
   type Controller = { disarm: () => void; restore: () => boolean };
-  function fakeWindow(): { w: Win; ownIdl: PropertyDescriptor } {
-    const w = new EventTarget() as Win;
-    let handler: unknown = null;
-    Object.defineProperty(w, 'onbeforeunload', {
+
+  /** A miniature page realm: its OWN Event / BeforeUnloadEvent prototypes
+   * (never Node's), a window whose listener list the test can see, and the
+   * browser's leave algorithm — listeners in registration order, then the IDL
+   * handler, whose return value cancels NATIVELY (past any JS shadow), then
+   * "would Chrome ask?". */
+  function fakePage() {
+    class PEvent {
+      _type: string;
+      _cancelled = false;
+      persisted = false;
+      constructor(type: string) {
+        this._type = type;
+      }
+    }
+    Object.defineProperty(PEvent.prototype, 'type', {
       configurable: true,
-      enumerable: true,
-      get: () => handler,
-      set: (v: unknown) => {
-        handler = typeof v === 'function' ? v : null;
+      get(this: PEvent) {
+        return this._type;
       },
     });
-    return { w, ownIdl: Object.getOwnPropertyDescriptor(w, 'onbeforeunload')! };
+    Object.defineProperty(PEvent.prototype, 'preventDefault', {
+      configurable: true,
+      writable: true,
+      value: function (this: PEvent) {
+        this._cancelled = true;
+      },
+    });
+    class PBeforeUnloadEvent extends PEvent {
+      _rv = '';
+      constructor() {
+        super('beforeunload');
+      }
+    }
+    Object.defineProperty(PBeforeUnloadEvent.prototype, 'returnValue', {
+      configurable: true,
+      enumerable: true,
+      get(this: PBeforeUnloadEvent) {
+        return this._rv;
+      },
+      set(this: PBeforeUnloadEvent, v: unknown) {
+        this._rv = String(v);
+      },
+    });
+    const nativeCancel = (e: PEvent) => (e._cancelled = true); // C++, no JS involved
+    const list: Entry[] = [];
+    let idl: unknown = null;
+    const capOf = (o: Opts) => (typeof o === 'boolean' ? o : !!o?.capture);
+    const drop = (entry: Entry) => {
+      const i = list.indexOf(entry);
+      if (i >= 0) list.splice(i, 1);
+    };
+    const proto = {};
+    Object.defineProperty(proto, 'onbeforeunload', {
+      configurable: true,
+      enumerable: true,
+      get: () => idl,
+      set: (v: unknown) => {
+        idl = typeof v === 'function' ? v : null;
+      },
+    });
+    const w = Object.create(proto) as Record<string, unknown> & {
+      addEventListener: (type: string, fn: Listener, o?: Opts) => void;
+      removeEventListener: (type: string, fn: Listener, o?: Opts) => void;
+      onbeforeunload: unknown;
+    };
+    Object.assign(w, {
+      Event: PEvent,
+      BeforeUnloadEvent: PBeforeUnloadEvent,
+      addEventListener(type: string, fn: Listener, o?: Opts) {
+        const capture = capOf(o);
+        if (list.some((e) => e.type === type && e.fn === fn && e.capture === capture)) return;
+        const entry = { type, fn, capture, once: typeof o === 'object' && !!o.once };
+        list.push(entry);
+        // The browser's abort algorithm: no JS removeEventListener involved.
+        if (typeof o === 'object') o.signal?.addEventListener('abort', () => drop(entry));
+      },
+      removeEventListener(type: string, fn: Listener, o?: Opts) {
+        const capture = capOf(o);
+        const at = list.findIndex((e) => e.type === type && e.fn === fn && e.capture === capture);
+        if (at >= 0) list.splice(at, 1);
+      },
+    });
+    const dispatch = (e: PEvent) => {
+      for (const entry of list.filter((x) => x.type === e._type)) {
+        if (!list.includes(entry)) continue;
+        if (entry.once) drop(entry);
+        if (typeof entry.fn === 'function') entry.fn.call(w, e);
+        else entry.fn.handleEvent(e);
+      }
+    };
+    return {
+      w,
+      PEvent,
+      PBeforeUnloadEvent,
+      list,
+      /** Would Chrome raise "Leave site?" for this leave? */
+      leave(): boolean {
+        const e = new PBeforeUnloadEvent();
+        dispatch(e);
+        if (typeof idl === 'function' && (idl as (e: unknown) => unknown).call(w, e) != null)
+          nativeCancel(e);
+        return e._cancelled || e._rv !== '';
+      },
+      pageshow(persisted: boolean) {
+        const e = new PEvent('pageshow');
+        e.persisted = persisted;
+        dispatch(e);
+      },
+      count: (type = 'beforeunload') => list.filter((e) => e.type === type).length,
+    };
   }
   const prepare = new Function(`return (${PREPARE_LEAVE_FN})`)() as (
-    this: Win,
+    this: unknown,
     ...args: unknown[]
-  ) => Controller;
-  function fire(w: Win): void {
-    w.dispatchEvent(new Event('beforeunload'));
-  }
-  function pageshow(w: Win, persisted: boolean): void {
-    const e = new Event('pageshow');
-    Object.defineProperty(e, 'persisted', { value: persisted });
-    w.dispatchEvent(e);
-  }
+  ) => Controller | null;
+  /** Prepared the way it runs, but ALSO handed the native registrations as
+   * `fn, capture` pairs — what `DOMDebugger.getEventListeners` reports, and
+   * what the old remove/re-add literal took. The literal ignores arguments;
+   * passing them anyway makes these cases pin the BEHAVIOUR, so they fail on
+   * that design rather than pass vacuously. */
+  const prepareReported = (page: ReturnType<typeof fakePage>) =>
+    prepare.call(
+      page.w,
+      ...page.list.filter((e) => e.type === 'beforeunload').flatMap((e) => [e.fn, e.capture]),
+    )!;
+
   function setup() {
-    const { w, ownIdl } = fakeWindow();
+    const page = fakePage();
     const hits: string[] = [];
-    const plain = () => hits.push('plain');
-    const obj = { handleEvent: () => hits.push('object') };
-    const idl = () => hits.push('idl');
-    w.addEventListener('beforeunload', plain);
-    w.addEventListener('beforeunload', obj, true);
-    w.onbeforeunload = idl;
-    // Chrome reports the IDL handler among the listeners too.
-    const ctl = prepare.call(w, plain, false, obj, true, idl, false);
-    return { w, ownIdl, hits, plain, obj, idl, ctl };
+    page.w.addEventListener('beforeunload', (e) => {
+      hits.push('plain');
+      (e as { preventDefault: () => void }).preventDefault();
+    });
+    // A capture-phase handleEvent object that cancels by returnValue alone.
+    page.w.addEventListener(
+      'beforeunload',
+      {
+        handleEvent: (e) => {
+          hits.push('object');
+          (e as { returnValue: unknown }).returnValue = 'unsaved';
+        },
+      },
+      true,
+    );
+    const idl = () => {
+      hits.push('idl');
+      return 'unsaved';
+    };
+    page.w.onbeforeunload = idl;
+    const ctl = prepareReported(page);
+    return { ...page, hits, idl, ctl };
   }
 
-  it('changes nothing until disarm, then removes every listener and the IDL handler', () => {
-    const { w, hits, ctl } = setup();
-    fire(w);
-    expect(hits).toEqual(['plain', 'object']);
-    hits.length = 0;
-    ctl.disarm();
-    fire(w);
-    expect(hits).toEqual([]);
-    expect(w.onbeforeunload).toBeNull();
+  it('changes nothing until disarm; then no leave is cancelled — yet every listener still runs', () => {
+    const t = setup();
+    expect(t.leave()).toBe(true);
+    t.hits.length = 0;
+    t.ctl.disarm();
+    expect(t.leave()).toBe(false);
+    // A last-moment draft save in a listener still happens; only the IDL
+    // handler (whose return value the browser applies natively) is lifted off.
+    expect(t.hits).toEqual(['plain', 'object']);
+    expect(t.w.onbeforeunload).toBeNull();
+    // The page's listener LIST is never touched.
+    expect(t.count()).toBe(2);
   });
 
-  it('restore puts back exactly what was there — no duplicate, the IDL handler as a handler', () => {
-    const { w, hits, idl, ctl } = setup();
-    ctl.disarm();
-    expect(ctl.restore()).toBe(true);
-    fire(w);
-    expect(hits.sort()).toEqual(['object', 'plain']);
-    expect(w.onbeforeunload).toBe(idl);
-    expect(ctl.restore()).toBe(false); // once
+  it('only a beforeunload event loses its cancel: any other preventDefault still works', () => {
+    const t = setup();
+    t.ctl.disarm();
+    const click = new t.PEvent('click');
+    (click as unknown as { preventDefault: () => void }).preventDefault();
+    expect(click._cancelled).toBe(true);
   });
 
-  it('a listener the PAGE removed meanwhile stays removed (an SPA unmounting its editor)', () => {
-    const { w, hits, plain, obj, ctl } = setup();
+  it('restore gives back the prototypes and the IDL handler; a leave asks again', () => {
+    const t = setup();
+    const pd = Object.getOwnPropertyDescriptor(t.PEvent.prototype, 'preventDefault');
+    const rv = Object.getOwnPropertyDescriptor(t.PBeforeUnloadEvent.prototype, 'returnValue');
+    t.ctl.disarm();
+    expect(t.ctl.restore()).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(t.PEvent.prototype, 'preventDefault')).toEqual(pd);
+    expect(Object.getOwnPropertyDescriptor(t.PBeforeUnloadEvent.prototype, 'returnValue')).toEqual(
+      rv,
+    );
+    expect(t.w.onbeforeunload).toBe(t.idl);
+    expect(Object.prototype.hasOwnProperty.call(t.w, 'onbeforeunload')).toBe(false);
+    expect(t.leave()).toBe(true);
+    expect(t.count('pageshow')).toBe(0); // its own hook is gone too
+    expect(t.ctl.restore()).toBe(false); // once
+  });
+
+  it('a listener the page dropped through an AbortSignal meanwhile stays dropped', () => {
+    // The old remove/re-add brought it back — re-added with no signal, so the
+    // page could never take it off again.
+    const page = fakePage();
+    const ac = new AbortController();
+    page.w.addEventListener(
+      'beforeunload',
+      (e) => ((e as { returnValue: unknown }).returnValue = 'x'),
+      {
+        signal: ac.signal,
+      },
+    );
+    const ctl = prepareReported(page);
     ctl.disarm();
-    // The router's cleanup, while the guard is down: a no-op on its own…
-    w.removeEventListener('beforeunload', plain);
-    // …capture spelled as an options object, matched like the browser does.
-    w.removeEventListener('beforeunload', obj, { capture: true });
+    ac.abort(); // an SPA route change unmounting its editor
     ctl.restore();
-    fire(w);
-    expect(hits).toEqual([]);
+    expect(page.count()).toBe(0);
+    expect(page.leave()).toBe(false);
   });
 
-  it('only a matching removal counts: another type, another capture flag, another target', () => {
-    const { w, hits, plain, ctl } = setup();
+  it('a once listener keeps its once-ness across a disarm and restore', () => {
+    const page = fakePage();
+    let fired = 0;
+    page.w.addEventListener('beforeunload', () => fired++, { once: true });
+    const ctl = prepareReported(page);
     ctl.disarm();
-    w.removeEventListener('unload', plain);
-    w.removeEventListener('beforeunload', plain, true); // registered without capture
-    const other = new EventTarget();
-    w.removeEventListener.call(other, 'beforeunload', plain);
     ctl.restore();
-    fire(w);
-    expect(hits).toContain('plain');
+    page.leave();
+    page.leave();
+    expect(fired).toBe(1);
+  });
+
+  it('a page whose add/removeEventListener multiplex (zone.js) keeps its guard, exactly once', () => {
+    // zone.js registers ONE native callback per type and keeps the page's
+    // handlers in its own task list. Routed through it, the old remove/re-add
+    // lost the guard (the re-add was "existing", so never native) or ran it
+    // hundreds of times. Now neither is ever called for beforeunload.
+    const page = fakePage();
+    const nativeAdd = page.w.addEventListener;
+    const nativeRemove = page.w.removeEventListener;
+    const tasks = new Map<string, Listener[]>();
+    const calls: string[] = [];
+    const shared = function (this: unknown, e: unknown) {
+      for (const fn of [...(tasks.get((e as { type: string }).type) ?? [])])
+        (fn as (e: unknown) => unknown).call(this, e);
+    };
+    page.w.addEventListener = (type, fn, o) => {
+      calls.push('add:' + type);
+      const list = tasks.get(type) ?? [];
+      if (list.length === 0) nativeAdd(type, shared, o);
+      tasks.set(type, [...list, fn]);
+    };
+    page.w.removeEventListener = (type, fn, o) => {
+      calls.push('remove:' + type);
+      const list = tasks.get(type) ?? [];
+      if (!list.includes(fn)) return nativeRemove(type, fn, o); // zone's fallthrough
+      const next = list.filter((x) => x !== fn);
+      tasks.set(type, next);
+      if (next.length === 0) nativeRemove(type, shared, o);
+    };
+    let fired = 0;
+    page.w.addEventListener('beforeunload', (e) => {
+      fired++;
+      (e as { preventDefault: () => void }).preventDefault();
+    });
+    calls.length = 0;
+    const ctl = prepareReported(page);
+    ctl.disarm();
+    expect(page.leave()).toBe(false);
+    ctl.restore();
+    expect(calls.filter((c) => c.endsWith(':beforeunload'))).toEqual([]);
+    expect(page.count()).toBe(1); // the native registration is untouched
+    fired = 0;
+    expect(page.leave()).toBe(true);
+    expect(fired).toBe(1);
   });
 
   it('an IDL handler the page cleared or replaced meanwhile is not overwritten', () => {
@@ -180,56 +344,46 @@ describe('PREPARE_LEAVE_FN, run standalone', () => {
     expect(t.w.onbeforeunload).toBe(newer);
   });
 
-  it('takes its watch down on restore: no own removeEventListener, the original accessor back', () => {
-    const { w, ownIdl, ctl } = setup();
-    ctl.disarm();
-    expect(Object.prototype.hasOwnProperty.call(w, 'removeEventListener')).toBe(true);
-    ctl.restore();
-    expect(Object.prototype.hasOwnProperty.call(w, 'removeEventListener')).toBe(false);
-    expect(Object.getOwnPropertyDescriptor(w, 'onbeforeunload')?.get).toBe(ownIdl.get);
-    // and the page's own removals go straight to the browser again
-    const late = () => {};
-    w.addEventListener('beforeunload', late);
-    w.removeEventListener('beforeunload', late);
-  });
-
-  it('never takes down a removeEventListener the page put there itself', () => {
-    const { w, ctl } = setup();
-    ctl.disarm();
-    const pages = () => {};
-    (w as unknown as { removeEventListener: unknown }).removeEventListener = pages;
-    ctl.restore();
-    expect((w as unknown as { removeEventListener: unknown }).removeEventListener).toBe(pages);
+  it('never takes down a preventDefault or returnValue the page installed itself meanwhile', () => {
+    const t = setup();
+    t.ctl.disarm();
+    const pages = function () {};
+    t.PEvent.prototype['preventDefault' as keyof typeof t.PEvent.prototype] = pages as never;
+    const rv = { configurable: true, get: () => 'mine', set: () => {} };
+    Object.defineProperty(t.PBeforeUnloadEvent.prototype, 'returnValue', rv);
+    t.ctl.restore();
+    expect(Object.getOwnPropertyDescriptor(t.PEvent.prototype, 'preventDefault')?.value).toBe(
+      pages,
+    );
+    expect(
+      Object.getOwnPropertyDescriptor(t.PBeforeUnloadEvent.prototype, 'returnValue')?.get,
+    ).toBe(rv.get);
   });
 
   it('a document restored from the back/forward cache gets its guard back on pageshow', () => {
-    const { w, hits, idl, ctl } = setup();
-    ctl.disarm();
-    pageshow(w, false); // an ordinary pageshow is not a return
-    fire(w);
-    expect(hits).toEqual([]);
-    pageshow(w, true);
-    fire(w);
-    expect(hits.sort()).toEqual(['object', 'plain']);
-    expect(w.onbeforeunload).toBe(idl);
-    expect(ctl.restore()).toBe(false); // already done — the extension's rearm is a no-op
-  });
-
-  it('…minus what the page removed on its way out (pagehide cleanup)', () => {
-    const { w, hits, plain, ctl } = setup();
-    ctl.disarm();
-    w.removeEventListener('beforeunload', plain);
-    pageshow(w, true);
-    fire(w);
-    expect(hits).toEqual(['object']);
+    const t = setup();
+    t.ctl.disarm();
+    t.pageshow(false); // an ordinary pageshow is not a return
+    expect(t.leave()).toBe(false);
+    t.pageshow(true);
+    expect(t.leave()).toBe(true);
+    expect(t.w.onbeforeunload).toBe(t.idl);
+    expect(t.ctl.restore()).toBe(false); // already done — the extension's rearm is a no-op
   });
 
   it('restore before disarm changes nothing', () => {
-    const { w, hits, ctl } = setup();
-    expect(ctl.restore()).toBe(false);
-    ctl.disarm(); // a late disarm after a restore must not strip the guard either
-    fire(w);
-    expect(hits).toEqual(['plain', 'object']);
+    const t = setup();
+    expect(t.ctl.restore()).toBe(false);
+    t.ctl.disarm(); // a late disarm after a restore must not disarm the guard either
+    expect(t.leave()).toBe(true);
+    expect(t.w.onbeforeunload).toBe(t.idl);
+  });
+
+  it('a page with nothing to shadow gets no controller — no quiet leave', () => {
+    const page = fakePage();
+    delete page.w.BeforeUnloadEvent;
+    expect(prepare.call(page.w)).toBeNull();
+    expect(prepare.call({})).toBeNull();
   });
 });
 
@@ -531,7 +685,7 @@ describe('disarmBeforeUnload / rearmIfSameDocument', () => {
       .filter((s) => s.method === 'Runtime.callFunctionOn')
       .map((s) => s.params?.functionDeclaration);
 
-  it('one fixed function, the handlers as structured arguments, in the call group', async () => {
+  it('one fixed function with no arguments, its lookups in the call group', async () => {
     const io = stubChrome({
       loaderIds: ['L1'],
       listeners: [
@@ -547,12 +701,14 @@ describe('disarmBeforeUnload / rearmIfSameDocument', () => {
       method: 'Runtime.evaluate',
       params: { expression: 'window', objectGroup: CALL_GROUP },
     });
+    expect(io.sent[1]).toEqual({
+      tabId: 7,
+      method: 'DOMDebugger.getEventListeners',
+      params: { objectId: 'win', objectGroup: CALL_GROUP },
+    });
     const calls = io.sent.filter((s) => s.method === 'Runtime.callFunctionOn');
     expect(calls.map((c) => c.params?.functionDeclaration)).toEqual([PREPARE_LEAVE_FN, DISARM_FN]);
-    expect(calls[0].params).toMatchObject({
-      objectId: 'win',
-      arguments: [{ objectId: 'h1' }, { value: false }, { objectId: 'o2' }, { value: true }],
-    });
+    expect(calls[0].params).toEqual({ objectId: 'win', functionDeclaration: PREPARE_LEAVE_FN });
     expect(calls[1].params).toEqual({ objectId: 'state', functionDeclaration: DISARM_FN });
   });
 
