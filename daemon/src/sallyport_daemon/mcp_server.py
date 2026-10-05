@@ -176,6 +176,9 @@ TOOLS: list[Tool] = [
             "may exist at once: past the cap it closes the least recently used ones it is "
             "allowed to (never one the human has looked at), and a later call naming a "
             "closed tab answers tab_gone. Call close_tab when you are done with a tab. "
+            "Navigating a tab you created away from its page raises no 'Leave site?' "
+            "prompt (unless the human has used that tab): its beforeunload handlers "
+            "are removed first, so whatever the page does on leave does not run. "
             "waitFor polls after the "
             "load until a selector/text shows up — on SPAs 'loaded' rarely means "
             "'rendered', so prefer navigate+waitFor over navigate then wait_for. "
@@ -210,7 +213,10 @@ TOOLS: list[Tool] = [
             "Allowlist-gated: the tab's URL must be in the extension's "
             "allowlist, otherwise the call fails with domain_not_allowed "
             "(prevents an agent from closing non-allowlisted tabs it can "
-            "still see via list_tabs)."
+            "still see via list_tabs). A tab you created (broker mode) is exempt "
+            "from that check and, unless the human has used it, closes without its "
+            "'Leave site?' prompt — the page's beforeunload handlers do not run, so "
+            "unsaved input on it is discarded."
         ),
         inputSchema={
             "type": "object",
@@ -232,7 +238,8 @@ TOOLS: list[Tool] = [
             "differs from the page you reloaded, which is the usual tell that the "
             "session expired and the app bounced you to a login page. Refs are "
             "invalidated, so pass observe:{snapshot:'compact'} to get fresh ones "
-            "back here rather than spending a snapshot call on it."
+            "back here rather than spending a snapshot call on it. A tab you "
+            "created reloads without a 'Leave site?' prompt."
         ),
         inputSchema={
             "type": "object",
@@ -263,7 +270,8 @@ TOOLS: list[Tool] = [
             "fire a load at all. On a timeout, do NOT assume the hop failed — "
             "it may have already landed before the load watchdog fired; "
             "check where you are with read_text/snapshot before retrying. "
-            "Conversely, if a beforeunload prompt on the page you're leaving "
+            "A tab you created leaves its page without a 'Leave site?' prompt. "
+            "On any other tab, if a beforeunload prompt on the page you're leaving "
             "gets dismissed (the default unless you armed handle_dialog to "
             "accept it), the hop is verified to have actually happened before "
             "success is reported — a cancelled hop fails with "

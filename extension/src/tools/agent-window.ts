@@ -84,13 +84,20 @@ async function persistWindows(): Promise<void> {
  * manager rather than a guarantee (macOS in particular has a long history of
  * activating new windows anyway). Re-focusing whatever window the human had is
  * a cheap belt on a platform-dependent flag: if `focused:false` was honoured
- * this is a no-op, and if it wasn't, the human keeps their place. */
+ * this is a no-op, and if it wasn't, the human keeps their place.
+ *
+ * ONLY when that window was actually focused, though. `getLastFocused` answers
+ * the most recently active Chrome window even while the human is in another
+ * app entirely, and `windows.update({focused:true})` on it ACTIVATES Chrome —
+ * on macOS the whole app comes to the front, over the terminal or editor the
+ * human was using. The restore exists to give back focus Chrome had; it must
+ * never take focus Chrome did not have. Pure decision: `shouldRestoreFocus`. */
 async function createWindowFor(session: string, url: string): Promise<chrome.windows.Window> {
-  let previous: number | undefined;
+  let before: chrome.windows.Window | undefined;
   try {
-    previous = (await chrome.windows.getLastFocused())?.id;
+    before = await chrome.windows.getLastFocused();
   } catch {
-    previous = undefined;
+    before = undefined;
   }
   const win = await chrome.windows.create({ url, focused: false });
   if (!win) {
@@ -99,10 +106,11 @@ async function createWindowFor(session: string, url: string): Promise<chrome.win
     // surface the rare failure explicitly instead of crashing below.
     throw new BridgeError('window_create_failed', 'could not create the agent window');
   }
-  if (previous !== undefined && win.id !== previous) {
+  const restoreTo = shouldRestoreFocus(before, win.id) ? before?.id : undefined;
+  if (restoreTo !== undefined) {
     try {
       const focused = await chrome.windows.getLastFocused();
-      if (focused?.id === win.id) await chrome.windows.update(previous, { focused: true });
+      if (focused?.id === win.id) await chrome.windows.update(restoreTo, { focused: true });
     } catch {
       // window gone / API unavailable — nothing to restore
     }
@@ -118,6 +126,18 @@ async function createWindowFor(session: string, url: string): Promise<chrome.win
     await persistWindows();
   }
   return win;
+}
+
+/** Should `createWindowFor` hand focus back to `before` (the last-focused
+ * window read BEFORE the create)? Only if it was a different window that
+ * really HAD focus — `focused === true`, i.e. Chrome was the active app. A
+ * window that was merely the last one used, with the human in another app,
+ * gets nothing: focusing it would bring Chrome to the front. Pure. */
+export function shouldRestoreFocus(
+  before: Pick<chrome.windows.Window, 'id' | 'focused'> | undefined,
+  createdId: number | undefined,
+): boolean {
+  return before?.id !== undefined && before.focused === true && before.id !== createdId;
 }
 
 /** Add a tab to an existing agent window. */

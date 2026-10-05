@@ -24,6 +24,7 @@ import {
   reconcileEpochs,
   serializeEpochs,
 } from './ownership.js';
+import { closeTabQuietly, mayCloseQuietly } from './quiet-leave.js';
 
 const STORE_KEY = 'sallyport_epochs';
 
@@ -65,7 +66,9 @@ export async function reconcileWithLiveTabs(): Promise<void> {
  *
  * `chrome.tabs.remove` resolves only once the tab is GONE, and a page with a
  * `beforeunload` handler can hold that open indefinitely (the dialog is browser
- * UI; with dialog handling off, nobody answers it). This runs on the create
+ * UI; with dialog handling off, nobody answers it). The quiet close avoids the
+ * prompt for our own tabs, but falls back to exactly that removal when it has
+ * no debugger foothold. This runs on the create
  * path, so an unbounded wait would hang the agent's `navigate` behind a page
  * nobody is looking at. */
 const EVICT_DEADLINE_MS = 2000;
@@ -102,7 +105,13 @@ export async function reapAgentTabs(session?: string): Promise<number[]> {
       });
       try {
         const outcome = await Promise.race([
-          chrome.tabs.remove(tabId).then(() => 'closed' as const),
+          // Quietly: an evicted tab with a beforeunload handler would otherwise
+          // raise its agent window over the human's work (quiet-leave.ts).
+          // planEviction never picks a human-engaged tab; the check is a
+          // second, local answer to the same question.
+          (mayCloseQuietly(tabId) ? closeTabQuietly(tabId) : chrome.tabs.remove(tabId)).then(
+            () => 'closed' as const,
+          ),
           deadline,
         ]);
         if (outcome === 'closed') {

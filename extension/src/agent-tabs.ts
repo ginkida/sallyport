@@ -1,4 +1,5 @@
 import { agentTabInfo, agentTabRecord } from './tools/ownership.js';
+import { closeTabQuietly } from './tools/quiet-leave.js';
 
 export type AgentTabRow = {
   tabId: number;
@@ -59,7 +60,11 @@ export async function closeAgentTabs(scope: 'all' | 'finished'): Promise<CloseAg
       continue;
     }
     try {
-      await chrome.tabs.remove(candidate.tabId);
+      // An agent-only tab closes without its beforeunload prompt (no window
+      // raised per tab, no sweep stuck on an unanswered "Close site?"); one the
+      // human engaged with keeps it — the prompt may guard their own typing.
+      if (current.human) await chrome.tabs.remove(candidate.tabId);
+      else await closeTabQuietly(candidate.tabId);
       result.closed++;
     } catch (error) {
       if (isMissingTabError(error)) result.skipped++;

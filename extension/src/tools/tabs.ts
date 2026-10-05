@@ -21,6 +21,12 @@ import {
   mintEpoch,
 } from './ownership.js';
 import { persistEpochs, reapAgentTabs } from './ownership-store.js';
+import {
+  closeTabQuietly,
+  disarmBeforeUnload,
+  mayCloseQuietly,
+  mayLeaveQuietly,
+} from './quiet-leave.js';
 import { createAgentTab } from './agent-window.js';
 import type { Tool } from './types.js';
 
@@ -240,6 +246,11 @@ export const navigate: Tool = async (args, ctx) => {
       // missed. Best-effort: a failed attach (e.g. DevTools already open on
       // this tab) must not block the navigate the agent actually asked for.
       await bestEffortAttach(tab.id!);
+      // The agent's own tab: leave without Chrome's "Leave site?" prompt, which
+      // would raise the agent window over whatever the human is doing and hold
+      // the navigation until they answer it (quiet-leave.ts). A human tab
+      // keeps the prompt.
+      if (mayLeaveQuietly(tab.id!)) await disarmBeforeUnload(tab.id!, ctx?.startedAt);
       await chrome.tabs.update(tab.id!, { url });
     }
   }
@@ -362,7 +373,12 @@ export const closeTab: Tool = async (args) => {
   const tab = await getTabOrGone(tabId);
   const ownAgentTab = isBrokerMode() && getEpoch(tabId) !== undefined;
   if (!ownAgentTab) await ensureAllowed(tab.url);
-  await chrome.tabs.remove(tabId);
+  // Our own tab closes WITHOUT its beforeunload prompt: Chrome raises the
+  // agent window to show one (focus theft) and the close waits on a human.
+  // Not for a tab the human engaged with, nor any non-agent tab — there the
+  // prompt may be guarding something a person typed (quiet-leave.ts).
+  if (ownAgentTab && mayCloseQuietly(tabId)) await closeTabQuietly(tabId);
+  else await chrome.tabs.remove(tabId);
   return { tabId, url: tab.url, data: { closed: tabId } };
 };
 
@@ -381,6 +397,8 @@ export const reload: Tool = async (args, ctx) => {
   // Best-effort: a failed attach (e.g. DevTools already open on this tab)
   // must not block the reload the agent actually asked for.
   await bestEffortAttach(tab.id!);
+  // Same as navigate: an agent's own tab reloads without a "Leave site?" prompt.
+  if (mayLeaveQuietly(tab.id!)) await disarmBeforeUnload(tab.id!, ctx?.startedAt);
   await chrome.tabs.reload(tab.id!, { bypassCache });
   await waitForLoad(tab.id!, 'reload', loadTimeoutMs(ctx?.startedAt, Date.now()));
   // A reload invalidates any refs we may have built for this tab, and any

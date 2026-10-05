@@ -64,7 +64,7 @@ the "Tools" table for per-tool notes. Quick reference:
 | Daemon ↔ extension authenticity | HMAC-SHA256, ts±30 s, 4096-nonce cache | `daemon/.../protocol.py`, `extension/src/crypto.ts` |
 | Network exposure | Loopback-only bind (`refuse_non_loopback`) | `daemon/.../__main__.py` |
 | Domain scope | Allowlist enforced before every DOM tool | `extension/src/allowlist.ts`, `extension/src/tools/gates.ts` |
-| Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, `snapshot`'s DOM-fallback walker, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation; `set_viewport`'s viewport read-back; `screenshot`'s one-word `window.devicePixelRatio` read, used only to RAISE a browser-owned size bound, never to lower it) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `domtree.ts`, `aim.ts`, `viewport.ts`, `screenshot.ts`. `print_to_pdf` runs NO page JS at all — structured CDP only |
+| Arbitrary JS | Per-domain `allowEvaluate` opt-in; fixed-literal probes (`fetch_in_page` body, `snapshot`'s DOM-fallback walker, `mouse_click`'s aiming probes — coordinates travel as structured `callFunctionOn` arguments, not interpolation; `set_viewport`'s viewport read-back; `screenshot`'s one-word `window.devicePixelRatio` read, used only to RAISE a browser-owned size bound, never to lower it; the two `beforeunload`-removal functions an agent's own tab runs before it navigates — the handler travels as a structured argument) interpolate no agent input and need only the allowlist | `extension/src/tools/gates.ts:ensureEvaluateAllowed`; `fetch.ts`, `domtree.ts`, `aim.ts`, `viewport.ts`, `screenshot.ts`, `quiet-leave.ts`. `print_to_pdf` runs NO page JS at all — structured CDP only |
 | Password input | `fill` reads `type` via browser DOM, then binds the write to its target: after `focus()` the browser's AX tree must show focus inside the target's subtree (through closed shadow roots, never into a frame), and an isolated-world guard cancels the insert at `beforeinput`/`textInput` if the focus chain has left the field (limits below); a frame is refused unless its whole document is an editor on an allowlisted origin; `key_type`/`send_keys` enumerate frames (temporary flat child sessions for OOPIFs), locate focused AX nodes through closed shadow DOM, then inspect browser-owned DOM attributes | `extension/src/tools/dom.ts`, `focus.ts`, `keyboard.ts` |
 | Element refs (`@eN`) | Per-tab map; ids are monotonic per tab and restart at `e1` only when the tab closes (a detach, navigation or re-snapshot wipes the map but keeps counting; an extension worker restart or reload resumes from the exact high-water mark — the highest id handed out — persisted in `chrome.storage.local` before any id it covers is handed out, so a restart re-issues no id and skips none), so a held ref MISSES instead of re-binding. Best-effort at that one seam: if storage refuses, a restarted worker counts from `e1` again. A refusal is never sticky — a refused load is retried by the next call, a refused write re-arms so the next call writes again, and a worker that has not managed to load writes nothing rather than replace the stored marks of tabs it never touched. Each ref is stamped with the main-frame loader id of the document it was minted in and refused as `bad_ref` once the tab shows another document — after a navigation the PAGE starts into a new renderer process, an old backendNodeId resolves to a live node of the new page | `extension/src/tools/refs.ts`, `ref-store.ts`, `resolve.ts:refDocumentState` |
 | Closing tabs | Allowlist-gated like other DOM tools, EXCEPT a tab the caller created in broker mode: the daemon has already proved ownership, which is a stronger answer to "may I destroy this tab" (and without it an agent tab that redirected off-allowlist could never be closed by its owner) | `extension/src/tools/tabs.ts:closeTab` |
@@ -127,7 +127,9 @@ fallback) are what an agent normally sees. `--no-broker` /
 `SALLYPORT_NO_BROKER=1` restores single-session standalone behaviour.
 
 Each session's tabs open in **its own** non-focused window, muted, with the
-human's previously-focused window restored afterwards. Those are ordinary
+human's previously-focused window restored afterwards — only when Chrome
+actually had focus, since focusing a window of a Chrome the human was not using
+would bring the whole app to the front (macOS). Those are ordinary
 windows in the human's profile — same cookie jar, same logins — because the
 point of driving the user's own browser is that an agent inherits the sessions
 they are already signed into. The separation is ownership, never identity: there
@@ -390,6 +392,42 @@ Chrome profile, sharing their cookies and logins by design. An agent driving an
 allowlisted site acts **as the signed-in user**. That is the premise of the
 whole project (see the threat model), not an oversight — the allowlist and
 per-domain `evaluate` opt-in are what bound it.
+
+### Broker mode: an agent's own tab leaves without asking
+
+A page with a `beforeunload` handler that has seen a user gesture — and an
+agent's click or typing is one — makes Chrome ask "Leave site?" / "Close
+site?" before it goes. To show that prompt Chrome activates the tab and focuses
+its window, even when a CDP client answers the dialog at once; on macOS the
+whole app comes to the front, and the close or navigation waits for a human
+click. So for a tab the agent CREATED and the human has not engaged with
+(`quiet-leave.ts:mayCloseQuietly`), the prompt is never raised: every close
+(`close_tab`, the tab reaper, `_release_tabs`' close, the popup sweep) goes
+through `Target.closeTarget`, which closes without running `beforeunload`
+(unload still runs — what Puppeteer's `page.close()` does), and an in-place
+`navigate`/`reload`/`history_go` first removes the main frame's `beforeunload`
+listeners (`DOMDebugger.getEventListeners` + two fixed functions, handler passed
+as a structured argument). What that means and what it doesn't:
+
+- **The page's own `beforeunload` logic does not run** on those paths — a
+  last-moment draft save or analytics beacon tied to it is skipped. Leaving is
+  what the agent asked for; nothing a person typed is involved.
+- **A human tab keeps Chrome's prompt**: anything without an epoch (the
+  human's own tabs, the standalone active-tab fallback) and an agent tab the
+  human activated or dragged into their own window. There the prompt may guard
+  their typing.
+- **Best effort, falls back to the old behaviour.** No debugger foothold
+  (DevTools open on the tab, a page extensions may not debug) → plain
+  `chrome.tabs.remove`, and the prompt can appear. A page frozen on an
+  `alert()` gets `DISARM_DEADLINE_MS` (1.5 s) and then navigates with its
+  listeners in place. The removal runs in the page's main world, so a page that
+  replaced `removeEventListener` keeps its prompt — it can only annoy, never
+  reach anything. A CHILD frame's listener is not removed.
+- **Not covered: navigations the page starts.** A `click` on a link or a form
+  submit is a navigation the renderer begins, and the agent's own tool calls
+  give no reliable point to intervene before it; such a prompt still raises the
+  tab. Same for a `beforeunload` listener the page registers again after the
+  removal and before the navigation commits.
 
 ### Broker mode: there is no per-session allowlist, and one would not be a boundary
 

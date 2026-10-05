@@ -141,6 +141,16 @@ const server = createServer((req, res) => {
         '<script>let n = 0; document.addEventListener("click", () => {' +
         ' document.getElementById("clicks").textContent = String(++n); }, true);</script>',
     );
+  } else if (req.url?.startsWith('/beforeunload')) {
+    // A page that asks before it is left — once it has had a user gesture,
+    // which an agent's click or typing is.
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(
+      '<!doctype html><title>Unsaved</title>' +
+        '<input id="draft" style="position:absolute;left:10px;top:10px;width:200px;height:30px">' +
+        '<script>addEventListener("beforeunload", (e) => { e.preventDefault(); e.returnValue = ""; });' +
+        'onbeforeunload = () => "unsaved";</script>',
+    );
   } else if (req.url?.startsWith('/pwframe')) {
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end('<!doctype html><input id="pw" type="password" autofocus>');
@@ -228,6 +238,62 @@ try {
       contents: `
         import './src/background.ts';
         import { mintEpoch, markHumanTab, markOrphanedTab } from './src/tools/ownership.ts';
+        import { attach } from './src/tools/cdp.ts';
+        import { closeTabQuietly, disarmBeforeUnload } from './src/tools/quiet-leave.ts';
+        // Focus theft: a beforeunload prompt makes Chrome ACTIVATE the tab and
+        // FOCUS its window. The agent's own tab must leave without raising one.
+        globalThis.quietLeaveTest = async (base) => {
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const bounded = (p, ms, what) => Promise.race([p, sleep(ms).then(() => { throw new Error(what + ' hung'); })]);
+          const settled = (p, ms) => Promise.race([p.then(() => 'done', () => 'done'), sleep(ms).then(() => 'pending')]);
+          const exists = (id) => chrome.tabs.get(id).then(() => true, () => false);
+          const events = [];
+          const onActivated = (info) => events.push('activated:' + info.tabId);
+          const onFocus = (windowId) => { if (windowId !== chrome.windows.WINDOW_ID_NONE) events.push('focus:' + windowId); };
+          chrome.tabs.onActivated.addListener(onActivated);
+          chrome.windows.onFocusChanged.addListener(onFocus);
+          const win = await chrome.windows.create({ url: base + '/?agent-window', focused: false });
+          // An agent tab in the BACKGROUND of its window, with a gesture on it.
+          const dirtyTab = async () => {
+            const tab = await chrome.tabs.create({ windowId: win.id, url: base + '/beforeunload', active: false });
+            for (let i = 0; i < 100 && (await chrome.tabs.get(tab.id)).status !== 'complete'; i++) await sleep(50);
+            await attach(tab.id);
+            // The capture test turned keep-awake off; a hidden tab takes no input without it.
+            await chrome.debugger.sendCommand({ tabId: tab.id }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+            for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased'])
+              await bounded(chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.dispatchMouseEvent', { type, x: 50, y: 25, button: 'left', clickCount: 1 }), 5000, 'click');
+            await bounded(chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.insertText', { text: 'draft' }), 5000, 'type');
+            mintEpoch(tab.id, 'smoke');
+            return tab.id;
+          };
+          const out = {};
+          try {
+            // Control: the plain removal DOES prompt here, so the cases below mean something.
+            const control = await dirtyTab();
+            events.length = 0;
+            out.controlRemove = await settled(chrome.tabs.remove(control), 1500);
+            out.controlEvents = [...events];
+            out.controlCleanup = await bounded(closeTabQuietly(control), 5000, 'cleanup');
+            const closing = await dirtyTab();
+            events.length = 0;
+            out.close = await bounded(closeTabQuietly(closing), 5000, 'quiet close');
+            out.closeGone = !(await exists(closing));
+            out.closeEvents = [...events];
+            const leaving = await dirtyTab();
+            events.length = 0;
+            out.disarmed = await disarmBeforeUnload(leaving);
+            await chrome.tabs.update(leaving, { url: base + '/?left' });
+            for (let i = 0; i < 60 && !(await chrome.tabs.get(leaving)).url.endsWith('/?left'); i++) await sleep(50);
+            out.leftUrl = (await chrome.tabs.get(leaving)).url;
+            out.quietEvents = [...events];
+            await closeTabQuietly(leaving);
+          } finally {
+            chrome.tabs.onActivated.removeListener(onActivated);
+            chrome.windows.onFocusChanged.removeListener(onFocus);
+            await chrome.windows.remove(win.id).catch(() => {});
+          }
+          return out;
+        };
         globalThis.seedAgentTabs = async (url) => {
           const ids = [];
           for (let i = 0; i < 3; i++) {
@@ -611,6 +677,35 @@ try {
   assert.ok(surviving.result.value.includes(tabId));
   console.log(
     'PASS: popup session groups and finished cleanup preserve viewed, active and non-agent tabs',
+  );
+  const quiet = await call(
+    'Runtime.evaluate',
+    {
+      expression: `quietLeaveTest(${JSON.stringify(fixtureUrl)})`,
+      awaitPromise: true,
+      returnByValue: true,
+    },
+    workerSession,
+  );
+  if (quiet.exceptionDetails) throw new Error(JSON.stringify(quiet.exceptionDetails));
+  const q = quiet.result.value;
+  // The fixture really prompts: a plain removal hangs on it and raises the tab.
+  assert.equal(q.controlRemove, 'pending', JSON.stringify(q));
+  assert.ok(
+    q.controlEvents.some((e) => e.startsWith('activated:')),
+    JSON.stringify(q),
+  );
+  assert.equal(q.controlCleanup, 'quiet', JSON.stringify(q));
+  // The agent's own tab closes and navigates away with no prompt, nothing
+  // activated, no window focused.
+  assert.equal(q.close, 'quiet', JSON.stringify(q));
+  assert.ok(q.closeGone, JSON.stringify(q));
+  assert.deepEqual(q.closeEvents, [], JSON.stringify(q));
+  assert.ok(q.disarmed >= 1, JSON.stringify(q));
+  assert.ok(q.leftUrl.endsWith('/?left'), JSON.stringify(q));
+  assert.deepEqual(q.quietEvents, [], JSON.stringify(q));
+  console.log(
+    'PASS: an agent tab with a beforeunload handler closes and navigates without a prompt',
   );
   if (testMcp) {
     // Hand the fixture back before the production worker drives it. The

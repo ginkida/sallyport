@@ -6,6 +6,31 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Agents no longer pull you into their tabs to click "Close" / "Leave". A page
+  with a `beforeunload` handler that had seen a click or typing — which an
+  agent's input is — made Chrome ask before the page went away, and to ask,
+  Chrome activated the agent tab and focused its window (bringing Chrome to the
+  front on macOS), then held the close or navigation until someone answered:
+  `close_tab`, the tab reaper, `_release_tabs` with
+  `closeAgentTabsOnDisconnect`, the popup's agent-tab sweep, and an in-place
+  `navigate`/`reload`/`history_go`. Answering the prompt over CDP does not help —
+  Chrome raises the window before the answer lands (measured on Chrome 154). For
+  a tab the agent created and you have not engaged with, closes now go through
+  `Target.closeTarget`, which skips `beforeunload` (unload still runs), and
+  in-place navigations first remove the page's `beforeunload` listeners. The
+  page's own `beforeunload` logic does not run on those paths. Your tabs, and an
+  agent tab you activated or dragged into your own window, keep Chrome's
+  prompt. Without a debugger foothold (DevTools open on the tab) it falls back
+  to the previous behaviour; a link click or form submit that leaves a page is
+  not covered (SECURITY.md).
+- Creating an agent window no longer brings a backgrounded Chrome to the front.
+  If the new window took focus, the previously focused window was re-focused —
+  even when that window only was the last one used and you were in another app,
+  in which case focusing it activated Chrome. It is now re-focused only when it
+  actually had focus.
+
 ## [0.26.0] — 2026-10-02
 
 ### Security

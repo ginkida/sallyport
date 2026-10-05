@@ -10,6 +10,7 @@ import {
   type HistoryEntry,
 } from '../src/tools/history.js';
 import { setAllowlist } from '../src/storage.js';
+import { clearAllEpochs, markHumanTab, mintEpoch, setBrokerMode } from '../src/tools/ownership.js';
 
 const entries: HistoryEntry[] = [
   { id: 10, url: 'https://a.example/start' },
@@ -156,6 +157,8 @@ function installHistoryChromeMock(opts: {
    * attaching CDP disables the back/forward cache, so a real redirect is a
    * live possibility, not an edge case. */
   redirectTo?: string;
+  /** Every CDP method sent, in order. */
+  log?: string[];
 }): void {
   const store = new Map<string, unknown>();
   let currentTab: MockTab = { ...opts.tab, status: opts.tab.status ?? 'complete' };
@@ -218,7 +221,16 @@ function installHistoryChromeMock(opts: {
       attach() {
         return Promise.resolve();
       },
-      sendCommand(_target: { tabId: number }, method: string, params?: { entryId?: number }) {
+      sendCommand(_target: { tabId: number }, method: string, params?: Record<string, unknown>) {
+        opts.log?.push(method);
+        if (method === 'Runtime.evaluate' && params?.expression === 'window') {
+          return Promise.resolve({ result: { objectId: 'window-1' } });
+        }
+        if (method === 'DOMDebugger.getEventListeners') {
+          return Promise.resolve({
+            listeners: [{ type: 'beforeunload', useCapture: true, handler: { objectId: 'h-1' } }],
+          });
+        }
         if (method === 'Page.getNavigationHistory') {
           return Promise.resolve(opts.navHistory);
         }
@@ -302,5 +314,59 @@ describe('historyGo — verifies the hop actually landed', () => {
     };
     // Reports where the tab ACTUALLY landed, not the (now-inaccurate) target.
     expect(result.data.url).toBe('https://allowed.example/login');
+  });
+});
+
+describe('historyGo — the agent own tab hops without a beforeunload prompt', () => {
+  // A prompt would raise the agent window over the human's work (Chrome
+  // activates + focuses to show it) and hold the hop until someone answers.
+  const navHistory = {
+    currentIndex: 1,
+    entries: [
+      { id: 10, url: 'https://allowed.example/start' },
+      { id: 11, url: 'https://allowed.example/current' },
+    ],
+  };
+
+  beforeEach(() => {
+    resetAttachedTabs();
+    clearAllEpochs();
+  });
+
+  async function run(setup: () => void): Promise<string[]> {
+    const log: string[] = [];
+    installHistoryChromeMock({
+      tab: { id: 1, url: 'https://allowed.example/current' },
+      navHistory,
+      hopSucceeds: true,
+      log,
+    });
+    await setAllowlist([{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }]);
+    setup();
+    await historyGo({ tabId: 1, direction: 'back' });
+    return log;
+  }
+
+  it('removes the page beforeunload listeners BEFORE the hop, in broker mode', async () => {
+    const log = await run(() => {
+      setBrokerMode(true);
+      mintEpoch(1, 'alpha');
+    });
+    const removed = log.indexOf('DOMDebugger.getEventListeners');
+    expect(removed).toBeGreaterThan(-1);
+    expect(log.lastIndexOf('Runtime.callFunctionOn')).toBeLessThan(
+      log.indexOf('Page.navigateToHistoryEntry'),
+    );
+  });
+
+  it('leaves a human tab (standalone) and a human-engaged agent tab alone', async () => {
+    expect(await run(() => {})).not.toContain('DOMDebugger.getEventListeners');
+    clearAllEpochs();
+    const log = await run(() => {
+      setBrokerMode(true);
+      mintEpoch(1, 'alpha');
+      markHumanTab(1);
+    });
+    expect(log).not.toContain('DOMDebugger.getEventListeners');
   });
 });

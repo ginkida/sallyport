@@ -84,3 +84,47 @@ describe('agent tab management', () => {
     expect(await closeAgentTabs('all')).toEqual({ closed: 2, failed: 0, skipped: 0 });
   });
 });
+
+describe('sweep closes agent-only tabs without the beforeunload prompt', () => {
+  // A sweep of N tabs with a dirty form each used to raise N "Close site?"
+  // prompts, each one activating its tab and focusing its window.
+  function quietDebugger(closed: number[]) {
+    const listeners = new Set<(id: number) => void>();
+    vi.stubGlobal('chrome', {
+      tabs: {
+        remove,
+        query,
+        async get(id: number) {
+          if (closed.includes(id)) throw new Error(`No tab with id: ${id}.`);
+          return { id };
+        },
+        onRemoved: {
+          addListener: (fn: (id: number) => void) => listeners.add(fn),
+          removeListener: (fn: (id: number) => void) => listeners.delete(fn),
+        },
+      },
+      debugger: {
+        getTargets: async () => [1, 2].map((tabId) => ({ id: `T${tabId}`, tabId })),
+        attach: async () => undefined,
+        detach: async () => undefined,
+        sendCommand: async (target: { tabId: number }, method: string) => {
+          if (method !== 'Target.closeTarget') return {};
+          closed.push(target.tabId);
+          for (const fn of [...listeners]) fn(target.tabId);
+          return { success: true };
+        },
+      },
+    });
+  }
+
+  it('uses Target.closeTarget for an agent-only tab and tabs.remove for a human-engaged one', async () => {
+    const closed: number[] = [];
+    quietDebugger(closed);
+    mintEpoch(1);
+    mintEpoch(2);
+    markHumanTab(2);
+    expect(await closeAgentTabs('all')).toEqual({ closed: 2, failed: 0, skipped: 0 });
+    expect(closed).toEqual([1]);
+    expect(remove.mock.calls).toEqual([[2]]);
+  });
+});

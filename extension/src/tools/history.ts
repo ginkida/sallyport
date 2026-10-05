@@ -34,6 +34,7 @@ import { BridgeError } from './errors.js';
 import { ensureAllowed } from './gates.js';
 import { getEpoch, isBrokerMode } from './ownership.js';
 import { parseObserve, runObserve } from './observe.js';
+import { disarmBeforeUnload, mayLeaveQuietly } from './quiet-leave.js';
 import { loadTimeoutMs } from './budget.js';
 import { parseWaitFor, runEmbeddedWait } from './poll.js';
 import { resetRefsForTab } from './refs.js';
@@ -177,6 +178,11 @@ export const historyGo: Tool = async (args, ctx) => {
     isAllowed,
   );
   const beforeUrl = tab.url ?? '';
+  // An agent's own tab hops without a "Leave site?" prompt (quiet-leave.ts) —
+  // a prompt would raise the agent window over the human's work. Everywhere
+  // else a prompt can still cancel the hop, which is what the
+  // navigation_cancelled check below is for.
+  if (mayLeaveQuietly(tab.id!)) await disarmBeforeUnload(tab.id!, ctx?.startedAt);
   await cdp(tab.id!, 'Page.navigateToHistoryEntry', { entryId: target.id });
   await waitForHistoryTransition(tab.id!, beforeUrl);
   await waitForLoad(tab.id!, 'history_go', loadTimeoutMs(ctx?.startedAt, Date.now()));

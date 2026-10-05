@@ -1,19 +1,28 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { mayClose, parseReleaseEntries, releaseAction, releaseTabs } from '../src/tools/release.js';
-import { agentTabInfo, clearAllEpochs, getEpoch, mintEpoch } from '../src/tools/ownership.js';
+import {
+  agentTabInfo,
+  clearAllEpochs,
+  getEpoch,
+  markHumanTab,
+  mintEpoch,
+} from '../src/tools/ownership.js';
 import { resetAttachedTabs } from '../src/tools/cdp.js';
 import { setSettings } from '../src/storage.js';
 
 type Calls = {
   removed: number[];
+  /** Closed through `Target.closeTarget` (no beforeunload prompt). */
+  closedQuietly: number[];
   updated: Array<{ tabId: number; muted?: boolean }>;
   detached: number[];
 };
 
 /** Minimal chrome for the release path: storage (settings live in local),
  * tabs.remove/update, and a debugger whose detach we can observe. */
-function installChromeMock(opts: { removeFails?: Set<number> } = {}): Calls {
-  const calls: Calls = { removed: [], updated: [], detached: [] };
+function installChromeMock(opts: { removeFails?: Set<number>; quietClose?: boolean } = {}): Calls {
+  const calls: Calls = { removed: [], closedQuietly: [], updated: [], detached: [] };
+  const removedListeners = new Set<(id: number) => void>();
   const local = new Map<string, unknown>();
   const session = new Map<string, unknown>();
   const store = (m: Map<string, unknown>) => ({
@@ -41,12 +50,39 @@ function installChromeMock(opts: { removeFails?: Set<number> } = {}): Calls {
         calls.updated.push({ tabId, muted: info.muted });
         return { id: tabId };
       },
-      onRemoved: { addListener() {} },
+      onRemoved: {
+        addListener(fn: (id: number) => void) {
+          removedListeners.add(fn);
+        },
+        removeListener(fn: (id: number) => void) {
+          removedListeners.delete(fn);
+        },
+      },
+      async get(tabId: number) {
+        if (calls.closedQuietly.includes(tabId)) throw new Error(`No tab with id: ${tabId}.`);
+        return { id: tabId };
+      },
     },
     debugger: {
       async detach(target: { tabId: number }) {
         calls.detached.push(target.tabId);
       },
+      // Without `quietClose` the debugger has no getTargets — the quiet route
+      // is unavailable and the plain removal runs, as on any older mock.
+      ...(opts.quietClose
+        ? {
+            async getTargets() {
+              return [11, 12].map((tabId) => ({ id: `T${tabId}`, tabId }));
+            },
+            async attach() {},
+            async sendCommand(target: { tabId: number }, method: string) {
+              if (method !== 'Target.closeTarget') return {};
+              calls.closedQuietly.push(target.tabId);
+              for (const fn of [...removedListeners]) fn(target.tabId);
+              throw new Error('Detached while handling command.');
+            },
+          }
+        : {}),
       onDetach: { addListener() {} },
       onEvent: { addListener() {} },
     },
@@ -168,9 +204,36 @@ describe('releaseTabs — the destructive path', () => {
     expect(res.data).toEqual({ released: 1, closed: 1 });
     expect(calls.removed).toEqual([11]);
     expect(getEpoch(11)).toBeUndefined();
-    // Removing the tab ends its CDP session, so we must not detach first —
-    // that would tear down the dialog handling able to answer a beforeunload.
+    // Closing the tab ends its CDP session, so there is nothing to detach
+    // first (and on the plain-removal fallback, detaching would tear down the
+    // dialog handling able to answer a beforeunload).
     expect(calls.detached).toEqual([]);
+  });
+
+  it('closes WITHOUT the beforeunload prompt — no window raised, no release stuck on it', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    const e1 = mintEpoch(11);
+    await setSettings({ closeAgentTabsOnDisconnect: true });
+
+    const res = await releaseTabs({ tabs: [{ tabId: 11, epoch: e1 }] });
+
+    expect(res.data).toEqual({ released: 1, closed: 1 });
+    expect(calls.closedQuietly).toEqual([11]);
+    expect(calls.removed).toEqual([]);
+    expect(getEpoch(11)).toBeUndefined();
+  });
+
+  it('keeps the prompt for a tab the human engaged with', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    const e1 = mintEpoch(12);
+    markHumanTab(12);
+    await setSettings({ closeAgentTabsOnDisconnect: true });
+
+    const res = await releaseTabs({ tabs: [{ tabId: 12, epoch: e1 }] });
+
+    expect(res.data).toEqual({ released: 1, closed: 1 });
+    expect(calls.removed).toEqual([12]);
+    expect(calls.closedQuietly).toEqual([]);
   });
 
   it('never touches a tab we did not create, in either mode', async () => {

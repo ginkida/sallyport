@@ -25,6 +25,7 @@ import {
   agentTabIds,
   clearAllEpochs,
   getEpoch,
+  markHumanTab,
   mintEpoch,
   setBrokerMode,
 } from '../src/tools/ownership.js';
@@ -46,6 +47,10 @@ type Calls = {
   // (dialog handling above all) is live for the page's own load.
   debuggerAttach: number[];
   removed: number[];
+  /** Closed through `Target.closeTarget` — no beforeunload, no prompt. */
+  closedQuietly: number[];
+  /** Every CDP command sent, in order (method + tabId). */
+  cdp: Array<{ tabId: number; method: string; params?: Record<string, unknown> }>;
 };
 
 function installChromeMock(opts: {
@@ -54,6 +59,10 @@ function installChromeMock(opts: {
   /** Where the browser ACTUALLY ends up, whatever URL it was sent to — the
    * SSO bounce / consent wall / shortener case navigate must now report. */
   redirectTo?: string;
+  /** Is Chrome the focused app — does the last-focused window have focus? */
+  chromeFocused?: boolean;
+  /** The window manager ignores `focused:false` and raises the new window. */
+  createStealsFocus?: boolean;
 }): Calls {
   const land = (url: string): string => opts.redirectTo ?? url;
   const store = new Map<string, unknown>();
@@ -66,7 +75,10 @@ function installChromeMock(opts: {
     windowsFocus: [],
     debuggerAttach: [],
     removed: [],
+    closedQuietly: [],
+    cdp: [],
   };
+  const removedListeners = new Set<(id: number) => void>();
   const byId = new Map<number, MockTab>();
   const windows = new Set<number>();
   let nextTabId = 999;
@@ -124,6 +136,7 @@ function installChromeMock(opts: {
         // creation, and a replacing mock would blank the url and hang
         // waitForLoad forever.
         if (info.url !== undefined) calls.update.push({ tabId, url: info.url });
+        if (info.url !== undefined) calls.cdp.push({ tabId, method: '(tabs.update)' });
         if (info.muted !== undefined) calls.muted.push({ tabId, muted: info.muted });
         const cur = getTab(tabId);
         // A url update completes the load (as before); other fields merge.
@@ -142,6 +155,7 @@ function installChromeMock(opts: {
         // mock only needs the end state so waitForLoad's fast path resolves.
         // `land` models a reload that does NOT come back to the same page —
         // the expired-session bounce to /login.
+        calls.cdp.push({ tabId, method: '(tabs.reload)' });
         const cur = getTab(tabId);
         byId.set(tabId, { ...cur, url: land(cur.url), status: 'complete' });
         return Promise.resolve();
@@ -160,14 +174,46 @@ function installChromeMock(opts: {
         return Promise.resolve(next);
       },
       onUpdated: { addListener() {}, removeListener() {} },
-      onRemoved: { addListener() {} },
+      onRemoved: {
+        addListener(fn: (id: number) => void) {
+          removedListeners.add(fn);
+        },
+        removeListener(fn: (id: number) => void) {
+          removedListeners.delete(fn);
+        },
+      },
     },
     debugger: {
       attach(target: { tabId: number }) {
         calls.debuggerAttach.push(target.tabId);
         return Promise.resolve();
       },
-      sendCommand() {
+      detach() {
+        return Promise.resolve();
+      },
+      getTargets() {
+        return Promise.resolve(
+          [...byId.keys()].map((tabId) => ({ id: `T${tabId}`, tabId, attached: false })),
+        );
+      },
+      sendCommand(target: { tabId: number }, method: string, params?: Record<string, unknown>) {
+        calls.cdp.push({ tabId: target.tabId, method, ...(params ? { params } : {}) });
+        if (method === 'Target.closeTarget') {
+          // Chrome closes the page without beforeunload; the session dies with
+          // it, which is how the command usually "fails".
+          calls.closedQuietly.push(target.tabId);
+          byId.delete(target.tabId);
+          for (const fn of [...removedListeners]) fn(target.tabId);
+          return Promise.reject(new Error('Detached while handling command.'));
+        }
+        if (method === 'Runtime.evaluate' && params?.expression === 'window') {
+          return Promise.resolve({ result: { objectId: 'window-1' } });
+        }
+        if (method === 'DOMDebugger.getEventListeners') {
+          return Promise.resolve({
+            listeners: [{ type: 'beforeunload', useCapture: false, handler: { objectId: 'h-1' } }],
+          });
+        }
         return Promise.resolve({});
       },
       onEvent: { addListener() {} },
@@ -182,6 +228,7 @@ function installChromeMock(opts: {
         });
         const winId = nextWindowId++;
         windows.add(winId);
+        if (opts.createStealsFocus) focusedWindowId = winId;
         const id = nextTabId++;
         const tab: MockTab = { id, url: info.url, status: 'complete', windowId: winId };
         byId.set(id, tab);
@@ -192,7 +239,7 @@ function installChromeMock(opts: {
         return Promise.reject(new Error('no such window'));
       },
       getLastFocused() {
-        return Promise.resolve({ id: focusedWindowId });
+        return Promise.resolve({ id: focusedWindowId, focused: opts.chromeFocused ?? true });
       },
       update(windowId: number, info: { focused?: boolean }) {
         calls.windowsFocus.push({ windowId, focused: info.focused });
@@ -987,9 +1034,13 @@ describe('navigate — the tab reaper (maxAgentTabs)', () => {
     await navigate({ url: ALLOW }, { client: 'alpha' }); // 999
     await navigate({ url: ALLOW }, { client: 'alpha' }); // 1000
     expect(calls.removed).toEqual([]); // still room
+    expect(calls.closedQuietly).toEqual([]);
     await navigate({ url: ALLOW }, { client: 'alpha' }); // 1001, and 999 must go
 
-    expect(calls.removed).toEqual([999]);
+    // Closed QUIETLY: an evicted page with a beforeunload handler would
+    // otherwise raise its agent window over the human's work to ask.
+    expect(calls.closedQuietly).toEqual([999]);
+    expect(calls.removed).toEqual([]);
     expect(agentTabIds()).toEqual(new Set([1000, 1001]));
   });
 
@@ -1002,6 +1053,7 @@ describe('navigate — the tab reaper (maxAgentTabs)', () => {
 
     // Breaking another agent mid-task is worse than one tab over the cap.
     expect(calls.removed).toEqual([]);
+    expect(calls.closedQuietly).toEqual([]);
     expect(agentTabIds().size).toBe(2);
   });
 
@@ -1010,6 +1062,7 @@ describe('navigate — the tab reaper (maxAgentTabs)', () => {
     setBrokerMode(true);
     for (let i = 0; i < 3; i++) await navigate({ url: ALLOW }, { client: 'alpha' });
     expect(calls.removed).toEqual([]);
+    expect(calls.closedQuietly).toEqual([]);
 
     // Standalone owns no tabs at all, so there is nothing to reap — and the
     // active-tab fallback means it does not create one per navigate either.
@@ -1019,5 +1072,160 @@ describe('navigate — the tab reaper (maxAgentTabs)', () => {
     await navigate({ url: ALLOW });
     await navigate({ url: ALLOW });
     expect(solo.removed).toEqual([]);
+  });
+});
+
+describe('no beforeunload prompt for the agent own tab (focus theft)', () => {
+  // Chrome shows a beforeunload prompt by ACTIVATING the tab and FOCUSING its
+  // window — measured in Chrome 154, even with a CDP client answering it. On
+  // macOS that brings Chrome over whatever the human is doing, and the close or
+  // navigation then waits for a human click. For the agent's own tab nothing
+  // may raise it; for anything else Chrome's prompt stays.
+  const ALLOWED = [{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }];
+
+  async function brokerTab(url = 'https://allowed.example/form') {
+    const calls = installChromeMock({ tabs: [{ id: 7, url, status: 'complete' }] });
+    await setAllowlist(ALLOWED);
+    setBrokerMode(true);
+    mintEpoch(7, 'alpha');
+    return calls;
+  }
+
+  const disarmed = (calls: Calls) =>
+    calls.cdp.filter(
+      (c) =>
+        c.method === 'Runtime.callFunctionOn' &&
+        String(c.params?.functionDeclaration).includes('removeEventListener'),
+    );
+
+  it('close_tab closes its own tab through Target.closeTarget, never tabs.remove', async () => {
+    const calls = await brokerTab();
+    await closeTab({ tabId: 7 });
+    expect(calls.closedQuietly).toEqual([7]);
+    expect(calls.removed).toEqual([]);
+    expect(calls.cdp.find((c) => c.method === 'Target.closeTarget')?.params).toEqual({
+      targetId: 'T7',
+    });
+  });
+
+  it('close_tab keeps the prompt for a tab the human engaged with', async () => {
+    const calls = await brokerTab();
+    markHumanTab(7);
+    await closeTab({ tabId: 7 });
+    expect(calls.removed).toEqual([7]);
+    expect(calls.closedQuietly).toEqual([]);
+  });
+
+  it('close_tab keeps the prompt in standalone (not an agent tab)', async () => {
+    const calls = installChromeMock({ tabs: [{ id: 7, url: 'https://allowed.example/form' }] });
+    await setAllowlist(ALLOWED);
+    mintEpoch(7); // a leftover epoch must not matter outside broker mode
+    await closeTab({ tabId: 7 });
+    expect(calls.removed).toEqual([7]);
+    expect(calls.closedQuietly).toEqual([]);
+  });
+
+  it('falls back to tabs.remove when there is no debugger foothold', async () => {
+    const calls = await brokerTab();
+    const dbg = (globalThis as unknown as { chrome: { debugger: { attach: unknown } } }).chrome
+      .debugger;
+    dbg.attach = () => Promise.reject(new Error('Cannot access a chrome:// URL')); // not "already attached"
+    await closeTab({ tabId: 7 });
+    expect(calls.removed).toEqual([7]);
+    expect(calls.closedQuietly).toEqual([]);
+  });
+
+  it('navigate in place removes the page beforeunload listeners BEFORE moving the tab', async () => {
+    const calls = await brokerTab();
+    await navigate({ url: ALLOW, tabId: 7 });
+    const removal = disarmed(calls);
+    expect(removal).toHaveLength(1);
+    // The handler travels as a structured argument, never interpolated.
+    expect(removal[0].params?.arguments).toEqual([{ objectId: 'h-1' }, { value: false }]);
+    expect(
+      calls.cdp.some(
+        (c) =>
+          c.method === 'Runtime.callFunctionOn' &&
+          String(c.params?.functionDeclaration).includes('onbeforeunload = null'),
+      ),
+    ).toBe(true);
+    // ...and only then the navigation: the listener must be gone when Chrome asks.
+    expect(calls.cdp.indexOf(removal[0])).toBeLessThan(
+      calls.cdp.findIndex((c) => c.method === '(tabs.update)'),
+    );
+    expect(calls.update).toEqual([{ tabId: 7, url: ALLOW }]);
+  });
+
+  it('reload of the agent own tab disarms too', async () => {
+    const calls = await brokerTab();
+    await reload({ tabId: 7 });
+    const removal = disarmed(calls);
+    expect(removal).toHaveLength(1);
+    expect(calls.cdp.indexOf(removal[0])).toBeLessThan(
+      calls.cdp.findIndex((c) => c.method === '(tabs.reload)'),
+    );
+  });
+
+  it('a HUMAN tab keeps its prompt: standalone navigate/reload touch no listener', async () => {
+    const calls = installChromeMock({ active: { id: 3, url: 'https://allowed.example/form' } });
+    await setAllowlist(ALLOWED);
+    await navigate({ url: ALLOW });
+    await reload({});
+    expect(calls.cdp.some((c) => c.method === 'DOMDebugger.getEventListeners')).toBe(false);
+  });
+
+  it('an agent tab the human engaged with keeps its prompt', async () => {
+    const calls = await brokerTab();
+    markHumanTab(7);
+    await navigate({ url: ALLOW, tabId: 7 });
+    expect(calls.cdp.some((c) => c.method === 'DOMDebugger.getEventListeners')).toBe(false);
+  });
+
+  it('a page that never answers does not hold the navigation', async () => {
+    const calls = await brokerTab();
+    const dbg = (
+      globalThis as unknown as {
+        chrome: { debugger: { sendCommand: (...a: unknown[]) => Promise<unknown> } };
+      }
+    ).chrome.debugger;
+    const real = dbg.sendCommand;
+    // A page frozen on alert(): renderer-answered commands never come back.
+    dbg.sendCommand = (target, method, params) =>
+      method === 'Runtime.evaluate' ? new Promise(() => {}) : real(target, method, params);
+    const t0 = Date.now();
+    await navigate({ url: ALLOW, tabId: 7 }, { startedAt: Date.now() - 49_800 });
+    expect(Date.now() - t0).toBeLessThan(1_500);
+    expect(calls.update).toEqual([{ tabId: 7, url: ALLOW }]);
+  });
+});
+
+describe('agent window — focus restore never activates a Chrome that was in the background', () => {
+  const ALLOWED = [{ pattern: 'allowed.example', allowEvaluate: false, addedAt: 0 }];
+
+  it('does not focus the human window when Chrome was not the focused app', async () => {
+    // getLastFocused still names the human's window while they are in another
+    // app; windows.update({focused:true}) on it would bring Chrome to the front.
+    const calls = installChromeMock({ chromeFocused: false, createStealsFocus: true });
+    await setAllowlist(ALLOWED);
+    setBrokerMode(true);
+    await navigate({ url: ALLOW }, { client: 'alpha' });
+    expect(calls.windowsCreate).toHaveLength(1);
+    expect(calls.windowsFocus).toEqual([]);
+  });
+
+  it('still hands focus back when Chrome WAS focused and the new window took it', async () => {
+    const calls = installChromeMock({ chromeFocused: true, createStealsFocus: true });
+    await setAllowlist(ALLOWED);
+    setBrokerMode(true);
+    await navigate({ url: ALLOW }, { client: 'alpha' });
+    expect(calls.windowsFocus).toEqual([{ windowId: 1, focused: true }]);
+  });
+
+  it('does nothing when focused:false was honoured', async () => {
+    const calls = installChromeMock({ chromeFocused: true });
+    await setAllowlist(ALLOWED);
+    setBrokerMode(true);
+    await navigate({ url: ALLOW }, { client: 'alpha' });
+    expect(calls.windowsFocus).toEqual([]);
   });
 });
