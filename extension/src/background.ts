@@ -22,7 +22,13 @@ import { adoptOpenedTab, dropEpoch, setBrokerMode } from './tools/ownership.js';
 import { loadEpochs, persistEpochs, reconcileWithLiveTabs } from './tools/ownership-store.js';
 import { installHumanInterestListeners } from './human-interest.js';
 import { closeAgentTabs, listAgentTabs } from './agent-tabs.js';
-import { releaseKeepAwakeEverywhere, sweepStrandedHygiene } from './tools/cdp.js';
+import { detach, releaseKeepAwakeEverywhere, sweepStrandedHygiene } from './tools/cdp.js';
+import { onTab } from './tools/tab-chain.js';
+import {
+  ALARM_DISCONNECT_RELEASE,
+  createDisconnectRelease,
+  type DisconnectRelease,
+} from './disconnect-release.js';
 import { releaseStrandedTabs } from './tools/release.js';
 import { installCaptureSettingsListener } from './tools/capture-settings.js';
 
@@ -62,6 +68,39 @@ async function setSettingsForConnection(
   await setSettings(patch);
 }
 
+// A daemon that stays gone drives nothing: after a minute without a connection
+// every tab we hold is detached (disconnect-release.ts). Declared before the
+// bridge because the bridge's status callback feeds it; it only reads the
+// bridge's state when called, by which time `bridge` exists.
+const isConnected = (): boolean => bridge.status().state === 'connected';
+const disconnectRelease: DisconnectRelease = createDisconnectRelease({
+  now: () => Date.now(),
+  storage: {
+    get: (key) => chrome.storage.session.get(key) as Promise<Record<string, unknown>>,
+    set: (items) => chrome.storage.session.set(items),
+    remove: (key) => chrome.storage.session.remove(key),
+  },
+  alarms: {
+    create: (name, info) => void chrome.alarms.create(name, info),
+    clear: (name) => void chrome.alarms.clear(name),
+  },
+  isConnected,
+  attachedTabs: async () => {
+    const tabs: number[] = [];
+    for (const t of await chrome.debugger.getTargets()) {
+      if (t.attached && typeof t.tabId === 'number') tabs.push(t.tabId);
+    }
+    return tabs;
+  },
+  // Through the tab chain, so it can never land inside a call that began just
+  // as the bridge came back — and re-checked there. `detach` only ever ends
+  // OUR session: a tab DevTools alone holds answers with a harmless refusal.
+  detachTab: (tabId) =>
+    onTab(tabId, async () => {
+      if (!isConnected()) await detach(tabId);
+    }).catch(() => undefined),
+});
+
 const bridge = new BridgeConnection({
   storage: {
     getSecret,
@@ -95,6 +134,7 @@ const bridge = new BridgeConnection({
   },
   onStatus: (snapshot: StatusSnapshot) => {
     void updateBadge(snapshot);
+    void disconnectRelease.onStatus();
     chrome.runtime.sendMessage({ type: 'STATUS', status: snapshot }).catch(() => {
       // popup not open — fine.
     });
@@ -133,7 +173,8 @@ const bridge = new BridgeConnection({
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === ALARM_RECONNECT) void bridge.onAlarm();
+  if (alarm.name === ALARM_DISCONNECT_RELEASE) void disconnectRelease.onAlarm();
+  else if (alarm.name === ALARM_RECONNECT) void bridge.onAlarm();
   else if (alarm.name === ALARM_KEEPALIVE) void bridge.onKeepaliveAlarm();
 });
 
@@ -144,6 +185,9 @@ async function bootBridge(): Promise<void> {
   await loadEpochs();
   await reconcileWithLiveTabs();
   await bridge.start();
+  // A worker that woke up disconnected (paused, no secret, daemon down) may
+  // never see a status CHANGE — put the outage on record regardless.
+  void disconnectRelease.onStatus();
   // start() sets the initial state internally but only some paths call
   // pushStatus — make sure the toolbar badge is in sync on every wake-up.
   await updateBadge(bridge.status());
