@@ -643,6 +643,8 @@ interface TabHygiene {
   /** Focus emulation may be on; cleared when a nap or revoke is sent. */
   awake: boolean;
   napTimer: ReturnType<typeof setTimeout> | undefined;
+  /** When the armed `napTimer` fires. */
+  napDue: number;
   /** A nap is waiting on the tab chain. */
   napQueued: boolean;
   timer: ReturnType<typeof setTimeout> | undefined;
@@ -686,6 +688,7 @@ function newHygiene(): TabHygiene {
     console: false,
     awake: false,
     napTimer: undefined,
+    napDue: 0,
     napQueued: false,
     timer: undefined,
     timerDue: 0,
@@ -814,20 +817,25 @@ function scheduleHygiene(tabId: number, st: TabHygiene): void {
 }
 
 /** One extra timer per tab, independent of the 10 s flush. This runs on every
- * command sent and answered, so an armed timer is LEFT ALONE rather than
- * re-armed each time: it re-checks when it fires and re-arms for what is left
- * of the window. It can never be armed too late — activity only moves the due
- * time forward. Sweep records wait for the flush to prove ownership before
- * arming it. */
+ * command sent and answered, so — like `scheduleHygiene` — a timer armed early
+ * enough is LEFT ALONE: it re-checks when it fires and re-arms for what is left
+ * of the window. One armed LATER than now needed is pulled in: while a command
+ * is in flight the due time is its abandonment deadline, and its answer brings
+ * that back to the end of the idle window. Sweep records wait for the flush to
+ * prove ownership before arming it. */
 function scheduleKeepAwakeNap(tabId: number, st: TabHygiene): void {
   if (!st.awake || st.napQueued || st.unproven) {
     if (st.napTimer !== undefined) clearTimeout(st.napTimer);
     st.napTimer = undefined;
     return;
   }
-  if (st.napTimer !== undefined) return;
   const now = Date.now();
   const due = idleDueAt(st, now, KEEP_AWAKE_IDLE_MS);
+  if (st.napTimer !== undefined) {
+    if (st.napDue <= due) return;
+    clearTimeout(st.napTimer);
+  }
+  st.napDue = due;
   st.napTimer = setTimeout(
     () => {
       st.napTimer = undefined;

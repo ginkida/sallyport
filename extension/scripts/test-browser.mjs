@@ -2,6 +2,9 @@
 // Chromium / Chrome for Testing binary that permits --load-extension.
 // Uses a temporary profile and a localhost-only fixture. No normal profile,
 // pairing secret or external website is involved. --mcp adds an isolated daemon.
+// The --mcp lifecycle checks also run isolated brokers, shorten keep-awake's
+// idle interval ONLY in the temporary worker build, and wait for the real
+// 60 s disconnect alarm (allow another two minutes for these checks).
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -19,6 +22,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const chromeBin =
   process.env.CHROME_BIN || process.argv.slice(2).find((arg) => !arg.startsWith('--'));
 const testMcp = process.argv.includes('--mcp');
+const keepAwakeIdleMs = 3000;
 if (!chromeBin || typeof WebSocket === 'undefined') {
   throw new Error('Use Node >=22 and set CHROME_BIN to Chromium / Chrome for Testing.');
 }
@@ -28,6 +32,7 @@ const profileDir = join(temp, 'profile');
 let browser;
 let socket;
 let mcp;
+let broker;
 let diagnostics = '';
 let fixtureRequests = 0;
 const server = createServer((req, res) => {
@@ -269,6 +274,20 @@ async function until(probe, description, timeout = 15000) {
   throw new Error(`Timed out: ${description}\n${diagnostics}`);
 }
 
+async function stopBroker(signal = 'SIGTERM') {
+  if (!broker?.pid || broker.exitCode !== null || broker.signalCode !== null) return;
+  const child = broker;
+  const exited = once(child, 'exit');
+  child.kill(signal);
+  const force = setTimeout(() => child.kill('SIGKILL'), 5000);
+  try {
+    await exited;
+  } finally {
+    clearTimeout(force);
+  }
+  if (signal === 'SIGKILL') assert.equal(child.signalCode, 'SIGKILL');
+}
+
 try {
   await cp(join(root, 'dist'), extensionDir, { recursive: true });
   await mkdir(profileDir);
@@ -279,9 +298,10 @@ try {
       resolveDir: root,
       contents: `
         import './src/background.ts';
-        import { mintEpoch, markHumanTab, markOrphanedTab } from './src/tools/ownership.ts';
+        import { mintEpoch, markHumanTab, markOrphanedTab, agentTabInfo } from './src/tools/ownership.ts';
         import { attach } from './src/tools/cdp.ts';
         import { closeAgentTab, disarmBeforeUnload, rearmIfSameDocument } from './src/tools/quiet-leave.ts';
+        globalThis.frugalityTest = { markHumanTab, agentTabInfo };
         // Focus theft: a beforeunload prompt makes Chrome ACTIVATE the tab and
         // FOCUS its window. The agent's own tab must leave without raising one.
         globalThis.quietLeaveTest = async (base) => {
@@ -453,6 +473,30 @@ try {
     target: 'es2022',
     platform: 'browser',
     logLevel: 'silent',
+    plugins: testMcp
+      ? [
+          {
+            name: 'test-only-keep-awake-interval',
+            setup(build) {
+              build.onLoad({ filter: /[/\\]tools[/\\]cdp\.ts$/ }, async ({ path }) => {
+                const contents = await readFile(path, 'utf8');
+                const declaration = 'export const KEEP_AWAKE_IDLE_MS = 90_000;';
+                // esbuild define cannot override a declared module binding.
+                // Fail on source drift rather than silently waiting 90 s; no
+                // source file, shipped build or runtime setting is changed.
+                assert.equal(contents.split(declaration).length, 2, 'keep-awake default changed');
+                return {
+                  contents: contents.replace(
+                    declaration,
+                    `export const KEEP_AWAKE_IDLE_MS = ${keepAwakeIdleMs};`,
+                  ),
+                  loader: 'ts',
+                };
+              });
+            },
+          },
+        ]
+      : [],
   });
   await writeFile(
     join(extensionDir, 'capture-test.html'),
@@ -1274,10 +1318,294 @@ try {
     console.log(
       'PASS: MCP stdio → HMAC WebSocket → real Chrome actions, allowlist/password gates and audit redaction',
     );
+
+    // Standalone has neither per-client ownership nor session-end release.
+    // Reuse ONLY this test's port + secret, with an explicitly managed broker;
+    // --no-broker clients attach to it but cannot auto-spawn a replacement.
+    await mcp.close();
+    mcp = undefined;
+    const daemonArgs = ['--port', String(port), '--secret-file', secretFile];
+    const sourceDir = join(daemonRoot, 'src');
+    const startBroker = async () => {
+      broker = spawn(python, ['-m', 'sallyport_daemon', ...daemonArgs, 'broker'], {
+        env: { ...process.env, PYTHONPATH: sourceDir },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      let error;
+      let stderr = '';
+      broker.on('error', (e) => {
+        error = e;
+      });
+      broker.stderr.on('data', (chunk) => {
+        stderr = (stderr + chunk).slice(-8000);
+        diagnostics = (diagnostics + chunk).slice(-8000);
+      });
+      await until(() => {
+        if (error) throw error;
+        if (broker.exitCode !== null || broker.signalCode !== null)
+          throw new Error(`Broker exited before startup: ${stderr}`);
+        // Emitted only after BOTH the WS listener and the MCP socket bind.
+        return stderr.includes('broker mode — WS on');
+      }, 'isolated broker startup');
+    };
+    const openBrokerClient = async (label) => {
+      mcp = startMcp(python, ['--no-broker', ...daemonArgs, '--session-label', label], sourceDir);
+      assert.ok(
+        (
+          await mcp.request('initialize', {
+            protocolVersion: '2024-11-05',
+            capabilities: {},
+            clientInfo: { name: 'sallyport-frugality-test', version: '1' },
+          })
+        ).serverInfo,
+      );
+      mcp.notify('notifications/initialized');
+      await until(async () => {
+        const status = value(await callTool('status'));
+        assert.equal(status.mode, 'broker', 'lifecycle tests require broker ownership');
+        return status.connected;
+      }, 'authenticated broker connection');
+    };
+    const workerEval = async (expression) => {
+      const out = await call(
+        'Runtime.evaluate',
+        { expression, awaitPromise: true, returnByValue: true },
+        workerSession,
+      );
+      if (out.exceptionDetails) throw new Error(JSON.stringify(out.exceptionDetails));
+      return out.result.value;
+    };
+    const popupMessage = async (type) => {
+      const reply = await popupEval(
+        `new Promise(resolve => chrome.runtime.sendMessage({type:${JSON.stringify(type)}}, resolve))`,
+      );
+      assert.ok(reply.ok, JSON.stringify(reply));
+      return reply;
+    };
+    const patchSettings = (patch) =>
+      popupEval(`(async () => {
+        const {sallyport_settings = {}} = await chrome.storage.local.get('sallyport_settings');
+        await chrome.storage.local.set({sallyport_settings: {...sallyport_settings, ...${JSON.stringify(patch)}}});
+      })()`);
+    const bootId = () =>
+      workerEval(
+        'chrome.storage.session.get("sallyport_daemon_boot").then(v => v.sallyport_daemon_boot)',
+      );
+    const tabStates = (ids) =>
+      workerEval(`(async () => {
+        const tabs = await chrome.tabs.query({});
+        const targets = await chrome.debugger.getTargets();
+        return ${JSON.stringify(ids)}.map(tabId => {
+          const tab = tabs.find(t => t.id === tabId);
+          const target = targets.find(t => t.tabId === tabId && t.type === 'page');
+          return {tabId, exists: !!tab, attached: target?.attached ?? null, muted: tab?.mutedInfo?.muted ?? null};
+        });
+      })()`);
+    const waitForTabStates = async (ids, matches, description, timeout = 15000) => {
+      const before = await tabStates(ids);
+      const start = performance.now();
+      let after = before;
+      try {
+        return await until(
+          async () => {
+            after = await tabStates(ids);
+            return matches(after) && after;
+          },
+          description,
+          timeout,
+        );
+      } catch (error) {
+        throw new Error(
+          `${error.message}\nAfter ${Math.round(performance.now() - start)} ms: ` +
+            `before=${JSON.stringify(before)}, after=${JSON.stringify(after)}`,
+          { cause: error },
+        );
+      }
+    };
+    const assertDriven = async (ids) => {
+      const states = await tabStates(ids);
+      assert.deepEqual(
+        states,
+        ids.map((tabId) => ({ tabId, exists: true, attached: true, muted: true })),
+        'every test tab must start open, debugger-attached and agent-muted',
+      );
+    };
+    const openAgentTabs = async (count) => {
+      const ids = [];
+      for (let i = 0; i < count; i++) {
+        const tab = value(await callTool('navigate', { url: fixtureUrl }));
+        assert.equal(typeof tab.tabId, 'number', JSON.stringify(tab));
+        ids.push(tab.tabId);
+      }
+      assert.equal(new Set(ids).size, count);
+      const records = await workerEval('frugalityTest.agentTabInfo()');
+      for (const id of ids) {
+        const record = records.find((t) => t.tabId === id);
+        assert.ok(record && !record.human && !record.orphaned, JSON.stringify(records));
+      }
+      await assertDriven(ids);
+      return ids;
+    };
+    const handedBack = (tab) => tab.exists && tab.attached === false && tab.muted === false;
+    const waitForRelease = (ids, kept) =>
+      waitForTabStates(
+        ids,
+        (states) => states.every((t) => (kept.includes(t.tabId) ? handedBack(t) : !t.exists)),
+        'session tabs closed; kept tabs detached and unmuted',
+      );
+
+    await startBroker();
+    await patchSettings({ keepAgentTabsOnDisconnect: false, keepAwake: true });
+    await openBrokerClient('session-close');
+    const closingTabs = await openAgentTabs(3);
+    // Same synthetic human mark as seedAgentTabs / the popup's viewed case;
+    // focus events would test the window manager as well as release policy.
+    assert.equal(await workerEval(`frugalityTest.markHumanTab(${closingTabs[1]})`), true);
+    await mcp.close();
+    mcp = undefined;
+    await waitForRelease(closingTabs, [closingTabs[1]]);
+
+    await patchSettings({ keepAgentTabsOnDisconnect: true });
+    await openBrokerClient('session-keep');
+    const keptTabs = await openAgentTabs(2);
+    await mcp.close();
+    mcp = undefined;
+    await waitForRelease(keptTabs, keptTabs);
+    console.log(
+      'PASS: broker session end closes agent tabs, hands human tabs back, and honors keep-on-disconnect',
+    );
+    await patchSettings({ keepAgentTabsOnDisconnect: false });
+
+    await openBrokerClient('idle-nap');
+    const [napTab, coverTab] = await openAgentTabs(2);
+    // Inactive within an unfocused window: even headless Chrome must report
+    // this tab hidden once the visible capturer from focus emulation is gone.
+    await workerEval(`(async () => {
+      await chrome.tabs.update(${coverTab}, {active: true});
+      const human = await chrome.tabs.get(${tabId});
+      await chrome.windows.update(human.windowId, {focused: true});
+    })()`);
+    const napWindow = await workerEval(
+      `chrome.tabs.get(${napTab}).then(t => chrome.windows.get(t.windowId))`,
+    );
+    assert.equal(napWindow.focused, false, JSON.stringify(napWindow));
+    const presence = () =>
+      workerEval(`chrome.debugger.sendCommand({tabId:${napTab}}, 'Runtime.evaluate', {
+      expression: '({visibility:document.visibilityState, focused:document.hasFocus()})',
+      returnByValue: true
+    }).then(r => r.result.value)`);
+    // Observe through raw CDP, not a tool / cdp() call: sampling must neither
+    // re-assert focus emulation nor reset the activity clock being tested.
+    value(await callTool('read_text', { tabId: napTab }));
+    const napStart = performance.now();
+    assert.deepEqual(await presence(), { visibility: 'visible', focused: true });
+    await new Promise((done) => setTimeout(done, keepAwakeIdleMs / 2));
+    assert.deepEqual(await presence(), { visibility: 'visible', focused: true });
+    let napping;
+    try {
+      await until(
+        async () => {
+          napping = await presence();
+          return napping.visibility === 'hidden' && napping.focused === false;
+        },
+        'idle tab hidden and unfocused',
+        keepAwakeIdleMs + 5000,
+      );
+    } catch (error) {
+      throw new Error(
+        `${error.message}\nAfter ${Math.round(performance.now() - napStart)} ms: ` +
+          `before=visible/focused, after=${JSON.stringify(napping)}`,
+        { cause: error },
+      );
+    }
+    const napMs = Math.round(performance.now() - napStart);
+    await assertDriven([napTab]); // a nap must not be a debugger detach
+    value(await callTool('read_text', { tabId: napTab }));
+    assert.deepEqual(await presence(), { visibility: 'visible', focused: true });
+    console.log(
+      `PASS: keep-awake naps without detaching and the next tool wakes it (${napMs} ms; test-only ${keepAwakeIdleMs} ms interval)`,
+    );
+    await mcp.close();
+    mcp = undefined;
+    await waitForRelease([napTab, coverTab], []);
+
+    await openBrokerClient('daemon-restart');
+    const stranded = await openAgentTabs(3);
+    assert.equal(await workerEval(`frugalityTest.markHumanTab(${stranded[1]})`), true);
+    const originalBoot = await bootId();
+    assert.equal(typeof originalBoot, 'string');
+    await popupMessage('PAUSE');
+    await until(async () => !value(await callTool('status')).connected, 'extension socket dropped');
+    await assertDriven(stranded);
+    await popupMessage('RESUME');
+    await until(async () => value(await callTool('status')).connected, 'same broker reconnect');
+    // Allow asynchronous hello_ack housekeeping to run before asserting that
+    // the negative control preserved ALL tabs, not just the human one.
+    await new Promise((done) => setTimeout(done, 500));
+    assert.equal(await bootId(), originalBoot);
+    await assertDriven(stranded);
+    assert.deepEqual(
+      value(await callTool('list_tabs'))
+        .tabs.map((t) => t.tabId)
+        .sort(),
+      [...stranded].sort(),
+    );
+
+    await stopBroker('SIGKILL'); // no broker finally / _release_tabs can run
+    await mcp.close();
+    mcp = undefined;
+    await assertDriven(stranded);
+    await startBroker(); // same port + key, DIFFERENT process / boot id
+    await openBrokerClient('after-restart');
+    await until(async () => {
+      const boot = await bootId();
+      return typeof boot === 'string' && boot !== originalBoot;
+    }, 'new daemon boot recorded');
+    await waitForRelease(stranded, [stranded[1]]);
+    console.log(
+      'PASS: a different broker boot releases stranded tabs; reconnecting to the same broker preserves them',
+    );
+
+    const [disconnectedTab] = await openAgentTabs(1);
+    const disconnectBoot = await bootId();
+    const stoppedAt = Date.now();
+    await stopBroker('SIGKILL');
+    await mcp.close();
+    mcp = undefined;
+    const since = await until(async () => {
+      const got = await workerEval('chrome.storage.session.get("sallyport_disconnected_since")');
+      return (
+        typeof got.sallyport_disconnected_since === 'number' && got.sallyport_disconnected_since
+      );
+    }, 'daemon outage recorded');
+    assert.ok(since >= stoppedAt, 'the outage timestamp must belong to this broker stop');
+    await assertDriven([disconnectedTab]);
+    console.log('Waiting for the real 60 s daemon-disconnect alarm...');
+    await new Promise((done) => setTimeout(done, Math.max(0, since + 30000 - Date.now())));
+    await assertDriven([disconnectedTab]); // the 30 s alarm floor is not the policy window
+    await waitForTabStates(
+      [disconnectedTab],
+      (states) => states.every((t) => t.exists && t.attached === false),
+      'daemon-disconnected tab detached but still open',
+      100000,
+    );
+    const disconnectMs = Date.now() - since;
+    assert.ok(disconnectMs >= 60000, `detached too early: ${disconnectMs} ms`);
+    assert.equal(await bootId(), disconnectBoot, 'no new daemon may explain this detach');
+    assert.equal(
+      (await workerEval('chrome.storage.session.get("sallyport_disconnected_since")'))
+        .sallyport_disconnected_since,
+      'released',
+      'the disconnect alarm must have handled the outage',
+    );
+    console.log(
+      `PASS: without a daemon the disconnect alarm detaches after ${disconnectMs} ms and keeps the tab open`,
+    );
   }
   console.log(`Browser smoke test passed (${version.Browser}).`);
 } finally {
   await mcp?.close();
+  await stopBroker();
   socket?.close();
   if (browser?.pid && browser.exitCode === null && browser.signalCode === null) {
     const exited = once(browser, 'exit');
