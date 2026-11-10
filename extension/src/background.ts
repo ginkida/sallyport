@@ -77,6 +77,8 @@ async function setSettingsForConnection(
 // a daemon that accepts and then refuses (wrong secret, slot taken) would
 // otherwise restart the outage clock every few seconds and never let it run out.
 let acked = false;
+/** How long a housekeeping detach waits behind a tab's running call. */
+const DETACH_CHAIN_WAIT_MS = 3_000;
 const isConnected = (): boolean => acked && bridge.status().state === 'connected';
 const disconnectRelease: DisconnectRelease = createDisconnectRelease({
   now: () => Date.now(),
@@ -97,13 +99,23 @@ const disconnectRelease: DisconnectRelease = createDisconnectRelease({
     }
     return tabs;
   },
-  // Through the tab chain, so it can never land inside a call that began just
-  // as the bridge came back — and re-checked there. `detach` only ever ends
+  // Through the tab chain, so it never lands inside a call still running on
+  // the tab — but only for so long: with the daemon gone a minute, a call
+  // still holding the chain is one nobody waits for (the daemon abandons a call
+  // at 60 s), and a wedged renderer must not keep its tab attached for good.
+  // `detach` asks `isConnected` again right before it acts, and only ever ends
   // OUR session: a tab DevTools alone holds answers with a harmless refusal.
-  detachTab: (tabId) =>
-    onTab(tabId, async () => {
-      if (!isConnected()) await detach(tabId);
-    }).catch(() => undefined),
+  detachTab: async (tabId) => {
+    const run = (): Promise<void> => detach(tabId, { unless: isConnected });
+    let started = false;
+    const queued = onTab(tabId, () => {
+      started = true;
+      return run();
+    }).catch(() => undefined);
+    await Promise.race([queued, new Promise((r) => setTimeout(r, DETACH_CHAIN_WAIT_MS))]);
+    if (!started) await run().catch(() => undefined);
+    else await queued;
+  },
 });
 
 const bridge = new BridgeConnection({
@@ -182,8 +194,11 @@ const bridge = new BridgeConnection({
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_DISCONNECT_RELEASE) void disconnectRelease.onAlarm();
-  else if (alarm.name === ALARM_RECONNECT) void bridge.onAlarm();
-  else if (alarm.name === ALARM_KEEPALIVE) void bridge.onKeepaliveAlarm();
+  // Behind the boot barrier: an alarm WAKES the worker, and a reconnect that
+  // got its hello_ack before the epoch map was hydrated would compare the
+  // daemon against an empty registry (release.ts:releaseStrandedTabs).
+  else if (alarm.name === ALARM_RECONNECT) void bootBridge().then(() => bridge.onAlarm());
+  else if (alarm.name === ALARM_KEEPALIVE) void bootBridge().then(() => bridge.onKeepaliveAlarm());
 });
 
 async function bootBridgeOnce(): Promise<void> {

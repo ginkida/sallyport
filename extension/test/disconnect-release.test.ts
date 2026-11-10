@@ -133,16 +133,50 @@ describe('disconnect release — a daemon that is gone drives nothing', () => {
     expect(w.alarms.at(-1)).toEqual({ name: ALARM_DISCONNECT_RELEASE, delayInMinutes: 0.5 });
   });
 
-  it('stops detaching the moment the bridge reconnects', async () => {
+  it('does not start detaching when the bridge came back while it listed the tabs', async () => {
     w.connected = false;
     await w.release.onStatus();
     w.now += DISCONNECT_RELEASE_MS;
-    w.onDetach = () => {
-      w.connected = true;
-    };
+    const world = w;
+    const list = world.attached;
+    Object.defineProperty(world, 'attached', {
+      get() {
+        world.connected = true; // reconnects during the lookup
+        return list;
+      },
+    });
 
-    expect(await w.release.onAlarm()).toBe(1);
-    expect(w.detached).toEqual([11]);
+    expect(await w.release.onAlarm()).toBe(0);
+    expect(w.detached).toEqual([]);
+  });
+
+  it('one tab that never finishes detaching does not hold up the others', async () => {
+    w.connected = false;
+    await w.release.onStatus();
+    w.now += DISCONNECT_RELEASE_MS;
+    const hung = createDisconnectRelease({
+      now: () => w.now,
+      storage: {
+        get: async (key) => (w.store.has(key) ? { [key]: w.store.get(key) } : {}),
+        set: async (items) => {
+          for (const [k, v] of Object.entries(items)) w.store.set(k, v);
+        },
+        remove: async (key) => void w.store.delete(key),
+      },
+      alarms: { create: () => undefined, clear: () => undefined },
+      isConnected: () => false,
+      attachedTabs: async () => [11, 12, 13],
+      detachTab: (tabId) => {
+        if (tabId === 11) return new Promise<void>(() => undefined); // wedged
+        w.detached.push(tabId);
+        return Promise.resolve();
+      },
+    });
+
+    void hung.onAlarm();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(w.detached).toEqual([12, 13]);
   });
 
   it('survives a worker restart: the outage start is read back from storage', async () => {

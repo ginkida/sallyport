@@ -245,6 +245,10 @@ async function tryQuietClose(tabId: number, targets?: PageTargets): Promise<bool
   }
   let watch: ReturnType<typeof watchRemoval> | undefined;
   try {
+    // Asked again at the last moment: every step up to here awaited the
+    // browser, and the human may have clicked into the tab meanwhile. From
+    // here to the command there is no await left.
+    if (!mayCloseQuietly(tabId)) throw new Error('engaged meanwhile');
     watch = watchRemoval(tabId);
     let accepted: boolean;
     try {

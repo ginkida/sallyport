@@ -107,19 +107,21 @@ async function releaseOne(
   const action = releaseAction(keep, human);
 
   if (action === 'close' && mayClose(entry, minted)) {
-    // Close FIRST and skip the detach: closing the tab ends its CDP session
-    // anyway. Quietly — without the tab's beforeunload prompt, which Chrome
-    // would show by raising this agent window over the human's work, and
-    // which would hold this release until someone answered it
-    // (quiet-leave.ts).
+    // QUIETLY OR NOT AT ALL (`quietOnly`), like the reaper: without the tab's
+    // beforeunload prompt, which Chrome would show by raising this agent
+    // window over the human's work and which would hold this release until
+    // someone answered it (quiet-leave.ts). `closeAgentTab` re-asks, at the
+    // last moment, whether the human engaged with the tab or has it in front
+    // of them — the answer above can be stale by a browser round-trip — and a
+    // tab that fails that, or cannot be closed quietly (DevTools holds it),
+    // is KEPT and handed back below. Housekeeping never destroys a tab with
+    // the plain removal: that is the one path with no such re-check.
     try {
-      await closeAgentTab(tabId, { targets });
-      return { released: true, closed: true, dropped: dropEpoch(tabId) };
+      if ((await closeAgentTab(tabId, { quietOnly: true, targets })) === 'quiet') {
+        return { released: true, closed: true, dropped: dropEpoch(tabId) };
+      }
     } catch {
-      // Still there (or already gone). Fall back to handing it back, and KEEP
-      // the epoch so the tab stays visible to the popup's sweep.
-      await detach(tabId);
-      return { released: true, closed: false, dropped: false };
+      // already gone — the hand-back below is a no-op on it
     }
   }
 
@@ -215,11 +217,24 @@ const STRANDED_KEY = 'sallyport_stranded_tabs';
  * synchronous snapshot — there is no daemon record to compare against, and a
  * tab whose epoch changed meanwhile (closed, id recycled by a new create) fails
  * the epoch comparison and is left alone. Never throws. */
-export async function releaseStrandedTabs(boot: string | undefined): Promise<number> {
-  if (!boot) return 0;
+export function releaseStrandedTabs(boot: string | undefined): Promise<number> {
+  if (!boot) return Promise.resolve(0);
+  // Snapshot NOW, in the caller's tick; decide LATER, one ack at a time. Two
+  // acks of the same new daemon can overlap (a re-ack, a quick reconnect), and
+  // unserialised both would read the OLD boot id — the second one with a
+  // snapshot that already holds the new daemon's own tabs.
   const candidates: ReleaseEntry[] = agentTabInfo()
     .filter((t) => !t.orphaned)
     .map((t) => ({ tabId: t.tabId, epoch: t.epoch }));
+  const run = (): Promise<number> => releaseStranded(boot, candidates);
+  const next = strandedChain.then(run, run);
+  strandedChain = next.catch(() => 0);
+  return next;
+}
+
+let strandedChain: Promise<unknown> = Promise.resolve();
+
+async function releaseStranded(boot: string, candidates: ReleaseEntry[]): Promise<number> {
   try {
     const got = (await chrome.storage.session.get([BOOT_KEY, STRANDED_KEY])) as Record<
       string,
@@ -236,6 +251,9 @@ export async function releaseStrandedTabs(boot: string | undefined): Promise<num
       await chrome.storage.session.set({ [BOOT_KEY]: boot, [STRANDED_KEY]: pending });
     }
     if (pending.length === 0) return 0;
+    // A paused bridge acts on nothing — the ack may have been in flight when
+    // the human hit Pause. The list stays on record; the next ack resumes it.
+    if ((await getSettings()).paused) return 0;
     const live = pending.filter((c) => getEpoch(c.tabId) === c.epoch);
     const { released } = await releaseEntries(live);
     await chrome.storage.session.remove(STRANDED_KEY);

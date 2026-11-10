@@ -43,8 +43,8 @@ export type DisconnectReleaseDeps = {
   isConnected(): boolean;
   /** Tab ids Chrome reports a debugger attached to — ours or not. */
   attachedTabs(): Promise<number[]>;
-  /** Detach OUR session from the tab, serialised with tool calls on it; a tab
-   * we do not hold is a no-op. Must not throw. */
+  /** Detach OUR session from the tab unless the bridge is connected again by
+   * then; a tab we do not hold is a no-op. Bounded, and must not throw. */
   detachTab(tabId: number): Promise<void>;
 };
 
@@ -86,15 +86,13 @@ export function createDisconnectRelease(deps: DisconnectReleaseDeps): Disconnect
     // Mark the outage handled BEFORE detaching, so a status change landing
     // mid-release does not start a second pass.
     await deps.storage.set({ [SINCE_KEY]: 'released' });
-    let released = 0;
-    for (const tabId of await deps.attachedTabs()) {
-      // Reconnected while we were at it: whatever is still attached is about
-      // to be driven again.
-      if (deps.isConnected()) break;
-      await deps.detachTab(tabId);
-      released++;
-    }
-    return released;
+    // All at once: `detachTab` is bounded per tab, but one tab with a wedged
+    // renderer must not make the idle ones behind it wait their turn. Each
+    // detach re-checks the connection itself, right before it acts.
+    const tabs = await deps.attachedTabs();
+    if (deps.isConnected()) return 0;
+    await Promise.all(tabs.map((tabId) => deps.detachTab(tabId)));
+    return tabs.length;
   }
 
   return {

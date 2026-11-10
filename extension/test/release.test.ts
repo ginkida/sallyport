@@ -202,20 +202,21 @@ describe('releaseTabs — the destructive path', () => {
     expect(new Set(calls.detached)).toEqual(new Set(entries.map((e) => e.tabId)));
   });
 
-  it('by default closes the tabs, and forgets them', async () => {
+  it('never falls back to the plain removal: a tab it cannot close quietly is handed back', async () => {
+    // No quiet route (no debugger foothold — DevTools holds the tab). The plain
+    // `tabs.remove` is the one close with no last-moment "is a person on this
+    // tab?" check, and it can raise a beforeunload prompt — housekeeping never
+    // uses it. The tab stays, detached and orphaned, for the reaper or the popup.
     const calls = installChromeMock();
     const e1 = mintEpoch(11);
-    await setSettings({ keepAgentTabsOnDisconnect: false });
 
     const res = await releaseTabs({ tabs: [{ tabId: 11, epoch: e1 }] });
 
-    expect(res.data).toEqual({ released: 1, closed: 1 });
-    expect(calls.removed).toEqual([11]);
-    expect(getEpoch(11)).toBeUndefined();
-    // Closing the tab ends its CDP session, so there is nothing to detach
-    // first (and on the plain-removal fallback, detaching would tear down the
-    // dialog handling able to answer a beforeunload).
-    expect(calls.detached).toEqual([]);
+    expect(res.data).toEqual({ released: 1, closed: 0 });
+    expect(calls.removed).toEqual([]);
+    expect(calls.detached).toEqual([11]);
+    expect(getEpoch(11)).toBe(e1);
+    expect(agentTabInfo()[0].orphaned).toBe(true);
   });
 
   it('closes WITHOUT the beforeunload prompt — no window raised, no release stuck on it', async () => {
@@ -473,5 +474,63 @@ describe('release — review fixes', () => {
     mintEpoch(11);
     expect(await releaseStrandedTabs('boot-b')).toBe(0);
     expect(getEpoch(11)).toBeDefined();
+  });
+});
+
+describe('release — races found in review', () => {
+  beforeEach(() => {
+    clearAllEpochs();
+    resetAttachedTabs();
+  });
+
+  it('two overlapping acks of the new daemon never take the new daemon own tab', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    await releaseStrandedTabs('boot-a');
+    mintEpoch(11);
+
+    const first = releaseStrandedTabs('boot-b'); // snapshot: [11]
+    mintEpoch(13); // boot-b's first tab
+    const second = releaseStrandedTabs('boot-b'); // snapshot: [13] — must be ignored
+    await Promise.all([first, second]);
+
+    expect(calls.closedQuietly).toEqual([11]);
+    expect(getEpoch(13)).toBeDefined();
+  });
+
+  it('a human who engages while the release is deciding keeps the tab', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    const chromeMock = (globalThis as unknown as { chrome: Record<string, any> }).chrome;
+    const e1 = mintEpoch(11);
+    let asked = 0;
+    chromeMock.tabs.get = async (tabId: number) => {
+      // First look (release.ts): in the background. Second look (the close
+      // itself): the human has just clicked into it.
+      asked++;
+      if (asked === 2) markHumanTab(11);
+      return { id: tabId, active: false, windowId: 5 };
+    };
+
+    const res = await releaseTabs({ tabs: [{ tabId: 11, epoch: e1 }] });
+
+    expect(res.data).toEqual({ released: 1, closed: 0 });
+    expect(calls.closedQuietly).toEqual([]);
+    expect(calls.removed).toEqual([]);
+    expect(getEpoch(11)).toBe(e1);
+  });
+
+  it('a paused bridge releases nothing, and the list waits for the next ack', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    await releaseStrandedTabs('boot-a');
+    mintEpoch(11);
+    await setSettings({ paused: true });
+
+    expect(await releaseStrandedTabs('boot-b')).toBe(0);
+    expect(calls.closedQuietly).toEqual([]);
+
+    await setSettings({ paused: false });
+    mintEpoch(13);
+    expect(await releaseStrandedTabs('boot-b')).toBe(1);
+    expect(calls.closedQuietly).toEqual([11]);
+    expect(getEpoch(13)).toBeDefined();
   });
 });

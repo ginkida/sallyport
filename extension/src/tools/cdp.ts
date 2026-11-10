@@ -477,7 +477,7 @@ export async function releaseViewport(tabId: number, deadlineMs?: number): Promi
  * Best-effort by construction: a tab that is already gone, or was never
  * attached, is simply not our problem. Explicit detach clears our state too:
  * Chrome does not emit onDetach for the extension's own detach call. */
-export async function detach(tabId: number): Promise<void> {
+export async function detach(tabId: number, opts: { unless?: () => boolean } = {}): Promise<void> {
   // Drop any viewport emulation FIRST, while there is still a session to send
   // it on. Unlike every other override, this one does not reliably end with the
   // session — see `releaseViewport`. Best-effort AND bounded: a tab that was
@@ -495,6 +495,11 @@ export async function detach(tabId: number): Promise<void> {
   // survives it, so a gated detach would silently no-op for exactly the tabs
   // that have been attached longest. Detaching a tab we never held is a
   // harmless no-op that throws, which we swallow.
+  // `unless`: a housekeeping detach (disconnect-release) asks again HERE,
+  // after the bounded wait above — the bridge may have come back meanwhile,
+  // and a tabId-less call (standalone active-tab fallback) bypasses the tab
+  // chain, so it could already be driving this session.
+  if (opts.unless?.()) return;
   try {
     await chrome.debugger.detach({ tabId });
   } catch {

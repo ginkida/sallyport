@@ -22,7 +22,11 @@ uses [Semantic Versioning](https://semver.org/).
   (active tab of the focused window) is kept as well, and a click into an agent
   tab that woke the extension's sleeping worker is no longer lost before the
   ownership map is loaded. `sallyport-daemon exec` through a broker asks for
-  its tab to be left open (its session is that one call), as before.
+  its tab to be left open (its session is that one call), as before. This
+  cleanup only ever closes a tab quietly (no `beforeunload` prompt, with a
+  last-moment check that you have not engaged with it); a tab it cannot close
+  that way — DevTools is open on it — stays open, detached, for the tab reaper
+  or the popup's sweep. A paused bridge closes nothing.
 
 - Keep-awake naps. An agent tab that has had no activity for 90 seconds stops
   being kept "focused and visible" (the focus emulation is dropped) and is
