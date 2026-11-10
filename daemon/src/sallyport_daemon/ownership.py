@@ -245,6 +245,10 @@ def forget_gone_tab(
     later call naming it answers ``tab_not_owned``, which says the same thing."""
     if client_id is None or code != "tab_gone":
         return
+    # ``navigate {tabId: T, newTab: true}`` opens a NEW tab, and a ``tab_gone``
+    # from it is about that new tab (closed before it loaded) — T is alive.
+    if args.get("newTab"):
+        return
     tab_id = args.get("tabId")
     if _is_tab_id(tab_id):
         registry.drop_tab(client_id, tab_id)

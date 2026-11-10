@@ -593,3 +593,15 @@ async def test_call_tool_forgets_a_tab_the_extension_reports_gone() -> None:
     with pytest.raises(ToolError) as second:
         await b.call_tool("snapshot", {"tabId": 5}, client_id="A")
     assert second.value.code == "tab_not_owned"
+
+
+def test_forget_gone_tab_spares_the_tab_named_beside_new_tab() -> None:
+    """``navigate {tabId: T, newTab: true}`` opens a NEW tab; a tab_gone from it
+    is about that one (closed before it loaded). T is alive and must stay
+    owned — dropping it would strand a live tab from its own session."""
+    reg = OwnershipRegistry()
+    reg.record_create("A", 5, "e5", opened_at=1.0)
+
+    forget_gone_tab(reg, "A", {"tabId": 5, "newTab": True, "url": "https://x"}, "tab_gone")
+
+    assert reg.owns("A", 5)

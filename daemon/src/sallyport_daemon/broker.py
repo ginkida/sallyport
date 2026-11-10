@@ -125,6 +125,12 @@ class ClientIdentity:
 
     id: str
     label: str | None = None
+    # Peer asked that its tabs be LEFT OPEN when it disconnects (the one-shot
+    # `exec` client: its whole session is one call, so closing behind it would
+    # close the page it was run to open). Peer-declared, and safe to honour
+    # only because it points the conservative way — it can make the extension
+    # keep a tab, never close one.
+    keep_tabs: bool = False
 
 
 @dataclass
@@ -243,7 +249,8 @@ async def authenticate_connection(
     except (OSError, FramingError):
         await _close_quietly(writer)
         return None
-    return ClientIdentity(id=client_id, label=label)
+    keep_tabs = (env.body or {}).get("keepTabs") is True
+    return ClientIdentity(id=client_id, label=label, keep_tabs=keep_tabs)
 
 
 @asynccontextmanager
@@ -365,7 +372,7 @@ async def _serve_authenticated(
         # page rendering as if visible outlive every session that ever ran.
         released = bridge.release_client(identity.id)
         if released:
-            await bridge.release_tabs_in_browser(released)
+            await bridge.release_tabs_in_browser(released, keep=identity.keep_tabs)
         await _close_quietly(writer)
 
 
@@ -691,7 +698,10 @@ async def call_tool_via_broker(
     signer = Signer(secret)
     reader, writer = await asyncio.open_unix_connection(str(path))
     try:
-        await write_frame(writer, _dump_json(signer.sign(Envelope(type="hello", body={}))))
+        # keepTabs: a one-shot client's session ends with its one call, and
+        # the tab it opened is usually the point of running it.
+        hello = Envelope(type="hello", body={"keepTabs": True})
+        await write_frame(writer, _dump_json(signer.sign(hello)))
         # Every timeout here becomes a BrokerError. On Python 3.10
         # `asyncio.TimeoutError` is `concurrent.futures.TimeoutError` — NOT the
         # builtin `TimeoutError`, and therefore NOT an OSError — so letting it

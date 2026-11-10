@@ -766,3 +766,6 @@ async def test_release_tabs_in_browser_still_reaches_the_wire() -> None:
     sent.clear()
     await bridge.release_tabs_in_browser({})
     assert sent == []
+    # A client that asked to keep its tabs: the request travels with the release.
+    await bridge.release_tabs_in_browser({11: "e1"}, keep=True)
+    assert sent == [(RELEASE_TABS_TOOL, {"tabs": [{"tabId": 11, "epoch": "e1"}], "keep": True})]

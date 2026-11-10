@@ -403,3 +403,75 @@ describe('releaseStrandedTabs — a daemon that died sends no _release_tabs', ()
     expect(calls.closedQuietly).toEqual([]);
   });
 });
+
+describe('release — review fixes', () => {
+  beforeEach(() => {
+    clearAllEpochs();
+    resetAttachedTabs();
+  });
+
+  it('hands back the tab the human has IN FRONT of them, mark or no mark', async () => {
+    // Active tab of the focused window, never marked `human` (the worker was
+    // asleep for the activation, or the person simply never switched tabs).
+    const calls = installChromeMock({ quietClose: true });
+    const chromeMock = (globalThis as unknown as { chrome: Record<string, any> }).chrome;
+    chromeMock.tabs.get = async (tabId: number) => ({
+      id: tabId,
+      active: tabId === 12,
+      windowId: 5,
+    });
+    chromeMock.windows = { get: async () => ({ focused: true }) };
+    const e1 = mintEpoch(11);
+    const e2 = mintEpoch(12);
+
+    const res = await releaseTabs({
+      tabs: [
+        { tabId: 11, epoch: e1 },
+        { tabId: 12, epoch: e2 },
+      ],
+    });
+
+    expect(res.data).toEqual({ released: 2, closed: 1 });
+    expect(calls.closedQuietly).toEqual([11]);
+    expect(calls.removed).toEqual([]);
+    expect(calls.detached).toEqual([12]);
+    expect(getEpoch(12)).toBe(e2);
+  });
+
+  it('a client that asked to keep its tabs (exec) gets them handed back, whatever the setting', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    const e1 = mintEpoch(11);
+
+    const res = await releaseTabs({ tabs: [{ tabId: 11, epoch: e1 }], keep: true });
+
+    expect(res.data).toEqual({ released: 1, closed: 0 });
+    expect(calls.closedQuietly).toEqual([]);
+    expect(calls.detached).toEqual([11]);
+    // Only the literal `true` counts — nothing truthy-but-odd keeps a tab.
+    const e2 = mintEpoch(12);
+    const res2 = await releaseTabs({ tabs: [{ tabId: 12, epoch: e2 }], keep: 'yes' });
+    expect(res2.data).toEqual({ released: 1, closed: 1 });
+  });
+
+  it('a stranded release cut short is resumed by the next ack of the same daemon', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    await releaseStrandedTabs('boot-a');
+    const e1 = mintEpoch(11);
+    // The worker died right after remembering the new daemon: the candidate
+    // list is on record, nothing was released.
+    await chrome.storage.session.set({
+      sallyport_daemon_boot: 'boot-b',
+      sallyport_stranded_tabs: [{ tabId: 11, epoch: e1 }],
+    });
+    mintEpoch(13); // the new daemon's own tab — must not be swept up
+
+    expect(await releaseStrandedTabs('boot-b')).toBe(1);
+
+    expect(calls.closedQuietly).toEqual([11]);
+    expect(getEpoch(13)).toBeDefined();
+    // ...and only once.
+    mintEpoch(11);
+    expect(await releaseStrandedTabs('boot-b')).toBe(0);
+    expect(getEpoch(11)).toBeDefined();
+  });
+});

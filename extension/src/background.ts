@@ -72,7 +72,12 @@ async function setSettingsForConnection(
 // every tab we hold is detached (disconnect-release.ts). Declared before the
 // bridge because the bridge's status callback feeds it; it only reads the
 // bridge's state when called, by which time `bridge` exists.
-const isConnected = (): boolean => bridge.status().state === 'connected';
+// "Connected" here means the daemon ANSWERED the hello on this socket, not
+// that the socket opened: the state machine reports `connected` at WS open, and
+// a daemon that accepts and then refuses (wrong secret, slot taken) would
+// otherwise restart the outage clock every few seconds and never let it run out.
+let acked = false;
+const isConnected = (): boolean => acked && bridge.status().state === 'connected';
 const disconnectRelease: DisconnectRelease = createDisconnectRelease({
   now: () => Date.now(),
   storage: {
@@ -134,6 +139,7 @@ const bridge = new BridgeConnection({
   },
   onStatus: (snapshot: StatusSnapshot) => {
     void updateBadge(snapshot);
+    if (snapshot.state !== 'connected') acked = false;
     void disconnectRelease.onStatus();
     chrome.runtime.sendMessage({ type: 'STATUS', status: snapshot }).catch(() => {
       // popup not open — fine.
@@ -144,6 +150,8 @@ const bridge = new BridgeConnection({
   // mitigation. Re-signalled on every (re)connect, so it survives SW eviction.
   onBrokerMode: (broker: boolean, boot?: string) => {
     setBrokerMode(broker);
+    acked = true;
+    void disconnectRelease.onStatus();
     // A different daemon process than last time: every agent tab minted under
     // the previous one is unreachable now (release.ts). Applied in arrival
     // order with the ack, so the tabs it considers are exactly those that
@@ -178,7 +186,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   else if (alarm.name === ALARM_KEEPALIVE) void bridge.onKeepaliveAlarm();
 });
 
-async function bootBridge(): Promise<void> {
+async function bootBridgeOnce(): Promise<void> {
   // Rehydrate tab-ownership epochs from session storage (survives SW eviction)
   // and prune any whose tab is gone, BEFORE the connection can carry a tool
   // call that relies on them. Best-effort; the daemon stays the authority.
@@ -216,6 +224,16 @@ chrome.tabs.onCreated.addListener((tab) => {
 // "The human looked at this one" — the reaper's stop sign and what keeps an
 // agent tab's beforeunload prompt (human-interest.ts).
 installHumanInterestListeners();
+
+// ONE boot per worker. `onStartup`/`onInstalled` fire in addition to the
+// script-load call below, and a popup message can arrive before any of them has
+// finished — everything that touches the connection waits on this, so the
+// epoch map is always hydrated before a daemon's hello_ack is handled.
+let booted: Promise<void> | undefined;
+function bootBridge(): Promise<void> {
+  booted ??= bootBridgeOnce();
+  return booted;
+}
 
 chrome.runtime.onStartup.addListener(() => void bootBridge());
 chrome.runtime.onInstalled.addListener(() => void bootBridge());
@@ -299,6 +317,7 @@ chrome.runtime.onMessage.addListener((msg: PopupMessage, sender, sendResponse) =
           sendResponse({ ok: true, status: bridge.status() });
           break;
         case 'PAIR':
+          await bootBridge();
           await bridge.pair(msg.secret, msg.serverUrl);
           sendResponse({ ok: true, status: bridge.status() });
           break;
@@ -311,10 +330,12 @@ chrome.runtime.onMessage.addListener((msg: PopupMessage, sender, sendResponse) =
           sendResponse({ ok: true });
           break;
         case 'RESUME':
+          await bootBridge();
           await bridge.resume();
           sendResponse({ ok: true });
           break;
         case 'RECONNECT':
+          await bootBridge();
           await bridge.reconnectNow();
           sendResponse({ ok: true, status: bridge.status() });
           break;

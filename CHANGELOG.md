@@ -18,7 +18,11 @@ uses [Semantic Versioning](https://semver.org/).
   popup switch is now the opposite one, **keep a session's tabs open after it
   disconnects** (off by default); the old `closeAgentTabsOnDisconnect` value is
   ignored. With the old switch on, a tab you had looked at was closed too (with
-  its prompt); it is now kept.
+  its prompt); it is now kept. The tab you have in front of you at that moment
+  (active tab of the focused window) is kept as well, and a click into an agent
+  tab that woke the extension's sleeping worker is no longer lost before the
+  ownership map is loaded. `sallyport-daemon exec` through a broker asks for
+  its tab to be left open (its session is that one call), as before.
 
 - Keep-awake naps. An agent tab that has had no activity for 90 seconds stops
   being kept "focused and visible" (the focus emulation is dropped) and is

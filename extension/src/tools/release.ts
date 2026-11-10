@@ -30,7 +30,7 @@ import { getSettings } from '../storage.js';
 import { detach } from './cdp.js';
 import { agentTabInfo, agentTabRecord, dropEpoch, getEpoch, markOrphanedTab } from './ownership.js';
 import { persistEpochs } from './ownership-store.js';
-import { closeAgentTab, pageTargets, type PageTargets } from './quiet-leave.js';
+import { closeAgentTab, inFrontOfHuman, pageTargets, type PageTargets } from './quiet-leave.js';
 import type { Tool } from './types.js';
 
 /** What to do with a disconnected session's tab.
@@ -99,7 +99,12 @@ async function releaseOne(
   // tabs have a recorded epoch, so this is exactly the right filter — and it
   // is fail-closed.
   if (minted === undefined) return { released: false, closed: false, dropped: false };
-  const action = releaseAction(keep, agentTabRecord(tabId)?.human === true);
+  // "Human" is the recorded mark OR the tab being in front of a person right
+  // now (active tab of the focused window): someone can read or type in a tab
+  // without producing the events the mark is built from, and the mark itself
+  // can be missed by a worker that was asleep. Browser-answered, fail-closed.
+  const human = agentTabRecord(tabId)?.human === true || (!keep && (await inFrontOfHuman(tabId)));
+  const action = releaseAction(keep, human);
 
   if (action === 'close' && mayClose(entry, minted)) {
     // Close FIRST and skip the detach: closing the tab ends its CDP session
@@ -144,8 +149,9 @@ async function releaseOne(
 
 async function releaseEntries(
   entries: ReleaseEntry[],
+  forceKeep = false,
 ): Promise<{ released: number; closed: number }> {
-  const { keepAgentTabsOnDisconnect: keep } = await getSettings();
+  const keep = forceKeep || (await getSettings()).keepAgentTabsOnDisconnect;
   let released = 0;
   let closed = 0;
   let changed = false;
@@ -167,10 +173,13 @@ async function releaseEntries(
 }
 
 export const releaseTabs: Tool = async (args) => {
-  return { data: await releaseEntries(parseReleaseEntries(args.tabs)) };
+  // `keep`: the disconnecting client asked for its tabs to be left open (the
+  // one-shot `exec` client). It can only make this release MORE conservative.
+  return { data: await releaseEntries(parseReleaseEntries(args.tabs), args.keep === true) };
 };
 
 const BOOT_KEY = 'sallyport_daemon_boot';
+const STRANDED_KEY = 'sallyport_stranded_tabs';
 
 /** Release every agent tab a DEAD daemon left behind.
  *
@@ -189,6 +198,13 @@ const BOOT_KEY = 'sallyport_daemon_boot';
  * tabs. The candidates are snapshotted synchronously, before the first await,
  * so a tab the NEW daemon creates right after its ack is never among them.
  *
+ * The candidate list is WRITTEN DOWN together with the new boot id (one
+ * `storage.session` write) and erased only when the release has run: a worker
+ * evicted in between would otherwise remember the new daemon and forget the
+ * tabs, leaving them unowned AND un-orphaned for good. The next ack from the
+ * same daemon picks the list up. Re-deriving it then would be wrong — by that
+ * time it could contain the new daemon's own tabs.
+ *
  * Deliberately inert when there is nothing to compare: no `boot` (an older
  * daemon), or no remembered one (first ack of this browser session, or the
  * first after this extension version was installed — the tabs then may well
@@ -198,20 +214,32 @@ const BOOT_KEY = 'sallyport_daemon_boot';
  * The epoch each tab is released under is the one WE minted, read in the same
  * synchronous snapshot — there is no daemon record to compare against, and a
  * tab whose epoch changed meanwhile (closed, id recycled by a new create) fails
- * `mayClose` and is left alone. Never throws. */
+ * the epoch comparison and is left alone. Never throws. */
 export async function releaseStrandedTabs(boot: string | undefined): Promise<number> {
   if (!boot) return 0;
   const candidates: ReleaseEntry[] = agentTabInfo()
     .filter((t) => !t.orphaned)
     .map((t) => ({ tabId: t.tabId, epoch: t.epoch }));
   try {
-    const got = (await chrome.storage.session.get(BOOT_KEY)) as Record<string, unknown>;
+    const got = (await chrome.storage.session.get([BOOT_KEY, STRANDED_KEY])) as Record<
+      string,
+      unknown
+    >;
     const previous = got[BOOT_KEY];
-    if (previous === boot) return 0;
-    await chrome.storage.session.set({ [BOOT_KEY]: boot });
-    if (typeof previous !== 'string' || candidates.length === 0) return 0;
-    const live = candidates.filter((c) => getEpoch(c.tabId) === c.epoch);
-    return (await releaseEntries(live)).released;
+    let pending: ReleaseEntry[];
+    if (previous === boot) {
+      // Same daemon. Normally nothing to do — unless an earlier pass for it was
+      // cut short.
+      pending = parseReleaseEntries(got[STRANDED_KEY]);
+    } else {
+      pending = typeof previous === 'string' ? candidates : [];
+      await chrome.storage.session.set({ [BOOT_KEY]: boot, [STRANDED_KEY]: pending });
+    }
+    if (pending.length === 0) return 0;
+    const live = pending.filter((c) => getEpoch(c.tabId) === c.epoch);
+    const { released } = await releaseEntries(live);
+    await chrome.storage.session.remove(STRANDED_KEY);
+    return released;
   } catch {
     return 0; // storage unavailable — housekeeping never breaks a connect
   }

@@ -18,7 +18,7 @@
  * Split out of background.ts (pure wiring) so the timing is testable. */
 
 import { agentTabIds, getEpoch, markHumanTab } from './tools/ownership.js';
-import { persistEpochs } from './tools/ownership-store.js';
+import { epochsLoaded, persistEpochs, whenEpochsLoaded } from './tools/ownership-store.js';
 import { graceRemainingMs, onAgentWindowCreated } from './tools/agent-window.js';
 
 /** How long after we create an agent window a focus event on it is discounted
@@ -58,7 +58,12 @@ export function onTabActivated({ tabId, windowId }: { tabId: number; windowId: n
   // makes, all day, and in standalone the owned set is always empty — asking
   // the browser about the window before asking our own map would put a chrome
   // round-trip on a hot path that answers "not ours" essentially every time.
-  if (getEpoch(tabId) === undefined) return;
+  if (getEpoch(tabId) === undefined) {
+    // ...unless the map is simply not loaded yet: this very event may have
+    // woken the worker. Ask again once it is.
+    if (!epochsLoaded()) void whenEpochsLoaded().then(() => onTabActivated({ tabId, windowId }));
+    return;
+  }
   void (async () => {
     if (await windowIsFocused(windowId)) noteHumanInterest(tabId);
   })();
@@ -68,6 +73,10 @@ export function onTabActivated({ tabId, windowId }: { tabId: number; windowId: n
  * unambiguous "this is mine now", and the reason ownership never keys on
  * windowId. */
 export function onTabAttached(tabId: number): void {
+  if (getEpoch(tabId) === undefined && !epochsLoaded()) {
+    void whenEpochsLoaded().then(() => noteHumanInterest(tabId));
+    return;
+  }
   noteHumanInterest(tabId);
 }
 
@@ -80,7 +89,11 @@ export function onWindowFocusChanged(windowId: number): void {
   // tab is ours, so an "anything of ours at all?" bail placed first used to
   // skip the re-check for a session's first window.
   if (graceRemainingMs(windowId, HUMAN_FOCUS_GRACE_MS) > 0) return;
-  if (agentTabIds().size === 0) return; // nothing of ours to mark (standalone)
+  if (agentTabIds().size === 0) {
+    // Nothing of ours to mark (standalone) — or nothing loaded yet.
+    if (!epochsLoaded()) void whenEpochsLoaded().then(() => onWindowFocusChanged(windowId));
+    return;
+  }
   void (async () => {
     const tabId = await activeTabOf(windowId);
     if (tabId !== undefined && getEpoch(tabId) !== undefined) noteHumanInterest(tabId);

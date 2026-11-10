@@ -119,6 +119,21 @@ async def test_valid_hello_returns_client_id_and_acks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_hello_keep_tabs_needs_the_literal_true() -> None:
+    """A one-shot client (`exec`) asks for its tabs to be left open when it
+    disconnects. Peer-declared, so only the conservative direction exists: it
+    can keep a tab, never close one — and nothing merely truthy turns it on."""
+    for body, expected in (({"keepTabs": True}, True), ({"keepTabs": "yes"}, False), ({}, False)):
+        (sr, sw), (_cr, cw) = await _stream_pair()
+        signer = Signer(SECRET)
+        await write_frame(cw, _dump_json(signer.sign(Envelope(type="hello", body=body))))
+        identity = await authenticate_connection(sr, sw, Signer(SECRET))
+        assert identity is not None
+        assert identity.keep_tabs is expected
+        await _drain_close(sw, cw)
+
+
+@pytest.mark.asyncio
 async def test_hello_label_is_sanitised_and_capped() -> None:
     """A session may declare a cosmetic label. It is peer-supplied text that
     ends up in the extension's persisted audit log, so it is normalised and

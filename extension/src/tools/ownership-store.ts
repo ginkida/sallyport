@@ -37,6 +37,26 @@ export async function persistEpochs(): Promise<void> {
   }
 }
 
+let loaded = false;
+let markLoaded: () => void = () => undefined;
+const loadedOnce = new Promise<void>((resolve) => {
+  markLoaded = resolve;
+});
+
+/** Has the epoch map been rehydrated in this worker? Until it has, "not an
+ * agent tab" is not an answer — the map is merely empty. A browser event that
+ * WAKES the worker (the human clicking into an agent tab while no daemon is
+ * connected) is delivered before `loadEpochs` has run, and a listener that
+ * consulted the map then would drop the one event that says "a person is
+ * looking at this tab". Such listeners wait on `whenEpochsLoaded`. */
+export function epochsLoaded(): boolean {
+  return loaded;
+}
+
+export function whenEpochsLoaded(): Promise<void> {
+  return loadedOnce;
+}
+
 /** Rehydrate the epoch map from chrome.storage.session (SW boot). */
 export async function loadEpochs(): Promise<void> {
   try {
@@ -44,6 +64,9 @@ export async function loadEpochs(): Promise<void> {
     hydrateEpochs((got as Record<string, unknown>)[STORE_KEY]);
   } catch {
     // no snapshot / storage unavailable — start from an empty map.
+  } finally {
+    loaded = true;
+    markLoaded();
   }
 }
 

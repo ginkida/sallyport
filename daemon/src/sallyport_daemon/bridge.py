@@ -670,7 +670,9 @@ class Bridge:
         self._last_error.pop(client_id, None)
         return released
 
-    async def release_tabs_in_browser(self, tabs: dict[int, str | None]) -> None:
+    async def release_tabs_in_browser(
+        self, tabs: dict[int, str | None], *, keep: bool = False
+    ) -> None:
         """Ask the extension to stop DRIVING a disconnected client's tabs.
 
         Fire-and-forget housekeeping, not a gate: it detaches the debugger and
@@ -707,7 +709,12 @@ class Bridge:
             log.warning("ws: no free browser slot to release tabs %s", sorted(tabs))
             return
         try:
-            await self._call_tool_locked(RELEASE_TABS_TOOL, {"tabs": payload})
+            # `keep` (a client that asked for it, see broker.ClientIdentity)
+            # only ever makes the extension hand a tab back instead of closing it.
+            release_args: dict[str, Any] = {"tabs": payload}
+            if keep:
+                release_args["keep"] = True
+            await self._call_tool_locked(RELEASE_TABS_TOOL, release_args)
         except Exception:  # noqa: BLE001 - best-effort housekeeping
             log.warning("ws: releasing tabs %s failed", sorted(tabs), exc_info=True)
         finally:
