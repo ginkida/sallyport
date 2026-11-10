@@ -451,7 +451,7 @@ $('#status-settings').addEventListener('toggle', async () => {
   ($('#capture-console') as HTMLInputElement).checked = s.captureConsole;
   ($('#capture-network') as HTMLInputElement).checked = s.captureNetwork;
   ($('#handle-dialogs') as HTMLInputElement).checked = s.handleDialogs;
-  ($('#close-agent-tabs') as HTMLInputElement).checked = s.closeAgentTabsOnDisconnect;
+  ($('#keep-agent-tabs') as HTMLInputElement).checked = s.keepAgentTabsOnDisconnect;
   ($('#max-agent-tabs') as HTMLInputElement).value = String(s.maxAgentTabs);
 });
 
@@ -605,11 +605,11 @@ $('#handle-dialogs').addEventListener('change', async () => {
   await setSettings({ handleDialogs: ($('#handle-dialogs') as HTMLInputElement).checked });
 });
 
-$('#close-agent-tabs').addEventListener('change', async () => {
+$('#keep-agent-tabs').addEventListener('change', async () => {
   // Read at release time, so this takes effect for the next session that
   // disconnects — no need to restart anything.
   await setSettings({
-    closeAgentTabsOnDisconnect: ($('#close-agent-tabs') as HTMLInputElement).checked,
+    keepAgentTabsOnDisconnect: ($('#keep-agent-tabs') as HTMLInputElement).checked,
   });
 });
 

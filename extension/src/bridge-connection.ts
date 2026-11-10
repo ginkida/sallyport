@@ -42,7 +42,7 @@ export type Deps = {
    * body. Production wires it to ownership.setBrokerMode so the tool layer can
    * enable broker-only behaviours (owner-scoped list_tabs, focus mitigation);
    * tests observe directly. Optional — single-client builds may omit it. */
-  onBrokerMode?: (broker: boolean) => void;
+  onBrokerMode?: (broker: boolean, boot?: string) => void;
   /** Executes a tool against the page. Production wires to `runTool`. */
   runTool: ToolHandler;
   /** Extension version reported in the hello frame. */
@@ -525,7 +525,12 @@ export class BridgeConnection {
       case 'hello_ack':
         // Server confirmed pairing. Its body reports broker vs standalone mode;
         // surface it so the tool layer can enable broker-only behaviours.
-        this.deps.onBrokerMode?.(Boolean((env.body as { broker?: unknown } | null)?.broker));
+        {
+          const body = env.body as { broker?: unknown; boot?: unknown } | null;
+          // `boot` names the daemon PROCESS (absent from a pre-0.27 daemon).
+          const boot = typeof body?.boot === 'string' && body.boot ? body.boot : undefined;
+          this.deps.onBrokerMode?.(Boolean(body?.broker), boot);
+        }
         break;
       case 'tool_call':
         // Detached on purpose (see the message listener): starting it inside

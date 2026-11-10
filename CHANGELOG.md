@@ -6,6 +6,34 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A session's agent tabs are now closed when it ends** (was: left open and
+  unowned unless you ticked "close a session's tabs when it disconnects"). No
+  later session can reach a finished session's tabs, so left open they only
+  piled up — each a live renderer in your browser until you swept the popup or
+  the 20-tab ceiling evicted them. A tab you engaged with — activated in a
+  focused window, or dragged into one of your own — is never closed this way: it
+  stays open and is merely no longer driven (debugger detached, unmuted). The
+  popup switch is now the opposite one, **keep a session's tabs open after it
+  disconnects** (off by default); the old `closeAgentTabsOnDisconnect` value is
+  ignored. With the old switch on, a tab you had looked at was closed too (with
+  its prompt); it is now kept.
+
+### Fixed
+
+- Agent tabs no longer outlive a daemon that died. A broker that crashed, was
+  killed, or was stopped for an upgrade (`doctor --stop-broker`) took its tab
+  ownership registry with it and sent no release: its sessions' tabs stayed
+  open, debugger-attached and kept awake, no session of the next daemon could
+  name them, and the tab reaper would not take them either. The daemon now
+  names its process in `hello_ack` (`boot`), and when the extension connects to
+  a different one than last time, it releases every agent tab that existed at
+  that moment exactly as a disconnect would (closed, or handed back if you
+  engaged with it or keep tabs). Inert against an older daemon. If you point the
+  extension at a second daemon while the first still runs, the first one's tabs
+  are released too.
+
 ## [0.26.1] — 2026-10-05
 
 ### Fixed

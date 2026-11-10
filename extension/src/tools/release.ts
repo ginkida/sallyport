@@ -7,17 +7,20 @@
  * it when an MCP client disconnects, passing the tabs that client owned together
  * with the ownership epoch it recorded for each.
  *
- * BY DEFAULT the tabs stay OPEN: closing an agent's half-finished work is
- * exactly the loss invariant #12 gates `close_tab` against, and for an
- * interactive session those tabs are usually the result the human wanted. What
- * we always stop is the DRIVING — the debugger session goes away, and with it
- * Chrome's "started debugging this browser" bar, the sticky focus emulation that
- * makes the page report itself visible and keeps it rendering, and the
- * DevTools-open status that keeps the tab out of memory-saver discards.
+ * BY DEFAULT the tabs are CLOSED — an agent cleans up after itself. Nobody can
+ * name a disconnected session's tabs again (they are owner-scoped), so left
+ * open they only accumulate: each one a live renderer in the human's browser
+ * until someone sweeps the popup. The one exception is a tab the HUMAN engaged
+ * with (activated it in a focused window, dragged it into their own): that one
+ * is somebody's now, and it is handed back instead — left open, but no longer
+ * DRIVEN: the debugger session goes away, and with it Chrome's "started
+ * debugging this browser" bar, the focus emulation that keeps the page
+ * rendering as if visible, and the DevTools-open status that keeps the tab out
+ * of memory-saver discards.
  *
- * With `Settings.closeAgentTabsOnDisconnect` on, the tabs are CLOSED instead.
- * That switch is browser-global and cannot distinguish an ephemeral agent from
- * an interactive one — see its doc comment in storage.ts.
+ * With `Settings.keepAgentTabsOnDisconnect` on, every tab is handed back that
+ * way (the pre-0.27 default). The switch is browser-global — see its doc
+ * comment in storage.ts.
  *
  * Every step is best-effort per tab: this runs on a disconnect path, so one
  * vanished tab must not stop the rest from being released.
@@ -25,21 +28,22 @@
 
 import { getSettings } from '../storage.js';
 import { detach } from './cdp.js';
-import { dropEpoch, getEpoch, markOrphanedTab } from './ownership.js';
+import { agentTabInfo, agentTabRecord, dropEpoch, getEpoch, markOrphanedTab } from './ownership.js';
 import { persistEpochs } from './ownership-store.js';
 import { closeAgentTab, pageTargets, type PageTargets } from './quiet-leave.js';
 import type { Tool } from './types.js';
 
 /** What to do with a disconnected session's tab.
  *
- * `hand-back` is the default and the conservative one: stop driving the tab but
- * leave it open. `close` is opt-in, for EPHEMERAL agents — a dispatched one-shot
- * run is a new MCP session every time, so each run's tabs are orphaned on exit
- * and no later session can reach them (they are owner-scoped), which means they
- * pile up until a human sweeps them from the popup. Pure so the policy is
- * unit-tested rather than inferred from the chrome calls. */
-export function releaseAction(closeOnDisconnect: boolean): 'close' | 'hand-back' {
-  return closeOnDisconnect ? 'close' : 'hand-back';
+ * `close` is the default: the session is gone, no later one can reach its tabs,
+ * and a tab nobody can drive and nobody looked at is only a cost. `hand-back`
+ * (stop driving, leave open) is what a tab the HUMAN engaged with always gets —
+ * destroying something a person is looking at is the loss `close_tab`'s gate
+ * exists to prevent — and what every tab gets when the human asked to keep
+ * them. Pure so the policy is unit-tested rather than inferred from the chrome
+ * calls. */
+export function releaseAction(keepOnDisconnect: boolean, human = false): 'close' | 'hand-back' {
+  return keepOnDisconnect || human ? 'hand-back' : 'close';
 }
 
 /** One tab as the daemon names it: its id plus the ownership epoch the daemon
@@ -86,7 +90,7 @@ const RELEASE_CONCURRENCY = 8;
  * total it up without shared mutable state across concurrent workers. */
 async function releaseOne(
   entry: ReleaseEntry,
-  action: 'close' | 'hand-back',
+  keep: boolean,
   targets?: PageTargets,
 ): Promise<{ released: boolean; closed: boolean; dropped: boolean }> {
   const { tabId } = entry;
@@ -95,13 +99,14 @@ async function releaseOne(
   // tabs have a recorded epoch, so this is exactly the right filter — and it
   // is fail-closed.
   if (minted === undefined) return { released: false, closed: false, dropped: false };
+  const action = releaseAction(keep, agentTabRecord(tabId)?.human === true);
 
   if (action === 'close' && mayClose(entry, minted)) {
     // Close FIRST and skip the detach: closing the tab ends its CDP session
     // anyway. Quietly — without the tab's beforeunload prompt, which Chrome
     // would show by raising this agent window over the human's work, and
     // which would hold this release until someone answered it
-    // (quiet-leave.ts). A tab the human engaged with keeps its prompt.
+    // (quiet-leave.ts).
     try {
       await closeAgentTab(tabId, { targets });
       return { released: true, closed: true, dropped: dropEpoch(tabId) };
@@ -137,19 +142,19 @@ async function releaseOne(
   return { released: true, closed: false, dropped };
 }
 
-export const releaseTabs: Tool = async (args) => {
-  const entries = parseReleaseEntries(args.tabs);
-  const { closeAgentTabsOnDisconnect } = await getSettings();
-  const action = releaseAction(closeAgentTabsOnDisconnect);
+async function releaseEntries(
+  entries: ReleaseEntry[],
+): Promise<{ released: number; closed: number }> {
+  const { keepAgentTabsOnDisconnect: keep } = await getSettings();
   let released = 0;
   let closed = 0;
   let changed = false;
   // One target lookup for the whole release, not one per tab.
-  const targets = action === 'close' ? await pageTargets() : undefined;
+  const targets = keep ? undefined : await pageTargets();
 
   for (let i = 0; i < entries.length; i += RELEASE_CONCURRENCY) {
     const batch = entries.slice(i, i + RELEASE_CONCURRENCY);
-    const outcomes = await Promise.all(batch.map((entry) => releaseOne(entry, action, targets)));
+    const outcomes = await Promise.all(batch.map((entry) => releaseOne(entry, keep, targets)));
     for (const outcome of outcomes) {
       if (outcome.released) released++;
       if (outcome.closed) closed++;
@@ -158,5 +163,56 @@ export const releaseTabs: Tool = async (args) => {
   }
 
   if (changed) await persistEpochs();
-  return { data: { released, closed } };
+  return { released, closed };
+}
+
+export const releaseTabs: Tool = async (args) => {
+  return { data: await releaseEntries(parseReleaseEntries(args.tabs)) };
 };
+
+const BOOT_KEY = 'sallyport_daemon_boot';
+
+/** Release every agent tab a DEAD daemon left behind.
+ *
+ * `_release_tabs` is sent by a live daemon when one of its clients disconnects.
+ * A daemon that itself went away — crashed, killed, `doctor --stop-broker`
+ * before an upgrade — sends nothing, and its ownership registry (process
+ * memory) goes with it: every tab its sessions created stays open, attached and
+ * kept awake, yet no session of the next daemon can ever name one
+ * (`tab_not_owned`), and the reaper will not take them either, since nothing
+ * marked them orphaned.
+ *
+ * So the daemon names its process in the `hello_ack` (`boot`), and when that
+ * differs from the one this browser session last saw, every agent tab that
+ * exists AT THAT MOMENT is released exactly as a disconnect would release it:
+ * closed by default, handed back if the human engaged with it or asked to keep
+ * tabs. The candidates are snapshotted synchronously, before the first await,
+ * so a tab the NEW daemon creates right after its ack is never among them.
+ *
+ * Deliberately inert when there is nothing to compare: no `boot` (an older
+ * daemon), or no remembered one (first ack of this browser session, or the
+ * first after this extension version was installed — the tabs then may well
+ * belong to live sessions of the very daemon that is answering). The remembered
+ * id lives in `chrome.storage.session`, the lifetime the epoch map has.
+ *
+ * The epoch each tab is released under is the one WE minted, read in the same
+ * synchronous snapshot — there is no daemon record to compare against, and a
+ * tab whose epoch changed meanwhile (closed, id recycled by a new create) fails
+ * `mayClose` and is left alone. Never throws. */
+export async function releaseStrandedTabs(boot: string | undefined): Promise<number> {
+  if (!boot) return 0;
+  const candidates: ReleaseEntry[] = agentTabInfo()
+    .filter((t) => !t.orphaned)
+    .map((t) => ({ tabId: t.tabId, epoch: t.epoch }));
+  try {
+    const got = (await chrome.storage.session.get(BOOT_KEY)) as Record<string, unknown>;
+    const previous = got[BOOT_KEY];
+    if (previous === boot) return 0;
+    await chrome.storage.session.set({ [BOOT_KEY]: boot });
+    if (typeof previous !== 'string' || candidates.length === 0) return 0;
+    const live = candidates.filter((c) => getEpoch(c.tabId) === c.epoch);
+    return (await releaseEntries(live)).released;
+  } catch {
+    return 0; // storage unavailable — housekeeping never breaks a connect
+  }
+}

@@ -40,21 +40,28 @@ export type Settings = {
    * Default OFF — it lazily enables CDP `Network.enable` and reads response
    * bodies (widening the observable CDP footprint), so it is opt-in. */
   captureNetwork: boolean;
-  /** Close a session's agent tabs when that session disconnects, instead of
-   * leaving them open and unowned (release.ts). Default OFF: closing an
-   * agent's half-finished work is exactly the loss `close_tab`'s allowlist gate
-   * exists to prevent, and for an interactive session the tabs are usually
-   * what you want to look at. Useful for EPHEMERAL agents — a dispatched
-   * one-shot run is a fresh session every time, so its tabs otherwise
-   * accumulate (a later session can't reach them: tabs are owner-scoped).
+  /** Keep a session's agent tabs OPEN when that session disconnects, instead
+   * of closing them (release.ts). Default OFF — an agent closes its tabs behind
+   * itself: once the session is gone no later one can reach them (tabs are
+   * owner-scoped), so left open they only pile up, each a live renderer. A tab
+   * the HUMAN engaged with (activated in a focused window, dragged into their
+   * own) is never closed this way, whatever this says — it is handed back.
+   *
+   * Turn it on to get the pre-0.27 behaviour: every tab is left open and
+   * unowned, the debugger merely detached, and the popup's "Agent tabs" sweep
+   * or the tab reaper tidies them later.
    *
    * GLOBAL, and it cannot be otherwise: the extension is identity-blind by
    * design (ownership.ts) and the peer-declared session label never reaches
-   * this path, so with it on EVERY disconnecting session's tabs are closed —
-   * including your own interactive one. A close additionally requires the
-   * daemon's recorded ownership epoch to match (release.ts:mayClose), so a
-   * recycled tab id cannot destroy another session's tab. */
-  closeAgentTabsOnDisconnect: boolean;
+   * this path. A close additionally requires the daemon's recorded ownership
+   * epoch to match (release.ts:mayClose), so a recycled tab id cannot destroy
+   * another session's tab.
+   *
+   * A NEW key rather than a flipped default on the old
+   * `closeAgentTabsOnDisconnect`: `setSettings` stores the whole object, so
+   * everyone who ever touched any setting has an explicit `false` there that
+   * was never a choice. */
+  keepAgentTabsOnDisconnect: boolean;
   /** Auto-answer native JS dialogs (alert/confirm/prompt/beforeunload) on
    * driven tabs (dialog-capture.ts) — an open dialog freezes the page's JS
    * and no tool can click it — steerable via the `handle_dialog` tool.
@@ -167,7 +174,7 @@ export async function getSettings(): Promise<Settings> {
     captureConsole: !!v?.captureConsole, // default off (opt-in)
     captureNetwork: !!v?.captureNetwork, // default off (opt-in)
     handleDialogs: !!v?.handleDialogs, // default off (opt-in)
-    closeAgentTabsOnDisconnect: !!v?.closeAgentTabsOnDisconnect, // default off (destructive)
+    keepAgentTabsOnDisconnect: !!v?.keepAgentTabsOnDisconnect, // default off: close behind the session
     maxAgentTabs: normaliseMaxAgentTabs(v?.maxAgentTabs),
   };
 }

@@ -356,9 +356,9 @@ async def _serve_authenticated(
         async with mcp_socket_streams(reader, writer, signer) as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
     finally:
-        # Release this client's owned tabs (invariant #13). By default they stay
-        # open but become unowned, so the human can use/close them; the
-        # extension's `closeAgentTabsOnDisconnect` setting closes them instead.
+        # Release this client's owned tabs (invariant #13). By default the
+        # extension closes them (all but the ones the human engaged with); its
+        # `keepAgentTabsOnDisconnect` setting leaves them open and unowned.
         # Either way we ask the browser to stop DRIVING them (detach the
         # debugger, drop the focus emulation) — otherwise Chrome's "started
         # debugging this browser" bar and the focus emulation that keeps the

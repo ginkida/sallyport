@@ -172,18 +172,18 @@
             debugger's CDP footprint and answers dialogs you might have wanted to see.
           </div>
           <label class="checkbox">
-            <input type="checkbox" id="close-agent-tabs" /> close a session's tabs when it
+            <input type="checkbox" id="keep-agent-tabs" /> keep a session's tabs open after it
             disconnects
           </label>
           <div class="muted small hint">
-            Off by default: an agent's tabs are usually the result you wanted to see, and closing
-            half-finished work is what close_tab's gate protects against. Useful for
-            dispatched/one-shot agents, whose tabs pile up. This switch is GLOBAL — it cannot tell a
-            dispatched agent from an interactive one, so with it on your own session's tabs are
-            closed too when it exits. Closing is skipped for a tab whose ownership epoch no longer
-            matches, and it does no allowlist re-check: an agent tab is closed wherever it has since
-            navigated. No effect without a broker (--no-broker), and skipped while paused or while
-            the extension is disconnected.
+            Off by default: an agent closes its tabs behind itself. Once its session is gone no
+            other session can reach them, so left open they only pile up. A tab you looked at
+            (activated in a focused window, or dragged into your own) is never closed this way — it
+            stays open and is merely no longer driven. Turn this on to keep every tab. This switch
+            is GLOBAL — it cannot tell a dispatched agent from an interactive one. Closing is
+            skipped for a tab whose ownership epoch no longer matches, and it does no allowlist
+            re-check: an agent tab is closed wherever it has since navigated. No effect without a
+            broker (--no-broker), and skipped while paused or while the extension is disconnected.
           </div>
           <label class="muted small" for="max-agent-tabs">Max agent tabs at once</label>
           <div class="row">

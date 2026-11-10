@@ -138,9 +138,14 @@ is no incognito/profile boundary here and adding one would break that premise.
 When a session disconnects its tabs stop being driven — the daemon fires an
 internal `_release_tabs` so the debugger detaches, ending Chrome's "started
 debugging this browser" bar and the sticky focus emulation (which keeps a page
-rendering as if visible) for tabs whose agent is gone. By DEFAULT the tabs
-themselves stay open; the popup's `closeAgentTabsOnDisconnect` (off by default) closes them instead.
-That switch is browser-global — the extension is identity-blind, so it cannot
+rendering as if visible) for tabs whose agent is gone. By DEFAULT the tabs are
+then closed, except any the human engaged with (activated in a focused window,
+dragged into their own), which stay open; the popup's
+`keepAgentTabsOnDisconnect` (off by default) keeps every tab open instead. The
+same release runs extension-side for every agent tab when the extension
+reconnects to a DIFFERENT daemon process (the `boot` id in `hello_ack` changed):
+the previous daemon's ownership registry died with it, so no session can name
+those tabs again. That switch is browser-global — the extension is identity-blind, so it cannot
 distinguish an ephemeral agent from an interactive one — and a close requires the
 daemon's recorded ownership epoch to match the extension's, so a recycled tab id
 cannot destroy a live tab belonging to a different session.

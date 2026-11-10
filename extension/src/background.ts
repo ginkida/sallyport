@@ -23,6 +23,7 @@ import { loadEpochs, persistEpochs, reconcileWithLiveTabs } from './tools/owners
 import { installHumanInterestListeners } from './human-interest.js';
 import { closeAgentTabs, listAgentTabs } from './agent-tabs.js';
 import { releaseKeepAwakeEverywhere, sweepStrandedHygiene } from './tools/cdp.js';
+import { releaseStrandedTabs } from './tools/release.js';
 import { installCaptureSettingsListener } from './tools/capture-settings.js';
 
 // Capture opt-out must reach idle tabs, not just the next driven one — so the
@@ -101,7 +102,14 @@ const bridge = new BridgeConnection({
   // The daemon reports broker vs standalone in the hello_ack; the tool layer
   // reads ownership.isBrokerMode() to gate owner-scoped list_tabs + focus
   // mitigation. Re-signalled on every (re)connect, so it survives SW eviction.
-  onBrokerMode: (broker: boolean) => setBrokerMode(broker),
+  onBrokerMode: (broker: boolean, boot?: string) => {
+    setBrokerMode(broker);
+    // A different daemon process than last time: every agent tab minted under
+    // the previous one is unreachable now (release.ts). Applied in arrival
+    // order with the ack, so the tabs it considers are exactly those that
+    // existed before this daemon could create any.
+    void releaseStrandedTabs(boot);
+  },
   runTool: async (name, args): Promise<ToolHandlerResult> => {
     try {
       const data = await runTool(name, args);

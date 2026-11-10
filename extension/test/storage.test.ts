@@ -452,16 +452,25 @@ describe('appendAudit under concurrent tool calls', () => {
   });
 });
 
-describe('closeAgentTabsOnDisconnect setting', () => {
-  it('defaults OFF — releasing a session must not destroy its work by default', async () => {
+describe('keepAgentTabsOnDisconnect setting', () => {
+  it('defaults OFF — an agent closes its tabs behind itself', async () => {
     const s = await getSettings();
-    expect(s.closeAgentTabsOnDisconnect).toBe(false);
+    expect(s.keepAgentTabsOnDisconnect).toBe(false);
   });
 
   it('round-trips like the other opt-ins', async () => {
-    await setSettings({ closeAgentTabsOnDisconnect: true });
-    expect((await getSettings()).closeAgentTabsOnDisconnect).toBe(true);
-    await setSettings({ closeAgentTabsOnDisconnect: false });
-    expect((await getSettings()).closeAgentTabsOnDisconnect).toBe(false);
+    await setSettings({ keepAgentTabsOnDisconnect: true });
+    expect((await getSettings()).keepAgentTabsOnDisconnect).toBe(true);
+    await setSettings({ keepAgentTabsOnDisconnect: false });
+    expect((await getSettings()).keepAgentTabsOnDisconnect).toBe(false);
+  });
+
+  it('ignores the retired closeAgentTabsOnDisconnect key', async () => {
+    // Stored by every pre-0.27 install that ever saved a setting — an explicit
+    // `false` nobody chose. It must not keep the tabs open.
+    await chrome.storage.local.set({
+      sallyport_settings: { closeAgentTabsOnDisconnect: false },
+    });
+    expect((await getSettings()).keepAgentTabsOnDisconnect).toBe(false);
   });
 });

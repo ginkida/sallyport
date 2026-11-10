@@ -924,6 +924,24 @@ describe('broker-mode signal (hello_ack body)', () => {
     expect(seen).toEqual([true]);
   });
 
+  it('forwards the daemon boot id, and undefined when it is absent or malformed', async () => {
+    const seen: Array<string | undefined> = [];
+    const { deps } = makeDeps({ onBrokerMode: (_b, boot) => seen.push(boot) });
+    const bridge = new BridgeConnection(deps);
+    await bridge.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.simulateOpen();
+    await until(() => ws.sent.length === 1);
+
+    ws.simulateMessage(JSON.stringify(signEnvelope('hello_ack', { broker: true, boot: 'abc' })));
+    await until(() => seen.length === 1);
+    ws.simulateMessage(JSON.stringify(signEnvelope('hello_ack', { broker: true })));
+    await until(() => seen.length === 2);
+    ws.simulateMessage(JSON.stringify(signEnvelope('hello_ack', { broker: true, boot: 7 })));
+    await until(() => seen.length === 3);
+    expect(seen).toEqual(['abc', undefined, undefined]);
+  });
+
   it('reports broker:false when the daemon omits the flag (standalone)', async () => {
     const seen: boolean[] = [];
     const { deps } = makeDeps({ onBrokerMode: (b) => seen.push(b) });

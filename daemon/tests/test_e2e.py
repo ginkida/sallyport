@@ -142,7 +142,7 @@ async def test_hello_ack_reports_standalone_mode_by_default(harness: BridgeHarne
         await ext.send("hello", {"extensionVersion": "test"})
         ack = await ext.recv()
         assert ack.type == "hello_ack"
-        assert ack.body == {"broker": False}
+        assert ack.body == {"broker": False, "boot": harness.bridge._boot_id}  # noqa: SLF001
     finally:
         await ext.close()
 
@@ -158,7 +158,7 @@ async def test_hello_ack_reports_broker_mode() -> None:
         await ext.send("hello", {"extensionVersion": "test"})
         ack = await ext.recv()
         assert ack.type == "hello_ack"
-        assert ack.body == {"broker": True}
+        assert ack.body == {"broker": True, "boot": h.bridge._boot_id}  # noqa: SLF001
     finally:
         await ext.close()
         await h.stop()

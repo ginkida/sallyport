@@ -113,6 +113,14 @@ class Bridge:
         # agent-created tabs, and the focus-theft mitigation (dedicated window /
         # never foreground a created tab). Standalone leaves all of that off.
         self._broker_mode = broker_mode
+        # Identity of THIS daemon process, sent in every hello_ack. The tab
+        # ownership registry lives in this process's memory, so when the
+        # extension sees a different boot id than last time it knows every
+        # agent tab minted under the previous one is unreachable for good —
+        # its session died with that daemon and no `_release_tabs` was ever
+        # sent for it — and releases them itself. Not a secret and not a gate:
+        # it only ever triggers housekeeping on the extension's OWN agent tabs.
+        self._boot_id = _secrets.token_hex(8)
         self._request_timeout = request_timeout
         self._hello_timeout = hello_timeout
         self._client: ServerConnection | None = None
@@ -310,7 +318,7 @@ class Bridge:
 
         log.info("ws: client attached from %s", ws.remote_address)
         try:
-            ack = self._signer.sign(Envelope(type="hello_ack", body={"broker": self._broker_mode}))
+            ack = self._signer.sign(Envelope(type="hello_ack", body=self._hello_ack_body()))
             await self._send_raw(ws, ack)
             await self._read_loop(ws)
         except websockets.ConnectionClosed:
@@ -351,9 +359,7 @@ class Bridge:
             if env.type == "hello":
                 # The attach-time hello is consumed by _handle_client; this
                 # re-acks a (harmless) mid-session hello.
-                ack = self._signer.sign(
-                    Envelope(type="hello_ack", body={"broker": self._broker_mode})
-                )
+                ack = self._signer.sign(Envelope(type="hello_ack", body=self._hello_ack_body()))
                 await self._send_raw(ws, ack)
             elif env.type == "ping":
                 # The extension pings on a fixed cadence to keep its MV3
@@ -629,14 +635,17 @@ class Bridge:
         )
         return result
 
+    def _hello_ack_body(self) -> dict[str, Any]:
+        return {"broker": self._broker_mode, "boot": self._boot_id}
+
     def release_client(self, client_id: str | None) -> dict[int, str | None]:
         """Release a disconnected broker client's tab ownership (invariant #13).
 
-        Called by the broker when an MCP connection closes. By DEFAULT the tabs
-        stay open — they merely become unowned, so the human can use or close
-        them — rather than auto-closing work the agent left behind; the
-        extension's `closeAgentTabsOnDisconnect` setting (popup, off by default)
-        opts into closing them instead. Returns the released tab
+        Called by the broker when an MCP connection closes. What happens to the
+        tabs is the EXTENSION's policy: by default it closes them (an agent
+        cleans up after itself), except a tab the human engaged with, which is
+        handed back open; its `keepAgentTabsOnDisconnect` setting (popup) keeps
+        every tab open and merely unowned. Returns the released tab
         ids so the caller can ask the extension to stop *driving* them (detach
         the debugger, drop the focus emulation); leaving them attached is what
         made Chrome's "started debugging this browser" bar outlive every session
@@ -662,11 +671,10 @@ class Bridge:
         drops the focus emulation on tabs whose session is gone, so Chrome's
         "started debugging this browser" bar and the "this tab thinks it is
         focused and visible" override don't outlive the agent that caused
-        them. By DEFAULT the tabs themselves stay open and the human
-        decides what to do with them; the extension's
-        `closeAgentTabsOnDisconnect` setting (popup, off by default) closes them
-        instead — which is why the epoch travels with each id: a close is allowed
-        only when it matches. Orphan-don't-close is the DEFAULT, not part of
+        them. By DEFAULT the extension then CLOSES the tabs (all but the ones
+        the human engaged with); its `keepAgentTabsOnDisconnect` setting leaves
+        them open instead — which is why the epoch travels with each id: a close is allowed
+        only when it matches. Close-vs-keep is extension policy, not part of
         invariant #13; do not reason about it as one.
 
         Goes STRAIGHT to the wire rather than through `call_tool`, which now

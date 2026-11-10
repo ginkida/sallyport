@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { mayClose, parseReleaseEntries, releaseAction, releaseTabs } from '../src/tools/release.js';
+import {
+  mayClose,
+  parseReleaseEntries,
+  releaseAction,
+  releaseStrandedTabs,
+  releaseTabs,
+} from '../src/tools/release.js';
 import {
   agentTabInfo,
   clearAllEpochs,
@@ -72,7 +78,7 @@ function installChromeMock(opts: { removeFails?: Set<number>; quietClose?: boole
       ...(opts.quietClose
         ? {
             async getTargets() {
-              return [11, 12].map((tabId) => ({ id: `T${tabId}`, tabId, type: 'page' }));
+              return [11, 12, 13].map((tabId) => ({ id: `T${tabId}`, tabId, type: 'page' }));
             },
             async attach() {},
             async sendCommand(target: { tabId: number }, method: string) {
@@ -91,15 +97,17 @@ function installChromeMock(opts: { removeFails?: Set<number>; quietClose?: boole
 }
 
 describe('releaseAction — what happens to a disconnected session tabs', () => {
-  it('hands tabs back by default rather than closing them', () => {
-    // Closing an agent's half-finished work is exactly the loss invariant #12
-    // gates close_tab against, and for an interactive session those tabs are
-    // usually the result the human wanted to see.
-    expect(releaseAction(false)).toBe('hand-back');
+  it('closes by default — nobody can reach a finished session tabs again', () => {
+    expect(releaseAction(false)).toBe('close');
   });
 
-  it('closes them when the human opted in (ephemeral agents)', () => {
-    expect(releaseAction(true)).toBe('close');
+  it('hands every tab back when the human asked to keep them', () => {
+    expect(releaseAction(true)).toBe('hand-back');
+    expect(releaseAction(true, true)).toBe('hand-back');
+  });
+
+  it('never closes a tab the human engaged with', () => {
+    expect(releaseAction(false, true)).toBe('hand-back');
   });
 });
 
@@ -144,11 +152,11 @@ describe('releaseTabs — the destructive path', () => {
     resetAttachedTabs();
   });
 
-  it('by default stops driving the tabs but never closes them', async () => {
+  it('with keep on, stops driving the tabs but never closes them', async () => {
     const calls = installChromeMock();
     const e1 = mintEpoch(11);
     const e2 = mintEpoch(12);
-    await setSettings({ closeAgentTabsOnDisconnect: false });
+    await setSettings({ keepAgentTabsOnDisconnect: true });
 
     const res = await releaseTabs({
       tabs: [
@@ -185,7 +193,7 @@ describe('releaseTabs — the destructive path', () => {
     for (let tabId = 1; tabId <= 20; tabId++) {
       entries.push({ tabId, epoch: mintEpoch(tabId) });
     }
-    await setSettings({ closeAgentTabsOnDisconnect: false });
+    await setSettings({ keepAgentTabsOnDisconnect: true });
 
     const res = await releaseTabs({ tabs: entries });
 
@@ -194,10 +202,10 @@ describe('releaseTabs — the destructive path', () => {
     expect(new Set(calls.detached)).toEqual(new Set(entries.map((e) => e.tabId)));
   });
 
-  it('closes the tabs when the human opted in, and forgets them', async () => {
+  it('by default closes the tabs, and forgets them', async () => {
     const calls = installChromeMock();
     const e1 = mintEpoch(11);
-    await setSettings({ closeAgentTabsOnDisconnect: true });
+    await setSettings({ keepAgentTabsOnDisconnect: false });
 
     const res = await releaseTabs({ tabs: [{ tabId: 11, epoch: e1 }] });
 
@@ -213,7 +221,7 @@ describe('releaseTabs — the destructive path', () => {
   it('closes WITHOUT the beforeunload prompt — no window raised, no release stuck on it', async () => {
     const calls = installChromeMock({ quietClose: true });
     const e1 = mintEpoch(11);
-    await setSettings({ closeAgentTabsOnDisconnect: true });
+    await setSettings({ keepAgentTabsOnDisconnect: false });
 
     const res = await releaseTabs({ tabs: [{ tabId: 11, epoch: e1 }] });
 
@@ -223,24 +231,35 @@ describe('releaseTabs — the destructive path', () => {
     expect(getEpoch(11)).toBeUndefined();
   });
 
-  it('keeps the prompt for a tab the human engaged with', async () => {
+  it('never closes a tab the human engaged with — it is handed back', async () => {
     const calls = installChromeMock({ quietClose: true });
     const e1 = mintEpoch(12);
+    const e2 = mintEpoch(13);
     markHumanTab(12);
-    await setSettings({ closeAgentTabsOnDisconnect: true });
+    // No setting stored at all: this is the DEFAULT path.
 
-    const res = await releaseTabs({ tabs: [{ tabId: 12, epoch: e1 }] });
+    const res = await releaseTabs({
+      tabs: [
+        { tabId: 12, epoch: e1 },
+        { tabId: 13, epoch: e2 },
+      ],
+    });
 
-    expect(res.data).toEqual({ released: 1, closed: 1 });
-    expect(calls.removed).toEqual([12]);
-    expect(calls.closedQuietly).toEqual([]);
+    expect(res.data).toEqual({ released: 2, closed: 1 });
+    expect(calls.closedQuietly).toEqual([13]);
+    expect(calls.removed).toEqual([]);
+    // Open, no longer driven, unmuted, still listed in the popup's sweep.
+    expect(calls.detached).toEqual([12]);
+    expect(calls.updated).toEqual([{ tabId: 12, muted: false }]);
+    expect(getEpoch(12)).toBe(e1);
+    expect(getEpoch(13)).toBeUndefined();
   });
 
   it('never touches a tab we did not create, in either mode', async () => {
     for (const closeOnDisconnect of [false, true]) {
       clearAllEpochs();
       const calls = installChromeMock();
-      await setSettings({ closeAgentTabsOnDisconnect: closeOnDisconnect });
+      await setSettings({ keepAgentTabsOnDisconnect: !closeOnDisconnect });
 
       const res = await releaseTabs({ tabs: [{ tabId: 999, epoch: 'whatever' }] });
 
@@ -256,7 +275,7 @@ describe('releaseTabs — the destructive path', () => {
     // client names the stale one it recorded before the browser restarted.
     const calls = installChromeMock();
     mintEpoch(7);
-    await setSettings({ closeAgentTabsOnDisconnect: true });
+    await setSettings({ keepAgentTabsOnDisconnect: false });
 
     const res = await releaseTabs({ tabs: [{ tabId: 7, epoch: 'stale-epoch' }] });
 
@@ -268,7 +287,7 @@ describe('releaseTabs — the destructive path', () => {
   it('falls back to handing the tab back when the close fails', async () => {
     const calls = installChromeMock({ removeFails: new Set([11]) });
     const e1 = mintEpoch(11);
-    await setSettings({ closeAgentTabsOnDisconnect: true });
+    await setSettings({ keepAgentTabsOnDisconnect: false });
 
     const res = await releaseTabs({ tabs: [{ tabId: 11, epoch: e1 }] });
 
@@ -276,5 +295,111 @@ describe('releaseTabs — the destructive path', () => {
     expect(calls.detached).toEqual([11]);
     // The epoch is kept, so a survivor stays trackable in the popup's sweep.
     expect(getEpoch(11)).toBe(e1);
+  });
+});
+
+describe('releaseStrandedTabs — a daemon that died sends no _release_tabs', () => {
+  beforeEach(() => {
+    clearAllEpochs();
+    resetAttachedTabs();
+  });
+
+  it('does nothing on the first ack of a browser session, only remembers the daemon', async () => {
+    // The tabs may belong to live sessions of the very daemon answering (the
+    // extension was just updated under it) — nothing to compare, nothing done.
+    const calls = installChromeMock({ quietClose: true });
+    const e1 = mintEpoch(11);
+
+    expect(await releaseStrandedTabs('boot-a')).toBe(0);
+
+    expect(calls.closedQuietly).toEqual([]);
+    expect(calls.detached).toEqual([]);
+    expect(getEpoch(11)).toBe(e1);
+  });
+
+  it('does nothing when the same daemon answers again (reconnect, worker restart)', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    await releaseStrandedTabs('boot-a');
+    mintEpoch(11);
+
+    expect(await releaseStrandedTabs('boot-a')).toBe(0);
+
+    expect(calls.closedQuietly).toEqual([]);
+    expect(getEpoch(11)).toBeDefined();
+  });
+
+  it('closes the previous daemon tabs when a DIFFERENT one answers, keeping the human ones', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    await releaseStrandedTabs('boot-a');
+    mintEpoch(11);
+    const kept = mintEpoch(12);
+    markHumanTab(12);
+
+    expect(await releaseStrandedTabs('boot-b')).toBe(2);
+
+    expect(calls.closedQuietly).toEqual([11]);
+    expect(calls.removed).toEqual([]);
+    expect(calls.detached).toEqual([12]);
+    expect(getEpoch(11)).toBeUndefined();
+    expect(getEpoch(12)).toBe(kept);
+    expect(agentTabInfo().find((t) => t.tabId === 12)?.orphaned).toBe(true);
+    // ...and the new daemon is the remembered one now.
+    mintEpoch(13);
+    expect(await releaseStrandedTabs('boot-b')).toBe(0);
+    expect(getEpoch(13)).toBeDefined();
+  });
+
+  it('never takes a tab the NEW daemon created after its ack', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    await releaseStrandedTabs('boot-a');
+    mintEpoch(11);
+
+    const pending = releaseStrandedTabs('boot-b'); // candidates snapshotted here
+    mintEpoch(13); // the new daemon's first create, racing the release
+    await pending;
+
+    expect(calls.closedQuietly).toEqual([11]);
+    expect(getEpoch(13)).toBeDefined();
+  });
+
+  it('leaves alone a tab whose id was re-minted while the release was starting', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    await releaseStrandedTabs('boot-a');
+    mintEpoch(11);
+
+    const pending = releaseStrandedTabs('boot-b');
+    const fresh = mintEpoch(11); // same id, a new owner
+    await pending;
+
+    expect(calls.closedQuietly).toEqual([]);
+    expect(getEpoch(11)).toBe(fresh);
+  });
+
+  it('hands everything back when the human keeps tabs, and skips tabs already orphaned', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    await setSettings({ keepAgentTabsOnDisconnect: true });
+    await releaseStrandedTabs('boot-a');
+    const e1 = mintEpoch(11);
+    const e2 = mintEpoch(12);
+    await releaseTabs({ tabs: [{ tabId: 12, epoch: e2 }] }); // an ordinary disconnect
+    calls.detached.length = 0;
+
+    expect(await releaseStrandedTabs('boot-b')).toBe(1);
+
+    expect(calls.closedQuietly).toEqual([]);
+    expect(calls.detached).toEqual([11]);
+    expect(getEpoch(11)).toBe(e1);
+  });
+
+  it('is inert for a daemon that names no boot id, and never throws without storage', async () => {
+    const calls = installChromeMock({ quietClose: true });
+    await releaseStrandedTabs('boot-a');
+    mintEpoch(11);
+
+    expect(await releaseStrandedTabs(undefined)).toBe(0);
+    (globalThis as unknown as { chrome: { storage: unknown } }).chrome.storage = {};
+    expect(await releaseStrandedTabs('boot-b')).toBe(0);
+
+    expect(calls.closedQuietly).toEqual([]);
   });
 });
