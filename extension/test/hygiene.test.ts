@@ -62,13 +62,16 @@ afterEach(() => {
 /** A fresh cdp.ts, with `attachTabs` attached through the real `attach()` —
  * hygiene state is only ever kept for a session that is OURS, so a test that
  * drives a tab must attach it first, as every tool does. What attach itself
- * sends (keep-awake, the capture revocations) is cleared from `calls`. */
-async function load(attachTabs: number[] = [1, 2]) {
+ * sends (keep-awake, the capture revocations) is cleared from `calls`.
+ * Keep-awake is off unless a test exercises its separate idle window. */
+async function load(attachTabs: number[] = [1, 2], keepAwake = false) {
   const cdp = await import('../src/tools/cdp.js');
   const chain = await import('../src/tools/tab-chain.js');
   const g = globalThis as unknown as { chrome: Record<string, Record<string, unknown>> };
   g.chrome.debugger.attach = vi.fn().mockResolvedValue(undefined);
-  g.chrome.storage = { local: { get: vi.fn(async () => ({})) } };
+  g.chrome.storage = {
+    local: { get: vi.fn(async () => ({ sallyport_settings: { keepAwake } })) },
+  };
   for (const tabId of attachTabs) await cdp.attach(tabId);
   await vi.advanceTimersByTimeAsync(0);
   calls.length = 0;
@@ -513,6 +516,267 @@ describe('idle hygiene flush', () => {
   });
 });
 
+/** Only focus-emulation commands, excluding the setup attach's enable. */
+function focusCalls(tabId = 1): Call[] {
+  return calls.filter(
+    (c) => c.tabId === tabId && c.method === 'Emulation.setFocusEmulationEnabled',
+  );
+}
+
+describe('keep-awake idle nap', () => {
+  const NAP = 90_000;
+
+  it('flushes at 10 s, naps at 90 s, and sends neither again without a new attach', async () => {
+    const { cdp, KEEP_AWAKE_IDLE_MS } = await load([1], true);
+    expect(KEEP_AWAKE_IDLE_MS).toBe(NAP);
+    await vi.advanceTimersByTimeAsync(IDLE);
+    expect(flushed()).toEqual(['Runtime.releaseObjectGroup(sallyport-call)']);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(NAP - IDLE - 1);
+    expect(focusCalls()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(focusCalls()).toEqual([
+      {
+        tabId: 1,
+        sessionId: undefined,
+        method: 'Emulation.setFocusEmulationEnabled',
+        params: { enabled: false },
+      },
+    ]);
+    expect(vi.getTimerCount()).toBe(0);
+    const mark = calls.length;
+    await vi.advanceTimersByTimeAsync(NAP * 3);
+    expect(calls.slice(mark)).toEqual([]);
+    // Activity alone does not mean focus emulation was re-enabled.
+    await cdp(1, 'Page.getFrameTree');
+    await vi.advanceTimersByTimeAsync(NAP);
+    expect(focusCalls()).toHaveLength(1);
+  });
+
+  it('a new attach re-enables focus emulation, then another idle window naps again', async () => {
+    const { attach } = await load([1], true);
+    await vi.advanceTimersByTimeAsync(NAP);
+    await attach(1);
+    expect(focusCalls().map((c) => c.params)).toEqual([{ enabled: false }, { enabled: true }]);
+    expect(calls.some((c) => c.method === 'Page.setWebLifecycleState')).toBe(true);
+    await vi.advanceTimersByTimeAsync(NAP - 1);
+    expect(focusCalls()).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(focusCalls().map((c) => c.params)).toEqual([
+      { enabled: false },
+      { enabled: true },
+      { enabled: false },
+    ]);
+  });
+
+  it.each(['root', 'child'])('counts %s-session sends and answers as activity', async (session) => {
+    const { cdp, cdpSession } = await load([1, 2], true);
+    await vi.advanceTimersByTimeAsync(NAP - 1_000);
+    const slow = deferred<object>();
+    respond = (method) => (method === 'Page.getFrameTree' ? slow.promise : {});
+    const pending =
+      session === 'root'
+        ? cdp(1, 'Page.getFrameTree')
+        : cdpSession(1, 'child', 'Page.getFrameTree');
+    // The old nap deadline passes with a fresh command still in flight.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(focusCalls(1)).toEqual([]);
+    expect(focusCalls(2)).toHaveLength(1);
+    slow.resolve({});
+    await pending;
+    await vi.advanceTimersByTimeAsync(NAP - 1);
+    expect(focusCalls(1)).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(focusCalls(1).map((c) => c.params)).toEqual([{ enabled: false }]);
+  });
+
+  it('ages out an abandoned command and ignores its late answer', async () => {
+    const { cdp, ABANDONED_COMMAND_MS, hygieneStateForTest } = await load([1], true);
+    const late = deferred<object>();
+    respond = (method) => (method === 'Runtime.evaluate' ? late.promise : {});
+    const pending = cdp(1, 'Runtime.evaluate', { awaitPromise: true });
+    await vi.advanceTimersByTimeAsync(ABANDONED_COMMAND_MS);
+    await cdp(1, 'Page.getFrameTree');
+    expect(hygieneStateForTest(1)).toEqual({ inFlight: 0 });
+    await vi.advanceTimersByTimeAsync(NAP - 1);
+    late.resolve({});
+    await pending;
+    expect(focusCalls()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(focusCalls()).toHaveLength(1);
+  });
+
+  it('naps even when the last command is never answered and has been abandoned', async () => {
+    const { cdp } = await load([1], true);
+    respond = (method) => (method === 'Runtime.evaluate' ? new Promise(() => undefined) : {});
+    void cdp(1, 'Runtime.evaluate', { awaitPromise: true });
+    await vi.advanceTimersByTimeAsync(NAP - 1);
+    expect(focusCalls()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(focusCalls().map((c) => c.params)).toEqual([{ enabled: false }]);
+  });
+
+  it('keeps at most one nap timer alongside the hygiene timer', async () => {
+    const { cdp } = await load([1], true);
+    for (let i = 0; i < 5; i++) {
+      await cdp(1, 'Page.getFrameTree');
+      expect(vi.getTimerCount()).toBe(2);
+      await vi.advanceTimersByTimeAsync(IDLE);
+      expect(vi.getTimerCount()).toBe(1);
+    }
+    await vi.advanceTimersByTimeAsync(NAP - IDLE);
+    expect(focusCalls()).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not nap with keep-awake off, including after revoking an earlier enable', async () => {
+    const { attach } = await load([1]);
+    await vi.advanceTimersByTimeAsync(NAP * 2);
+    expect(focusCalls()).toEqual([]);
+    const g = globalThis as unknown as { chrome: Record<string, Record<string, unknown>> };
+    g.chrome.storage = { local: { get: vi.fn(async () => ({})) } };
+    await attach(1);
+    expect(focusCalls().map((c) => c.params)).toEqual([{ enabled: true }]);
+    g.chrome.storage = {
+      local: { get: vi.fn(async () => ({ sallyport_settings: { keepAwake: false } })) },
+    };
+    await attach(1);
+    expect(focusCalls().map((c) => c.params)).toEqual([{ enabled: true }, { enabled: false }]);
+    await vi.advanceTimersByTimeAsync(NAP * 2);
+    expect(focusCalls()).toHaveLength(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('a popup revoke cancels the nap on every attached tab', async () => {
+    const { releaseKeepAwakeEverywhere } = await load([1, 2], true);
+    await releaseKeepAwakeEverywhere();
+    const mark = calls.length;
+    await vi.advanceTimersByTimeAsync(NAP * 2);
+    expect(
+      calls.slice(mark).filter((c) => c.method === 'Emulation.setFocusEmulationEnabled'),
+    ).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(['removed', 'detach event', 'explicit detach'])('%s drops the nap timer', async (end) => {
+    const { detach } = await load([1], true);
+    if (end === 'removed') for (const l of removedListeners) l(1);
+    else if (end === 'detach event') for (const l of detachListeners) l({ tabId: 1 });
+    else await detach(1);
+    expect(vi.getTimerCount()).toBe(0);
+    const mark = calls.length;
+    await vi.advanceTimersByTimeAsync(NAP * 2);
+    expect(calls.slice(mark)).toEqual([]);
+  });
+
+  it('queues behind a call on the tab chain', async () => {
+    const { onTab } = await load([1], true);
+    await vi.advanceTimersByTimeAsync(IDLE);
+    const gate = deferred<void>();
+    const order: string[] = [];
+    respond = (method) => {
+      if (method === 'Emulation.setFocusEmulationEnabled') order.push('nap');
+      return {};
+    };
+    void onTab(1, async () => {
+      await gate.promise;
+      order.push('call done');
+    });
+    await vi.advanceTimersByTimeAsync(NAP);
+    expect(focusCalls()).toEqual([]);
+    gate.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(order).toEqual(['call done', 'nap']);
+  });
+
+  it('re-checks idleness inside the chain when the queued call used CDP', async () => {
+    const { cdp, onTab } = await load([1], true);
+    await vi.advanceTimersByTimeAsync(IDLE);
+    const gate = deferred<void>();
+    void onTab(1, async () => {
+      await gate.promise;
+      await cdp(1, 'Page.getFrameTree');
+    });
+    await vi.advanceTimersByTimeAsync(NAP);
+    gate.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(focusCalls()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(NAP - 1);
+    expect(focusCalls()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(focusCalls()).toHaveLength(1);
+  });
+
+  it('a queued nap ignores a dropped record even after a new attach', async () => {
+    const { attach, onSessionDetached, onTab } = await load([1], true);
+    await vi.advanceTimersByTimeAsync(IDLE);
+    const gate = deferred<void>();
+    void onTab(1, () => gate.promise);
+    await vi.advanceTimersByTimeAsync(NAP);
+    onSessionDetached(1);
+    await attach(1);
+    const mark = calls.length;
+    gate.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.slice(mark)).toEqual([]);
+    await vi.advanceTimersByTimeAsync(NAP);
+    expect(focusCalls().map((c) => c.params)).toEqual([{ enabled: true }, { enabled: false }]);
+  });
+
+  it('bounds a wedged nap, and its late answer is not activity', async () => {
+    const { onTab, HYGIENE_FLUSH_DEADLINE_MS } = await load([1], true);
+    const late = deferred<object>();
+    respond = (method) => (method === 'Emulation.setFocusEmulationEnabled' ? late.promise : {});
+    await vi.advanceTimersByTimeAsync(NAP);
+    const ran = vi.fn();
+    void onTab(1, async () => ran());
+    await vi.advanceTimersByTimeAsync(HYGIENE_FLUSH_DEADLINE_MS - 1);
+    expect(ran).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ran).toHaveBeenCalledOnce();
+    late.resolve({});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(0);
+    const mark = calls.length;
+    await vi.advanceTimersByTimeAsync(NAP * 2);
+    expect(calls.slice(mark)).toEqual([]);
+  });
+
+  it.each(['reject', 'throw'])(
+    'a nap that fails by %s leaves the chain usable',
+    async (failure) => {
+      const { onTab } = await load([1], true);
+      respond = (method) => {
+        if (method !== 'Emulation.setFocusEmulationEnabled') return {};
+        if (failure === 'throw') throw new Error('sync');
+        return Promise.reject(new Error('not attached'));
+      };
+      await vi.advanceTimersByTimeAsync(NAP);
+      expect(focusCalls()).toHaveLength(1);
+      const ran = vi.fn();
+      await onTab(1, async () => ran());
+      expect(ran).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it('a sweep naps only after proof, and new activity during proof postpones the nap', async () => {
+    const { cdp, sweepStrandedHygiene } = await load([]);
+    const proof = deferred<object>();
+    getTargets.mockResolvedValue([{ attached: true, tabId: 5 }]);
+    respond = (method) => (method === 'Runtime.releaseObjectGroup' ? proof.promise : {});
+    await sweepStrandedHygiene();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(flushed(0, 5)).toEqual(['Runtime.releaseObjectGroup(sallyport-call)']);
+    await cdp(5, 'Page.getFrameTree');
+    proof.resolve({});
+    await vi.advanceTimersByTimeAsync(NAP - 1);
+    expect(focusCalls(5)).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(focusCalls(5).map((c) => c.params)).toEqual([{ enabled: false }]);
+  });
+});
+
 describe('startup sweep', () => {
   it('fully flushes every tab still attached, at once, and skips the rest', async () => {
     const { sweepStrandedHygiene } = await load([]);
@@ -532,6 +796,8 @@ describe('startup sweep', () => {
     ]);
     expect(calls.filter((c) => c.tabId !== 5)).toEqual([]);
     expectNoBareAxDisable();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(focusCalls(5).map((c) => c.params)).toEqual([{ enabled: false }]);
   });
 
   it('a tab already driven again waits for its idle window, then gets the full flush', async () => {
@@ -578,6 +844,9 @@ describe('startup sweep', () => {
       'Runtime.releaseObjectGroup(console)',
     ]);
     expectNoBareAxDisable();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(focusCalls(5).map((c) => c.params)).toEqual([{ enabled: false }]);
+    expect(focusCalls(6)).toEqual([]);
     expect(vi.getTimerCount()).toBe(0);
     const mark = calls.length;
     await vi.advanceTimersByTimeAsync(IDLE * 10);
@@ -602,6 +871,9 @@ describe('startup sweep', () => {
     ]);
     expectNoBareAxDisable();
     // The burst's own wait is bounded too: the chain is not held forever.
+    await vi.advanceTimersByTimeAsync(HYGIENE_FLUSH_DEADLINE_MS);
+    expect(focusCalls(6).map((c) => c.params)).toEqual([{ enabled: false }]);
+    // The nap queued behind that burst has its own bounded wait.
     await vi.advanceTimersByTimeAsync(HYGIENE_FLUSH_DEADLINE_MS);
     expect(vi.getTimerCount()).toBe(0);
   });

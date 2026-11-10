@@ -333,7 +333,9 @@ export async function attach(tabId: number): Promise<void> {
  * commands are cheap no-ops when already in effect). Both are experimental
  * CDP commands — same status as Accessibility.getFullAXTree, which we
  * already rely on — and strictly best-effort: failure degrades to the old
- * behaviour, never breaks the call. The effect ends at debugger detach.
+ * behaviour, never breaks the call. After KEEP_AWAKE_IDLE_MS without CDP
+ * activity, the idle nap drops focus emulation until the next attach(); it
+ * also ends at debugger detach.
  *
  * What focus emulation really does is more than "focused": Chrome implements
  * it by taking a VISIBLE capturer handle on the tab
@@ -341,9 +343,9 @@ export async function attach(tabId: number): Promise<void> {
  * with stay_hidden=false), and a tab with a visible capturer is computed as
  * visible. So while it is on, a background tab in an unfocused or occluded
  * agent window reports visibilityState 'visible' and hasFocus() true, renders
- * frames, runs rAF and is not timer-throttled — for the whole attachment,
- * idle time between calls included, at a CPU/GPU cost on animated pages. That
- * capturer is also what lets `screenshot` raster a background tab (see the
+ * frames, runs rAF and is not timer-throttled — including short idle gaps,
+ * until the 90 s nap, at a CPU/GPU cost on animated pages. The capturer also
+ * lets `screenshot` raster a background tab (see the
  * note in screenshot.ts); an occluded or minimised window can still stall a
  * capture (`tab_not_visible`). The handle is dropped by
  * `setFocusEmulationEnabled{false}` or at detach.
@@ -354,6 +356,8 @@ export async function attach(tabId: number): Promise<void> {
  * DISABLES the focus emulation on the driven tab (see `releaseKeepAwake`), not
  * merely stops re-asserting it. */
 async function keepAwake(tabId: number): Promise<void> {
+  const st = ownHygiene(tabId);
+  if (st) st.awake = true;
   try {
     await cdp(tabId, 'Page.setWebLifecycleState', { state: 'active' });
   } catch {
@@ -371,6 +375,8 @@ async function keepAwake(tabId: number): Promise<void> {
  * effort. `Page.setWebLifecycleState` has no clean inverse, but focus emulation
  * is the presence-relevant override, so disabling it is what stops the leak. */
 async function releaseKeepAwake(tabId: number): Promise<void> {
+  const st = hygiene.get(tabId);
+  if (st) st.awake = false;
   try {
     await cdp(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: false });
   } catch {
@@ -581,6 +587,8 @@ export async function releaseChildAx(tabId: number, sessionId: string): Promise<
 // The flush sends its commands with chrome.debugger.sendCommand directly, so
 // they neither count as activity (it would re-arm itself forever) nor set
 // flags. Its state is per tab and synchronously mutated, like `attached`.
+// Focus emulation naps on a separate 90 s timer, using the same activity and
+// tab chain so it cannot land inside a call either.
 
 /** Object group every remote object a single tool call mints belongs to, unless
  * the call manages its own group. Released by the idle flush — nothing may need
@@ -590,7 +598,10 @@ export const CALL_GROUP = 'sallyport-call';
 /** A tab with no CDP activity for this long gets its hygiene flush. */
 export const HYGIENE_IDLE_MS = 10_000;
 
-/** The whole flush stops waiting after this. Its commands are answered by the
+/** Focus emulation naps after this long without CDP activity. */
+export const KEEP_AWAKE_IDLE_MS = 90_000;
+
+/** An idle flush or nap stops waiting after this. Its commands are answered by the
  * renderer, and a wedged one (an unanswered dialog, a runaway script) must not
  * hold the tab chain. */
 export const HYGIENE_FLUSH_DEADLINE_MS = 2_000;
@@ -624,6 +635,11 @@ interface TabHygiene {
   /** Release the 'console' group even if this worker never saw capture on the
    * tab — set by the startup sweep, which cannot know. */
   console: boolean;
+  /** Focus emulation may be on; cleared when a nap or revoke is sent. */
+  awake: boolean;
+  napTimer: ReturnType<typeof setTimeout> | undefined;
+  /** A nap is waiting on the tab chain. */
+  napQueued: boolean;
   timer: ReturnType<typeof setTimeout> | undefined;
   /** When the armed `timer` fires. */
   timerDue: number;
@@ -663,6 +679,9 @@ function newHygiene(): TabHygiene {
     ax: false,
     dom: false,
     console: false,
+    awake: false,
+    napTimer: undefined,
+    napQueued: false,
     timer: undefined,
     timerDue: 0,
     queued: false,
@@ -745,19 +764,19 @@ function pruneAbandoned(st: TabHygiene, now: number): void {
   }
 }
 
-/** The earliest moment the tab can be flushed: HYGIENE_IDLE_MS after its last
- * activity, and not before every command still in flight has either been
- * answered or aged out as abandoned. */
-function flushDueAt(st: TabHygiene, now: number): number {
-  let due = st.lastActivity + HYGIENE_IDLE_MS;
+/** The earliest moment the tab has been idle for `idleMs`, and not before
+ * every command still in flight has either been answered or aged out as
+ * abandoned. */
+function idleDueAt(st: TabHygiene, now: number, idleMs: number): number {
+  let due = st.lastActivity + idleMs;
   for (const sentAt of st.inFlight.values()) {
     if (now - sentAt < ABANDONED_COMMAND_MS) due = Math.max(due, sentAt + ABANDONED_COMMAND_MS);
   }
   return due;
 }
 
-function isIdle(st: TabHygiene, now: number): boolean {
-  return now >= flushDueAt(st, now);
+function isIdle(st: TabHygiene, now: number, idleMs = HYGIENE_IDLE_MS): boolean {
+  return now >= idleDueAt(st, now, idleMs);
 }
 
 /** Arm the tab's one timer for when it can next be flushed. A timer already
@@ -766,8 +785,9 @@ function isIdle(st: TabHygiene, now: number): boolean {
 function scheduleHygiene(tabId: number, st: TabHygiene): void {
   const now = Date.now();
   pruneAbandoned(st, now);
+  scheduleKeepAwakeNap(tabId, st);
   if (st.queued) return;
-  const due = flushDueAt(st, now);
+  const due = idleDueAt(st, now, HYGIENE_IDLE_MS);
   if (st.timer !== undefined) {
     if (st.timerDue <= due) return;
     clearTimeout(st.timer);
@@ -786,6 +806,51 @@ function scheduleHygiene(tabId: number, st: TabHygiene): void {
     },
     Math.max(0, due - now),
   );
+}
+
+/** One extra timer per tab, independent of the 10 s flush. This runs on every
+ * command sent and answered, so an armed timer is LEFT ALONE rather than
+ * re-armed each time: it re-checks when it fires and re-arms for what is left
+ * of the window. It can never be armed too late — activity only moves the due
+ * time forward. Sweep records wait for the flush to prove ownership before
+ * arming it. */
+function scheduleKeepAwakeNap(tabId: number, st: TabHygiene): void {
+  if (!st.awake || st.napQueued || st.unproven) {
+    if (st.napTimer !== undefined) clearTimeout(st.napTimer);
+    st.napTimer = undefined;
+    return;
+  }
+  if (st.napTimer !== undefined) return;
+  const now = Date.now();
+  const due = idleDueAt(st, now, KEEP_AWAKE_IDLE_MS);
+  st.napTimer = setTimeout(
+    () => {
+      st.napTimer = undefined;
+      if (hygiene.get(tabId) !== st) return;
+      if (!isIdle(st, Date.now(), KEEP_AWAKE_IDLE_MS)) {
+        scheduleKeepAwakeNap(tabId, st);
+        return;
+      }
+      st.napQueued = true;
+      void onTab(tabId, () => napIfStillIdle(tabId, st));
+    },
+    Math.max(0, due - now),
+  );
+}
+
+async function napIfStillIdle(tabId: number, st: TabHygiene): Promise<void> {
+  st.napQueued = false;
+  if (hygiene.get(tabId) !== st || !st.awake || st.unproven) return;
+  // A call ahead of us, or a tabId-less call bypassing the chain, may have
+  // started since the timer was armed. Use the same abandoned-command rule.
+  if (!isIdle(st, Date.now(), KEEP_AWAKE_IDLE_MS)) {
+    scheduleKeepAwakeNap(tabId, st);
+    return;
+  }
+  st.awake = false;
+  // Direct, bounded and best-effort: the nap is not activity and cannot arm
+  // either timer, even when Chrome answers after the deadline.
+  await answers(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: false });
 }
 
 async function flushIfStillIdle(tabId: number, st: TabHygiene): Promise<void> {
@@ -860,6 +925,8 @@ async function answers(
  * re-attaching a full AXContext to every new document of the tab). Best-effort
  * throughout: errors are swallowed, the wait is bounded, nothing throws. */
 async function flushHygiene(tabId: number, st: TabHygiene, releaseCallGroup = true): Promise<void> {
+  // An unproven sweep record has passed its proof before reaching here.
+  scheduleKeepAwakeNap(tabId, st);
   const releaseAx = st.ax;
   const disableDom = st.dom;
   const releaseConsole = st.console || isConsoleCaptureActive(tabId);
@@ -903,14 +970,15 @@ export function hygieneStateForTest(tabId: number): { inFlight: number } | undef
 function dropHygiene(tabId: number): void {
   const st = hygiene.get(tabId);
   if (st?.timer !== undefined) clearTimeout(st.timer);
+  if (st?.napTimer !== undefined) clearTimeout(st.napTimer);
   hygiene.delete(tabId);
 }
 
 /** Flush the tabs a previous worker left attached.
  *
  * An MV3 worker restart wipes every timer and flag above while the debugger
- * session — and the AXContext, DOM agent and object groups it holds — survives
- * it. On worker start, every tab `chrome.debugger.getTargets` reports attached
+ * session — and its AXContext, DOM agent, object groups and focus emulation —
+ * survives it. On worker start, every tab `chrome.debugger.getTargets` reports attached
  * gets the full flush (all flags set, since nothing remembers which were used)
  * as soon as it is idle: at once for a tab nobody has driven since, through the
  * usual timer for one already in use again. `attached` there is also true for a
@@ -934,6 +1002,7 @@ export async function sweepStrandedHygiene(): Promise<void> {
       st.ax = true;
       st.dom = true;
       st.console = true;
+      st.awake = true;
       scheduleHygiene(tabId, st);
     }
   } catch {

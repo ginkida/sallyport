@@ -20,6 +20,13 @@ uses [Semantic Versioning](https://semver.org/).
   ignored. With the old switch on, a tab you had looked at was closed too (with
   its prompt); it is now kept.
 
+- Keep-awake naps. An agent tab that has had no activity for 90 seconds stops
+  being kept "focused and visible" (the focus emulation is dropped) and is
+  woken again by the next tool call. The emulation is a visible capturer: a
+  background agent tab kept rendering frames and running animations and
+  unthrottled timers for the whole session, idle gaps included — about 40 % of
+  a core on an animated page, measured. A page left alone that long now sees
+  itself hidden, as any background tab does, until the agent returns to it.
 - A `navigate` that opens a tab reports `openTabs` once the session holds five
   or more — how many tabs it has opened and not closed. In broker mode a
   `navigate` without `tabId` always opens a tab, so an agent that never passes
