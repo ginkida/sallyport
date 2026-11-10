@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-11-10
+
 ### Changed
 
 - **A session's agent tabs are now closed when it ends** (was: left open and
@@ -3279,7 +3281,8 @@ client) and Chrome, end-to-end tested on a real page.
   state wasn't exactly `connected`; now visible in any "paired & not paused"
   state, with dynamic helper text.
 
-[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.26.1...HEAD
+[Unreleased]: https://github.com/ginkida/sallyport/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/ginkida/sallyport/compare/v0.26.1...v0.27.0
 [0.26.1]: https://github.com/ginkida/sallyport/compare/v0.26.0...v0.26.1
 [0.26.0]: https://github.com/ginkida/sallyport/compare/v0.25.1...v0.26.0
 [0.25.1]: https://github.com/ginkida/sallyport/compare/v0.25.0...v0.25.1
