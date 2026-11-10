@@ -185,20 +185,22 @@ def record_result(
     result: Any,
     *,
     opened_at: float,
-) -> None:
+) -> bool:
     """After a successful create-capable call, record the (possibly new) owned
     tab from its result data. No-op in standalone or for non-create tools.
+    Returns whether the call added a tab the client did not own before.
 
     Recording from ``navigate``'s result is safe: an in-place navigate only
     targets an already-owned tab (the gate enforced it), and ``newTab`` mints a
     fresh tab — so this can never grant ownership of a foreign/human tab."""
     if client_id is None or name not in CREATE_CAPABLE:
-        return
+        return False
     if not isinstance(result, dict):
-        return
+        return False
     tab_id = result.get("tabId")
     if not _is_tab_id(tab_id):
-        return
+        return False
+    created = not registry.owns(client_id, tab_id)
     registry.record_create(
         client_id,
         tab_id,
@@ -206,6 +208,46 @@ def record_result(
         opened_at=opened_at,
         window=result.get("window"),
     )
+    return created
+
+
+# From this many open tabs on, a result that just OPENED another one says how
+# many the session now holds. A tabId-less ``navigate`` in broker mode always
+# opens a tab, so an agent that forgets to pass the id back opens one per step;
+# the tool description says so, but a number in the result of the very call that
+# did it is what gets noticed. Below the threshold it is noise.
+OPEN_TABS_NOTE_AT = 5
+
+
+def note_open_tabs(
+    registry: OwnershipRegistry, client_id: str | None, result: Any, *, created: bool
+) -> Any:
+    """Add ``openTabs`` to the result of a call that just opened the client's
+    Nth tab, N >= ``OPEN_TABS_NOTE_AT``. Advisory only — the registry counts the
+    tabs this client opened and has not closed (or been told are gone), which
+    is the number the agent can act on."""
+    if client_id is None or not created or not isinstance(result, dict):
+        return result
+    count = len(registry.owned_tab_ids(client_id))
+    if count < OPEN_TABS_NOTE_AT:
+        return result
+    return {**result, "openTabs": count}
+
+
+def forget_gone_tab(
+    registry: OwnershipRegistry, client_id: str | None, args: dict[str, Any], code: str | None
+) -> None:
+    """Evict a tab the extension just reported gone (``tab_gone``: closed by the
+    human, the tab reaper or another path, or its id recycled). The client can
+    never use the id again, and until now only a successful ``close_tab`` or the
+    disconnect shrank the registry — so a long session that lost tabs to the
+    reaper kept every dead id, and the open-tab count above would be wrong. A
+    later call naming it answers ``tab_not_owned``, which says the same thing."""
+    if client_id is None or code != "tab_gone":
+        return
+    tab_id = args.get("tabId")
+    if _is_tab_id(tab_id):
+        registry.drop_tab(client_id, tab_id)
 
 
 def record_opened_tabs(

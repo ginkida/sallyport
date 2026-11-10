@@ -20,8 +20,27 @@ uses [Semantic Versioning](https://semver.org/).
   ignored. With the old switch on, a tab you had looked at was closed too (with
   its prompt); it is now kept.
 
+- A `navigate` that opens a tab reports `openTabs` once the session holds five
+  or more — how many tabs it has opened and not closed. In broker mode a
+  `navigate` without `tabId` always opens a tab, so an agent that never passes
+  the id back opens one per step; the number arrives in the result of the call
+  that did it.
+
 ### Fixed
 
+- Tabs stop being driven when the daemon stays gone. With no connection for a
+  minute (daemon stopped or crashed, bridge paused, secret cleared) the
+  extension detaches its debugger session from every tab — until now they kept
+  Chrome's "started debugging this browser" bar, their CDP state, and the
+  DevTools-open status that keeps a tab out of Memory Saver for as long as the
+  browser ran, because the release is something only a live daemon sends. The
+  tabs stay open; if the same daemon comes back, its agents re-attach on their
+  next call (refs from before are `bad_ref`, a `set_viewport` emulation is
+  cleared).
+- The daemon forgets a tab the extension reports gone (`tab_gone`). Only a
+  successful `close_tab` or the disconnect used to shrink a session's owned
+  set, so tabs closed by the human or the tab reaper stayed on record for the
+  session's lifetime. A later call naming such a tab answers `tab_not_owned`.
 - Agent tabs no longer outlive a daemon that died. A broker that crashed, was
   killed, or was stopped for an upgrade (`doctor --stop-broker`) took its tab
   ownership registry with it and sent no release: its sessions' tabs stayed

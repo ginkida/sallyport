@@ -526,6 +526,8 @@ class Bridge:
             CLIENT_LABEL_ARG,
             CREATE_CAPABLE,
             ensure_owns,
+            forget_gone_tab,
+            note_open_tabs,
             record_close,
             record_opened_tabs,
             record_result,
@@ -585,7 +587,7 @@ class Bridge:
                     # then owner-scope a list_tabs result (fail-closed) before it
                     # leaves the daemon.
                     now = time.time()
-                    record_result(self._ownership, client_id, name, result, opened_at=now)
+                    created = record_result(self._ownership, client_id, name, result, opened_at=now)
                     # Tabs the PAGE opened during the call (target=_blank,
                     # window.open, an OAuth popup). The extension adopts them for
                     # the tab that spawned them; without recording it here they
@@ -604,6 +606,8 @@ class Bridge:
                         # literally named "epoch" isn't silently stripped too.
                         result = {k: v for k, v in result.items() if k != "epoch"}
                     record_close(self._ownership, client_id, name, args)
+                    # Tell an agent that just opened its Nth tab how many it holds.
+                    result = note_open_tabs(self._ownership, client_id, result, created=created)
                     if name == "list_tabs":
                         result = scope_list_tabs(self._ownership, client_id, result)
                     # Daemon-side post-call processing — print_to_pdf writes its
@@ -614,6 +618,8 @@ class Bridge:
                     if processor is not None:
                         result = await processor(args, result)
         except Exception as exc:
+            # A tab the extension reports gone leaves the caller's owned set.
+            forget_gone_tab(self._ownership, client_id, args, getattr(exc, "code", None))
             # CancelledError is a BaseException, so a cancelled call is NOT
             # recorded here — only genuinely completed (errored) calls are.
             self._record_call(

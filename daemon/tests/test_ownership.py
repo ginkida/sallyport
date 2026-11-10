@@ -18,6 +18,8 @@ from sallyport_daemon.ownership import (
     EPOCH_ARG,
     OwnershipRegistry,
     ensure_owns,
+    forget_gone_tab,
+    note_open_tabs,
     record_close,
     record_opened_tabs,
     record_result,
@@ -500,3 +502,94 @@ async def test_call_tool_adoption_does_not_cross_clients() -> None:
     await b.call_tool("click", {"tabId": 5, "selector": "a"}, client_id="A")
 
     assert b._ownership.owns("B", 6) is False
+
+
+async def test_navigate_reports_open_tabs_once_a_session_holds_several() -> None:
+    """A tabId-less navigate in broker mode always opens a tab, so an agent that
+    never passes the id back opens one per step. From the fifth on, the result
+    of the call that opened it says how many the session holds."""
+    b = _StubBridge()
+    outs = []
+    for tab_id in range(1, 7):
+        b.responses["navigate"] = {"tabId": tab_id, "epoch": f"e{tab_id}", "url": "https://x"}
+        outs.append(await b.call_tool("navigate", {"url": "https://x"}, client_id="A"))
+
+    assert ["openTabs" in o for o in outs] == [False, False, False, False, True, True]
+    assert outs[4]["openTabs"] == 5
+    assert outs[5]["openTabs"] == 6
+
+    # Re-navigating a tab it already holds opens nothing, so says nothing.
+    b.responses["navigate"] = {"tabId": 6, "epoch": "e6", "url": "https://y"}
+    again = await b.call_tool("navigate", {"url": "https://y", "tabId": 6}, client_id="A")
+    assert "openTabs" not in again
+
+    # Another client's count is its own.
+    b.responses["navigate"] = {"tabId": 50, "epoch": "e50", "url": "https://x"}
+    other = await b.call_tool("navigate", {"url": "https://x"}, client_id="B")
+    assert "openTabs" not in other
+
+
+async def test_open_tabs_count_follows_close_tab() -> None:
+    b = _StubBridge()
+    for tab_id in range(1, 6):
+        b.responses["navigate"] = {"tabId": tab_id, "epoch": f"e{tab_id}", "url": "https://x"}
+        await b.call_tool("navigate", {"url": "https://x"}, client_id="A")
+    b.responses["close_tab"] = {"closed": 1}
+    await b.call_tool("close_tab", {"tabId": 1}, client_id="A")
+    await b.call_tool("close_tab", {"tabId": 2}, client_id="A")
+
+    b.responses["navigate"] = {"tabId": 9, "epoch": "e9", "url": "https://x"}
+    out = await b.call_tool("navigate", {"url": "https://x"}, client_id="A")
+
+    assert "openTabs" not in out  # 4 open
+
+
+def test_note_open_tabs_is_inert_in_standalone_and_on_junk() -> None:
+    reg = OwnershipRegistry()
+    for tab_id in range(1, 8):
+        reg.record_create("A", tab_id, f"e{tab_id}", opened_at=1.0)
+    assert note_open_tabs(reg, None, {"tabId": 1}, created=True) == {"tabId": 1}
+    assert note_open_tabs(reg, "A", {"tabId": 1}, created=False) == {"tabId": 1}
+    assert note_open_tabs(reg, "A", "junk", created=True) == "junk"
+    assert note_open_tabs(reg, "A", {"tabId": 1}, created=True) == {"tabId": 1, "openTabs": 7}
+
+
+def test_forget_gone_tab_evicts_only_on_tab_gone() -> None:
+    reg = OwnershipRegistry()
+    reg.record_create("A", 5, "e5", opened_at=1.0)
+    reg.record_create("B", 6, "e6", opened_at=1.0)
+
+    forget_gone_tab(reg, "A", {"tabId": 5}, "timeout")
+    assert reg.owns("A", 5)
+    forget_gone_tab(reg, None, {"tabId": 5}, "tab_gone")
+    assert reg.owns("A", 5)
+    forget_gone_tab(reg, "A", {"tabId": 6}, "tab_gone")  # not A's to forget
+    assert reg.owns("B", 6)
+    forget_gone_tab(reg, "A", {"tabId": True}, "tab_gone")
+    forget_gone_tab(reg, "A", {}, "tab_gone")
+    assert reg.owns("A", 5)
+
+    forget_gone_tab(reg, "A", {"tabId": 5}, "tab_gone")
+    assert not reg.owns("A", 5)
+
+
+async def test_call_tool_forgets_a_tab_the_extension_reports_gone() -> None:
+    class _Gone(_StubBridge):
+        async def _call_tool_locked(
+            self, name: str, args: dict[str, Any], client_id: str | None = None
+        ) -> Any:
+            if name == "snapshot":
+                raise ToolError("tab 5 is gone", code="tab_gone")
+            return await super()._call_tool_locked(name, args, client_id)
+
+    b = _Gone()
+    b.responses["navigate"] = {"tabId": 5, "epoch": "e1", "url": "https://x"}
+    await b.call_tool("navigate", {"url": "https://x"}, client_id="A")
+
+    with pytest.raises(ToolError) as first:
+        await b.call_tool("snapshot", {"tabId": 5}, client_id="A")
+    assert first.value.code == "tab_gone"
+    assert not b._ownership.owns("A", 5)
+    with pytest.raises(ToolError) as second:
+        await b.call_tool("snapshot", {"tabId": 5}, client_id="A")
+    assert second.value.code == "tab_not_owned"
